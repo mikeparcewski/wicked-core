@@ -8090,7 +8090,10 @@ thread_local! {
 
 /// (core#1290) Run `f` with every [`run_bounded`] on THIS thread keeping at most `cap` bytes of
 /// stdout text (never more than the runner's own cap): a carried council ballot runs its seat
-/// with its own output cap, bounded while it is read rather than cut after the carrier returns.
+/// with its own output cap, so the runner's retained text stops growing at it rather than being
+/// cut after the carrier returns. It bounds what the RUNNER keeps; the raw line read stays bounded
+/// by the runner's own cap (a supported stream-json record must still decode whole), and an
+/// adapter's held answer keeps its own fixed bound (`AGY_HELD_TEXT`).
 pub(crate) fn with_stdout_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<usize>);
     impl Drop for Restore {
@@ -8102,16 +8105,19 @@ pub(crate) fn with_stdout_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// (core#1290) Read one line of `r` into `buf` (its `\n`, and a `\r` before it, dropped),
-/// holding at most `cap` bytes of it: `Ok(None)` at the end of input, else `Ok(Some(over))`, with
-/// `over` when the line ran past `cap`. The rest of an over-long line is read and dropped, never
-/// held: `BufRead::lines` held a whole line, however long, before any cap applied.
+/// (core#1290) Read one line of `r` into `buf` (its `\n`, and a `\r` before it, dropped, as
+/// `BufRead::lines` drops them), holding at most `cap` bytes of it: `Ok(None)` at the end of input,
+/// else `Ok(Some(over))`, with `over` when the line's content ran past `cap`. The rest of an
+/// over-long line is read and dropped, never held: `BufRead::lines` held a whole line, however
+/// long, before any cap applied. A `\r\n` ending never counts against the cap (codex r1 on #1774):
+/// one byte past it is held until the line ends, so a CR split from its LF across reads is seen.
 pub(crate) fn read_line_capped(
     r: &mut impl std::io::BufRead,
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<Option<bool>> {
     buf.clear();
+    let hold = cap.saturating_add(1);
     let (mut over, mut any) = (false, false);
     loop {
         let avail = match r.fill_buf() {
@@ -8120,12 +8126,15 @@ pub(crate) fn read_line_capped(
             Err(e) => return Err(e),
         };
         if avail.is_empty() {
+            // The last line, with no `\n`: a trailing `\r` is content, as `lines` keeps it.
+            over |= buf.len() > cap;
+            buf.truncate(cap);
             return Ok(any.then_some(over));
         }
         any = true;
         let end = avail.iter().position(|&b| b == b'\n');
         let chunk = &avail[..end.unwrap_or(avail.len())];
-        let room = cap.saturating_sub(buf.len());
+        let room = hold.saturating_sub(buf.len());
         over |= chunk.len() > room;
         buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
         let used = end.map_or(avail.len(), |i| i + 1);
@@ -8134,6 +8143,8 @@ pub(crate) fn read_line_capped(
             if !over && buf.last() == Some(&b'\r') {
                 buf.pop();
             }
+            over |= buf.len() > cap;
+            buf.truncate(cap);
             return Ok(Some(over));
         }
     }
@@ -10599,6 +10610,30 @@ mod tests {
         assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), Some(false));
         assert_eq!(buf, b"ij");
         assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), None);
+    }
+
+    /// codex r1 on #1774: content of exactly the cap is a whole line whether it ends `\n`, `\r\n`
+    /// (the CR and LF in separate reads too) or nothing; one byte more is over.
+    #[test]
+    fn read_line_capped_takes_exactly_the_cap_with_any_ending() {
+        for cap_fill in [1, 2, 3, 4, 64] {
+            let mut r = std::io::BufReader::with_capacity(
+                cap_fill,
+                &b"abc\nabc\r\nabcd\r\nab\rc\nabc\r"[..],
+            );
+            let mut buf = Vec::new();
+            let mut next = || {
+                let over = read_line_capped(&mut r, &mut buf, 3).unwrap();
+                (over, String::from_utf8_lossy(&buf).into_owned())
+            };
+            assert_eq!(next(), (Some(false), "abc".to_string()), "fill {cap_fill}");
+            assert_eq!(next(), (Some(false), "abc".to_string()), "fill {cap_fill}");
+            assert_eq!(next(), (Some(true), "abc".to_string()), "fill {cap_fill}");
+            assert_eq!(next(), (Some(true), "ab\r".to_string()), "fill {cap_fill}");
+            // The last line keeps its `\r` (as `lines` does), so it is 4 bytes: over.
+            assert_eq!(next(), (Some(true), "abc".to_string()), "fill {cap_fill}");
+            assert_eq!(next(), (None, String::new()), "fill {cap_fill}");
+        }
     }
 
     /// (core#1290) A 9 MiB line with no newline in it is never held whole: it is dropped with a
