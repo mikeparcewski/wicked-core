@@ -664,6 +664,32 @@ pub struct PendingPlan {
     /// prompt shows the running order, as the def runs it. Empty on an initial plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done: Vec<String>,
+    /// (core#1382) What put the plan in its band, as the gate prompt says it: the score, the
+    /// score's own reasons (reach: changed symbols and their dependents, test gap, …), the declared
+    /// files, and a ratchet or destructive floor that held the band up. Empty on a row persisted
+    /// before the field existed, and on a revision with no score of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub band_why: Vec<String>,
+}
+
+/// (core#1382) Why a plan scored `scored` lands in its band ([`PendingPlan::band_why`]): an
+/// operator reading a high band on a small change sees that reach set it, not a scoring error.
+fn band_why(scored: &Scored, plan: &PlanSteps, prior_max: u8) -> Vec<String> {
+    let a = &scored.assessment;
+    let mut why = vec![format!("score {}", a.score)];
+    why.extend(a.reasons.iter().cloned());
+    if let Some(touch) = plan.touch.as_ref().filter(|t| !t.is_empty()) {
+        why.push(format!("{} declared file(s)", touch.len()));
+    }
+    if scored.destructive && !a.reasons.iter().any(|r| r.starts_with("destructive floor")) {
+        why.push("a destructive path is touched".to_string());
+    }
+    if prior_max > a.score {
+        why.push(format!(
+            "the band keeps this run's highest score so far, {prior_max}"
+        ));
+    }
+    why
 }
 
 /// Which row of the approval matrix a plan event is (§8.6).
@@ -1198,6 +1224,7 @@ pub(crate) fn decide(
                 touch_source: Some(touch_source_of(&proposal.source)),
                 rules,
                 done: Vec::new(),
+                band_why: band_why(scored, &plan, prior.max_score),
             });
             Ok(Decided {
                 state,
@@ -1458,6 +1485,12 @@ pub(crate) fn gate_prompt(p: &PendingPlan, ord: u32, auto: bool) -> String {
         if auto { "auto" } else { "manual" },
         steps.join(" → ")
     );
+    if !p.band_why.is_empty() {
+        // A reason is free text (a PA's own `RISK` reasons ride the score): an arrow in it would
+        // read as a step separator to a parser of the step list, so it is spelled `->` here.
+        let why = p.band_why.join("; ").replace('\u{2192}', "->");
+        out.push_str(&format!(". Band {} from: {why}", p.band));
+    }
     if !p.floor_added.is_empty() {
         out.push_str(&format!(". Floor added: {}", p.floor_added.join(", ")));
     }
@@ -1511,6 +1544,25 @@ fn wire_step(s: &PlanStep) -> Value {
     }
     if let Some(p) = s.pool {
         o.insert("pool".into(), json!(p));
+    }
+    // (core#1259) The controls the plan set on the step, so a reader of the plan's events (studio's
+    // plan card) sees what shapes the step's gates. Display only: the engine composes from the plan.
+    if let Some(Some(pin)) = &s.validator_pin {
+        o.insert("validator_pin".into(), json!(pin));
+    }
+    for (key, set) in [
+        ("executes_code", s.executes_code),
+        ("writes_nothing", s.writes_nothing),
+        ("verified_evidence", s.verified_evidence),
+        ("requires_capture_report", s.requires_capture_report),
+        ("answer_only", s.answer_only),
+    ] {
+        if let Some(b) = set {
+            o.insert(key.into(), json!(b));
+        }
+    }
+    if let Some(d) = s.required_deliverables.as_ref().filter(|d| !d.is_empty()) {
+        o.insert("required_deliverables".into(), json!(d));
     }
     if let Some(a) = &s.added_by {
         o.insert("added_by".into(), json!(a));
@@ -2000,6 +2052,7 @@ mod tests {
             touch_source: None,
             rules: Vec::new(),
             done: vec!["pa-scope".into(), "build".into()],
+            band_why: Vec::new(),
         };
         let prompt = gate_prompt(&p, 3, false);
         assert!(
@@ -2100,6 +2153,134 @@ mod tests {
 
     fn scored_for(p: &PlanSteps) -> Scored {
         intent_score(p, Graph::Unavailable("no repo".into()))
+    }
+
+    /// (core#1382) A plan gate held on a reach-based band says what put the plan there: the
+    /// score, its reasons as the score table wrote them (two changed symbols with forty
+    /// dependents), and the declared files. A two-file change in a high band reads as intended.
+    #[test]
+    fn the_plan_gate_prompt_says_what_put_the_plan_in_its_band() {
+        let p = plan(json!({
+            "steps": [{"catalog": "build"}],
+            "touch": ["src/auth/session.rs", "src/auth/token.rs"]
+        }));
+        let signals = crate::review_scale::ImpactSignals {
+            changed_symbols: 2,
+            dependents: 40,
+            products: 1,
+            ..Default::default()
+        };
+        // The score table's own writer, as `review_scale::assess` calls it on a graph read.
+        let table = crate::review_scale::impact_score(&signals);
+        let scored = Scored {
+            assessment: Assessment {
+                deterministic: table.score,
+                score: table.score,
+                reasons: table.reasons.clone(),
+                model: None,
+                signals: Some(signals),
+                plan: crate::review_scale::plan_for(table.score),
+            },
+            destructive: false,
+        };
+        let d = decide(
+            "r1",
+            Proposal {
+                by: "human".into(),
+                source: ProposalSource::Launch {
+                    session_id: "r1".into(),
+                },
+                kind: ProposalKind::Initial,
+                preset: None,
+                plan: p,
+                reviewing_ord: None,
+                approved_by_human: false,
+            },
+            &TeamPlanState::default(),
+            &HumanConfirm::All,
+            &scored,
+            &NoRules,
+            1,
+        )
+        .unwrap();
+        let held = d
+            .state
+            .pending
+            .as_ref()
+            .expect("manual mode holds the plan");
+        let reach = table
+            .reasons
+            .iter()
+            .find(|r| r.starts_with("reach "))
+            .expect("the table names the reach");
+        assert!(reach.contains("40 dependent(s)"), "{reach}");
+        let prompt = gate_prompt(held, 1, false);
+        assert!(
+            prompt.contains(&format!(
+                ". Band {} from: score {}; {reach}",
+                held.band, table.score
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("; 2 declared file(s)"), "{prompt}");
+        // A reason with an arrow (a PA's free-text `RISK` reason) never reads as a step separator.
+        let mut arrowed = held.clone();
+        arrowed
+            .band_why
+            .push("draft \u{2192} customer publication".into());
+        let prompt = gate_prompt(&arrowed, 1, false);
+        let steps_part = prompt.split("): ").nth(1).unwrap();
+        assert_eq!(
+            steps_part.matches('\u{2192}').count(),
+            arrowed.steps.steps.len() - 1,
+            "only the step list carries arrows: {prompt}"
+        );
+        assert!(prompt.contains("draft -> customer publication"), "{prompt}");
+        // A row persisted before the field existed reads as no reasons, and the prompt is as before.
+        let mut old = serde_json::to_value(held).unwrap();
+        old.as_object_mut().unwrap().remove("band_why");
+        let old: PendingPlan = serde_json::from_value(old).unwrap();
+        assert!(!gate_prompt(&old, 1, false).contains("from: score"));
+    }
+
+    /// (core#1259) A plan's events carry each step's controls, as the plan set them, through the
+    /// wire contract (`TeamEvent::from_payload`): a reader of the plan sees an answer-only step, a
+    /// pinned one and a lowered pool. A step that sets none serializes as before.
+    #[test]
+    fn plan_events_carry_each_steps_controls() {
+        // The plan as a launch body names it (crew's `plan.steps`).
+        let p = plan(json!({"steps": [
+            {"catalog": "build", "pool": 1, "executes_code": true,
+             "required_deliverables": ["docs/api.md"]},
+            {"catalog": "understand", "id": "answer", "answer_only": true,
+             "writes_nothing": true, "validator_pin": "evidence-floor"},
+            {"catalog": "review"}
+        ]}));
+        let p = with_default_ids(&p);
+        let ev = plan_proposed(
+            "r1",
+            "human",
+            "prop-1",
+            None,
+            ProposalKind::Initial,
+            None,
+            &p,
+            1,
+        )
+        .unwrap();
+        let payload = ev.to_payload().unwrap();
+        let steps = payload["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["pool"], 1);
+        assert_eq!(steps[0]["executes_code"], true);
+        assert_eq!(steps[0]["required_deliverables"], json!(["docs/api.md"]));
+        assert_eq!(steps[1]["answer_only"], true);
+        assert_eq!(steps[1]["writes_nothing"], true);
+        assert_eq!(steps[1]["validator_pin"], "evidence-floor");
+        assert_eq!(
+            steps[2],
+            json!({"catalog": "review", "id": "review"}),
+            "a step with no controls is as before"
+        );
     }
 
     /// WT-C3: a rule source that answers with fixed rules and records every context it was
