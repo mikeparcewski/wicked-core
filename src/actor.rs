@@ -15796,6 +15796,7 @@ print(json.dumps({{"check": "pages", "pages": n, "source": "chrome-render", "ver
     }
 
     /// A `file://` URL for a test path (no escaping needed for the temp paths these tests use).
+    #[cfg(unix)]
     fn url_of(p: &std::path::Path) -> String {
         format!("file://{}", p.display())
     }
