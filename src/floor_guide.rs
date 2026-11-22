@@ -898,7 +898,7 @@ impl Compiled {
     /// (core#1101) How many tests a run's text results say it EXECUTED, per qualifier: every
     /// `count` line's `n`, summed under the `section` it follows (under `""` without a keyed list,
     /// or before any section). `None` without a `count` piece; `Err` for an `n` that is not a
-    /// number.
+    /// number, or a section with no `count` line.
     pub(crate) fn executed(
         &self,
         text: &str,
@@ -907,12 +907,27 @@ impl Compiled {
         let keyed = self.keyed();
         let mut q = String::new();
         let mut by = std::collections::BTreeMap::<String, usize>::new();
+        // (review on #1766) Every section the run opens must state its count: a section whose
+        // count line `count` does not match (`running 1 test` against a plural-only regex) is
+        // unknown, never absent.
+        let mut open: Option<String> = None;
+        let uncounted = |open: &Option<String>| -> Option<String> {
+            open.as_ref().map(|q| {
+                format!(
+                    "section `{q}` has no line `parser.count` matches, so what it ran is unknown"
+                )
+            })
+        };
         for l in text.lines().map(|l| l.trim_end_matches('\r')) {
             if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
+                if let Some(e) = uncounted(&open) {
+                    return Some(Err(e));
+                }
                 q = s
                     .name("q")
                     .map(|m| m.as_str().to_string())
                     .unwrap_or_default();
+                open = Some(q.clone());
             }
             let Some(n) = count.captures(l).and_then(|c| c.name("n")) else {
                 continue;
@@ -922,10 +937,14 @@ impl Compiled {
                     "`parser.count` matched `{l}`, whose `n` is not a number"
                 )));
             };
+            open = None;
             let at = by
                 .entry(if keyed { q.clone() } else { String::new() })
                 .or_default();
             *at = at.saturating_add(n);
+        }
+        if let Some(e) = uncounted(&open) {
+            return Some(Err(e));
         }
         Some(Ok(by))
     }
@@ -1312,6 +1331,18 @@ mod tests {
         // A library-only list beside a full run: `bin2` (and its `c`) never listed.
         let err = c.completeness(text, &listed[..2]).unwrap_err();
         assert!(err.contains("section `bin2`"), "{err}");
+        // Equal totals, different qualifiers: bin1 2 + bin2 1 against bin1 1 + bin2 2.
+        let swapped = [t("bin1", "a"), t("bin2", "c"), t("bin2", "d")];
+        let err = c.completeness(text, &swapped).unwrap_err();
+        assert!(err.contains("section `bin1`"), "{err}");
+        // (review on #1766) A section whose count line the regex misses is unknown, not absent.
+        let plural = {
+            let mut p = c.clone();
+            p.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\d+) tests$".into());
+            p
+        };
+        let err = plural.completeness(text, &listed[..2]).unwrap_err();
+        assert!(err.contains("section `bin2` has no line"), "{err}");
         // Doctests the list does not print.
         let docs = text.replace("running 0 tests", "running 3 tests");
         let err = c.completeness(&docs, &listed).unwrap_err();
@@ -1351,6 +1382,14 @@ mod tests {
         assert_eq!(j.completeness(xml, &two), Ok(()));
         let err = j.completeness(xml, &two[..1]).unwrap_err();
         assert!(err.contains("the run has `k::y`"), "{err}");
+        // Same size, different ids: `x, y` run against `x, z` listed.
+        let other = [t("s", "k::x"), t("s", "k::z")];
+        let err = j.completeness(xml, &other).unwrap_err();
+        assert!(err.contains("the run has `k::y`"), "{err}");
+        // A testcase run twice balancing a listed one the run lacks.
+        let twice = r#"<testsuite name="s"><testcase classname="k" name="x"/>
+            <testcase classname="k" name="x"/></testsuite>"#;
+        assert!(j.completeness(twice, &two).is_err());
     }
 
     /// (confirmation round on d32b2b2, codex P1) A check name keys files the engine writes: only
@@ -1466,6 +1505,22 @@ mod tests {
         // floor-nesting failures), so the floor still reads the check as unusable, never as a guide
         // that does not parse.
         assert!(t.version.is_some());
+        // (core#1101, review on #1766) Its list names doctests (ids with spaces), and every
+        // section a run counts, doctests included, is the list's: `complete` can pass on it.
+        let c = t.compile().expect("compiles");
+        let listing = "     Running unittests src/lib.rs (target/debug/deps/wicked_core-0a1b)\n\
+                       t::a: test\n   Doc-tests wicked_core\nsrc/clock.rs - clock (line 7): test\n";
+        let listed = c.list(listing);
+        assert_eq!(
+            listed,
+            [
+                self::t("wicked_core-0a1b", "t::a"),
+                self::t("wicked_core", "src/clock.rs - clock (line 7)")
+            ]
+        );
+        let run = "     Running unittests src/lib.rs (target/debug/deps/wicked_core-0a1b)\n\
+                   running 1 test\ntest t::a ... ok\n   Doc-tests wicked_core\nrunning 1 test\n";
+        assert_eq!(t.completeness(run, &listed), Ok(()));
         let v = t.verified.as_ref().expect("a verified block");
         assert!(v.results.contains_key("version") && !v.runner_version.is_empty());
         // (confirmation round) An npm gate provisions as detection does: an `install` check

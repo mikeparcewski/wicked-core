@@ -291,6 +291,16 @@ struct Probe<'a> {
     scratch: &'a CheckScratch,
 }
 
+/// (core#1101) The passing test `alone` and `deselect` probe: under `t`'s qualifier, not `t`, not
+/// `skip`, and with an id no other listed test has under ANY qualifier.
+fn unique_passing(ids: &[TestId], t: &TestId, skip: impl Fn(&TestId) -> bool) -> Option<TestId> {
+    ids.iter()
+        .find(|x| {
+            x.q == t.q && *x != t && !skip(*x) && ids.iter().filter(|y| y.id == x.id).count() == 1
+        })
+        .cloned()
+}
+
 fn verdict(ok: bool, why: impl FnOnce() -> String) -> String {
     if ok {
         "pass".into()
@@ -659,16 +669,7 @@ impl Probe<'_> {
         let (aexit, alone_t) = self.results(&both_copy, &g.alone_argv(&t));
         // (core#1101) A passing test whose id is unique across EVERY qualifier: running or
         // deselecting a shared name proves nothing about one test.
-        let passing = listed
-            .ids
-            .iter()
-            .find(|x| {
-                x.q == t.q
-                    && **x != t
-                    && !is(x, m2)
-                    && listed.ids.iter().filter(|y| y.id == x.id).count() == 1
-            })
-            .cloned();
+        let passing = unique_passing(&listed.ids, &t, |x| is(x, m2));
         out.insert(
             "alone".into(),
             match (&passing, &alone_t) {
@@ -748,4 +749,30 @@ fn now_rfc3339() -> String {
         rem % 3600 / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(q: &str, id: &str) -> TestId {
+        TestId {
+            q: q.into(),
+            id: id.into(),
+        }
+    }
+
+    /// (core#1101, review on #1766) The passing test probed is unique across EVERY qualifier:
+    /// `A/pass` is skipped while `B/pass` exists, even though it is unique under `A`.
+    #[test]
+    fn the_passing_test_is_unique_across_every_qualifier() {
+        let m = t("A", "m");
+        let mut ids = vec![m.clone(), t("A", "pass"), t("B", "pass"), t("A", "m2")];
+        assert_eq!(unique_passing(&ids, &m, |x| x.id == "m2"), None);
+        ids.push(t("A", "solo"));
+        assert_eq!(
+            unique_passing(&ids, &m, |x| x.id == "m2"),
+            Some(t("A", "solo"))
+        );
+    }
 }
