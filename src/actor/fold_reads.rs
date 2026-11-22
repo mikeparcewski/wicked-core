@@ -186,27 +186,24 @@ pub(crate) type Maps = Arc<Mutex<crate::acp_runner::ElicitationMaps>>;
 /// (core#1742) The validator's process group is registered under its run, as a tool child is, so
 /// the run's reassign or cancel stops it before a replacement can be dispatched into the same
 /// worktree. `seq` is the run's launch identity at the hand-off: a reassign, a cancel and a
-/// relaunch each advance it. A group spawned after that (the reassign landed between the hand-off
-/// and the spawn) is stopped at once, since the reassign has already taken the groups it kills.
+/// relaunch each advance it, under the same lock this spawn holds. So either the group is
+/// registered first (and the reassign or cancel that follows takes and stops it), or the identity
+/// moved first and the validator is never started.
 fn validator_watch(maps: Maps, run_id: String, seq: u64) -> crate::validator::SpawnWatch {
     let (m, run) = (maps.clone(), run_id.clone());
     crate::validator::SpawnWatch {
-        on_spawn: Box::new(move |pgid| {
-            let stale = {
-                let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
-                if g.current_launch_seq(&run) == seq {
-                    // A tool child of the same run cannot be live here: the step's result, which
-                    // ends it, is what this read was handed off for.
-                    let _ = g.register_tool_child(&run, pgid);
-                    false
-                } else {
-                    true
-                }
-            };
-            if stale {
-                #[cfg(unix)]
-                crate::validator::kill_pgroup_graceful(pgid);
+        spawn: Box::new(move |spawn| {
+            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+            if g.current_launch_seq(&run) != seq {
+                return Err(std::io::Error::other(
+                    "the run's attempt was superseded before its validator started",
+                ));
             }
+            let child = spawn()?;
+            // A tool child of the same run cannot be live here: the step's result, which ends it,
+            // is what this read was handed off for.
+            let _ = g.register_tool_child(&run, child.id());
+            Ok(child)
         }),
         on_done: Box::new(move |pgid| {
             maps.lock()
@@ -585,25 +582,58 @@ mod tests {
             "nothing is left registered"
         );
 
-        // A group spawned after the reassign took the run's groups is stopped at its spawn.
-        let late = validator_watch(maps.clone(), "r-stop".into(), 1);
-        let t = std::time::Instant::now();
-        let denial = crate::validator::with_spawn_watch(late, || {
-            crate::pipeline::pinned_validator_denial_with_env(&unit, Some(wd.as_path()), None, &[])
+        // A validator whose run's identity moved before it started is never started, even one
+        // that writes at once (codex round 1: a kill after the spawn would come too late).
+        let mut eager = unit.clone();
+        eager.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "touch late-write.txt".into(),
+            approved: true,
         });
-        assert!(denial.is_some(), "a stopped validator never passes");
-        assert!(
-            t.elapsed() < Duration::from_secs(3),
-            "stopped at spawn, not run out ({:?})",
-            t.elapsed()
-        );
-        std::thread::sleep(Duration::from_millis(3500));
-        assert!(!wd.join("late-write.txt").exists());
+        let late = validator_watch(maps.clone(), "r-stop".into(), 1);
+        let denial = crate::validator::with_spawn_watch(late, || {
+            crate::pipeline::pinned_validator_denial_with_env(&eager, Some(wd.as_path()), None, &[])
+        });
+        assert!(denial.is_some(), "a validator never started never passes");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!wd.join("late-write.txt").exists(), "it never ran");
         assert!(maps
             .lock()
             .unwrap()
             .take_tool_child_pgroups("r-stop")
             .is_empty());
+
+        // A validator's group dies with it: what the script backgrounded cannot write after the
+        // leader exits and its group is released (codex round 1).
+        let mut detached = unit.clone();
+        detached.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "(sleep 2; touch bg-write.txt) & exit 0".into(),
+            approved: true,
+        });
+        let current = maps.lock().unwrap().current_launch_seq("r-stop");
+        let watch = validator_watch(maps.clone(), "r-stop".into(), current);
+        let denial = crate::validator::with_spawn_watch(watch, || {
+            crate::pipeline::pinned_validator_denial_with_env(
+                &detached,
+                Some(wd.as_path()),
+                None,
+                &[],
+            )
+        });
+        assert_eq!(denial, None, "the leader passed");
+        assert!(
+            maps.lock()
+                .unwrap()
+                .take_tool_child_pgroups("r-stop")
+                .is_empty(),
+            "the group is released once it is quiet"
+        );
+        std::thread::sleep(Duration::from_millis(3000));
+        assert!(
+            !wd.join("bg-write.txt").exists(),
+            "the backgrounded writer died with its validator"
+        );
         let _ = std::fs::remove_dir_all(&wd);
     }
 

@@ -248,7 +248,7 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
         t.elapsed()
     );
 
-    // Relaunch the same id while the first life's validator still runs. Its creator call is held.
+    // Relaunch the same id. Its creator call is held.
     core.launch_run(spec("r-handoff", &entry.id))
         .expect("relaunch");
     wait_until("the relaunched life's creator call", || {
@@ -256,16 +256,18 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
     });
     assert!(
         !file(&wt, "ended").exists(),
-        "the first validator is still running"
+        "the first validator never ended: the cancel stopped it"
     );
     let relaunched = state_of(&core, "r-handoff");
 
-    // Let the first life's validator end. Its result comes back to a run that was relaunched.
+    // (core#1742) The cancel stopped the first life's validator: told to go now, it never writes
+    // into the tree the relaunched life uses, and its result (back with no verdict) never folds.
     std::fs::write(file(&wt, "go"), "").unwrap();
-    wait_until("the first life's validator to end", || {
-        file(&wt, "ended").is_file()
-    });
     std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !file(&wt, "ended").exists(),
+        "the cancelled life's validator ran on in the relaunched tree"
+    );
     assert_eq!(
         state_of(&core, "r-handoff"),
         relaunched,

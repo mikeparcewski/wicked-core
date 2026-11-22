@@ -1853,11 +1853,18 @@ fn wait_bounded(
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+        if has_exited_unreaped(child)? {
+            // QUIESCE (core#1742, as a tool phase does): the leader exited but is not yet reaped,
+            // so its pid (the group id) is still reserved. Kill the group first, so anything the
+            // script backgrounded dies with the validator; then let a watching run release the
+            // group, and only then collect the status.
+            kill_child_tree(child);
+            watch_done(child.id());
+            return child.wait().map(Some);
         }
         if start.elapsed() >= timeout {
             kill_child_tree(child);
+            watch_done(child.id());
             reap_bounded(child);
             return Ok(None);
         }
@@ -1880,7 +1887,7 @@ fn run_bounded_status_capturing_stderr(
 ) -> (std::io::Result<Option<std::process::ExitStatus>>, String) {
     own_process_group(&mut cmd);
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = match cmd.spawn() {
+    let mut child = match watched_spawn(&mut || cmd.spawn()) {
         Ok(c) => c,
         Err(e) => return (Err(e), String::new()),
     };
@@ -1907,20 +1914,25 @@ fn run_bounded_status_capturing_stderr(
         });
     }
     let pgid = child.id();
-    watch_spawned(pgid);
     let status = wait_bounded(&mut child, timeout);
+    // A wait that failed released nothing yet (a release is a compare-and-remove: idempotent).
     watch_done(pgid);
     let _ = done_rx.recv_timeout(Duration::from_millis(500));
     let kept = head.lock().unwrap_or_else(|p| p.into_inner());
     (status, String::from_utf8_lossy(&kept).into_owned())
 }
 
-/// (core#1742) Who is told about a validator's process group on this thread: the fold's off-actor
-/// reads ([`crate::actor`]'s `fold_reads`) register it under the run, as a tool child is, so a
-/// reassign or a cancel of the run stops it. `on_spawn` runs right after the spawn (the group id is
-/// the child's pid), `on_done` once the wait has ended.
+/// The spawn a [`SpawnWatch`] wraps.
+pub(crate) type Spawn<'a> = dyn FnMut() -> std::io::Result<std::process::Child> + 'a;
+
+/// (core#1742) Who owns a validator's process group on this thread: the fold's off-actor reads
+/// ([`crate::actor`]'s `fold_reads`) register it under the run, as a tool child is, so a reassign
+/// or a cancel of the run stops it.
 pub(crate) struct SpawnWatch {
-    pub(crate) on_spawn: Box<dyn Fn(u32)>,
+    /// Runs the spawn, so the watcher can refuse it (an `Err`: nothing is started) and register
+    /// the new group atomically with it.
+    pub(crate) spawn: Box<dyn Fn(&mut Spawn<'_>) -> std::io::Result<std::process::Child>>,
+    /// The group is released: its leader exited and the group was killed, not yet reaped.
     pub(crate) on_done: Box<dyn Fn(u32)>,
 }
 
@@ -1942,12 +1954,11 @@ pub(crate) fn with_spawn_watch<R>(watch: SpawnWatch, f: impl FnOnce() -> R) -> R
     f()
 }
 
-fn watch_spawned(pgid: u32) {
-    SPAWN_WATCH.with(|w| {
-        if let Some(w) = w.borrow().as_ref() {
-            (w.on_spawn)(pgid);
-        }
-    });
+fn watched_spawn(spawn: &mut Spawn<'_>) -> std::io::Result<std::process::Child> {
+    SPAWN_WATCH.with(|w| match w.borrow().as_ref() {
+        Some(w) => (w.spawn)(spawn),
+        None => spawn(),
+    })
 }
 
 fn watch_done(pgid: u32) {
