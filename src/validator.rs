@@ -655,15 +655,134 @@ const PS_EXEC_RULE: &str = "(allow process-exec (with no-sandbox) (literal \"/bi
 /// the system temp dir, and the std stdio devices; reads/exec stay open (`allow default`). `None` if the
 /// run dir can't be canonicalized (→ caller degrades to the floor). Canonicalization matters on macOS
 /// where `/var/folders/…` is a symlink to `/private/var/folders/…`; SBPL `subpath` needs the real path.
+#[cfg(test)]
 fn macos_sandbox_profile_for_roots(
     write_roots: &[&Path],
     network: NetworkPolicy,
     pty: PtyPolicy,
 ) -> Option<String> {
+    macos_sandbox_profile_reading(write_roots, network, pty, None)
+}
+
+/// (core#1335) The system directories a read-allowlisted macOS jail reads beside its own roots: the
+/// OS, its libraries, configuration, devices and fonts, and the shared Python installs. Nothing under
+/// a user's home. Spiked on macOS 26 with chrome-headless-shell 156 and garden's `page_count.py`
+/// under a Homebrew, a `/usr/bin` and a uv `.venv` Python.
+const MACOS_READ_SYSTEM: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private/etc",
+    "/dev",
+    "/Library/Fonts",
+    "/Library/Frameworks",
+    "/Library/Developer/CommandLineTools",
+];
+
+/// (core#1335) The same for a Linux (bwrap) jail: each one that exists is bound read-only (a link,
+/// as `/bin` is on a merged-`/usr` system, is recreated as the same link).
+const LINUX_READ_SYSTEM: &[&str] = &[
+    "/usr",
+    "/etc",
+    "/sys",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/var/cache/fontconfig",
+    "/nix/store",
+];
+
+/// (core#1335) This account's home: `HOME` when set and absolute, else the account database's entry
+/// for this uid (a daemon started without `HOME`). `None` when neither is known.
+fn account_home() -> Option<std::path::PathBuf> {
+    let env = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|h| h.is_absolute());
+    env.or_else(account_home_from_db)
+}
+
+#[cfg(unix)]
+fn account_home_from_db() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
+    // SAFETY: `pwd` and `buf` outlive the call; `getpwuid_r` writes only into them and sets `found`
+    // to `&pwd` or null. The home string is copied out before either is dropped.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        );
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        let home = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir));
+        home.is_absolute().then_some(home)
+    }
+}
+
+#[cfg(not(unix))]
+fn account_home_from_db() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// (core#1335) The read roots a read-allowlisted jail admits: each by its real path, never `/` and
+/// never the home directory or one of its ancestors (an interpreter in `~/bin` must not open the
+/// whole home). A root that does not exist is dropped.
+fn admitted_read_roots(read_roots: &[&Path], home: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for r in read_roots {
+        let Ok(r) = r.canonicalize() else { continue };
+        let holds_home = home.as_ref().is_some_and(|h| h.starts_with(&r));
+        if r.parent().is_none() || holds_home || out.contains(&r) {
+            continue;
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// [`macos_sandbox_profile_for_roots`], and with `read_allow` a READ allowlist (core#1335): file data
+/// is readable only under [`MACOS_READ_SYSTEM`], the write roots and `read_allow` (each already a real
+/// path). Metadata stays readable, so paths still resolve; the secret-dir denies below still win.
+fn macos_sandbox_profile_reading(
+    write_roots: &[&Path],
+    network: NetworkPolicy,
+    pty: PtyPolicy,
+    read_allow: Option<&[std::path::PathBuf]>,
+) -> Option<String> {
     let primary = write_roots.first()?.canonicalize().ok()?;
     let mut p = String::from("(version 1)\n(allow default)\n");
     if network.restricts() {
         p.push_str("(deny network*)\n");
+    }
+    if let Some(reads) = read_allow {
+        let mut allow = String::from("(allow file-read-data (literal \"/\")");
+        let system = MACOS_READ_SYSTEM.iter().map(std::path::PathBuf::from);
+        let own = std::iter::once(primary.clone())
+            .chain(
+                write_roots
+                    .iter()
+                    .skip(1)
+                    .filter_map(|r| r.canonicalize().ok()),
+            )
+            .chain(reads.iter().cloned());
+        for dir in system.chain(own) {
+            allow.push_str(&format!(" (subpath {})", sbpl_quote(&dir)));
+        }
+        allow.push_str(")\n");
+        p.push_str("(deny file-read-data)\n");
+        p.push_str(&allow);
     }
     if matches!(network, NetworkPolicy::LoopbackOnly) {
         // After the deny, so these win for loopback only (A12, spiked on macOS 26: a loopback
@@ -926,10 +1045,29 @@ pub(crate) fn serve_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
 
 /// (PLAN G12) The jail the `draft_render` Tool runs in: writes only under `write_roots` (no system-temp
 /// carve-out), no network at all (no loopback, no unix socket), the curated secret dirs unreadable.
-/// `Sandboxed` on macOS (sandbox-exec) and Linux (bwrap + the AF_UNIX seccomp program); elsewhere the
-/// caller gets a non-`Sandboxed` level and renders nothing.
-pub(crate) fn render_jail(write_roots: &[&Path]) -> SandboxLauncher {
-    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::Isolated, PtyPolicy::Deny)
+/// (core#1335) Reads are an ALLOWLIST: the system's own directories ([`MACOS_READ_SYSTEM`],
+/// [`LINUX_READ_SYSTEM`]), the write roots and `read_roots` ([`admitted_read_roots`]: never `/` or a
+/// root holding the home). A seat-written page therefore cannot pull any other host file into the
+/// print (an iframe of a file under the home changes the page count). `Sandboxed` on macOS
+/// (sandbox-exec) and Linux (bwrap + the AF_UNIX seccomp program); elsewhere the caller gets a
+/// non-`Sandboxed` level and renders nothing.
+pub(crate) fn render_jail(write_roots: &[&Path], read_roots: &[&Path]) -> SandboxLauncher {
+    // The home guard needs a home: with none known (no `HOME`, no account entry), no jail is armed
+    // and the caller records `unjailed_host` rather than risk admitting a root that holds it.
+    let Some(home) = account_home() else {
+        return SandboxLauncher {
+            wrapper: Vec::new(),
+            level: SandboxLevel::BestEffort,
+        };
+    };
+    let reads = admitted_read_roots(read_roots, Some(&home));
+    launcher_for_roots_reading(
+        write_roots,
+        NetworkPolicy::Isolated,
+        secret_read_block_dirs(),
+        PtyPolicy::Deny,
+        Some(reads.as_slice()),
+    )
 }
 
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
@@ -1053,12 +1191,26 @@ fn launcher_for_roots_masking(
     secret_dirs: Vec<std::path::PathBuf>,
     pty: PtyPolicy,
 ) -> SandboxLauncher {
+    launcher_for_roots_reading(write_roots, network, secret_dirs, pty, None)
+}
+
+/// [`launcher_for_roots_masking`], and with `read_allow` (real paths) a READ allowlist (core#1335):
+/// macOS [`macos_sandbox_profile_reading`]; bwrap binds the system directories and `read_allow`
+/// read-only instead of the whole filesystem.
+fn launcher_for_roots_reading(
+    write_roots: &[&Path],
+    network: NetworkPolicy,
+    secret_dirs: Vec<std::path::PathBuf>,
+    pty: PtyPolicy,
+    read_allow: Option<&[std::path::PathBuf]>,
+) -> SandboxLauncher {
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
     };
     if let Some(tool) = find_on_path("sandbox-exec").filter(|_| sandbox_exec_arms()) {
-        if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network, pty) {
+        if let Some(profile) = macos_sandbox_profile_reading(write_roots, network, pty, read_allow)
+        {
             return SandboxLauncher {
                 wrapper: vec![
                     tool.to_string_lossy().into_owned(),
@@ -1090,19 +1242,49 @@ fn launcher_for_roots_masking(
                         .filter_map(|root| root.canonicalize().ok()),
                 )
                 .collect();
-            let mut w: Vec<String> = vec![
-                tool.to_string_lossy().into_owned(),
-                "--ro-bind".to_string(),
-                "/".to_string(),
-                "/".to_string(),
-                "--dev".to_string(),
-                "/dev".to_string(),
-                "--proc".to_string(),
-                "/proc".to_string(),
-                // C4: the whole process tree dies with the launcher — no orphaned/backgrounded survivors.
-                "--die-with-parent".to_string(),
-                "--unshare-pid".to_string(),
-            ];
+            let mut w: Vec<String> = vec![tool.to_string_lossy().into_owned()];
+            match read_allow {
+                None => w.extend(["--ro-bind", "/", "/"].map(String::from)),
+                // (core#1335) A read allowlist: the system's directories and the caller's roots,
+                // read-only, over bwrap's empty root; nothing else of the host is in the jail.
+                Some(reads) => {
+                    for &dir in LINUX_READ_SYSTEM {
+                        let path = Path::new(dir);
+                        match std::fs::symlink_metadata(path) {
+                            Ok(m) if m.file_type().is_symlink() => {
+                                if let Ok(target) = std::fs::read_link(path) {
+                                    w.push("--symlink".to_string());
+                                    w.push(target.to_string_lossy().into_owned());
+                                    w.push(dir.to_string());
+                                }
+                            }
+                            Ok(m) if m.is_dir() => {
+                                w.extend(["--ro-bind", dir, dir].map(String::from));
+                            }
+                            _ => {}
+                        }
+                    }
+                    for r in reads {
+                        let r = r.to_string_lossy().into_owned();
+                        w.push("--ro-bind".to_string());
+                        w.push(r.clone());
+                        w.push(r);
+                    }
+                }
+            }
+            w.extend(
+                [
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    // C4: the whole process tree dies with the launcher — no orphaned/backgrounded
+                    // survivors.
+                    "--die-with-parent",
+                    "--unshare-pid",
+                ]
+                .map(String::from),
+            );
             if network.restricts() {
                 // LoopbackOnly too: bwrap brings `lo` up in the new namespace, and nothing else.
                 w.push("--unshare-net".to_string());
@@ -4822,7 +5004,7 @@ mod tests {
             .unwrap();
             assert!(d.contains(carve.as_str()), "{d}");
         }
-        let jail = render_jail(&[root.as_path()]);
+        let jail = render_jail(&[root.as_path()], &[]);
         if cfg!(target_os = "macos") && jail.level == SandboxLevel::Sandboxed {
             let outside = base.join("outside.txt");
             let script = format!(
@@ -4851,6 +5033,157 @@ mod tests {
             );
             assert!(jail.wrapper.iter().any(|a| a == "--unshare-net"));
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1335) The render jail reads only an allowlist: a file under one of its read roots (and in
+    /// its write root) is readable, a file beside them is not, while the system's tools still run.
+    /// Every other jail keeps reading the whole filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn the_render_jail_reads_only_its_allowlist() {
+        if skip_when_nested("the_render_jail_reads_only_its_allowlist")
+            || skip_in_container_floor("the_render_jail_reads_only_its_allowlist")
+        {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("wicked-render-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, allowed, beside) =
+            (base.join("root"), base.join("allowed"), base.join("beside"));
+        for d in [&root, &allowed, &beside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(root.join("own.txt"), "own").unwrap();
+        std::fs::write(allowed.join("in.txt"), "in").unwrap();
+        std::fs::write(beside.join("secret.txt"), "secret").unwrap();
+        let jail = render_jail(&[root.as_path()], &[allowed.as_path()]);
+        if jail.level != SandboxLevel::Sandboxed {
+            eprintln!("SKIP the_render_jail_reads_only_its_allowlist: no render jail here");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let script = format!(
+            "cat ./own.txt >/dev/null || exit 11; cat '{}' >/dev/null || exit 12; \
+             cat '{}' >/dev/null 2>&1 && exit 13; ls / >/dev/null || exit 14; exit 0",
+            allowed.join("in.txt").display(),
+            beside.join("secret.txt").display()
+        );
+        let out = std::process::Command::new(&jail.wrapper[0])
+            .hardened()
+            .args(&jail.wrapper[1..])
+            .args(["/bin/sh", "-c", &script])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{out:?} (11/12: an allowed read refused, 13: a file beside the roots was read)"
+        );
+        // The validators' jail is unchanged: it reads the file beside its root.
+        let deny = detect_sandbox_launcher(&root, None);
+        if deny.level == SandboxLevel::Sandboxed {
+            let st = std::process::Command::new(&deny.wrapper[0])
+                .hardened()
+                .args(&deny.wrapper[1..])
+                .args(["/bin/sh", "-c"])
+                .arg(format!(
+                    "cat '{}' >/dev/null",
+                    beside.join("secret.txt").display()
+                ))
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(st.success(), "{st:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1335) The macOS profile: data reads denied, then allowed for the system directories, the
+    /// write roots and the read roots; the secret-dir denies come after it (they still win).
+    #[test]
+    fn the_render_profile_allowlists_reads_and_the_others_do_not() {
+        let base = std::env::temp_dir().join(format!("wicked-render-sb-{}", std::process::id()));
+        let (root, read) = (base.join("root"), base.join("read"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&read).unwrap();
+        let reads = vec![read.canonicalize().unwrap()];
+        let p = macos_sandbox_profile_reading(
+            &[root.as_path()],
+            NetworkPolicy::Isolated,
+            PtyPolicy::Deny,
+            Some(reads.as_slice()),
+        )
+        .unwrap();
+        let deny = p
+            .find("(deny file-read-data)\n")
+            .expect("data reads denied");
+        let allow = p
+            .find("(allow file-read-data (literal \"/\")")
+            .unwrap_or_else(|| panic!("{p}"));
+        assert!(deny < allow, "{p}");
+        for d in ["/System", "/usr", "/private/etc", "/Library/Fonts"] {
+            assert!(p.contains(&format!("(subpath \"{d}\")")), "{d}: {p}");
+        }
+        assert!(p.contains(&sbpl_quote(&reads[0])), "{p}");
+        assert!(
+            p.contains(&sbpl_quote(&root.canonicalize().unwrap())),
+            "{p}"
+        );
+        if let Some(secret) = secret_read_block_dirs().first() {
+            let s = p
+                .find(&format!(
+                    "(deny file-read* (subpath {}))",
+                    sbpl_quote(secret)
+                ))
+                .unwrap_or_else(|| panic!("{p}"));
+            assert!(s > allow, "the secret denies follow the allowlist: {p}");
+        }
+        for network in [
+            NetworkPolicy::Isolated,
+            NetworkPolicy::Deny,
+            NetworkPolicy::Allow,
+        ] {
+            let p = macos_sandbox_profile_for_roots(&[root.as_path()], network, PtyPolicy::Deny)
+                .unwrap();
+            assert!(!p.contains("(deny file-read-data)"), "{p}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1335) Without `HOME`, the home guard still has a home: the account database's.
+    #[cfg(unix)]
+    #[test]
+    fn the_account_home_is_known_without_home() {
+        let Some(db) = account_home_from_db() else {
+            eprintln!("SKIP the_account_home_is_known_without_home: no account entry for this uid");
+            return;
+        };
+        assert!(db.is_absolute(), "{db:?}");
+    }
+
+    /// (core#1335) `/`, the home and its ancestors never become read roots; a missing one is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_root_never_opens_the_home_or_the_root() {
+        let base = std::env::temp_dir().join(format!("wicked-render-home-{}", std::process::id()));
+        let home = base.join("home/me");
+        let tool = home.join("tools/py");
+        std::fs::create_dir_all(&tool).unwrap();
+        let real = |p: &Path| p.canonicalize().unwrap();
+        let got = admitted_read_roots(
+            &[
+                Path::new("/"),
+                &home,
+                &base.join("home"),
+                &tool,
+                &tool,
+                &base.join("missing"),
+            ],
+            Some(&home),
+        );
+        assert_eq!(got, vec![real(&tool)]);
         let _ = std::fs::remove_dir_all(&base);
     }
 
