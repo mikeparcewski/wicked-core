@@ -633,12 +633,17 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
         }}]}]
     }));
     // The seat's gate hook: `/hook/<token>` to the engine's relay; the token in the path is the
-    // relay's credential (unknown tokens are denied there).
+    // relay's credential (unknown tokens are denied there). A codex ChatGPT seat's token refresh
+    // (core#997) goes to the same relay, which renews the broker's sign-in for a live codex
+    // unit's key and answers no token.
     if let Some(up) = &config.hook_upstream {
         binds.push(json!({
             "port": crate::hook_relay::HOOK_PORT,
             "listeners": [{ "routes": [{
-                "matches": [{"path": {"pathPrefix": "/hook/"}}],
+                "matches": [
+                    {"path": {"pathPrefix": "/hook/"}},
+                    {"path": {"exact": crate::hook_relay::CODEX_REFRESH_PATH}, "method": "POST"}
+                ],
                 "backends": [{"host": up}]
             }]}]
         }));
@@ -927,8 +932,25 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     // OpenAI provider's base URL (core#989).
     if kind == CredentialKind::CodexChatgpt {
         env.retain(|(name, _)| name != "OPENAI_BASE_URL");
+        // core#997: after an upstream 401, codex refreshes its sign-in at its token endpoint.
+        // That is the relay (the broker renews; [`crate::seat_refresh::recover_codex`]), never
+        // auth.openai.com, which open egress would otherwise reach with the placeholder.
+        env.push((CODEX_REFRESH_URL_ENV.into(), codex_refresh_url()));
     }
     env
+}
+
+/// codex's override of its token endpoint (codex 0.162.1 `login/src/auth/manager.rs`
+/// `REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR`).
+pub(crate) const CODEX_REFRESH_URL_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+
+/// Where a codex ChatGPT seat refreshes its sign-in: the gate-hook relay's codex route.
+pub(crate) fn codex_refresh_url() -> String {
+    format!(
+        "http://agw:{}{}",
+        crate::hook_relay::HOOK_PORT,
+        crate::hook_relay::CODEX_REFRESH_PATH
+    )
 }
 
 /// An agy seat on its Gemini API-key route: agy takes the Gemini API when its settings say
@@ -976,7 +998,47 @@ pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 /// table into a same-named table of its config layers, so a provider table a seat left in its
 /// own config home (an `env_key`, an `experimental_bearer_token`) would otherwise change how this
 /// one authenticates (codex review of core#989).
+///
+/// Every codex container (k8s) seat also gets [`CODEX_NON_MODEL_OFF`] (core#1478); host seats
+/// never reach this ([`crate::container_floor`] calls it on the online pod path only).
 pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<String> {
+    let mut args = seat_route_args(cli, kind);
+    if cli == "codex" {
+        for value in CODEX_NON_MODEL_OFF {
+            args.extend(["-c".to_string(), value.to_string()]);
+        }
+    }
+    args
+}
+
+/// (core#1478) codex's calls that are not model turns, switched off with codex's own config keys
+/// (each read at codex 0.162.1, the seat's pin). A seat's only paths out are the gateway's model
+/// routes and its CONNECT listener, so each of these was a refused CONNECT (about 335 per seat
+/// on a live gateway) or, under open egress, a call around the gateway:
+/// - `analytics.enabled=false`: product analytics (`<chatgpt_base_url>/codex/analytics-events`);
+/// - `otel.metrics_exporter="none"`: the built-in Statsig metrics exporter
+///   (`https://ab.chatgpt.com/otlp/v1/metrics`, `otel/src/config.rs`);
+/// - `features.apps=false`: the ChatGPT apps MCP server (`<chatgpt_base_url>/ps/mcp`);
+/// - `features.plugins=false`: codex's plugin system, the remote catalogue
+///   (`<chatgpt_base_url>/ps/plugins/…`) and installed plugins alike. A seat installs none (its
+///   skills come from its engine-minted `CODEX_HOME/skills`). The narrower
+///   `features.remote_plugin=false` was measured and still syncs the curated catalogue
+///   (chatgpt.com and github.com);
+/// - `chatgpt_base_url` at a closed loopback port: the ChatGPT backend calls with no switch of
+///   their own (workspace routing discovery `wham/accounts/check`, git attribution's
+///   `wham/settings/user`) fail inside the seat at once, as they already failed at the gateway,
+///   and never reach a route with the broker's credential. Model turns use the provider's own
+///   `base_url`, and a 401 refresh uses [`CODEX_REFRESH_URL_ENV`]; neither reads this.
+pub(crate) const CODEX_NON_MODEL_OFF: [&str; 5] = [
+    "analytics.enabled=false",
+    "otel.metrics_exporter=\"none\"",
+    "features.apps=false",
+    "features.plugins=false",
+    "chatgpt_base_url=\"http://127.0.0.1:9/backend-api\"",
+];
+
+/// The arguments that point a seat signed in with `kind` at its route.
+fn seat_route_args(cli: &str, kind: Option<CredentialKind>) -> Vec<String> {
     match (cli, kind) {
         ("codex", Some(CredentialKind::CodexChatgpt)) => {
             let base = format!(
@@ -2568,7 +2630,7 @@ mod tests {
                 assert!(args.contains(&format!("base_url=\"{url}\"")), "{args}");
             } else {
                 assert!(env.iter().any(|(k, v)| k == base && *v == url));
-                assert!(seat_args_for(cli, Some(kind)).is_empty());
+                assert!(seat_route_args(cli, Some(kind)).is_empty());
             }
             assert!(env
                 .iter()
@@ -2600,7 +2662,7 @@ mod tests {
         let again = seat_args_for("codex", Some(CredentialKind::CodexChatgpt));
         assert_ne!(args[1], again[1], "a fresh id per execution");
         assert_eq!(
-            args,
+            args[..4],
             vec![
                 "-c".to_string(),
                 format!("model_provider=\"{id}\""),
@@ -2639,8 +2701,102 @@ mod tests {
             ("pi", Some(CredentialKind::CodexChatgpt)),
             ("codex", None),
         ] {
-            assert!(seat_args_for(cli, kind).is_empty(), "{cli} {kind:?}");
+            assert!(seat_route_args(cli, kind).is_empty(), "{cli} {kind:?}");
         }
+    }
+
+    /// core#1478: every codex container seat switches off codex's calls that are not model
+    /// turns with codex's own config keys (each a valid `-c key=value` codex parses as TOML), so
+    /// none of them is a refused CONNECT to chatgpt.com / ab.chatgpt.com at the gateway. No
+    /// other seat gets them.
+    #[test]
+    fn codex_seats_switch_off_their_non_model_calls_1478() {
+        let off: Vec<String> = CODEX_NON_MODEL_OFF
+            .iter()
+            .flat_map(|v| ["-c".to_string(), v.to_string()])
+            .collect();
+        for kind in [
+            Some(CredentialKind::CodexChatgpt),
+            Some(CredentialKind::CodexApiKey),
+            None,
+        ] {
+            let args = seat_args_for("codex", kind);
+            assert!(args.ends_with(&off), "{kind:?}: {args:?}");
+        }
+        let mut doc = toml::Table::new();
+        for pair in CODEX_NON_MODEL_OFF {
+            let (key, value) = pair.split_once('=').unwrap();
+            let parsed: toml::Table = toml::from_str(&format!("x = {value}")).expect(pair);
+            let mut at = &mut doc;
+            let parts: Vec<&str> = key.split('.').collect();
+            for part in &parts[..parts.len() - 1] {
+                at = at
+                    .entry(part.to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+            }
+            at.insert(parts[parts.len() - 1].to_string(), parsed["x"].clone());
+        }
+        assert_eq!(doc["analytics"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["otel"]["metrics_exporter"].as_str(), Some("none"));
+        assert_eq!(doc["features"]["apps"].as_bool(), Some(false));
+        assert_eq!(doc["features"]["plugins"].as_bool(), Some(false));
+        // The ChatGPT backend base is a closed port on the seat's own loopback: never a
+        // gateway route (which would carry the broker's credential) and never chatgpt.com.
+        let base = doc["chatgpt_base_url"].as_str().unwrap();
+        assert!(base.starts_with("http://127.0.0.1:9/"), "{base}");
+        for cli in ["claude", "pi", "opencode", "copilot", "agy"] {
+            assert!(seat_args_for(cli, None).is_empty(), "{cli}");
+        }
+    }
+
+    /// core#997: a codex seat signed in with ChatGPT refreshes at the gate-hook
+    /// relay (codex's own token-endpoint override), never at auth.openai.com, and the gateway
+    /// routes exactly that request to the relay. No other seat is pointed there.
+    #[test]
+    fn a_chatgpt_codex_seat_refreshes_at_the_relay_not_upstream_997() {
+        let env = seat_env_for("codex", CredentialKind::CodexChatgpt, "wk-test-PLACEHOLDER");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+                    && v == "http://agw:8711/codex/refresh"),
+            "{env:?}"
+        );
+        for (cli, kind) in [
+            ("codex", CredentialKind::CodexApiKey),
+            ("claude", CredentialKind::ClaudeOauth),
+            ("pi", CredentialKind::ProviderKey),
+        ] {
+            let env = seat_env_for(cli, kind, "wk-test-PLACEHOLDER");
+            assert!(
+                !env.iter().any(|(k, _)| k == CODEX_REFRESH_URL_ENV),
+                "{cli} {kind:?}"
+            );
+        }
+        let config = GatewayConfig {
+            hook_upstream: Some("host.lima.internal:51234".into()),
+            ..GatewayConfig::default()
+        };
+        let rendered = render(&config);
+        let hook = rendered["binds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["port"] == crate::hook_relay::HOOK_PORT)
+            .unwrap();
+        let route = &hook["listeners"][0]["routes"][0];
+        assert!(
+            route["matches"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"path": {"exact": "/codex/refresh"}, "method": "POST"})),
+            "{route}"
+        );
+        assert_eq!(
+            route["backends"],
+            json!([{"host": "host.lima.internal:51234"}])
+        );
     }
 
     /// #1439: adopting a pre-subscription persisted config fills the new listeners without

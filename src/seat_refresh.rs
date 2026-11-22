@@ -1,6 +1,8 @@
 //! The broker's ONE refresher (DES-CONTAINER-FLOOR §6, item 2): the only place a signed-in
 //! agent's sign-in is renewed. Seats never refresh (their placeholder expiry is far in the
-//! future), so parallel seats never race a refresh.
+//! future), so parallel seats never race a refresh. A codex seat that gets an upstream 401 asks
+//! its token endpoint, which is the gate-hook relay: it forces one pass of this refresher and
+//! hands the seat no token ([`recover_codex`], core#997).
 //!
 //! **The broker renews nothing itself (core#1024).** It makes no token request and never
 //! presents itself as any vendor's client. A sign-in is renewed by the agent's own CLI, the way
@@ -679,6 +681,148 @@ fn refusal(status: u16, body: &[u8]) -> String {
     }
 }
 
+/// core#997 (operator ruling 2026-10-18, option c): a codex seat signed in with ChatGPT that gets
+/// a 401 upstream (the gateway served a broker token the provider no longer takes) asks codex's
+/// own token endpoint for a refresh. That endpoint is the gate-hook relay
+/// (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`), never auth.openai.com, and the seat's refresh token is
+/// its unit key. The relay renews the BROKER's sign-in here with a forced pass of the one
+/// refresher, and answers with no token at all: the seat keeps its placeholders, retries, and the
+/// gateway sends the renewed token. The seat never holds or receives a real credential.
+///
+/// One forced renewal at a time in this process (one lock for every gateway dir; a daemon has
+/// one), callers waiting for it, and a renewal's result stands for its gateway dir for
+/// [`RECOVERY_COOLDOWN`]: every seat that got the same 401 shares one renewal, and a seat that
+/// keeps failing cannot make the broker renew more than once a cooldown. A recovery that only
+/// found the broker busy renewed nothing and is not kept: the next seat's refresh tries again.
+pub(crate) const RECOVERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a forced renewal waits for a pass that holds the broker (the periodic one, a sign-in).
+const RECOVERY_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a forced renewal looks again at a busy broker (each look resolves the gateway).
+const RECOVERY_BUSY_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a renewal is given to reach the gateway before the seat retries: agentgateway v1.6.0
+/// re-reads a watched `backendAuth` file after a 250 ms debounce and a config reload
+/// (`crates/agentgateway/src/util.rs` `new_debouncer`).
+#[cfg(not(test))]
+const GATEWAY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const GATEWAY_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A forced codex renewal of one gateway dir's broker.
+pub(crate) type Forcer = std::sync::Arc<dyn Fn(&Path) -> Result<Outcome, String> + Send + Sync>;
+
+/// The gateway dirs this process refreshes, each with its forced codex renewal ([`register`]).
+static FORCERS: std::sync::Mutex<Vec<(PathBuf, Forcer)>> = std::sync::Mutex::new(Vec::new());
+
+/// The last forced renewal of each gateway dir: when it ended and what it gave. Its one lock
+/// (process-wide, not per dir) is held across a renewal, so concurrent recoveries share one.
+type LastRecovery = (std::time::Instant, Result<(), String>);
+static RECOVERED: std::sync::Mutex<Vec<(PathBuf, LastRecovery)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// What a seat's refresh request got ([`recover_codex`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// The broker's sign-in was renewed (now, or by a recovery within the cooldown).
+    Renewed,
+    /// The presented token is no live codex ChatGPT unit's key.
+    UnknownUnit,
+    /// The broker could not renew (the reason names no credential).
+    Failed(String),
+}
+
+/// Register `dir`'s forced codex renewal (the daemon's refresher does, [`start`]).
+pub(crate) fn register(dir: &Path, forcer: Forcer) {
+    let mut f = FORCERS.lock().unwrap_or_else(|p| p.into_inner());
+    f.retain(|(d, _)| d != dir);
+    f.push((dir.to_path_buf(), forcer));
+}
+
+/// The gateway dir (and its renewal) of the live codex ChatGPT unit whose key is `presented`:
+/// the unit is registered with the gateway (its `units.json`) under the placeholder JWT that key
+/// makes ([`crate::seat_credentials::sent_bearer`]).
+fn codex_unit_dir(presented: &str) -> Option<(PathBuf, Forcer)> {
+    let shaped = presented
+        .strip_prefix("wk-")
+        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !shaped {
+        return None;
+    }
+    let jwt = crate::seat_credentials::sent_bearer(
+        "codex",
+        crate::seat_credentials::CredentialKind::CodexChatgpt,
+        presented,
+    );
+    let forcers = FORCERS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    forcers.into_iter().find(|(dir, _)| {
+        crate::seat_gateway::load_config(dir)
+            .is_ok_and(|c| c.units.iter().any(|u| u.seat == "codex" && u.key == jwt))
+    })
+}
+
+/// Recover a codex seat from an upstream 401: its refresh request presented `presented`.
+pub(crate) fn recover_codex(presented: &str) -> Recovery {
+    match codex_unit_dir(presented) {
+        Some((dir, forcer)) => {
+            recover_with(&dir, forcer.as_ref(), RECOVERY_BUSY_WAIT, GATEWAY_SETTLE)
+        }
+        None => Recovery::UnknownUnit,
+    }
+}
+
+/// One forced renewal of `dir` shared by every recovery within [`RECOVERY_COOLDOWN`] (pure of the
+/// transport: `force` is the refresher's forced codex pass). A pass that finds the broker busy
+/// is retried until `busy_wait`; a renewal waits `settle` for the gateway before it is answered.
+pub(crate) fn recover_with(
+    dir: &Path,
+    force: &(dyn Fn(&Path) -> Result<Outcome, String> + Send + Sync),
+    busy_wait: std::time::Duration,
+    settle: std::time::Duration,
+) -> Recovery {
+    use std::time::Instant;
+    let mut recovered = RECOVERED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, (at, result))) = recovered.iter().find(|(d, _)| d == dir) {
+        if at.elapsed() < RECOVERY_COOLDOWN {
+            return match result {
+                Ok(()) => Recovery::Renewed,
+                Err(e) => Recovery::Failed(e.clone()),
+            };
+        }
+    }
+    let deadline = Instant::now() + busy_wait;
+    let result = loop {
+        match force(dir) {
+            Ok(Outcome::Refreshed { .. }) => break Ok(()),
+            Ok(Outcome::Busy) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    RECOVERY_BUSY_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            // Renewed nothing: answered, never kept (the other pass may have renewed codex).
+            Ok(Outcome::Busy) => {
+                return Recovery::Failed(
+                    "another broker pass held the sign-in past the wait; retry".to_string(),
+                )
+            }
+            Ok(Outcome::NotRefreshable) => {
+                break Err("the broker holds no ChatGPT sign-in for codex; sign codex in".into())
+            }
+            Ok(Outcome::NotDue { .. }) => {
+                break Err("codex renewed nothing; sign codex in again".to_string())
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    if result.is_ok() {
+        std::thread::sleep(settle);
+    }
+    recovered.retain(|(d, _)| d != dir);
+    recovered.push((dir.to_path_buf(), (Instant::now(), result.clone())));
+    match result {
+        Ok(()) => Recovery::Renewed,
+        Err(e) => Recovery::Failed(e),
+    }
+}
+
 #[cfg(unix)]
 mod live {
     use super::*;
@@ -1214,7 +1358,7 @@ mod live {
     /// re-created meanwhile is found again); a pass that cannot get one is logged and skipped.
     pub(crate) fn start(
         dir: &Path,
-        io: impl Fn() -> Result<Box<dyn BrokerIo>, String> + Send + 'static,
+        io: impl Fn() -> Result<Box<dyn BrokerIo>, String> + Send + Sync + 'static,
     ) {
         static STARTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
         {
@@ -1224,6 +1368,12 @@ mod live {
             }
             s.push(dir.to_path_buf());
         }
+        let io = std::sync::Arc::new(io);
+        // core#997: a codex seat's 401 recovery forces this same refresher's codex pass.
+        super::register(dir, {
+            let io = io.clone();
+            std::sync::Arc::new(move |dir: &Path| refresh(io()?.as_ref(), dir, "codex", true))
+        });
         let pass = {
             let dir = dir.to_path_buf();
             move || {
@@ -2005,5 +2155,198 @@ mod tests {
         record_last(&dir, "claude", None);
         assert_eq!(last_refresh(&dir, "claude"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#997: a recovery renews the broker once; every recovery of the same gateway within
+    /// the cooldown shares that renewal (callers that arrive during it wait for it), a busy
+    /// broker is waited for, and a failed renewal is answered with its reason and also stands
+    /// for the cooldown, so a failing seat cannot make the broker renew again and again.
+    #[test]
+    fn a_401_recovery_renews_the_broker_once_per_cooldown_997() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir =
+            std::env::temp_dir().join(format!("c11-recover-{}", uuid::Uuid::new_v4().simple()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let force = {
+            let calls = calls.clone();
+            move |_: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(Outcome::Refreshed { expires_at: None })
+            }
+        };
+        let force = Arc::new(force);
+        let started = Instant::now();
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let (dir, force) = (dir.clone(), force.clone());
+                std::thread::spawn(move || {
+                    recover_with(
+                        &dir,
+                        force.as_ref(),
+                        Duration::ZERO,
+                        Duration::from_millis(50),
+                    )
+                })
+            })
+            .collect();
+        for w in waiters {
+            assert_eq!(w.join().unwrap(), Recovery::Renewed);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one renewal for every seat's 401"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "renewal then settle"
+        );
+
+        // A broker another pass holds is waited for, then renewed.
+        let busy = std::env::temp_dir().join(format!("c11-busy-{}", uuid::Uuid::new_v4().simple()));
+        let tries = AtomicUsize::new(0);
+        let held_then_free = |_: &Path| {
+            if tries.fetch_add(1, Ordering::SeqCst) < 2 {
+                Ok(Outcome::Busy)
+            } else {
+                Ok(Outcome::Refreshed { expires_at: None })
+            }
+        };
+        assert_eq!(
+            recover_with(
+                &busy,
+                &held_then_free,
+                Duration::from_secs(5),
+                Duration::ZERO
+            ),
+            Recovery::Renewed
+        );
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        // core#1788 F2: a recovery that only found the broker busy renewed nothing and is not
+        // kept: the next seat's refresh renews (the other pass may have finished meanwhile).
+        let held = std::env::temp_dir().join(format!("c11-held-{}", uuid::Uuid::new_v4().simple()));
+        let looks = AtomicUsize::new(0);
+        let busy_once = |_: &Path| {
+            if looks.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Outcome::Busy)
+            } else {
+                Ok(Outcome::Refreshed { expires_at: None })
+            }
+        };
+        assert!(matches!(
+            recover_with(&held, &busy_once, Duration::ZERO, Duration::ZERO),
+            Recovery::Failed(e) if e.contains("held the sign-in")
+        ));
+        assert_eq!(
+            recover_with(&held, &busy_once, Duration::ZERO, Duration::ZERO),
+            Recovery::Renewed,
+            "a busy result is never answered from the cache"
+        );
+        assert_eq!(looks.load(Ordering::SeqCst), 2);
+
+        // A failed renewal names why, and stands for the cooldown (no second renewal).
+        let failing =
+            std::env::temp_dir().join(format!("c11-fail-{}", uuid::Uuid::new_v4().simple()));
+        let fails = AtomicUsize::new(0);
+        let refused = |_: &Path| {
+            fails.fetch_add(1, Ordering::SeqCst);
+            Err(
+                "codex could not renew its sign-in (its account/read answered an error)"
+                    .to_string(),
+            )
+        };
+        let why = Recovery::Failed(
+            "codex could not renew its sign-in (its account/read answered an error)".into(),
+        );
+        assert_eq!(
+            recover_with(&failing, &refused, Duration::ZERO, Duration::ZERO),
+            why
+        );
+        assert_eq!(
+            recover_with(&failing, &refused, Duration::ZERO, Duration::ZERO),
+            why
+        );
+        assert_eq!(fails.load(Ordering::SeqCst), 1);
+        let signed_out =
+            std::env::temp_dir().join(format!("c11-out-{}", uuid::Uuid::new_v4().simple()));
+        assert!(matches!(
+            recover_with(&signed_out, &|_: &Path| Ok(Outcome::NotRefreshable), Duration::ZERO, Duration::ZERO),
+            Recovery::Failed(e) if e.contains("sign codex in")
+        ));
+    }
+
+    /// core#997: only a LIVE codex ChatGPT unit's key (the refresh token its placeholder holds)
+    /// makes the broker renew, and only the gateway that unit is registered with; anything else
+    /// (another seat's unit, a deregistered unit, a malformed token) renews nothing.
+    #[test]
+    fn only_a_live_codex_units_key_renews_its_own_gateway_997() {
+        use crate::seat_credentials::{sent_bearer, CredentialKind};
+        use crate::seat_gateway::{
+            configure_gateway, deregister_unit, register_unit, GatewayConfig, UnitKey,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("c11-units-{}", uuid::Uuid::new_v4().simple()));
+        let other =
+            std::env::temp_dir().join(format!("c11-other-{}", uuid::Uuid::new_v4().simple()));
+        for d in [&dir, &other] {
+            configure_gateway(d, &GatewayConfig::default()).unwrap();
+        }
+        let unit = |seat: &str| {
+            let mut u = UnitKey::new("FAKE-run", "FAKE-unit", seat);
+            let raw = u.key.clone();
+            if seat == "codex" {
+                u.key = sent_bearer("codex", CredentialKind::CodexChatgpt, &raw);
+                u.bearer = u.key.clone();
+            }
+            (u, raw)
+        };
+        let (codex, codex_key) = unit("codex");
+        let (claude, claude_key) = unit("claude");
+        register_unit(&dir, codex.clone()).unwrap();
+        register_unit(&dir, claude).unwrap();
+        let (mine, theirs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        for (d, n) in [(&dir, mine.clone()), (&other, theirs.clone())] {
+            register(
+                d,
+                Arc::new(move |_: &Path| {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    Ok(Outcome::Refreshed { expires_at: None })
+                }),
+            );
+        }
+        for bad in [
+            claude_key.as_str(),
+            "wk-nothex",
+            "PLACEHOLDER-refresh",
+            "",
+            &codex.key,
+        ] {
+            assert_eq!(recover_codex(bad), Recovery::UnknownUnit, "{bad}");
+        }
+        assert_eq!(mine.load(Ordering::SeqCst), 0);
+        assert_eq!(recover_codex(&codex_key), Recovery::Renewed);
+        assert_eq!(mine.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            theirs.load(Ordering::SeqCst),
+            0,
+            "only the unit's own gateway renews"
+        );
+        deregister_unit(&dir, &codex.key).unwrap();
+        assert_eq!(
+            recover_codex(&codex_key),
+            Recovery::UnknownUnit,
+            "a unit that ended"
+        );
+        let mut f = FORCERS.lock().unwrap();
+        f.retain(|(d, _)| d != &dir && d != &other);
+        drop(f);
+        for d in [dir, other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

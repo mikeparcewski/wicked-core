@@ -22,6 +22,12 @@ pub(crate) enum CredentialKind {
 }
 
 const ACCOUNT_ID: &str = "acct-PLACEHOLDER";
+/// (core#997) The placeholder JWT's user. codex 0.162.1 treats a reloaded sign-in as the same
+/// owner only when the ChatGPT user and account both match (`login/src/auth/change_state.rs`
+/// `same_owner`); without a user, the reload after its refresh read as an account change, which
+/// revoked its application network policy and failed the turn ("application network policy is
+/// unavailable").
+const USER_ID: &str = "user-PLACEHOLDER";
 
 /// One brokered subscription provider of an agent (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 1):
 /// its own broker file, its own static gateway route and its own placeholder entry.
@@ -278,6 +284,8 @@ pub(crate) fn seat_files(
 
 /// The exact apiKey value to register, excluding the HTTP `Bearer ` prefix. Codex sends the
 /// entire JWT, not just its per-unit signature. No JWT is signed by or trusted as a provider.
+/// The JWT is a pure function of the unit key, so the gate-hook relay can match the refresh token
+/// a codex seat presents against the registered units ([`crate::seat_refresh::recover_codex`]).
 pub(crate) fn sent_bearer(cli: &str, kind: CredentialKind, unit_key: &str) -> String {
     if cli == "codex" && kind == CredentialKind::CodexChatgpt {
         let header = json!({"alg": "none", "typ": "JWT"});
@@ -286,7 +294,8 @@ pub(crate) fn sent_bearer(cli: &str, kind: CredentialKind, unit_key: &str) -> St
             "exp": 4102444800_u64,
             "wicked_unit_key": unit_key,
             "https://api.openai.com/auth": {
-                "chatgpt_plan_type": "pro", "chatgpt_account_id": ACCOUNT_ID
+                "chatgpt_plan_type": "pro", "chatgpt_account_id": ACCOUNT_ID,
+                "chatgpt_user_id": USER_ID
             }
         });
         let encode = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
@@ -314,6 +323,9 @@ pub(crate) fn placeholder_files(
         ("claude", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
             (".credentials.json", json!({}))
         }
+        // core#997: the refresh token is the unit's own key. codex posts it to the gate-hook
+        // relay (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`, never auth.openai.com) after an upstream
+        // 401, and the relay renews the broker's sign-in only for a live codex unit's key.
         ("codex", CredentialKind::CodexChatgpt) => {
             let jwt = sent_bearer(cli, kind, unit_key);
             (
@@ -322,7 +334,7 @@ pub(crate) fn placeholder_files(
                     "auth_mode": "chatgpt", "OPENAI_API_KEY": null,
                     "tokens": {
                         "id_token": jwt, "access_token": jwt,
-                        "refresh_token": "PLACEHOLDER-refresh", "account_id": ACCOUNT_ID
+                        "refresh_token": unit_key, "account_id": ACCOUNT_ID
                     },
                     "last_refresh": "2099-01-01T00:00:00Z"
                 }),
@@ -518,8 +530,14 @@ mod tests {
             .split("\" >")
             .next()
             .unwrap();
-        let expected: Value =
-            serde_json::from_str(&literal.replace("\\\"", "\"").replace("$J", &jwt)).unwrap();
+        // core#997: the refresh token is the unit's key now (the spike's was a fixed string).
+        let expected: Value = serde_json::from_str(
+            &literal
+                .replace("\\\"", "\"")
+                .replace("$J", &jwt)
+                .replace("PLACEHOLDER-refresh", KEY),
+        )
+        .unwrap();
         let actual = file("codex", CredentialKind::CodexChatgpt, "auth.json");
         assert_eq!(actual, expected);
         assert_eq!(actual["tokens"]["access_token"], jwt);
@@ -534,6 +552,12 @@ mod tests {
         let claims = decode(segments[1]);
         assert_eq!(claims["exp"], 4102444800_u64);
         assert_eq!(claims["wicked_unit_key"], KEY);
+        // core#997: a user, so codex reads its post-refresh reload as the same owner.
+        assert_eq!(
+            claims["https://api.openai.com/auth"]["chatgpt_user_id"],
+            "user-PLACEHOLDER"
+        );
+        assert_eq!(actual["tokens"]["refresh_token"], KEY);
         assert_eq!(
             claims["https://api.openai.com/auth"]["chatgpt_account_id"],
             actual["tokens"]["account_id"]

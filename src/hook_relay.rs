@@ -60,6 +60,37 @@ macro_rules! relay_log {
 
 /// The gateway port the seat's gate hook posts to (not a browser-blocked port).
 pub(crate) const HOOK_PORT: u16 = 8711;
+/// (core#997) codex's token endpoint in a ChatGPT seat (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`): the
+/// gateway routes it on [`HOOK_PORT`] to this relay, which renews the broker's sign-in
+/// ([`crate::seat_refresh::recover_codex`]). Never a real credential either way.
+pub(crate) const CODEX_REFRESH_PATH: &str = "/codex/refresh";
+/// The largest codex refresh request read (a client id, a grant type and a unit key).
+const MAX_REFRESH_BODY: usize = 16 * 1024;
+/// codex refreshes waiting on the broker at once. A waiting refresh holds none of the gate
+/// hook's [`MAX_CONNS`] slots, so seats waiting on a renewal never refuse a claude unit's tool
+/// call; past this many, a refresh is answered at once with a retryable 503.
+const MAX_REFRESH_WAITS: usize = 16;
+
+static REFRESH_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// One codex refresh waiting on the broker, counted while it lives.
+struct RefreshWait;
+
+impl RefreshWait {
+    fn take() -> Option<Self> {
+        if REFRESH_WAITS.fetch_add(1, Ordering::SeqCst) >= MAX_REFRESH_WAITS {
+            REFRESH_WAITS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(RefreshWait)
+    }
+}
+
+impl Drop for RefreshWait {
+    fn drop(&mut self) {
+        REFRESH_WAITS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 /// How long one tool call's judgement may take before it is denied.
 const HOOK_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(60));
 /// The largest hook payload the relay reads (a tool call's input).
@@ -92,8 +123,7 @@ fn relay() -> Option<&'static Relay> {
                             continue;
                         };
                         spawn_or_fail_closed(conn, "wicked-hook-call", move |conn| {
-                            let _slot = slot;
-                            serve(conn)
+                            serve(conn, slot)
                         });
                     }
                 })
@@ -533,6 +563,7 @@ fn route(request_line: &str) -> Option<Route> {
     let path = parts.next()?;
     match (method, path) {
         ("GET", "/ping") => Some(Route::Ping),
+        ("POST", CODEX_REFRESH_PATH) => Some(Route::CodexRefresh),
         ("POST", p) => {
             let token = p.strip_prefix("/hook/")?;
             (!token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit()))
@@ -546,6 +577,8 @@ fn route(request_line: &str) -> Option<Route> {
 enum Route {
     Ping,
     Hook(String),
+    /// A codex seat's token refresh after an upstream 401 (core#997).
+    CodexRefresh,
 }
 
 fn respond(mut conn: TcpStream, status: &str, body: &str) {
@@ -763,8 +796,8 @@ fn bounded_line(reader: &mut impl BufRead, budget: &mut usize) -> Option<String>
     String::from_utf8(line).ok()
 }
 
-/// A chunked body (a proxy may re-frame the hook's request), at most [`MAX_BODY`] bytes.
-fn read_chunked(reader: &mut impl BufRead) -> Option<Vec<u8>> {
+/// A chunked body (a proxy may re-frame the hook's request), at most `max` bytes.
+fn read_chunked(reader: &mut impl BufRead, max: usize) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let mut budget = 1024;
@@ -780,7 +813,7 @@ fn read_chunked(reader: &mut impl BufRead) -> Option<Vec<u8>> {
                 }
             }
         }
-        if body.len() + size > MAX_BODY {
+        if body.len() + size > max {
             return None;
         }
         let at = body.len();
@@ -801,7 +834,9 @@ fn tool_call(body: &[u8]) -> Option<String> {
     (!tool.is_empty()).then(|| tool.to_string())
 }
 
-fn serve(conn: TcpStream) {
+/// Serve one connection holding one of the [`MAX_CONNS`] slots (`slot`, freed when it returns;
+/// a codex refresh frees it before it waits, [`codex_refresh`]).
+fn serve(conn: TcpStream, slot: Slot) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
     let Ok(read_half) = conn.try_clone() else {
         // Unservable (no descriptor to read with): unattributable, so every live unit fails closed.
@@ -878,11 +913,14 @@ fn serve(conn: TcpStream) {
     }
     match route {
         Some(Route::Ping) => return respond(conn, "200 OK", "{\"pong\":true}"),
+        Some(Route::CodexRefresh) => {
+            return codex_refresh(conn, &mut reader, length, chunked, slot)
+        }
         Some(Route::Hook(_)) => {}
         None => return respond(conn, "404 Not Found", "{}"),
     }
     let body = if chunked {
-        match read_chunked(&mut reader) {
+        match read_chunked(&mut reader, MAX_BODY) {
             Some(b) => b,
             None => {
                 return refuse(
@@ -919,6 +957,76 @@ fn serve(conn: TcpStream) {
         &judge(&reg, &call, &tool, &body, HOOK_TIMEOUT),
     );
     drop(call);
+}
+
+/// (core#997) A codex seat's token refresh after an upstream 401, in OAuth's JSON shape: a live
+/// codex unit's key as its refresh token renews the broker's sign-in and is answered `{}` (no
+/// token: the seat keeps its placeholders and retries through the gateway, which now sends the
+/// renewed one). An unknown key is `invalid_grant` (codex gives up at once); a renewal that failed
+/// is a 503 naming why (codex reports it as a failed refresh). Nothing in either answer is a
+/// credential.
+fn codex_refresh(
+    conn: TcpStream,
+    reader: &mut impl BufRead,
+    length: Option<usize>,
+    chunked: bool,
+    slot: Slot,
+) {
+    let body = if chunked {
+        read_chunked(reader, MAX_REFRESH_BODY)
+    } else {
+        length.filter(|n| *n <= MAX_REFRESH_BODY).and_then(|n| {
+            let mut body = vec![0u8; n];
+            reader.read_exact(&mut body).ok().map(|()| body)
+        })
+    };
+    let presented = body
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| Some(v.get("refresh_token")?.as_str()?.to_string()));
+    let Some(token) = presented else {
+        return codex_refresh_answer(conn, crate::seat_refresh::Recovery::UnknownUnit);
+    };
+    // A renewal can take seconds: the wait is bounded on its own and frees the gate-hook slot.
+    let Some(_wait) = RefreshWait::take() else {
+        return codex_refresh_answer(
+            conn,
+            crate::seat_refresh::Recovery::Failed(
+                "too many codex seats are waiting on a renewal; retry".into(),
+            ),
+        );
+    };
+    drop(slot);
+    codex_refresh_answer(conn, crate::seat_refresh::recover_codex(&token));
+}
+
+/// The OAuth-shaped answer to a codex refresh ([`codex_refresh`]).
+fn codex_refresh_answer(conn: TcpStream, recovery: crate::seat_refresh::Recovery) {
+    match recovery {
+        crate::seat_refresh::Recovery::Renewed => respond(conn, "200 OK", "{}"),
+        crate::seat_refresh::Recovery::UnknownUnit => respond(
+            conn,
+            "401 Unauthorized",
+            &serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "not the sign-in of a live codex seat"
+            })
+            .to_string(),
+        ),
+        crate::seat_refresh::Recovery::Failed(why) => {
+            relay_log!("wicked-core: a codex seat's 401 recovery could not renew the broker's sign-in: {why}");
+            respond(
+                conn,
+                "503 Service Unavailable",
+                &serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": format!(
+                        "the broker could not renew the codex sign-in: {why}"
+                    )
+                })
+                .to_string(),
+            )
+        }
+    }
 }
 
 /// A refusal for a request on `token` that is not judged (a malformed request): recorded in the
@@ -1711,9 +1819,194 @@ exit 2
         assert_eq!(budget, 9);
         assert_eq!(bounded_line(&mut r, &mut budget), None);
         let mut r = std::io::Cursor::new(b"4\r\nabcd\r\n0\r\n\r\n".to_vec());
-        assert_eq!(read_chunked(&mut r).as_deref(), Some(&b"abcd"[..]));
+        assert_eq!(
+            read_chunked(&mut r, MAX_BODY).as_deref(),
+            Some(&b"abcd"[..])
+        );
         let mut r = std::io::Cursor::new(format!("{:x}\r\n", MAX_BODY + 1).into_bytes());
-        assert_eq!(read_chunked(&mut r), None);
+        assert_eq!(read_chunked(&mut r, MAX_BODY), None);
+    }
+
+    /// core#997 end to end on loopback: codex's refresh request (OAuth's JSON body, as codex
+    /// 0.162.1 posts it to `CODEX_REFRESH_TOKEN_URL_OVERRIDE`) carrying a live codex unit's key
+    /// renews the broker once and is answered `{}` (no token); an unknown key is `invalid_grant`
+    /// and renews nothing; a renewal that fails is a 503 naming why. On main the route does not
+    /// exist (404); this test uses this change's `seat_refresh::register`, so it does not compile
+    /// there.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_seats_refresh_renews_the_broker_and_hands_back_no_token_997() {
+        use crate::seat_credentials::{sent_bearer, CredentialKind};
+        use crate::seat_gateway::{configure_gateway, register_unit, GatewayConfig, UnitKey};
+        use crate::seat_refresh::Outcome;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_codex_seats_refresh_renews_the_broker_and_hands_back_no_token_997",
+        ) {
+            return;
+        }
+        // The relay's connection counts are process-wide: one relay test at a time.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let port = port().expect("the relay listens");
+        let post = |refresh_token: &str| -> (String, serde_json::Value) {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let body = serde_json::json!({
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token
+            })
+            .to_string();
+            write!(
+                s,
+                "POST /codex/refresh HTTP/1.1\r\nhost: agw:8711\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+            let status = head.lines().next().unwrap().to_string();
+            (status, serde_json::from_str(body).unwrap())
+        };
+        let gw = |name: &str| {
+            let d = std::env::temp_dir().join(format!(
+                "c11-relay-{name}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            configure_gateway(&d, &GatewayConfig::default()).unwrap();
+            let mut u = UnitKey::new("FAKE-run", "FAKE-unit", "codex");
+            let raw = u.key.clone();
+            u.key = sent_bearer("codex", CredentialKind::CodexChatgpt, &raw);
+            u.bearer = u.key.clone();
+            register_unit(&d, u).unwrap();
+            (d, raw)
+        };
+        let (ok_dir, ok_key) = gw("ok");
+        let renewals = std::sync::Arc::new(AtomicUsize::new(0));
+        crate::seat_refresh::register(&ok_dir, {
+            let renewals = renewals.clone();
+            std::sync::Arc::new(move |_: &std::path::Path| {
+                renewals.fetch_add(1, Ordering::SeqCst);
+                Ok(Outcome::Refreshed { expires_at: None })
+            })
+        });
+        let (bad_dir, bad_key) = gw("bad");
+        crate::seat_refresh::register(
+            &bad_dir,
+            std::sync::Arc::new(|_: &std::path::Path| {
+                Err("codex could not renew its sign-in (its account/read answered an error)".into())
+            }),
+        );
+
+        let (status, body) = post(&ok_key);
+        assert!(status.contains(" 200 "), "{status}");
+        assert_eq!(body, serde_json::json!({}), "no token, real or placeholder");
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+
+        let (status, body) = post("wk-00000000000000000000000000000000");
+        assert!(status.contains(" 401 "), "{status}");
+        assert_eq!(body["error"], "invalid_grant");
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            1,
+            "an unknown key renews nothing"
+        );
+
+        let (status, body) = post(&bad_key);
+        assert!(status.contains(" 503 "), "{status}");
+        assert_eq!(body["error"], "temporarily_unavailable");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("account/read answered an error"),
+            "{body}"
+        );
+        for d in [ok_dir, bad_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// core#997 (codex review r1): codex seats waiting on a renewal hold none of the gate hook's
+    /// connection slots (so they never make a claude unit's tool call overflow and fail closed),
+    /// and their number is bounded: past [`MAX_REFRESH_WAITS`] a refresh is answered at once
+    /// with a retryable 503 and renews nothing.
+    #[cfg(unix)]
+    #[test]
+    fn codex_refresh_waits_hold_no_hook_slot_and_are_bounded_997() {
+        use crate::seat_credentials::{sent_bearer, CredentialKind};
+        use crate::seat_gateway::{configure_gateway, register_unit, GatewayConfig, UnitKey};
+        use crate::seat_refresh::Outcome;
+        use std::sync::atomic::AtomicBool;
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "codex_refresh_waits_hold_no_hook_slot_and_are_bounded_997",
+        ) {
+            return;
+        }
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let port = port().expect("the relay listens");
+        let dir = std::env::temp_dir().join(format!("c11-waits-{}", uuid::Uuid::new_v4().simple()));
+        configure_gateway(&dir, &GatewayConfig::default()).unwrap();
+        let mut u = UnitKey::new("FAKE-run", "FAKE-unit", "codex");
+        let key = u.key.clone();
+        u.key = sent_bearer("codex", CredentialKind::CodexChatgpt, &key);
+        register_unit(&dir, u).unwrap();
+        static HOLD: AtomicBool = AtomicBool::new(true);
+        crate::seat_refresh::register(
+            &dir,
+            std::sync::Arc::new(|_: &std::path::Path| {
+                while HOLD.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(Outcome::Refreshed { expires_at: None })
+            }),
+        );
+        let post = move |key: String| {
+            std::thread::spawn(move || {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let body =
+                    format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{key}\"}}");
+                write!(
+                    s,
+                    "POST /codex/refresh HTTP/1.1\r\nhost: agw\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                let mut resp = String::new();
+                s.read_to_string(&mut resp).unwrap();
+                resp
+            })
+        };
+        let waiting: Vec<_> = (0..MAX_REFRESH_WAITS).map(|_| post(key.clone())).collect();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while REFRESH_WAITS.load(Ordering::SeqCst) < MAX_REFRESH_WAITS {
+            assert!(
+                Instant::now() < deadline,
+                "the refreshes never started waiting"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            ACTIVE.load(Ordering::SeqCst),
+            0,
+            "a waiting refresh holds a hook slot"
+        );
+        let over = post(key.clone()).join().unwrap();
+        assert!(over.starts_with("HTTP/1.1 503"), "{over}");
+        assert!(over.contains("too many codex seats"), "{over}");
+        HOLD.store(false, Ordering::SeqCst);
+        for w in waiting {
+            let resp = w.join().unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The relay end to end on loopback with a fake `gate-hook` (a script that denies when the
