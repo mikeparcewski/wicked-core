@@ -7047,6 +7047,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
         worktree_clean: None,
         tree_after_failure: None,
         phase_scope: None,
+        pinned_validator: None,
+        creator_paths: None,
+        fold_handoff: None,
     };
     (output, agent_verdict, evidence)
 }

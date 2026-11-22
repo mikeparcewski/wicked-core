@@ -437,6 +437,46 @@ pub struct UnitEvidence {
     /// after the step. `None` = not read here; the fold then reads it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_scope: Option<PhaseScopeRead>,
+    /// (core#1418) The unit's pinned validator, run off the actor before the fold on the inputs the
+    /// fold would hand it. The fold applies its denial only on equal inputs; otherwise it runs the
+    /// validator itself. `None` = not read off the actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_validator: Option<PinnedValidatorRead>,
+    /// (core#1418) A creator floor's changed paths, diffed off the actor before the fold. `None` =
+    /// not read off the actor; the fold then diffs itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_paths: Option<CreatorPathsRead>,
+    /// (core#1418) Which hand-off of the actor (`actor::fold_reads`) made the two reads above. Never on the wire: a read the actor did not hand off itself is not applied,
+    /// and a hand-off the run outlived (cancelled or relaunched since) is dropped.
+    #[serde(skip)]
+    pub fold_handoff: Option<u64>,
+}
+
+/// (core#1418) A pinned validator's re-verify, run off the actor ([`UnitEvidence::pinned_validator`])
+/// with the inputs it ran on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedValidatorRead {
+    pub validator: crate::validator::DeterministicValidator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_path: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// The denial it reached (`None` = passed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<String>,
+}
+
+/// (core#1418) A creator floor's changed paths, diffed off the actor between two trees
+/// ([`UnitEvidence::creator_paths`]). Trees are content ids, so equal ids mean an equal diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatorPathsRead {
+    pub baseline_tree: String,
+    pub after_tree: String,
+    /// The paths and whether they were cut at the cap; `None` when the diff failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<(Vec<crate::worktree_guard::ChangedPath>, bool)>,
 }
 
 /// (core#1390) What the worker read for the fold's phase-scope warning ([`UnitEvidence::phase_scope`]).
