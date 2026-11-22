@@ -1751,3 +1751,90 @@ fn a_publish_has_no_executor_seat_qe_reviewer() {
         .any(|(seat, basis)| seat == "codex"
             && basis == crate::qe_acceptance::review::BASIS_EXECUTOR));
 }
+
+/// core#1343: a `run-cost` launch whose facts step could not be armed with its unit's capability
+/// token (no input governance, or no broker URL) is refused at admission, typed, with nothing
+/// persisted. It used to start, and its facts step then failed with "none could be armed".
+/// Armed, it is admitted (and is not an Apps run). Red on main: admission returned `Ok(None)`.
+#[test]
+fn a_run_cost_launch_that_could_not_arm_the_crew_tool_channel_is_refused() {
+    let store = seeded();
+    let clis = [cli("claude"), cli("codex")];
+    let qe = QeOverride::Auto;
+    let base = || LaunchFacts {
+        floor: Some("host"),
+        ..facts(crate::actor::RUN_COST_PRESET, &clis, &qe)
+    };
+    for (f, want) in [
+        (
+            LaunchFacts {
+                governed: false,
+                ..base()
+            },
+            "input governance",
+        ),
+        (
+            LaunchFacts {
+                crew_url: false,
+                ..base()
+            },
+            "broker URL",
+        ),
+        (
+            LaunchFacts {
+                governed: false,
+                crew_url: false,
+                ..base()
+            },
+            "WICKED_CREW_URL",
+        ),
+    ] {
+        let err = admit(&store, &f).unwrap_err();
+        assert!(err.downcast_ref::<AppsLaunchRefused>().is_some(), "{err:#}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`run-cost` launch is refused") && msg.contains(want),
+            "{msg}"
+        );
+    }
+    assert!(
+        admit(&store, &base()).unwrap().is_none(),
+        "an armed run-cost launch is admitted, and is not an Apps run"
+    );
+    // A saved `run-cost` that runs no crew facts command needs no channel, so it is not refused.
+    let mut store = store;
+    let row = crate::preset::Preset {
+        name: crate::actor::RUN_COST_PRESET.into(),
+        scope: "project:p1".into(),
+        steps: vec![crate::plan::PlanStep {
+            catalog: "understand".into(),
+            id: "model".into(),
+            ..Default::default()
+        }],
+        created_by: "api".into(),
+        updated_at: 1,
+        deleted_at: None,
+        required_instruments: None,
+        title: None,
+        summary: None,
+        use_when: Vec::new(),
+    };
+    crate::domain::put_node(&mut store, row.to_node()).unwrap();
+    let saved = LaunchFacts {
+        project_id: Some("p1"),
+        governed: false,
+        crew_url: false,
+        ..base()
+    };
+    assert!(
+        admit(&store, &saved).unwrap().is_none(),
+        "no facts Tool, no channel to arm"
+    );
+    // Any other launch is not judged by this rule.
+    let other = LaunchFacts {
+        governed: false,
+        crew_url: false,
+        ..facts("feature", &clis, &qe)
+    };
+    assert!(admit(&store, &other).unwrap().is_none());
+}
