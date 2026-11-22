@@ -7536,7 +7536,7 @@ fn cat_batch(
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
     let mut answer = || -> Result<(), String> {
-        for i in 0..n {
+        for &i in at.iter().take(n) {
             let mut header = String::new();
             out.read_line(&mut header).map_err(|e| e.to_string())?;
             let mut words = header.split_whitespace();
@@ -7565,7 +7565,7 @@ fn cat_batch(
                 out.read_exact(&mut nl).map_err(|e| e.to_string())?;
                 body
             };
-            each(at[i], body)?;
+            each(i, body)?;
         }
         Ok(())
     };
