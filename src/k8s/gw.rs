@@ -2379,7 +2379,7 @@ case "$*" in
     ;;
 *)
     for arg do marker=$arg; done
-    printf '%s' "$marker" > marker
+    printf '%s' "$marker" > marker.tmp && mv marker.tmp marker
     exec sleep 600
     ;;
 esac

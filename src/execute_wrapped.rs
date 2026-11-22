@@ -5168,7 +5168,7 @@ impl WrappedCliStepRunner {
                     // (core#1717) stderr goes into the transcript: cut the secrets a CLI prints
                     // there (env dumps, auth headers, tokens) with the tool-output redaction,
                     // keeping its lines as they are for the refusal classifiers.
-                    let err = crate::tool_activity::redact_text(&err);
+                    let err = crate::tool_activity::redact_prose(&err);
                     let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
                         (false, false) => format!("{out}\n{err}"),
                         (false, _) => out,

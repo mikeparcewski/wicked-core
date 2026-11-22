@@ -1121,10 +1121,29 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     None
 }
 
+/// `git clone`'s long options that take a separate value (besides `--config`).
+const CLONE_LONG_VALUE_OPTS: &[&str] = &[
+    "--template",
+    "--reference",
+    "--reference-if-able",
+    "--origin",
+    "--branch",
+    "--revision",
+    "--upload-pack",
+    "--depth",
+    "--shallow-since",
+    "--shallow-exclude",
+    "--separate-git-dir",
+    "--jobs",
+    "--server-option",
+    "--filter",
+    "--bundle-uri",
+    "--ref-format",
+];
+
 /// The keys of `git clone`'s `-c <k=v>` / `--config <k=v>`: attached (`-ck=v`, `--config=k=v`),
 /// in a short cluster (`-qc k=v`, `-qck=v`) and as a long prefix (`--con`). Options stop at `--`;
-/// the other short options that take a value (`-o -b -u -j`) consume it. A long option's value
-/// is not skipped, so a value spelled like a fenced `-c` fails closed.
+/// the other options that take a value (`-o -b -u -j`, [`CLONE_LONG_VALUE_OPTS`]) consume it.
 fn clone_config_keys(rest: &[String]) -> Vec<&str> {
     let long = |t: &str| t.len() > 4 && "--config".starts_with(t);
     let mut keys = Vec::new();
@@ -1134,6 +1153,11 @@ fn clone_config_keys(rest: &[String]) -> Vec<&str> {
         i += 1;
         if t == "--" {
             break;
+        }
+        // A long option that takes a value consumes it, `--` included (`--template -- -c k=v`).
+        if !long(t) && t.len() > 4 && CLONE_LONG_VALUE_OPTS.iter().any(|o| o.starts_with(t)) {
+            i += 1;
+            continue;
         }
         let kv = if long(t) {
             rest.get(i).map(|v| {
@@ -1186,9 +1210,10 @@ fn judge_git_config(rest: &[String]) -> Option<String> {
         "--show-origin",
         "--show-scope",
     ];
-    // Options that take the next token as their value (`--comment get` is a comment).
+    // Options that take the next token as their value (`--comment get` is a comment); git also
+    // takes an unambiguous prefix of a long one (`--comm`), so any long-option prefix of at least
+    // three letters counts (failing closed: a prefix that is not one only refuses a read).
     const VALUE_OPTS: &[&str] = &[
-        "-f",
         "--file",
         "--blob",
         "--comment",
@@ -1204,7 +1229,8 @@ fn judge_git_config(rest: &[String]) -> Option<String> {
         if READ_FLAGS.contains(&rest[i].as_str()) {
             return None;
         }
-        i += if VALUE_OPTS.contains(&rest[i].as_str()) {
+        let t = rest[i].as_str();
+        i += if t == "-f" || (t.len() > 4 && VALUE_OPTS.iter().any(|o| o.starts_with(t))) {
             2
         } else {
             1
@@ -1583,6 +1609,8 @@ mod tests {
             "git clone -qcremote.origin.pushurl=z src dst",
             "git config --comment get remote.origin.pushurl https://example.invalid/o/r.git",
             "git config remote.origin.pushurl https://example.invalid/o/r.git --get",
+            "git config --comm get remote.origin.pushurl https://example.invalid/o/r.git",
+            "git clone --template -- -c remote.origin.pushurl=z src dst",
         ] {
             assert!(hit(cmd).is_some(), "not refused: {cmd}");
         }
