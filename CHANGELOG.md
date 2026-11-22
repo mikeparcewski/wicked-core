@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Container seats, codex:** a codex seat signed in with ChatGPT now recovers from an upstream 401. Its token refresh goes to the gateway's gate-hook route (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`), never to auth.openai.com. The relay renews the broker's sign-in with one forced refresher pass, shared by every seat within a minute, and answers with no token, so the seat retries with its placeholder and the gateway sends the renewed token. An unknown key gets `invalid_grant`; a failed renewal gets a 503 naming why. The placeholder's refresh token is now the unit's key, and its JWT carries a placeholder user, so codex keeps its network policy after the reload (core#997). Every codex seat also switches off its non-model calls with codex's own config keys: analytics, Statsig metrics (ab.chatgpt.com), the apps MCP server, the remote plugin catalogue, and the ChatGPT backend base (a closed loopback port). A seat's session no longer makes refused CONNECTs to chatgpt.com or ab.chatgpt.com (core#1478).
+
 - **core-ts 0.15.48** — 2026-11-22 — patch release on the train-11 cut 7c8ef169, carrying 59 PRs since 0.15.47: #1644, #1645, #1646, #1647, #1648, #1649, #1650, #1651, #1652, #1654, #1655, #1656, #1658, #1659, #1660, #1661, #1664, #1665, #1666, #1669, #1670, #1671, #1672, #1675, #1676, #1677, #1678, #1679, #1680, #1684, #1685, #1686, #1687, #1691, #1692, #1693, #1694, #1695, #1696, #1697, #1704, #1705, #1706, #1707, #1710, #1711, #1712, #1713, #1723, #1725, #1726, #1727, #1728, #1729, #1732, #1733, #1741, #1745, #1749.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 
