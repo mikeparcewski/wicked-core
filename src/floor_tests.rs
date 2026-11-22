@@ -751,7 +751,10 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+        // (core#1101) A doctest: its `Doc-tests` section counts `running 1 test`, so `complete`
+        // passes only because the guide's list names it too (`src/lib.rs - f (line 1)`).
+        "/// ```\n/// assert_eq!(1, 1);\n/// ```\npub fn f() {}\n\n\
+         #[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -1502,20 +1505,25 @@ fn doctests_run_under_the_real_floor_sandbox() {
 /// `-- <id> --exact` runs one. Markers: `flaky.list` fails the first list of a probe scratch,
 /// `broken.alone` fails `a` run alone, `red.base` fails `a` always, `alone.all` makes a one-test
 /// run run them all, `plant.link` plants `zz_m` as a link to `$OUTSIDE`, `swallow` exits 0 on a
-/// failure, `dup.list` lists `a` twice.
+/// failure, `dup.list` lists `a` twice. (core#1101) A run prints `running <n> tests` first;
+/// `partial.list` lists `a` alone; `skip.greedy` makes `--skip=m` skip `m2` too; `dup.only`
+/// lists `a` twice and has no `b`.
 #[cfg(unix)]
 const STAND_IN: &str = r#"mode=run; name=; skip=' '
 for a in "$@"; do case "$a" in --list) mode=list;; --skip=*) skip="$skip${a#--skip=} ";; --|--exact) ;; *) name=$a;; esac; done
-all="a b"; [ -f zz_m ] && [ ! -L zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
+[ -f skip.greedy ] && case "$skip" in *" m "*) skip="${skip}m2 ";; esac
+all="a b"; [ -f dup.only ] && all="a"; [ -f zz_m ] && [ ! -L zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
 if [ -n "$name" ] && [ ! -f alone.all ]; then case " $all " in *" $name "*) all=$name;; *) all=;; esac; fi
 [ -n "$name" ] && [ -f broken.alone ] && [ "$name" = a ] && exit 1
 [ -n "$LEAK" ] && [ $mode = list ] && exit 3
 [ -f plant.link ] && [ ! -L zz_m ] && ln -s "$OUTSIDE" zz_m
+[ -f partial.list ] && [ $mode = list ] && all=a
 case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
     for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done
-    [ -f dup.list ] && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
-  *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+    { [ -f dup.list ] || [ -f dup.only ]; } && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
+  *) n=0; f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; n=$((n+1)); case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+    echo "running $n tests"
     if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
     printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'
     [ -f swallow ] && exit 0; exit 101;;
@@ -1529,7 +1537,8 @@ fn stand_in_guide() -> serde_json::Value {
         "name": "test", "run": ["sh", "runner.sh"], "failedExit": [101],
         "results": {"kind": "text"},
         "parser": {"blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
-                               "end": "^test result: FAILED"}]},
+                               "end": "^test result: FAILED"}],
+                   "count": r"^running (?P<n>\d+) tests$"},
         "list": {"run": ["sh", "runner.sh", "--list"], "item": r"^(?P<id>\S+): test$"},
         "alone": {"run": ["sh", "runner.sh", "--", "{id}", "--exact"]},
         "deselect": {"append": ["--skip={id}"]},
@@ -1662,8 +1671,27 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     // deselect of a test listed twice proves nothing.
     let r = with("swallow", &g).unwrap();
     assert!(r["mutation"].starts_with("fail:"), "{r:?}");
+    // (core#1101) …and a list that names a test twice runs more than it lists, or less: not
+    // `complete`. The passing test probed is one whose id is unique (`b`); with none, `alone`
+    // and `deselect` fail.
     let r = with("dup.list", &g).unwrap();
-    assert!(r["deselect"].starts_with("fail:"), "{r:?}");
+    assert!(r["complete"].starts_with("fail:"), "{r:?}");
+    assert!(r["deselect"].starts_with("pass"), "`b` is unique: {r:?}");
+    let r = with("dup.only", &g).unwrap();
+    for p in ["alone", "deselect"] {
+        assert!(r[p].contains("unique across every qualifier"), "{p}: {r:?}");
+    }
+    // (core#1101) A list that names fewer tests than the run executes is not `complete`.
+    let r = with("partial.list", &g).unwrap();
+    assert!(
+        r["complete"].contains("executed 2 test(s); the list names 1"),
+        "{r:?}"
+    );
+    // (core#1101) A deselect that drops the second mutation with the first: deselecting both
+    // runs green, but the first alone no longer fails naming the second.
+    let r = with("skip.greedy", &g).unwrap();
+    assert_eq!(r["mutation"], "pass (retried)", "{r:?}");
+    assert!(r["multi"].starts_with("fail:"), "{r:?}");
     let mut bad2 = g.clone();
     bad2["probes"]["mutation2"]["file"] = "../m2".into();
     let r = with("bad2.marker", &bad2).unwrap();
@@ -4350,6 +4378,133 @@ fn the_floors_copies_keep_the_declared_line_endings() {
         "the unconverted bytes are not the checkout: {raw:?}"
     );
     drop(checkout);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (core#1131) A path that starts with a space or ends in CR is converted under ITS OWN
+/// attributes: git's batch parser drops the whitespace after the id and reads a trailing CR as the
+/// line ending, so ` x.cmd` and `Icon\r` used to be converted under `x.cmd`'s and `Icon`'s
+/// `-text` and stayed LF. Their neighbours, through the batch, keep theirs.
+#[cfg(unix)]
+#[test]
+fn an_odd_path_is_converted_under_its_own_attributes_1131() {
+    let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs");
+        return;
+    }
+    let repo = scratch("export-odd");
+    std::fs::write(
+        repo.join(".gitattributes"),
+        "*.cmd text eol=crlf\n/x.cmd -text\nIcon* text eol=crlf\n/Icon -text\n",
+    )
+    .unwrap();
+    for name in [" x.cmd", "x.cmd", "Icon\r", "Icon"] {
+        std::fs::write(repo.join(name), "a\nb\n").unwrap();
+    }
+    let head = git_repo_with_commit(&repo);
+    let git_dir = repo.join(".git");
+    let _scratch = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &git_dir, &head).unwrap();
+    let read = |name: &str| std::fs::read(base.dir.join(name)).unwrap();
+    assert_eq!(
+        read(" x.cmd"),
+        b"a\r\nb\r\n",
+        "` x.cmd` under its own `*.cmd`"
+    );
+    assert_eq!(
+        read("Icon\r"),
+        b"a\r\nb\r\n",
+        "`Icon\\r` under its own `Icon*`"
+    );
+    assert_eq!(read("x.cmd"), b"a\nb\n", "`x.cmd` keeps its `-text`");
+    assert_eq!(read("Icon"), b"a\nb\n", "`Icon` keeps its `-text`");
+    drop(base);
+    let _ = remove_base_export(&root);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (core#1131, coord r1 on #1765) The odd-path routing on EVERY OS: `cat_batch` (which the pod
+/// export shares) converts ` x.cmd` and `Icon\r` under their own attributes and their neighbours
+/// under theirs, straight from blobs (no file is written, so a name Windows cannot hold is fine).
+/// Past [`ODD_PATH_CAP`] odd paths, it fails closed before running any git.
+#[test]
+fn odd_paths_convert_under_their_own_attributes_on_every_os_1131() {
+    let repo = scratch("export-odd-batch");
+    std::fs::write(repo.join("blob.txt"), "a\nb\n").unwrap();
+    git(&repo, &["init", "-q"]);
+    // Git for Windows refuses an index path with a control character (`Icon\r`) under its
+    // default `core.protectNTFS`; this tree is only ever read as blobs.
+    git(&repo, &["config", "core.protectNTFS", "false"]);
+    let attrs = repo.join("attrs.txt");
+    std::fs::write(
+        &attrs,
+        "*.cmd text eol=crlf\n/x.cmd -text\nIcon* text eol=crlf\n/Icon -text\n",
+    )
+    .unwrap();
+    let blob = git(&repo, &["hash-object", "-w", "--no-filters", "blob.txt"]);
+    let attrs_blob = git(&repo, &["hash-object", "-w", "--no-filters", "attrs.txt"]);
+    let names = [" x.cmd", "x.cmd", "Icon\r", "Icon"];
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{attrs_blob},.gitattributes"),
+        ],
+    );
+    for n in names {
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{n}"),
+            ],
+        );
+    }
+    let tree = git(&repo, &["write-tree"]);
+    let git_dir = repo.join(".git");
+    // The cap is checked before any git runs.
+    let many: Vec<String> = (0..=ODD_PATH_CAP)
+        .map(|i| format!("{blob}  odd{i}"))
+        .collect();
+    let mut called = false;
+    let err = cat_batch(&git_dir, &tree, true, many, |_, _| {
+        called = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.contains("at most 64"), "{err}");
+    assert!(!called);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40)");
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
+    let mut got: Vec<(usize, Vec<u8>)> = Vec::new();
+    cat_batch(
+        &git_dir,
+        &tree,
+        true,
+        names.iter().map(|n| format!("{blob} {n}")).collect(),
+        |i, body| {
+            got.push((i, body));
+            Ok(())
+        },
+    )
+    .unwrap();
+    got.sort();
+    let want: Vec<(usize, Vec<u8>)> = vec![
+        (0, b"a\r\nb\r\n".to_vec()),
+        (1, b"a\nb\n".to_vec()),
+        (2, b"a\r\nb\r\n".to_vec()),
+        (3, b"a\nb\n".to_vec()),
+    ];
+    assert_eq!(got, want);
     let _ = std::fs::remove_dir_all(&repo);
 }
 

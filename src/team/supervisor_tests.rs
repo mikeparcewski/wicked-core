@@ -3273,3 +3273,231 @@ fn a_deferred_finding_is_a_checklist_item_in_the_review_brief() {
         plain[0].2
     );
 }
+
+// ── core#1289: a team council excludes parties by identity and takes the host council slot ──────
+
+fn builtin_seat(key: &str) -> wicked_council::AgenticCli {
+    wicked_council::registry::builtin()
+        .into_iter()
+        .find(|c| c.key == key)
+        .unwrap_or_else(|| panic!("no built-in seat `{key}`"))
+}
+
+fn council_request() -> DecisionRequest {
+    DecisionRequest {
+        session_id: "run-1289".into(),
+        ord: 1,
+        question: "Is the finding at src/a.rs:10 a defect?".into(),
+        options: vec!["Monitor: yes".into(), "Worker: no".into()],
+        evidence: "src/a.rs:10".into(),
+    }
+}
+
+fn slot_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "wicked-1289-{name}-{}-{}.lock",
+        std::process::id(),
+        COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+    ))
+}
+
+/// A second registry key that runs a party's binary is the party: it does not vote. A seat whose
+/// launch cannot be verified (a launcher script) cannot be shown distinct, so it does not either.
+/// Before core#1289 the team council excluded by key only, and both sat.
+#[test]
+fn a_team_council_excludes_an_alias_of_a_party_by_identity() {
+    let mut alias = builtin_seat("claude");
+    alias.key = "claude-work".into();
+    let mut wrapper = builtin_seat("codex");
+    wrapper.key = "wrapped".into();
+    wrapper.binary = "my-wrapper".into();
+    wrapper.headless_invocation = "my-wrapper -p \"{PROMPT}\"".into();
+    let roster = vec![
+        builtin_seat("claude"),
+        alias,
+        builtin_seat("codex"),
+        wrapper,
+        builtin_seat("pi"),
+    ];
+    let seats: Vec<String> = team_council_seats(roster, &["claude#2".to_string()])
+        .expect("every party's launch is verified")
+        .into_iter()
+        .map(|c| c.key)
+        .collect();
+    assert!(
+        !seats.iter().any(|k| k == "claude-work"),
+        "an alias running the party's binary sits: {seats:?}"
+    );
+    assert!(
+        !seats.iter().any(|k| k == "wrapped"),
+        "a seat whose launch cannot be verified sits: {seats:?}"
+    );
+    assert_eq!(seats, vec!["codex".to_string(), "pi".to_string()]);
+}
+
+/// codex r2 on #1771 (core#1775): a Windows record spelling its binary `claude.exe` is the
+/// shipped `claude`. As a party it is verified and excludes the `claude` aliases; as a voter it
+/// sits. Before, the kept suffix made it an unverifiable identity: no council at all.
+#[test]
+fn a_windows_executable_spelling_is_the_same_identity() {
+    let mut party = builtin_seat("claude");
+    party.key = "claude-win".into();
+    party.binary = r"C:\Tools\Claude.EXE".into();
+    party.headless_invocation = party
+        .headless_invocation
+        .replacen("claude", "Claude.EXE", 1);
+    let mut voter = builtin_seat("codex");
+    voter.key = "codex-win".into();
+    voter.binary = "codex.exe".into();
+    voter.headless_invocation = voter.headless_invocation.replacen("codex", "codex.cmd", 1);
+    let roster = vec![builtin_seat("claude"), party, voter, builtin_seat("pi")];
+    let seats: Vec<String> = team_council_seats(roster, &["claude-win#1".to_string()])
+        .expect("a .exe party is verified")
+        .into_iter()
+        .map(|c| c.key)
+        .collect();
+    assert_eq!(seats, vec!["codex-win".to_string(), "pi".to_string()]);
+}
+
+/// codex r1 on #1771: a party whose own record runs a launcher script could be running any CLI
+/// underneath, so no seat can be shown distinct from it: no council (`identity_unknown`), and the
+/// engine is never asked. Before, its wrapper name was its only identity and `claude` sat.
+#[test]
+fn a_team_council_refuses_a_party_whose_launch_cannot_be_verified() {
+    let mut wrapped = builtin_seat("codex");
+    wrapped.key = "wrapped-worker".into();
+    wrapped.binary = "my-wrapper".into();
+    wrapped.headless_invocation = "my-wrapper -p \"{PROMPT}\"".into();
+    let roster = vec![builtin_seat("claude"), builtin_seat("pi"), wrapped];
+    let why = team_council_seats(roster.clone(), &["wrapped-worker#1".to_string()])
+        .expect_err("a party running a wrapper is refused");
+    assert!(why.starts_with("identity_unknown"), "{why}");
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: slot_path("unknown"),
+    };
+    let out = council.convene_from(
+        roster,
+        council_request(),
+        &["wrapped-worker#1".to_string()],
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(&out, CouncilOutcome::NoSeats(w) if w.starts_with("identity_unknown")),
+        "{out:?}"
+    );
+    assert!(rx.try_recv().is_err(), "the engine was asked");
+}
+
+/// While another council holds the host slot, a team council waits within its budget, then times
+/// out without ever reaching the engine. Before core#1289 it sent `ConveneDecision` at once.
+#[test]
+fn a_team_council_waits_for_the_host_slot_and_never_reaches_the_engine_while_held() {
+    let path = slot_path("busy");
+    let held = crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now())
+        .unwrap_or_else(|_| panic!("the test could not take its own slot"));
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let started = Instant::now();
+    let out = council.convene_from(
+        vec![builtin_seat("codex"), builtin_seat("pi")],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_millis(600),
+    );
+    assert_eq!(out, CouncilOutcome::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(
+        rx.try_recv().is_err(),
+        "the council reached the engine without the host slot"
+    );
+    drop(held);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// codex r2 on #1771: a slot freed only after the convene budget ran out starts no council. The
+/// holder releases it at 150 ms; the budget is 50 ms. Before, the 200 ms poll took it then and the
+/// command reached the engine for a ruling nobody would wait for.
+#[test]
+fn a_slot_freed_after_the_budget_starts_no_council() {
+    let path = slot_path("late");
+    let held = crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now())
+        .unwrap_or_else(|_| panic!("the test could not take its own slot"));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let out = council.convene_from(
+        vec![builtin_seat("codex"), builtin_seat("pi")],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_millis(50),
+    );
+    release.join().unwrap();
+    assert_eq!(out, CouncilOutcome::TimedOut);
+    assert!(
+        rx.try_recv().is_err(),
+        "a council started after its budget ran out"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The slot rides in the command: it stays held until the council (the engine side) drops it,
+/// and the seats handed over are the non-party ones.
+#[test]
+fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
+    let path = slot_path("carried");
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let engine = std::thread::spawn({
+        let path = path.clone();
+        move || match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(crate::command::Command::ConveneDecision {
+                clis, lock, reply, ..
+            }) => {
+                let busy = matches!(
+                    crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now()),
+                    Err(crate::cli_runner::SlotRefused::Busy)
+                );
+                drop(lock);
+                let free = crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now())
+                    .is_ok();
+                let _ = reply.send(Err(anyhow::anyhow!("stub engine")));
+                let keys: Vec<String> = clis.into_iter().map(|c| c.key).collect();
+                (keys, busy, free)
+            }
+            _ => panic!("no ConveneDecision reached the engine"),
+        }
+    });
+    let out = council.convene_from(
+        vec![
+            builtin_seat("claude"),
+            builtin_seat("codex"),
+            builtin_seat("pi"),
+        ],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_secs(30),
+    );
+    assert!(
+        matches!(&out, CouncilOutcome::Failed(e) if e.contains("stub engine")),
+        "{out:?}"
+    );
+    let (keys, busy, free) = engine.join().unwrap();
+    assert_eq!(keys, vec!["codex".to_string(), "pi".to_string()]);
+    assert!(busy, "the slot was free while the council held it");
+    assert!(free, "the slot stayed held after the council dropped it");
+    let _ = std::fs::remove_file(&path);
+}

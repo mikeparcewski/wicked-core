@@ -147,7 +147,7 @@ pub(crate) fn strip_echo(output: &str, blocks: &[&RunContext]) -> Option<String>
 pub(crate) fn pin(unit: &mut WorkUnit) -> Option<RunContext> {
     let sc = unit.run_context.as_mut()?;
     if !sc.pinned {
-        if let Some(l) = latest(&sc.run_id).filter(|l| l.version > sc.ctx.version) {
+        if let Some(l) = latest(&sc.run_id).filter(|l| supersedes(l, &sc.ctx)) {
             sc.ctx = l;
         }
         sc.pinned = true;
@@ -160,7 +160,12 @@ pub(crate) fn pin(unit: &mut WorkUnit) -> Option<RunContext> {
 pub(crate) fn strip_answer(unit: &WorkUnit, out: &mut StepOutput) {
     if let Some(sc) = &unit.run_context {
         let recent = published(&sc.run_id);
-        let blocks: Vec<&RunContext> = std::iter::once(&sc.ctx).chain(recent.iter()).collect();
+        // (codex r1 on #1777) An empty block (nothing in force, or a clear) rendered nothing, so
+        // there is no echo of it to strip: its framing alone must never cut a seat's own words.
+        let blocks: Vec<&RunContext> = std::iter::once(&sc.ctx)
+            .chain(recent.iter())
+            .filter(|c| !c.sections.is_empty())
+            .collect();
         if let Some(clean) = strip_echo(&out.output, &blocks) {
             out.output = clean;
         }
@@ -338,30 +343,66 @@ fn check_author_id(id: &str) -> Result<(), String> {
 /// earlier ones are what a seat launched under them may echo back (`Stamping` strips them all).
 const PUBLISHED_KEPT: usize = 8;
 
-fn live() -> &'static RwLock<HashMap<String, Vec<RunContext>>> {
-    static LIVE: OnceLock<RwLock<HashMap<String, Vec<RunContext>>>> = OnceLock::new();
+/// One run's published blocks, one slot per publishing engine: the thread that published them
+/// (the engine's actor thread: `publish` is actor-only), the most recent publisher last. Readers
+/// see the run as before (the latest publisher's block, every slot's recent ones); an engine's
+/// cleanup drops only its own slot (core#1322; codex r1 on #1777: two engines may share a
+/// caller-supplied run id).
+type Slots = Vec<(std::thread::ThreadId, Vec<RunContext>)>;
+
+fn live() -> &'static RwLock<HashMap<String, Slots>> {
+    static LIVE: OnceLock<RwLock<HashMap<String, Slots>>> = OnceLock::new();
     LIVE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Publish the session's block for `run_id`'s seats (ACTOR ONLY: the session is the record and
 /// this is its copy). A cleared block (no section) is kept with its version, so a seat stamped
-/// before the clear reads the clear at render; `None` (a session with no block) drops the run.
+/// before the clear reads the clear at render; `None` (a session with no block) drops the run
+/// (this engine's slot of it).
 pub(crate) fn publish(run_id: &str, ctx: Option<&RunContext>) {
+    let Some(c) = ctx else {
+        forget(run_id);
+        return;
+    };
+    let me = std::thread::current().id();
     let mut m = live().write().unwrap_or_else(|p| p.into_inner());
-    match ctx {
-        Some(c) => {
-            let kept = m.entry(run_id.to_string()).or_default();
-            if kept.last() != Some(c) {
-                kept.push(c.clone());
-                if kept.len() > PUBLISHED_KEPT {
-                    kept.remove(0);
-                }
-            }
+    let slots = m.entry(run_id.to_string()).or_default();
+    let mut kept = match slots.iter().position(|(t, _)| *t == me) {
+        Some(i) => slots.remove(i).1,
+        None => Vec::new(),
+    };
+    if kept.last() != Some(c) {
+        kept.push(c.clone());
+        if kept.len() > PUBLISHED_KEPT {
+            kept.remove(0);
         }
-        None => {
+    }
+    slots.push((me, kept));
+}
+
+/// (core#1322) The run ended (completed, failed or cancelled): this engine's published blocks
+/// for it are dropped, so the map does not grow for the daemon's life. Every launch path publishes
+/// the session's block again before it stamps, so a resumed run's seats lose nothing.
+pub(crate) fn forget(run_id: &str) {
+    let me = std::thread::current().id();
+    let mut m = live().write().unwrap_or_else(|p| p.into_inner());
+    if let Some(slots) = m.get_mut(run_id) {
+        slots.retain(|(t, _)| *t != me);
+        if slots.is_empty() {
             m.remove(run_id);
         }
     }
+}
+
+/// (core#1322) The engine is shutting down: drop every block THIS thread (its actor) published,
+/// and only those (another engine in the process keeps its own, the same run id included).
+pub(crate) fn forget_published_here() {
+    let me = std::thread::current().id();
+    let mut m = live().write().unwrap_or_else(|p| p.into_inner());
+    m.retain(|_, slots| {
+        slots.retain(|(t, _)| *t != me);
+        !slots.is_empty()
+    });
 }
 
 /// The block published for `run_id`, cleared or not.
@@ -370,7 +411,8 @@ fn latest(run_id: &str) -> Option<RunContext> {
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .get(run_id)
-        .and_then(|k| k.last().cloned())
+        .and_then(|slots| slots.last())
+        .and_then(|(_, kept)| kept.last().cloned())
 }
 
 /// Every block recently published for `run_id` (oldest first): what a seat of the run may have
@@ -380,8 +422,36 @@ fn published(run_id: &str) -> Vec<RunContext> {
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .get(run_id)
-        .cloned()
+        .map(|slots| {
+            slots
+                .iter()
+                .flat_map(|(_, kept)| kept.iter().cloned())
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// (core#1322) The stamp of a seat stamped while nothing was published: an empty block no author
+/// set (a real block, a clear included, always names a `human` or `system` author), so the first
+/// block published after it is adopted whatever its version (version 0 included).
+fn absent() -> RunContext {
+    RunContext {
+        version: 0,
+        sections: Vec::new(),
+        set_by: ContextAuthor {
+            kind: String::new(),
+            id: String::new(),
+        },
+    }
+}
+
+fn is_absent(c: &RunContext) -> bool {
+    c.set_by.kind.is_empty() && c.sections.is_empty()
+}
+
+/// Whether `newer`, published after a seat was stamped with `stamped`, replaces it.
+fn supersedes(newer: &RunContext, stamped: &RunContext) -> bool {
+    newer.version > stamped.version || (is_absent(stamped) && !is_absent(newer))
 }
 
 /// The block in force for `run_id`, when it has any section.
@@ -411,18 +481,17 @@ pub(crate) fn takes_block(unit: &WorkUnit) -> bool {
 }
 
 /// Stamp `unit` with `run_id`'s block in force now (or clear it): ALWAYS overwrites, so a unit
-/// cloned from an earlier launch never carries an older block.
+/// cloned from an earlier launch never carries an older block. (core#1322) A seat that takes a
+/// block is stamped even when none is published yet, with an empty version-0 block (the shape of
+/// a cleared one: nothing renders), so a FIRST block set while its launch is prepared still
+/// reaches it at the pin, as a later set does.
 pub(crate) fn stamp(unit: &mut WorkUnit, run_id: &str, ord: u32) {
-    unit.run_context = if takes_block(unit) {
-        latest(run_id).map(|ctx| SeatContext {
-            run_id: run_id.to_string(),
-            ord,
-            ctx,
-            pinned: false,
-        })
-    } else {
-        None
-    };
+    unit.run_context = takes_block(unit).then(|| SeatContext {
+        run_id: run_id.to_string(),
+        ord,
+        ctx: latest(run_id).unwrap_or_else(absent),
+        pinned: false,
+    });
 }
 
 /// Which seat a unit launches, as `runContextDelivered` names it.
@@ -519,7 +588,7 @@ pub(crate) fn effective(sc: &SeatContext) -> Option<RunContext> {
     // dropped), so `latest` is `None` only for a run whose session no longer has a block at all;
     // the stamp then stands.
     let c = match latest(&sc.run_id) {
-        Some(l) if l.version > sc.ctx.version => l,
+        Some(l) if supersedes(&l, &sc.ctx) => l,
         _ => sc.ctx.clone(),
     };
     (!c.sections.is_empty()).then_some(c)

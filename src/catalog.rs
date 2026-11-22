@@ -1132,6 +1132,9 @@ fn migration_preset() -> Vec<PlanStep> {
 /// in the form crew registered them with the draft skill held, `withDraftSkill(<def>, true)`;
 /// pinned to the C1 mapping by a test). chat: understand → `understand`, revise → `produce`;
 /// draft: draft → `produce` (crew folded the outline into its one phase); edit: edit → `produce`.
+/// draft and chat then print the document they wrote: `measure-pages` (the engine's
+/// [`crate::draft_render`] Tool, PLAN G12; core#1334 for chat). An edit writes fragments, not a
+/// document, so it has nothing to print.
 /// Every agent step runs `wicked-garden-draft`, the document quality floor. They are repo-less creator plans, so
 /// the PA rates their RISK first (§11.3): a routine internal draft proceeds in auto mode, a
 /// high-stakes one pauses.

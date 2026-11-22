@@ -4804,6 +4804,209 @@ fn a_red_package_the_base_already_had_stays_unseparated_f24() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// (core#1314) A package force-added (`git add -f`) under an ignored path is one the change
+/// introduced: pre-fix, the head's snapshot (`add -A`) left it out and `introduced_dir` made
+/// no claim.
+#[test]
+fn a_force_added_package_under_an_ignored_path_is_introduced_1314() {
+    let repo = f24_repo("f24-forced");
+    std::fs::write(repo.join(".gitignore"), "tmp/\nvendor/\n").unwrap();
+    let base = git_repo_with_commit(&repo);
+    f24_red_package(&repo, "vendor/pkg", "pkg::adds");
+    git(&repo, &["add", "-f", "vendor/pkg"]);
+    assert_eq!(
+        introduced_dir(&repo, &repo.join(".git"), &base, "vendor/pkg").unwrap(),
+        NewDir::Introduced
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (core#1110) A process that swaps the base export's package directory while base
+/// detection reads it, and restores it after, cannot change what the base runs: detection
+/// reads the directory held before it began. Pre-fix, detection read the impostor (which
+/// declares no `test`) by path, and the restored path passed the identity check after it.
+/// A swap left in place fails the base closed.
+#[cfg(unix)]
+#[test]
+fn a_base_detection_swap_and_restore_cannot_change_the_base_check_1110() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    for restore in [true, false] {
+        let repo = f24_repo(&format!("held-detect-{restore}"));
+        f24_red_package(&repo, "pkg", "pkg::shared");
+        std::fs::write(repo.join("pkg/notes.txt"), "v1\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(repo.join("pkg/notes.txt"), "v2\n").unwrap();
+        let parked: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let fired = Rc::new(Cell::new(false));
+        let (p_in, p_out, f_out) = (parked.clone(), parked.clone(), fired.clone());
+        test_seam::around_base_detect(
+            move |pkg| {
+                // Park the real package; an impostor that declares no `test` takes its path.
+                let aside = pkg.with_file_name("pkg-parked");
+                std::fs::rename(pkg, &aside).unwrap();
+                std::fs::create_dir_all(pkg.join(".wicked")).unwrap();
+                std::fs::write(pkg.join("package.json"), r#"{"name":"pkg"}"#).unwrap();
+                std::fs::write(pkg.join(CONFIG_PATH), r#"{"test":false}"#).unwrap();
+                *p_in.borrow_mut() = Some(aside);
+            },
+            move |pkg| {
+                f_out.set(true);
+                if restore {
+                    let aside = p_out.borrow_mut().take().expect("parked");
+                    std::fs::remove_dir_all(pkg).unwrap();
+                    std::fs::rename(&aside, pkg).unwrap();
+                }
+            },
+        );
+        let report = run_floor(&repo, &f24_ctx(&repo, &base));
+        let _ = test_seam::take_base_detect(true);
+        let _ = test_seam::take_base_detect(false);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the core#1110 floor cannot run");
+            return;
+        }
+        assert!(fired.get(), "the base detection hook ran: {report:#?}");
+        let c = f24_check(&report, "pkg");
+        let err = f24_base_error(c);
+        assert!(!err.starts_with(DECLARES_NO_PREFIX), "{err}");
+        if restore {
+            // The base ran its OWN red `test` — not an error, not a failed install.
+            let run = c
+                .base
+                .as_ref()
+                .filter(|b| b.error.is_none())
+                .and_then(|b| b.run.as_ref())
+                .unwrap_or_else(|| panic!("the base ran: {c:#?}"));
+            assert_eq!(run.exit_code, Some(101), "{run:#?}");
+            assert!(run.stdout_tail.contains("pkg::shared"), "{run:#?}");
+            assert_eq!(
+                c.classification.as_deref(),
+                Some(BASE_RED_UNSEPARATED),
+                "{c:#?}"
+            );
+        } else {
+            assert!(
+                err.contains("could not be determined") && err.contains("no longer the directory"),
+                "a swap left in place fails the base closed: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+/// (core#1110) Under [`held_reads`], detection reads the held directory, not whatever is at
+/// its path now; a link is refused, never followed; a missing parent is absent.
+#[cfg(unix)]
+#[test]
+fn held_reads_read_the_held_directory_not_the_path_1110() {
+    let root = scratch("held-reads");
+    let config = |dir: &Path, word: &str| {
+        std::fs::create_dir_all(dir.join(".wicked")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"pkg"}"#).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_PATH),
+            serde_json::json!({ "test": ["echo", word] }).to_string(),
+        )
+        .unwrap();
+    };
+    let path = root.join("pkg");
+    config(&path, "original");
+    let held = HeldDir::open(&root).unwrap();
+    let pkg = held.at("pkg").unwrap();
+    assert!(pkg.still_at(&path).is_ok());
+    std::fs::rename(&path, root.join("parked")).unwrap();
+    config(&path, "impostor");
+    let test_argv = |d: Result<Vec<RepoCheck>, String>| {
+        d.unwrap()
+            .into_iter()
+            .find(|c| c.name == "test")
+            .map(|c| c.argv)
+    };
+    assert_eq!(test_argv(detect(&path)), Some(s(&["echo", "impostor"])));
+    let read = held_reads(&path, &pkg, || detect(&path)).unwrap();
+    assert_eq!(test_argv(read), Some(s(&["echo", "original"])));
+    assert!(pkg.still_at(&path).is_err(), "the swap is still in place");
+    // Outside the anchor, by path again.
+    assert_eq!(test_argv(detect(&path)), Some(s(&["echo", "impostor"])));
+    // A link in the held directory is refused; a missing parent is absent.
+    std::fs::remove_file(root.join("parked/package.json")).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", root.join("parked/package.json")).unwrap();
+    let link = held_reads(&path, &pkg, || {
+        probe(&path, "package.json").map(|p| p.is_some())
+    })
+    .unwrap();
+    assert!(
+        link.as_ref().is_err_and(|e| e.contains("symlink")),
+        "{link:?}"
+    );
+    let missing = held_reads(&path, &pkg, || {
+        probe(&path, "nowhere/package.json").map(|p| p.is_some())
+    })
+    .unwrap();
+    assert_eq!(missing, Ok(false));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (core#1408) A root that declares `native_rebuild` is provisioned on the head before any
+/// member's checks; the base comparison of a member's check runs the root's install and
+/// native build too, in the root. A root that declares none adds nothing; a root config that
+/// does not parse leaves the base unknown (`Err`), as the head's root detection fails too.
+#[cfg(unix)]
+#[test]
+fn the_base_provisions_the_roots_native_build_for_a_member_1408() {
+    for (tag, cfg) in [
+        ("declares", r#"{"native_rebuild":["better-sqlite3"]}"#),
+        ("none", "{}"),
+        ("broken", "{"),
+    ] {
+        let repo = scratch(&format!("root-native-{tag}"));
+        std::fs::write(repo.join(".gitignore"), "tmp/\nnode_modules/\n").unwrap();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"root","dependencies":{"better-sqlite3":"12.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(repo.join(CONFIG_PATH), cfg).unwrap();
+        std::fs::create_dir_all(repo.join("packages/a")).unwrap();
+        std::fs::write(
+            repo.join("packages/a/package.json"),
+            r#"{"name":"a","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        let head = git_repo_with_commit(&repo);
+        let _scratch = CheckScratch::prepare(&repo).unwrap();
+        let root = HeldDir::open(&repo).unwrap();
+        let base = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
+        let ctx = FloorContext::default();
+        let steps = base.root_native("packages/a", &ctx);
+        match tag {
+            "declares" => {
+                let steps = steps.unwrap();
+                let got: Vec<(&str, &str)> = steps
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.dir.as_str()))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![("install", ""), (NATIVE_BUILD_CHECK, "")],
+                    "{steps:?}"
+                );
+                assert_eq!(steps[1].argv, native_build_argv(&["better-sqlite3"]));
+            }
+            "none" => assert!(steps.unwrap().is_empty()),
+            _ => assert!(steps.is_err(), "{steps:?}"),
+        }
+        // A root check is the root's own: nothing extra.
+        assert!(base.root_native("", &ctx).unwrap().is_empty());
+        drop(base);
+        let _ = remove_base_export(&root);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
 /// (F24, pi review) The rename guard holds past git's rename limit: a moved package whose files
 /// changed names and content is still a move with `diff.renameLimit = 1` in the repository's
 /// config (git would otherwise list it as deletes + adds, exit 0).

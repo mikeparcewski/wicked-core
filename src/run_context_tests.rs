@@ -317,9 +317,104 @@ fn a_stamp_always_overwrites_and_never_reaches_a_tool_step_or_the_seat_reprobe()
     let mut other = WorkUnit::pending("x", "rc-other", 1, "x");
     stamp(&mut other, "rc-other", 1);
     assert!(
-        other.run_context.is_none(),
+        render(&other).is_none() && prefix(&other).is_empty(),
         "another run's seats get nothing"
     );
+}
+
+/// (core#1322 item 4) A FIRST block set while a launch is prepared (nothing was published when the
+/// seat was stamped) reaches that launch at its pin, as a later set does. Before, a seat stamped
+/// with nothing in force carried no stamp at all, so the carrier never looked again.
+#[test]
+fn a_first_block_set_while_the_launch_is_prepared_reaches_it() {
+    let run = "rc-first-block";
+    let mut u = WorkUnit::pending("rc-first-block:build", run, 1, "build it");
+    stamp(&mut u, run, 1);
+    assert!(render(&u).is_none(), "nothing in force yet: byte-identical");
+    publish(run, Some(&block(1, vec![section("goal", "first", 1)])));
+    let handed = pin(&mut u).expect("the first block reaches the launch");
+    assert_eq!(handed.version, 1);
+    assert_eq!(render(&u).map(|(v, _)| v), Some(1));
+    forget(run);
+
+    // codex r1 on #1777: a first block may carry version 0 (accepted when the session had none);
+    // it still replaces the "nothing published" stamp, at the pin and at render.
+    let run = "rc-first-block-v0";
+    let mut u = WorkUnit::pending("rc-first-block-v0:build", run, 1, "build it");
+    stamp(&mut u, run, 1);
+    publish(run, Some(&block(0, vec![section("goal", "zero", 0)])));
+    assert_eq!(
+        render(&u).map(|(v, _)| v),
+        Some(0),
+        "rendered before the pin"
+    );
+    let handed = pin(&mut u).expect("a version-0 first block reaches the launch");
+    assert!(handed.sections.iter().any(|s| s.text == "zero"));
+    forget(run);
+}
+
+/// codex r1 on #1777: a run with no block stamps its seats (so a first block can still reach
+/// them), but nothing was handed, so a seat's answer that happens to read like the framing is
+/// left whole.
+#[test]
+fn a_run_with_no_block_never_strips_a_seats_answer() {
+    let run = "rc-no-block-strip";
+    let framing = frame(&block(0, vec![]), false);
+    let answer = format!("{framing}\nmy own words");
+    let seat = Seat::answering(&answer);
+    let r = Stamping::wrap(seat.clone(), run, 1);
+    let unit = WorkUnit::pending("rc-no-block-strip:build", run, 1, "turn");
+    let out = r.run_unit(&input(run, unit));
+    assert_eq!(out.output, answer);
+}
+
+/// (core#1322 item 2) A run's published blocks are dropped when it ends, and an engine's shutdown
+/// drops only the runs its own (actor) thread published.
+#[test]
+fn a_runs_blocks_are_dropped_when_it_ends_and_at_its_engines_shutdown() {
+    let ended = "rc-drain-ended";
+    publish(ended, Some(&block(1, vec![section("goal", "g", 1)])));
+    assert!(current(ended).is_some());
+    forget(ended);
+    assert!(current(ended).is_none(), "the ended run's blocks are gone");
+    assert!(published(ended).is_empty());
+
+    let mine = "rc-drain-mine";
+    let theirs = "rc-drain-theirs";
+    publish(theirs, Some(&block(1, vec![section("goal", "t", 1)])));
+    std::thread::spawn(move || {
+        publish(mine, Some(&block(1, vec![section("goal", "m", 1)])));
+        assert!(current(mine).is_some());
+        forget_published_here();
+        assert!(current(mine).is_none(), "the engine's own run is dropped");
+    })
+    .join()
+    .unwrap();
+    assert!(
+        current(theirs).is_some(),
+        "another engine's run is kept at this one's shutdown"
+    );
+    forget(theirs);
+
+    // codex r1 on #1777: two engines may share a caller-supplied run id. One engine's end or
+    // shutdown drops only its own slot: the other's seats still read their block.
+    let shared = "rc-drain-shared";
+    publish(shared, Some(&block(1, vec![section("goal", "here", 1)])));
+    std::thread::spawn(move || {
+        publish(shared, Some(&block(1, vec![section("goal", "there", 1)])));
+        forget(shared);
+        publish(shared, Some(&block(2, vec![section("goal", "there", 2)])));
+        forget_published_here();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        current(shared).map(|c| c.version),
+        Some(1),
+        "the other engine's end and shutdown kept this engine's block"
+    );
+    forget(shared);
+    assert!(current(shared).is_none());
 }
 
 /// The power-turn property: the per-unit runner stamps EVERY launch with the block in force at
@@ -339,7 +434,14 @@ fn the_per_unit_runner_stamps_every_launch_at_launch_time_and_delegates_the_rest
     let judge = WorkUnit::pending("validator-agent", "validator", 1, "judge");
     r.run_unit(&input("validator-xyz", judge));
     let seen = seat.seen();
-    assert!(seen[0].unit.run_context.is_none(), "nothing set yet");
+    assert!(
+        seen[0]
+            .unit
+            .run_context
+            .as_ref()
+            .is_some_and(|s| s.ctx.version == 0 && s.ctx.sections.is_empty()),
+        "nothing set yet: an empty stamp"
+    );
     assert_eq!(seen[1].unit.run_context.as_ref().unwrap().ctx.version, 1);
     let j = seen[2]
         .unit
@@ -1425,6 +1527,16 @@ fn the_engine_keeps_the_block_on_the_session_stamps_each_unit_and_survives_a_res
     );
     approve(&core, &run);
     wait(&core, &run, crate::SessionStatus::Completed);
+    // (core#1322) The run ended: the engine dropped its published blocks (the actor does it right
+    // after it persists the terminal status; a read may see the status a moment before).
+    let ended = std::time::Instant::now();
+    while !published(&run).is_empty() && ended.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        current(&run).is_none() && published(&run).is_empty(),
+        "a completed run's blocks outlive it"
+    );
     let second: Vec<StepInput> = seat2
         .seen()
         .into_iter()

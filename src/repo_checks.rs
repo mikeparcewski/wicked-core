@@ -2209,6 +2209,17 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 /// path again); `Err` = a symlink, an identity mismatch (something swapped the entry between the
 /// two syscalls), or an unreadable entry.
 fn probe(worktree: &Path, rel: &str) -> Result<Option<Probed>, String> {
+    // (core#1110) Under a held-reads anchor, an entry below the held path is read through the
+    // held directory, never by path.
+    #[cfg(unix)]
+    if let Some(r) = HELD_READS.with(|h| {
+        h.borrow().as_ref().and_then(|(root, held)| {
+            let under = worktree.strip_prefix(root).ok()?;
+            Some(probe_held(held, &under.join(rel), rel))
+        })
+    }) {
+        return r;
+    }
     let p = worktree.join(rel);
     let lstat = match std::fs::symlink_metadata(&p) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -2275,6 +2286,83 @@ fn probe(worktree: &Path, rel: &str) -> Result<Option<Probed>, String> {
         meta,
         file: Some(file),
     }))
+}
+
+#[cfg(unix)]
+thread_local! {
+    /// (core#1110) While [`held_reads`] runs: the path detection was handed and the directory
+    /// held there. [`probe`] reads every entry below that path through the held fd.
+    static HELD_READS: std::cell::RefCell<Option<(PathBuf, HeldDir)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// (core#1110) Run `f` (a detection over `root`) with every [`probe`] below `root` reading
+/// through `held` — the directory held at `root` before `f` ran — so a directory swapped in at
+/// the path while `f` reads is never what it reads.
+#[cfg(unix)]
+fn held_reads<T>(root: &Path, held: &HeldDir, f: impl FnOnce() -> T) -> Result<T, String> {
+    struct Restore(Option<(PathBuf, HeldDir)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            HELD_READS.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+    let fd = held.fd.try_clone().map_err(|e| e.to_string())?;
+    let prev = HELD_READS.with(|h| h.replace(Some((root.to_path_buf(), HeldDir { fd }))));
+    let _restore = Restore(prev);
+    Ok(f())
+}
+
+/// (core#1110) [`probe`] of `at` (relative to `held`; `rel` names it in messages) through the
+/// held directory: a missing entry or parent is absent; a link — the entry or a parent — is
+/// refused, never followed; a directory answers presence (its fstat); anything else is opened
+/// `O_NOFOLLOW | O_NONBLOCK` (a FIFO never stalls the read) and its OPENED descriptor returned.
+#[cfg(unix)]
+fn probe_held(held: &HeldDir, at: &Path, rel: &str) -> Result<Option<Probed>, String> {
+    let at = at.to_str().ok_or_else(|| format!("`{rel}` is not UTF-8"))?;
+    let names = rel_names(at)?;
+    for n in 1..names.len() {
+        let parent = names[..n].join("/");
+        match held.kind(&parent) {
+            Ok(None) => return Ok(None),
+            Ok(Some(EntryKind::Dir)) => {}
+            Ok(Some(EntryKind::Link)) => {
+                return Err(format!(
+                    "`{rel}` passes through a symlink (the floor never follows links out of the \
+                     worktree)"
+                ))
+            }
+            Ok(Some(_)) => return Err(format!("`{rel}` could not be inspected: not a directory")),
+            Err(e) => return Err(format!("`{rel}` could not be inspected: {e}")),
+        }
+    }
+    match held.kind(at) {
+        Ok(None) => Ok(None),
+        Ok(Some(EntryKind::Link)) => Err(format!(
+            "`{rel}` is a symlink (the floor never follows links out of the worktree)"
+        )),
+        Ok(Some(EntryKind::Dir)) => {
+            let dir = held
+                .subdir(at, false)
+                .map_err(|e| format!("`{rel}` could not be inspected: {e}"))?;
+            let meta = std::fs::File::from(dir.fd)
+                .metadata()
+                .map_err(|e| format!("`{rel}` could not be inspected: {e}"))?;
+            Ok(Some(Probed { meta, file: None }))
+        }
+        Ok(Some(_)) => {
+            let file = held
+                .open_read(at)
+                .map_err(|e| format!("`{rel}` could not be opened: {e}"))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("`{rel}` could not be fstat'ed after open: {e}"))?;
+            let file = meta.is_file().then_some(file);
+            Ok(Some(Probed { meta, file }))
+        }
+        Err(e) => Err(format!("`{rel}` could not be inspected: {e}")),
+    }
 }
 
 /// Which package manager a Node repo uses, read off its lockfile (npm when none says otherwise).
@@ -6414,6 +6502,10 @@ fn write_private_git_dir(
     Ok(())
 }
 
+/// (core#1131) The most paths [`cat_batch`] converts one git at a time (a path that starts with
+/// whitespace or ends in CR); more fail the export closed.
+const ODD_PATH_CAP: usize = 64;
+
 /// The path given to the end-of-body request (any; the object is missing).
 const SENTINEL_PATH: &str = "wicked-end";
 
@@ -6430,6 +6522,41 @@ fn cat_batch(
     mut each: impl FnMut(usize, Vec<u8>) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::io::{BufRead, Read, Write};
+    // (core#1131) git's batch parser drops the whitespace between the id and the path, and reads
+    // a trailing CR as part of the line ending: a path that starts with a space or a tab, or ends
+    // in CR, would be converted under ANOTHER name's attributes. Each such path is converted on
+    // its own ([`cat_one_filtered`]: the path is an argv element, byte-exact); the rest go
+    // through the batch, each answered under its original index.
+    let odd = |line: &str| {
+        line.split_once(' ')
+            .is_some_and(|(_, p)| p.starts_with([' ', '\t']) || p.ends_with('\r'))
+    };
+    // (coord r1 on #1765) Each odd path costs its own git: past the cap, the export fails closed
+    // (the base is then unknown, never compared) instead of spawning one git per file of a tree
+    // built to hold thousands of them.
+    let odd_count = if filtered {
+        inputs.iter().filter(|l| odd(l)).count()
+    } else {
+        0
+    };
+    if odd_count > ODD_PATH_CAP {
+        return Err(format!(
+            "the tree has {odd_count} paths that start with whitespace or end in CR; the export \
+             converts at most {ODD_PATH_CAP} of them one by one"
+        ));
+    }
+    let mut at: Vec<usize> = Vec::with_capacity(inputs.len());
+    let mut batch: Vec<String> = Vec::with_capacity(inputs.len());
+    for (i, line) in inputs.into_iter().enumerate() {
+        if filtered && odd(&line) {
+            let (oid, path) = line.split_once(' ').expect("an odd line has a path");
+            each(i, cat_one_filtered(conv_git_dir, tree, oid, path)?)?;
+        } else {
+            at.push(i);
+            batch.push(line);
+        }
+    }
+    let inputs = batch;
     if inputs.is_empty() {
         return Ok(());
     }
@@ -6480,7 +6607,7 @@ fn cat_batch(
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
     let mut answer = || -> Result<(), String> {
-        for i in 0..n {
+        for &i in at.iter().take(n) {
             let mut header = String::new();
             out.read_line(&mut header).map_err(|e| e.to_string())?;
             let mut words = header.split_whitespace();
@@ -6518,6 +6645,44 @@ fn cat_batch(
     let _ = feeder.join();
     let _ = child.wait();
     answered
+}
+
+/// (core#1131) One blob `oid`, converted as `git checkout` would write it at `path` under `tree`'s
+/// attributes, by its own `git cat-file --filters --path=<path>` in the private repository
+/// `conv_git_dir` ([`cat_batch`]'s settings): the path reaches git as an argv element, so a
+/// leading space or a trailing CR is part of the name the attributes are matched against.
+fn cat_one_filtered(
+    conv_git_dir: &Path,
+    tree: &str,
+    oid: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let attr_source = format!("--attr-source={tree}");
+    let path_arg = format!("--path={path}");
+    // spawn-audit: hardened — git plumbing over a private repository holding no driver config.
+    let mut cat = Command::new("git");
+    cat.hardened()
+        .args([
+            "-c",
+            "core.bare=true",
+            attr_source.as_str(),
+            "cat-file",
+            "--filters",
+            path_arg.as_str(),
+            oid,
+        ])
+        .current_dir(conv_git_dir)
+        .env("GIT_DIR", conv_git_dir)
+        .stdin(std::process::Stdio::null());
+    isolate_git_config(&mut cat);
+    let out = cat.output().map_err(|e| format!("git cat-file: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file --filters for {path:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
 }
 
 /// Stream blobs, optionally converted under `tree`'s own attributes and only the source
@@ -7205,7 +7370,7 @@ pub(crate) enum NewDir {
 /// (F24) Did the change introduce `dir` (repo-relative, `/`-separated)? Read through the PINNED
 /// `git_dir` only: the base side from the base COMMIT (a literal pathspec, so no pathspec magic
 /// in a repo-controlled name), the head side from a fresh snapshot of the worktree's tree
-/// (tracked + untracked-not-ignored, [`crate::worktree_guard::snapshot_through`]), and the
+/// (tracked + untracked-not-ignored + force-added, [`crate::worktree_guard::snapshot_through_strict`]), and the
 /// rename guard from git's own rename detection between the two trees. `Err` when git cannot
 /// answer: the caller then makes no claim.
 pub(crate) fn introduced_dir(
@@ -7270,7 +7435,9 @@ pub(crate) fn introduced_dir(
             return Ok(NewDir::No);
         }
     }
-    let head = crate::worktree_guard::snapshot_through(worktree, git_dir)
+    // (core#1314) Strict: a package force-added under an ignored path is in the head's tree, and
+    // a subtree git could not read is an error (no claim), never a smaller tree.
+    let head = crate::worktree_guard::snapshot_through_strict(worktree, git_dir)
         .map_err(|e| format!("the head's tree could not be read: {e}"))?;
     let is_tree = |e: &String| e.split_whitespace().nth(1) == Some("tree");
     if !at(&head.tree)?.iter().any(is_tree) {
@@ -7666,6 +7833,74 @@ impl BaseTree {
         )
     }
 
+    /// (core#1110) The checks of the export's package at `rel`, detected through that directory
+    /// held first ([`Self::read_held`]).
+    fn detect_held(&self, rel: &str, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+        self.read_held(rel, |path| detect_with(path, ctx))
+    }
+
+    /// (core#1110) `read` over the export's directory at `rel`, every [`probe`] of it THROUGH
+    /// that directory held first ([`HeldDir::at`], [`held_reads`]): a directory swapped in at the
+    /// path while `read` reads is never what it reads. After it, the held directory must still be
+    /// the one at the path ([`HeldDir::still_at`]: a swap made before the hold and undone after
+    /// fails here) and the walk from the export root must still reach it
+    /// ([`HeldDir::still_at_rel`]). Without directory fds (Windows) `read` goes by path, checked
+    /// the same way after.
+    fn read_held<T>(
+        &self,
+        rel: &str,
+        read: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let path = self.dir.join(rel);
+        #[cfg(unix)]
+        let got = {
+            let held = self.held.at(rel)?;
+            #[cfg(test)]
+            if let Some(f) = test_seam::take_base_detect(true) {
+                f(path.as_path());
+            }
+            let got = held_reads(&path, &held, || read(path.as_path()))?;
+            #[cfg(test)]
+            if let Some(f) = test_seam::take_base_detect(false) {
+                f(path.as_path());
+            }
+            held.still_at(&path)?;
+            got
+        };
+        #[cfg(not(unix))]
+        let got = read(path.as_path());
+        self.held.still_at_rel(&self.dir, rel)?;
+        got
+    }
+
+    /// (core#1408) The root package's provisioning for a check in the subdirectory `dir`: a root
+    /// whose config declares `native_rebuild` is always detected on the head (a config makes the
+    /// root's checks run, [`detect_manifests`]), and its install and native build run there before
+    /// any member's checks — so the base runs them too, in the root, in that order. An
+    /// intermediate directory is not provisioned on the head, so not here either. Nothing for a
+    /// root check, or a root that declares no native build; `Err` (the base is unknown) when the
+    /// root's config or checks cannot be read, as the head's root detection would fail too.
+    fn root_native(&self, dir: &str, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+        if dir.is_empty() {
+            return Ok(Vec::new());
+        }
+        let declares = self.read_held("", |root| {
+            Ok(read_config(root)?.is_some_and(|c| !c.native_rebuild.is_empty()))
+        })?;
+        if !declares {
+            return Ok(Vec::new());
+        }
+        let detected = self.detect_held("", ctx)?;
+        Ok([PROVISIONING_CHECK, NATIVE_BUILD_CHECK]
+            .into_iter()
+            .filter_map(|name| detected.iter().find(|c| c.name == name))
+            .map(|c| RepoCheck {
+                dir: String::new(),
+                ..c.clone()
+            })
+            .collect())
+    }
+
     /// [`Self::run_check`]; `scoped` (core#1198) runs `check` as a failing-set run: recorded with
     /// its scope, and cached under the failing-set record.
     fn run_check_as(
@@ -7727,16 +7962,11 @@ impl BaseTree {
         }
         // (core#817) A subdirectory package's check is detected in the BASE's copy of that
         // directory; a package the change introduced has none, and fails closed below.
-        let detected = match detect_with(&self.dir.join(&check.dir), &base_ctx) {
+        // (core#1110) Read through the package directory held first ([`Self::detect_held`]).
+        let detected = match self.detect_held(&check.dir, &base_ctx) {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        // Detection reads the export by path (each file `O_NOFOLLOW`, its identity checked,
-        // [`probe`]): what it read was the export only while the package's directory still IS the
-        // held one — a process the head left running that swapped it for a link fails the base.
-        if let Err(e) = self.held.still_at_rel(&self.dir, &check.dir) {
-            return fail(format!("the base's checks could not be determined: {e}"));
-        }
         // A guide's check is the base's by construction: the guide is read from the base.
         if check.name != "test_targeted"
             && check.source != GUIDE_SOURCE
@@ -7746,6 +7976,37 @@ impl BaseTree {
                 "{DECLARES_NO_PREFIX}{}` check (the change introduced it)",
                 check.name
             ));
+        }
+        // (core#1408) The root's declared native build provisions its members on the head; the
+        // base gets it too, before the member's own provisioning, as on the head.
+        let root_steps = match self.root_native(&check.dir, &base_ctx) {
+            Ok(steps) => steps,
+            Err(e) => {
+                return fail(format!(
+                    "the base's root package could not be determined: {e}"
+                ))
+            }
+        };
+        for step in root_steps {
+            let r = run_held(
+                &self.dir,
+                Some(&self.held),
+                &step,
+                sandbox,
+                scratch,
+                Tree::Base,
+            );
+            if !r.passed() {
+                let what = if step.name == NATIVE_BUILD_CHECK {
+                    "native addon build"
+                } else {
+                    "dependency install"
+                };
+                return fail(format!(
+                    "the base's root {what} did not pass ({})",
+                    r.summary()
+                ));
+            }
         }
         let target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
@@ -8042,9 +8303,11 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// the change's own, so a recorded `base_red_unseparated` for one is not reused; v15, core#1422:
 /// the pod floor's copies are converted like a checkout, so a base result recorded from a raw
 /// copy is not reused; v16, wicked-core#1701: a prose-only change sharing a completed base failure
-/// passes, so earlier floor decisions must be reconsidered): a record of any other version, or a
-/// bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 16;
+/// passes, so earlier floor decisions must be reconsidered; v17, core#1110/#1408: the base reads
+/// its package through the held directory and builds the root's declared native addons for a
+/// member, so a base result recorded without them is not reused): a record of any other version,
+/// or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 17;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -8209,7 +8472,21 @@ pub(crate) fn results_of(
     scratch: &CheckScratch,
     since: std::time::SystemTime,
 ) -> Result<(Vec<TestId>, Vec<TestId>), String> {
-    let c = g.compile()?;
+    g.compile()?;
+    parse_results(g, &results_text(held, check, g, run, scratch, since)?)
+}
+
+/// (core#1101) The text [`results_of`] parses: the results file `how.path` names (written by this
+/// run, read through the held directory, stored beside the run's logs), else the run's stored
+/// output.
+pub(crate) fn results_text(
+    held: &HeldDir,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    run: &mut CheckRun,
+    scratch: &CheckScratch,
+    since: std::time::SystemTime,
+) -> Result<String, String> {
     let r = match &g.results.how.path {
         Some(path) => {
             let f = open_results(
@@ -8236,17 +8513,25 @@ pub(crate) fn results_of(
     if r.truncated {
         return Err("they were cut at the log cap".into());
     }
-    let text =
-        String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned();
+    Ok(String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned())
+}
+
+/// (DES-BUILD-GUIDE) A results text, parsed as `g` reads it: every testcase (junit) and the
+/// failing ids.
+pub(crate) fn parse_results(
+    g: &GuideCheck,
+    text: &str,
+) -> Result<(Vec<TestId>, Vec<TestId>), String> {
+    let c = g.compile()?;
     match g.results.kind.as_str() {
         "junit" => crate::floor_guide::junit(
-            &text,
+            text,
             &g.results.id,
             g.results.id_join.as_deref().unwrap_or("::"),
             c.keyed(),
         )
         .ok_or_else(|| "the results hold no testsuite".to_string()),
-        _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
+        _ => Ok((Vec::new(), c.failures(text, c.keyed()))),
     }
 }
 
@@ -8485,6 +8770,12 @@ impl HeldDir {
     pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
         let names = rel_names(rel)?;
         self.walk(&names, rel, create).map(|fd| HeldDir { fd })
+    }
+
+    /// (core#1110) The directory at `rel` held on its own (`rel` empty or `.`: the held root
+    /// itself), walked through no link.
+    pub(crate) fn at(&self, rel: &str) -> Result<HeldDir, String> {
+        self.dir_fd(rel).map(|fd| HeldDir { fd })
     }
 
     /// The directory at `rel` (`rel` empty or `.`: the held root itself) as an open fd, walked
@@ -9060,6 +9351,29 @@ pub(crate) mod test_seam {
         static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
         static ADMISSION: Cell<Option<Admission>> = const { Cell::new(None) };
         static DISK_STOP_AFTER: RefCell<Option<String>> = const { RefCell::new(None) };
+        static BASE_DETECT: RefCell<(Option<PathHook>, Option<PathHook>)> =
+            const { RefCell::new((None, None)) };
+    }
+    type PathHook = Box<dyn FnOnce(&std::path::Path)>;
+    /// (core#1110) Run `before` once on this thread's next base detection, with the package path,
+    /// after its directory is held and before detection reads; `after` once, after it read.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn around_base_detect(
+        before: impl FnOnce(&std::path::Path) + 'static,
+        after: impl FnOnce(&std::path::Path) + 'static,
+    ) {
+        BASE_DETECT.with(|h| *h.borrow_mut() = (Some(Box::new(before)), Some(Box::new(after))));
+    }
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn take_base_detect(before: bool) -> Option<PathHook> {
+        BASE_DETECT.with(|h| {
+            let mut h = h.borrow_mut();
+            if before {
+                h.0.take()
+            } else {
+                h.1.take()
+            }
+        })
     }
     /// (core#1731) Record a disk-watch stop on this thread's floor once the check `name` is
     /// decided, as a stop in one of its nested runs (a base, an inventory) would.

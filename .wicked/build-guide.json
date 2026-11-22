@@ -114,7 +114,8 @@
             "end": "^test result: FAILED",
             "use": "last-before-end"
           }
-        ]
+        ],
+        "count": "^running (?P<n>\\d+) tests?$"
       },
       "list": {
         "run": [
@@ -126,7 +127,7 @@
           "--",
           "--list"
         ],
-        "item": "^(?P<id>\\S+): test$",
+        "item": "^(?P<id>.+): test$",
         "section": "^\\s+(?:Running .*\\((?:.*[/\\\\])?|Doc-tests )(?P<q>[^/\\\\()\\s]+)\\)?$",
         "merge": true
       },

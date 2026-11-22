@@ -125,6 +125,33 @@ pub struct EditorConformance {
     /// Required cases the report does not carry (they never ran).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
+    /// (core#1329) The required case ids this row was judged against: the engine's required set when
+    /// it judged. Empty on a record from before it was kept; a PASS whose set is not today's
+    /// [`required_cases`] is not evidence for today's cases ([`brief_block`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<String>,
+}
+
+impl EditorConformance {
+    /// The cases this engine requires of the row now: [`RUN_PLUGIN_CASES`] for a run plugin, else
+    /// [`required_cases`] for its protocols.
+    fn required_now(&self, plugin: bool) -> Vec<&'static str> {
+        if plugin {
+            RUN_PLUGIN_CASES.to_vec()
+        } else {
+            required_cases(&self.protocol)
+        }
+    }
+
+    /// (core#1329) Whether the row was judged against exactly the case set this engine requires now.
+    fn judged_current_cases(&self, plugin: bool) -> bool {
+        let mut want = self.required_now(plugin);
+        let mut have: Vec<&str> = self.cases.iter().map(String::as_str).collect();
+        want.sort_unstable();
+        have.sort_unstable();
+        have.dedup();
+        have == want
+    }
 }
 
 /// What the engine recorded for one conformance attempt, persisted on the conformance unit.
@@ -166,6 +193,52 @@ impl ConformanceRecord {
 
     pub(crate) fn passed(&self) -> bool {
         self.outcome == OUTCOME_PASS
+    }
+
+    /// (core#1329) Whether every row was judged against the case set this engine requires now.
+    fn judged_current_cases(&self) -> bool {
+        self.editors.iter().all(|e| e.judged_current_cases(false))
+            && self.plugins.iter().all(|p| p.judged_current_cases(true))
+    }
+}
+
+/// (core#1329) Case ids as a label: numbered ids collapse into runs of one prefix (`0-12, 18`,
+/// `r0-r5`); an id with no number is listed as it is, last. Empty: `no recorded case set`.
+pub(crate) fn case_label(cases: &[String]) -> String {
+    let mut numbered: Vec<(&str, u32)> = Vec::new();
+    let mut other: Vec<&str> = Vec::new();
+    for c in cases {
+        let head = c.split('-').next().unwrap_or("");
+        let digits = head.trim_start_matches(|ch: char| ch.is_ascii_alphabetic());
+        let prefix = &head[..head.len() - digits.len()];
+        match digits.parse::<u32>() {
+            Ok(n) => numbered.push((prefix, n)),
+            Err(_) => other.push(c.as_str()),
+        }
+    }
+    numbered.sort_unstable();
+    numbered.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < numbered.len() {
+        let (p, start) = numbered[i];
+        let mut end = start;
+        while i + 1 < numbered.len() && numbered[i + 1] == (p, end + 1) {
+            i += 1;
+            end += 1;
+        }
+        parts.push(if end == start {
+            format!("{p}{start}")
+        } else {
+            format!("{p}{start}-{p}{end}")
+        });
+        i += 1;
+    }
+    parts.extend(other.into_iter().map(str::to_string));
+    if parts.is_empty() {
+        "no recorded case set".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -221,6 +294,7 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
             } else {
                 required_cases(&protocol)
             };
+            let judged: Vec<String> = required.iter().map(|c| c.to_string()).collect();
             for case in required {
                 match cases.and_then(|c| c.get(case)) {
                     None => missing.push(case.to_string()),
@@ -245,6 +319,7 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
                 protocol,
                 failed,
                 missing,
+                cases: judged,
             });
         }
     }
@@ -473,23 +548,20 @@ pub(crate) fn brief_block(
     let after = after
         .map(|a| format!(" after unit {a}"))
         .unwrap_or_default();
+    // (core#1329) Each row's cases are the ones its record says it was judged against.
     let editors = r
         .editors
         .iter()
+        .chain(&r.plugins)
         .map(|e| {
-            let p = if e.protocol.contains(&2) {
-                "cases 0-16, 18"
-            } else {
-                "cases 0-12, 18"
-            };
-            format!("{} {} (entry sha256 {}; {p})", e.id, e.version, e.sha256)
-        })
-        .chain(r.plugins.iter().map(|p| {
             format!(
-                "{} {} (entry sha256 {}; cases r0-r5)",
-                p.id, p.version, p.sha256
+                "{} {} (entry sha256 {}; cases {})",
+                e.id,
+                e.version,
+                e.sha256,
+                case_label(&e.cases)
             )
-        }))
+        })
         .collect::<Vec<_>>()
         .join("; ");
     let entries = if r.plugins.is_empty() {
@@ -501,6 +573,9 @@ pub(crate) fn brief_block(
         "The engine ran the editor conformance cases itself on this host{after}{jail} (unit {ord}{tree}): "
     );
     let stale = r.passed() && (current.is_none() || r.tree.as_deref() != current);
+    // (core#1329) A PASS judged against another case set than the one this engine requires (an
+    // engine upgraded between the conformance unit and this review) never ran today's cases.
+    let old_cases = r.passed() && !r.judged_current_cases();
     let body = match r.outcome.as_str() {
         OUTCOME_PASS if stale => format!(
             "PASSED, but on another tree than the one under review ({}): the work changed after this \
@@ -508,6 +583,31 @@ pub(crate) fn brief_block(
              engine runs the cases again (a send-back to the creator re-runs them).",
             current.unwrap_or("the current tree could not be read")
         ),
+        OUTCOME_PASS if old_cases => {
+            let rows = r
+                .editors
+                .iter()
+                .map(|e| (e, false))
+                .chain(r.plugins.iter().map(|p| (p, true)))
+                .filter(|(e, plugin)| !e.judged_current_cases(*plugin))
+                .map(|(e, plugin)| {
+                    let now: Vec<String> =
+                        e.required_now(plugin).iter().map(|c| c.to_string()).collect();
+                    format!(
+                        "{} judged cases {}, this engine requires cases {}",
+                        e.id,
+                        case_label(&e.cases),
+                        case_label(&now)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "PASSED, but against another case set than this engine requires ({rows}): \
+                 conformance is UNVERIFIED for the required cases. A conformance item is a FAIL \
+                 until the engine runs the cases again (a send-back to the creator re-runs them)."
+            )
+        }
         OUTCOME_PASS => format!(
             "PASSED — every required case for every {entries}: {editors}. This is the conformance \
              evidence for this tree: cite it for any conformance item. Do not run conformance.py in \
@@ -573,7 +673,8 @@ mod tests {
                 sha256: "ab12".into(),
                 protocol: vec![3],
                 failed: vec![],
-                missing: vec![]
+                missing: vec![],
+                cases: RUN_PLUGIN_CASES.iter().map(|c| c.to_string()).collect(),
             }]
         );
         r.tree = Some("t1".into());
@@ -748,6 +849,81 @@ mod tests {
         }
         let refused = ConformanceRecord::refused(0, "runtime_missing", "x");
         assert!(brief_block(6, None, &refused, Some("t1")).contains("UNVERIFIED"));
+    }
+
+    /// (core#1329) A PASS judged before a case-set change (a record from before the judged set was
+    /// kept, or one that judged the pre-S9 cases without 7 and 18) is UNVERIFIED on the very same
+    /// tree, and is never described with today's range. A current PASS is labelled from its record.
+    #[test]
+    fn a_pass_judged_against_another_case_set_is_unverified() {
+        let old = r#"{"outcome":"pass","tree":"t1","jail":"bwrap","editors":[{"id":"acme-x",
+            "version":"0.1.0","sha256":"ab","protocol":[1]}],"attempt":0}"#;
+        let r: ConformanceRecord = serde_json::from_str(old).unwrap();
+        assert!(r.editors[0].cases.is_empty());
+        let b = brief_block(6, Some(5), &r, Some("t1"));
+        assert!(b.contains("UNVERIFIED") && b.contains("is a FAIL"), "{b}");
+        assert!(!b.contains("every required case"), "{b}");
+        assert!(
+            b.contains(
+                "acme-x judged cases no recorded case set, this engine requires cases 0-12, 18"
+            ),
+            "{b}"
+        );
+        let mut pre = r.clone();
+        pre.editors[0].cases = CASES
+            .iter()
+            .filter(|c| !["7-edit", "18-shows"].contains(*c))
+            .map(|c| c.to_string())
+            .collect();
+        let b = brief_block(6, Some(5), &pre, Some("t1"));
+        assert!(
+            b.contains("UNVERIFIED") && b.contains("judged cases 0-6, 8-12,"),
+            "{b}"
+        );
+        // A run plugin judged against fewer cases than today's is the same.
+        let mut plug = r.clone();
+        plug.editors.clear();
+        plug.plugins = vec![EditorConformance {
+            id: "acme-phase".into(),
+            version: "1".into(),
+            sha256: "cd".into(),
+            protocol: vec![3],
+            failed: vec![],
+            missing: vec![],
+            cases: RUN_PLUGIN_CASES[..5]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        }];
+        let b = brief_block(6, Some(5), &plug, Some("t1"));
+        assert!(
+            b.contains("judged cases r0-r4") && b.contains("UNVERIFIED"),
+            "{b}"
+        );
+        // Today's judgment: labelled from the record, evidence for this tree, and on the wire.
+        for (protocol, label) in [(vec![1], "cases 0-12, 18"), (vec![1, 2], "cases 0-16, 18")] {
+            let e = serde_json::json!([{"id": "acme-x", "version": "0.1.0", "sha256": "ab",
+                "protocol": protocol, "cases": cases(&required_cases(&protocol), &[])}]);
+            let mut r = judge_report(Some(&report(e, true, None)), 1);
+            r.tree = Some("t1".into());
+            let b = brief_block(6, Some(5), &r, Some("t1"));
+            assert!(b.contains(label) && !b.contains("UNVERIFIED"), "{b}");
+            let wire = serde_json::to_value(&r).unwrap();
+            assert_eq!(
+                wire["editors"][0]["cases"].as_array().map(Vec::len),
+                Some(required_cases(&protocol).len())
+            );
+        }
+    }
+
+    #[test]
+    fn case_labels_collapse_numbered_runs() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(case_label(&v(&CASES)), "0-12, 18");
+        assert_eq!(case_label(&v(&required_cases(&[2]))), "0-16, 18");
+        assert_eq!(case_label(&v(&RUN_PLUGIN_CASES)), "r0-r5");
+        assert_eq!(case_label(&v(&["3-a", "1-b", "x-odd"])), "1, 3, x-odd");
+        assert_eq!(case_label(&[]), "no recorded case set");
     }
 
     #[test]
