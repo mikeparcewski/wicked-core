@@ -707,6 +707,27 @@ fn dir_like(m: &std::fs::Metadata) -> bool {
     m.is_dir()
 }
 
+/// (core#1314) Where the index entry `p` (`/`-separated) lives under `worktree`, built one
+/// component at a time. `None` for an entry that is empty, absolute, or has a component that is
+/// empty, `.`, `..` or not one plain name on this platform (a drive or a `\` on Windows): the
+/// seat can write such entries into the index, and none of them is a path inside the tree.
+fn index_entry_path(worktree: &Path, p: &str) -> Option<PathBuf> {
+    if p.is_empty() {
+        return None;
+    }
+    let mut at = worktree.to_path_buf();
+    for c in p.split('/') {
+        let mut parts = Path::new(c).components();
+        match (parts.next(), parts.next()) {
+            (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(c) => {
+                at.push(c)
+            }
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
 /// (core#1314) The paths an index lists (`ls-files -z --cached`), as raw bytes.
 fn index_paths(cwd: &Path, env: &[(&str, &Path)]) -> anyhow::Result<Vec<Vec<u8>>> {
     Ok(
@@ -790,7 +811,12 @@ fn snapshot_through_inner(
                         String::from_utf8_lossy(e.as_bytes())
                     )
                 })?;
-                match std::fs::symlink_metadata(worktree.join(&p)) {
+                // (coord r1 on #1764) Joined by component (a Windows `\\?\` worktree takes no
+                // `/`), and an entry that is absolute or climbs is refused before any stat.
+                let at = index_entry_path(worktree, &p).ok_or_else(|| {
+                    anyhow::anyhow!("the index tracks a path outside the worktree ({p:?})")
+                })?;
+                match std::fs::symlink_metadata(&at) {
                     // A file or a link: force-added as the worktree holds it. A staged entry the
                     // worktree replaced with a directory (or, on Windows, a junction) is `add
                     // -A`'s to read: forcing it would import the directory's ignored contents.
@@ -1777,6 +1803,34 @@ pub(crate) mod tests {
             names(&strict.tree)
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (coord r1 on #1764) An index entry maps under the worktree one component at a time
+    /// (a Windows `\\?\` worktree takes no `/`); an entry that is absolute or climbs is
+    /// refused before any stat.
+    #[test]
+    fn an_index_entry_maps_by_component_and_never_leaves_the_tree_1314() {
+        let w = Path::new("w");
+        assert_eq!(
+            index_entry_path(w, "a/b.txt"),
+            Some(w.join("a").join("b.txt"))
+        );
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "./a", "a/."] {
+            assert_eq!(index_entry_path(w, bad), None, "{bad:?}");
+        }
+        #[cfg(windows)]
+        {
+            let verbatim = Path::new(r"\\?\C:\w");
+            assert_eq!(
+                index_entry_path(verbatim, "a/b.txt"),
+                Some(PathBuf::from(r"\\?\C:\w\a\b.txt"))
+            );
+            for bad in ["C:/x", "C:x", r"a\..\b", r"\\srv\share"] {
+                assert_eq!(index_entry_path(verbatim, bad), None, "{bad:?}");
+            }
+        }
+        // (git's own plumbing refuses to write such an entry, so it is reached only through a
+        // raw index write: covered here at the mapping, which every stat goes through.)
     }
 
     /// A repo with one commit and a linked worktree on `wicked/<tag>` — the engine's real layout —
