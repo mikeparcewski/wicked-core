@@ -833,12 +833,106 @@ fn try_fill(
     if campaign.status != CampaignStatus::Running {
         return Ok(());
     }
+    // (core#1435) A node whose tree an earlier life is still reaping waits, `Ready`, for the tree:
+    // its launch would mint on the actor and wait there for the reap. It is dispatched by
+    // `CampaignTick` once the tree is idle; the nodes after it are not held up.
+    let mut deferred: BTreeSet<String> = BTreeSet::new();
     while campaign.running_count() < campaign.def.max_concurrency {
-        let Some(node) = campaign.dispatchable().into_iter().next() else {
+        let Some(node) = campaign
+            .dispatchable()
+            .into_iter()
+            .find(|n| !deferred.contains(n))
+        else {
             break;
         };
+        if let Some((root, run_id)) = busy_tree_of(campaign, &node, &*store) {
+            defer_until_tree_idle(seams.self_tx, &campaign.id, root, run_id);
+            deferred.insert(node);
+            continue;
+        }
         dispatch(campaign, &node, store, subscribers, in_flight, seams)?;
     }
+    Ok(())
+}
+
+/// (core#1435) The repository root and run id of node `node_id`'s tree when a FRESH launch of it
+/// would wait on that tree: a reap or removal of an earlier life of the same run id (a relaunch
+/// right after a cancel reuses the node's run ids) still holds it. A resume (`ReadyToResume`)
+/// mints nothing, and a node with no repository has no tree.
+fn busy_tree_of(
+    campaign: &Campaign,
+    node_id: &str,
+    store: &dyn GraphRead,
+) -> Option<(String, String)> {
+    if campaign.status_of(node_id) != NodeStatus::Ready {
+        return None;
+    }
+    let repo_id = campaign
+        .def
+        .nodes
+        .iter()
+        .find(|n| n.node_id == node_id)?
+        .run_spec
+        .repo_ref
+        .clone()?;
+    let root = crate::repo::get_repo(store, &repo_id)
+        .ok()
+        .flatten()?
+        .root_path;
+    let run_id = campaign.derive_run_id(node_id);
+    crate::repo::tree_busy(&root, &run_id).then_some((root, run_id))
+}
+
+/// (core#1435) Wait, on a thread of its own, for `run_id`'s tree to be idle, then post
+/// `CampaignTick` so the actor dispatches the node that waited for it. One waiter per tree.
+fn defer_until_tree_idle(
+    self_tx: &Sender<Command>,
+    campaign_id: &str,
+    root: String,
+    run_id: String,
+) {
+    static WAITING: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let key = format!("{root}\0{run_id}");
+    if !WAITING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.clone())
+    {
+        return;
+    }
+    eprintln!(
+        "wicked-core: campaign {campaign_id}: run {run_id} waits for its tree's earlier reap to \
+         end before it launches (core#1435)"
+    );
+    let (tx, campaign) = (self_tx.clone(), campaign_id.to_string());
+    std::thread::spawn(move || {
+        crate::repo::wait_tree_idle(&root, &run_id);
+        WAITING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        let _ = tx.send(Command::CampaignTick { campaign });
+    });
+}
+
+/// (core#1435) `CampaignTick`: dispatch what a running campaign can dispatch now (a node that
+/// waited for its tree). A campaign that is gone or not running is left alone.
+pub(crate) fn tick(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    campaign_id: &str,
+) -> anyhow::Result<()> {
+    let Some(mut campaign) = get_campaign(&*store, campaign_id)? else {
+        return Ok(());
+    };
+    if campaign.status != CampaignStatus::Running {
+        return Ok(());
+    }
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
     Ok(())
 }
 
@@ -1887,6 +1981,132 @@ fn require_failure_gate(campaign: &Campaign, node_id: &str) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#1435: relaunching a campaign while an earlier life's reap still holds a node's tree
+    /// does not wait on the actor. The node stays `Ready` (nothing launched, nothing minted) and the
+    /// campaign is not finalized; once the tree is idle a waiter posts `CampaignTick`, and the tick
+    /// dispatches the node. On main the launch minted on the actor and waited for the hold (here
+    /// released after 10 s), so the node was no longer `Ready` when the launch returned.
+    #[test]
+    fn a_campaign_relaunch_does_not_wait_on_a_node_trees_reap() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        use wicked_apps_core::{open_store, HardenedCommand};
+
+        let root = std::env::temp_dir().join(format!(
+            "wicked-campaign-busy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.invalid"]);
+        git(&["config", "user.name", "wicked-test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let entry = crate::repo::register_repo(
+            &mut store,
+            crate::repo::RepoSpec {
+                name: "campaign-busy".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let mut n1 = node("n1");
+        n1.run_spec.repo_ref = Some(entry.id.clone());
+        let def = CampaignDef {
+            id: "busy".into(),
+            name: "busy tree".into(),
+            nodes: vec![n1],
+            edges: vec![],
+            policy: FailurePolicy::FailFast,
+            max_concurrency: 1,
+            denial_gate: Default::default(),
+        };
+        let run_id = "busy:n1:a0".to_string();
+
+        // An earlier life's reap holds the node's tree, on a thread of its own (as the reap does).
+        let (held_tx, held_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let holder = {
+            let (r, id) = (entry.root_path.clone(), run_id.clone());
+            std::thread::spawn(move || {
+                let _held = crate::repo::hold_tree_for_test(&r, &id);
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            })
+        };
+        held_rx.recv().unwrap();
+
+        let (tx, rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let lifecycle_maps = None;
+        let seams = Seams {
+            runner: &runner,
+            self_tx: &tx,
+            registry: &registry,
+            process_gen: uuid::Uuid::new_v4(),
+            lifecycle_maps: &lifecycle_maps,
+            qe_host: &Default::default(),
+        };
+        let mut subs = crate::event_log::EventSink::default();
+        let mut in_flight: HashSet<String> = HashSet::new();
+        launch(&mut store, &mut subs, &mut in_flight, &seams, def).unwrap();
+        let c = get_campaign(&store, "busy").unwrap().unwrap();
+        assert_eq!(
+            c.status_of("n1"),
+            NodeStatus::Ready,
+            "the node waits for its tree instead of launching into it"
+        );
+        assert_eq!(c.status, CampaignStatus::Running, "not finalized meanwhile");
+        assert!(
+            crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .is_none(),
+            "nothing was launched"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Command::CampaignTick { campaign }) => {
+                    assert_eq!(campaign, "busy");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("the idle tree posts CampaignTick: {e}"),
+            }
+        }
+        tick(&mut store, &mut subs, &mut in_flight, &seams, "busy").unwrap();
+        let c = get_campaign(&store, "busy").unwrap().unwrap();
+        assert_ne!(
+            c.status_of("n1"),
+            NodeStatus::Ready,
+            "the tick dispatched the node once its tree was idle"
+        );
+        assert_eq!(c.node_run_id.get("n1"), Some(&run_id));
+        let _ = crate::repo::reap_worktree_if_clean(&entry.root_path, &run_id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn node(id: &str) -> CampaignNode {
         CampaignNode {

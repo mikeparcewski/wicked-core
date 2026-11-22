@@ -1437,9 +1437,15 @@ fn tree_locks() -> &'static (std::sync::Mutex<TreeQueues>, std::sync::Condvar) {
 /// (core#1429) A place in a tree's queue, taken now and waited for later: first come, first
 /// served. The actor takes one for a cancel's reap BEFORE the cancel replies, so a relaunch of the
 /// same run id, which can only come after that reply, mints after the reap (review on #1433).
+///
+/// (coord review of #1736) A ticket dropped without being waited for (its holder panicked before
+/// its turn, say) still gives its place up when its turn comes ([`Drop`]): the tree's queue is
+/// never wedged behind it.
 pub(crate) struct TreeTicket {
     key: String,
     ticket: u64,
+    /// Waited for (or given up): its place in the queue is accounted for.
+    done: bool,
 }
 
 fn tree_key(repo_root: &str, run_id: &str) -> String {
@@ -1453,23 +1459,71 @@ pub(crate) fn reserve_tree(repo_root: &str, run_id: &str) -> TreeTicket {
     let e = map.entry(key.clone()).or_insert((0, 0));
     let ticket = e.0;
     e.0 += 1;
-    TreeTicket { key, ticket }
+    TreeTicket {
+        key,
+        ticket,
+        done: false,
+    }
 }
 
 impl TreeTicket {
-    fn wait(self) -> TreeLock {
+    /// Give the place up without touching the tree: wait for its turn, then pass it on. A ticket
+    /// that is never waited for would hold the tree's queue forever.
+    pub(crate) fn release(self) {
+        drop(self.wait());
+    }
+
+    fn wait(mut self) -> TreeLock {
+        self.done = true;
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
         while map.get(&self.key).is_some_and(|e| e.1 != self.ticket) {
             map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
         }
-        TreeLock(self.key)
+        TreeLock(std::mem::take(&mut self.key))
+    }
+}
+
+impl Drop for TreeTicket {
+    /// A ticket never waited for gives its place up in turn. Blocks until then, so it is dropped
+    /// unwaited only off the actor (a cleanup thread unwinding).
+    fn drop(&mut self) {
+        if !self.done {
+            drop(
+                TreeTicket {
+                    key: std::mem::take(&mut self.key),
+                    ticket: self.ticket,
+                    done: false,
+                }
+                .wait(),
+            );
+        }
     }
 }
 
 impl TreeLock {
     fn take(repo_root: &str, run_id: &str) -> Self {
         reserve_tree(repo_root, run_id).wait()
+    }
+}
+
+/// (core#1435) Whether `run_id`'s tree is taken or queued for: a reap or removal of an earlier life
+/// of the same run id is still going, so a mint now would wait for it.
+pub(crate) fn tree_busy(repo_root: &str, run_id: &str) -> bool {
+    let (held, _) = tree_locks();
+    held.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&tree_key(repo_root, run_id))
+}
+
+/// (core#1435) Block until nothing holds or waits for `run_id`'s tree (see [`tree_busy`]). For a
+/// thread of its own, never the actor.
+pub(crate) fn wait_tree_idle(repo_root: &str, run_id: &str) {
+    let key = tree_key(repo_root, run_id);
+    let (held, freed) = tree_locks();
+    let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
+    while map.contains_key(&key) {
+        map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
     }
 }
 
@@ -4868,6 +4922,40 @@ mod tests {
             "the relaunch minted after the reap: its tree is live"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (coord review of #1736, B1) A ticket whose holder never waits for it (a cleanup thread that
+    /// panicked before its turn) gives its place up when its turn comes: the tree's queue is not
+    /// wedged, and the next taker gets the tree.
+    #[test]
+    fn a_ticket_dropped_before_its_turn_gives_its_place_up() {
+        let p = "/nonexistent/wicked-b1-root".to_string();
+        let held = hold_tree_for_test(&p, "run-b1");
+        // Its place is taken behind `held`; the thread panics before waiting for it.
+        let holder = std::thread::spawn({
+            let ticket = reserve_tree(&p, "run-b1");
+            move || {
+                let _ticket = ticket;
+                panic!("the cleanup panicked before its turn");
+            }
+        });
+        // The next taker queues behind the panicked holder's place.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let taker = std::thread::spawn({
+            let ticket = reserve_tree(&p, "run-b1");
+            move || {
+                let _tree = ticket.wait();
+                let _ = tx.send(());
+            }
+        });
+        drop(held);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(),
+            "the next taker got the tree: the unwaited ticket gave its place up"
+        );
+        assert!(holder.join().is_err(), "the holder panicked");
+        taker.join().unwrap();
+        assert!(!tree_busy(&p, "run-b1"), "the queue is empty again");
     }
 
     /// (review on #1431) A resume that finds its tree in place adopts it for the resuming daemon.

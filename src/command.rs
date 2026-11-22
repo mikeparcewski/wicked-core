@@ -464,6 +464,9 @@ pub(crate) enum Command {
     /// Internal: a HITL gate opened inside a campaign node's Run — free its slot, surface the prompt,
     /// and dispatch independent work into the freed slot.
     CampaignNodeAwaiting { run_id: String, prompt: String },
+    /// Internal (core#1435): a node's tree that an earlier reap held is idle now; dispatch what
+    /// the campaign can dispatch.
+    CampaignTick { campaign: String },
     /// Register (or replace) a workflow def in the actor's registry. Validates before inserting.
     /// `json` is a serialized `WorkflowDef`. Replies `Err` if validation fails.
     /// (core#590 S5) Convene a council on one disputed decision (`Core::convene_decision`). The
@@ -771,6 +774,7 @@ impl Command {
             Command::CampaignDetailQuery { .. } => "CampaignDetailQuery",
             Command::CampaignRunFinished { .. } => "CampaignRunFinished",
             Command::CampaignNodeAwaiting { .. } => "CampaignNodeAwaiting",
+            Command::CampaignTick { .. } => "CampaignTick",
             Command::ConveneDecision { .. } => "ConveneDecision",
             Command::ReserveRuleCouncil { .. } => "ReserveRuleCouncil",
             Command::ConveneRuleCouncil { .. } => "ConveneRuleCouncil",
