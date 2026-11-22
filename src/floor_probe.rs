@@ -367,43 +367,21 @@ impl Probe<'_> {
         (r.exit_code, text)
     }
 
-    /// (core#1101) `complete`: the clean run executed exactly as many tests as the list names —
-    /// with junit, every testcase with an id (run or skipped); with text, the `parser.count` lines
-    /// in the sections the list names ([`crate::floor_guide::Compiled::executed`]). An incomplete
-    /// list (a `--lib` list beside a full run) could otherwise make a name shared with an unlisted
-    /// test look unique.
-    fn complete(&self, listed: &Toc, text: &Result<String, String>, parsed: &Parsed) -> String {
+    /// (core#1101) `complete`: the clean run executed exactly the tests the list names
+    /// ([`GuideCheck::completeness`]: no name listed twice; junit, the testcase ids one for one;
+    /// text, `parser.count` per qualifier). An incomplete list (a `--lib` list beside a full run)
+    /// could otherwise make a name shared with an unlisted test look unique.
+    fn complete(&self, listed: &Toc, text: &Result<String, String>) -> String {
         if let Some(why) = &listed.incomplete {
             return format!("fail: the list: {why}");
         }
-        let executed = if self.g.results.kind == "junit" {
-            match parsed {
-                Ok((all, _)) => all.len(),
-                Err(e) => return format!("fail: the clean run's results: {e}"),
-            }
-        } else {
-            let text = match text {
-                Ok(t) => t,
-                Err(e) => return format!("fail: the clean run's results: {e}"),
-            };
-            let counted = match self.g.compile() {
-                Ok(c) => c.executed(text, &listed.ids),
-                Err(e) => return format!("fail: {e}"),
-            };
-            match counted {
-                None => {
-                    return "fail: no `parser.count` to count the tests the run executed".into()
-                }
-                Some(Err(e)) => return format!("fail: {e}"),
-                Some(Ok(n)) => n,
-            }
-        };
-        verdict(executed == listed.ids.len(), || {
-            format!(
-                "the clean run executed {executed} test(s); the list names {}",
-                listed.ids.len()
-            )
-        })
+        match text {
+            Err(e) => format!("fail: the clean run's results: {e}"),
+            Ok(t) => match self.g.completeness(t, &listed.ids) {
+                Ok(()) => "pass".into(),
+                Err(e) => format!("fail: {e}"),
+            },
+        }
     }
 
     /// A results run that exits 0 and names no failure.
@@ -507,10 +485,7 @@ impl Probe<'_> {
         let (exit, clean_text) = self.results_text(&clean_copy, &g.run);
         drop(clean_copy);
         let clean: Parsed = clean_text.clone().and_then(|t| parse_results(g, &t));
-        out.insert(
-            "complete".into(),
-            self.complete(&clean_list, &clean_text, &clean),
-        );
+        out.insert("complete".into(), self.complete(&clean_list, &clean_text));
         let green = exit == Some(0) && clean.as_ref().is_ok_and(|(_, f)| f.is_empty());
         out.insert(
             "run".into(),

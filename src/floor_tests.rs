@@ -751,8 +751,8 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        // (core#1101) A doctest runs but is never listed: `complete` counts only the sections
-        // the list names, so its `Doc-tests` section's `running 1 test` is not the list's.
+        // (core#1101) A doctest: its `Doc-tests` section counts `running 1 test`, so `complete`
+        // passes only because the guide's list names it too (`src/lib.rs - f (line 1)`).
         "/// ```\n/// assert_eq!(1, 1);\n/// ```\npub fn f() {}\n\n\
          #[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
     )

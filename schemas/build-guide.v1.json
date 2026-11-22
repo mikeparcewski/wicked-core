@@ -111,7 +111,7 @@
             },
             "count": {
               "$ref": "#/$defs/regex",
-              "description": "Lines that say how many tests ran, with a named group `n` (a number), e.g. libtest's `^running (?P<n>\\d+) tests?$`. Summed over the clean run's results, in the sections the list names (a section the list never names, such as `Doc-tests`, is skipped), it must equal the number of tests the list names (the `complete` probe). Required for a text check's exclusion to be relied on."
+              "description": "Lines that say how many tests ran, with a named group `n` (a number), e.g. libtest's `^running (?P<n>\\d+) tests?$`. Summed per `section` over the clean run's results, each qualifier's total must equal the number of tests the list names under it, and a section the list never names (a binary a `--lib` list omits, or doctests a list does not print) fails: this is the `complete` probe, which also refuses a list that names a test twice, and with junit compares every testcase id, skipped ones included. Required for a text check's exclusion to be relied on."
             },
             "blocks": {
               "type": "array",

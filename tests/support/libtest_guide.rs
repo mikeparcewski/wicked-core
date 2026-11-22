@@ -1,7 +1,8 @@
 /// A build-guide check (DES-BUILD-GUIDE, contract v1) for a libtest-style runner — `cargo test` and
 /// the stand-ins that mimic it: the binaries' `Running` lines (stderr, merged) qualify ids; a
 /// failure is a name in the final `failures:` list; one test runs alone with `<name> --exact`, and
-/// deselects with `--skip=<name> --exact`; `running N tests` lines count what a run executed.
+/// deselects with `--skip=<name> --exact`; `running N tests` lines count what a run executed, and
+/// the list names doctests too (their ids hold spaces), so every section a run counts is listed.
 /// Verified (every probe `pass`) on `verified` when it is
 /// not empty. Test fixture data, shared by the lib's and the integration tests: the floor knows
 /// none of it.
@@ -24,7 +25,7 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
             "start": "^failures:$", "item": r"^    (?P<id>\S+)$",
             "end": "^test result: FAILED", "use": "last-before-end"}],
             "count": r"^running (?P<n>\d+) tests?$"},
-        "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
+        "list": {"run": tail(&["--list"]), "item": r"^(?P<id>.+): test$",
                  "section": section, "merge": true},
         "alone": {"run": tail(&["{id}", "--exact"])},
         "deselect": {"append": ["--", "--skip={id}", "--exact"]},
