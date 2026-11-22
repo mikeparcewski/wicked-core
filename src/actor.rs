@@ -16429,12 +16429,33 @@ fn run_conformance_harness(
 /// private temp directory is writable. Crew's install gate calls this; it never runs the
 /// harness unjailed.
 pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
-    run_editor_conformance_with(request_json, &crate::validator::serve_jail)
+    run_editor_conformance_with(
+        request_json,
+        &crate::validator::serve_jail,
+        &install_conformance_stop(crate::power::live_actor_gens()),
+    )
+}
+
+/// (core#1708) The install-time harness's stop: `shutdown` once an engine actor that was live when
+/// the call began has taken `Shutdown` (crew's daemon stopping or restarting its `Core`). The call
+/// is static (`Core.runEditorConformance`), so no run or `Core` owns it; the engines live at its
+/// start stand for the daemon that asked. On `shutdown` the harness's poll loop
+/// ([`run_tool_cmd_jailed`]) kills the jailed process group at once, as the review-time step's
+/// does; it used to run on to its own deadline (up to 900 s). A call made with no engine live
+/// has nothing to stop it but that deadline, as before.
+fn install_conformance_stop(engines: Vec<uuid::Uuid>) -> impl Fn() -> Option<&'static str> {
+    move || {
+        engines
+            .iter()
+            .any(|g| crate::power::actor_tx(Some(*g)).is_none())
+            .then_some(STOP_SHUTDOWN)
+    }
 }
 
 fn run_editor_conformance_with(
     request_json: &str,
     jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
 ) -> Result<String, String> {
     use crate::editor_conformance as ec;
     #[derive(serde::Deserialize)]
@@ -16513,7 +16534,7 @@ fn run_editor_conformance_with(
         0,
         deadline,
         jail,
-        &|| None,
+        stop,
         &|_| {},
         &|_| {},
     );
@@ -16625,7 +16646,7 @@ mod editor_install_conformance_tests {
                 for timeout in [1, 900] {
                     let request =
                         serde_json::json!({ "packRoot": pack, "timeoutS": timeout }).to_string();
-                    let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                    let raw = run_editor_conformance_with(&request, &jail, &|| None).unwrap();
                     let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                     assert!(called.get());
                     assert_eq!(response["record"]["outcome"], "refused");
@@ -16634,6 +16655,71 @@ mod editor_install_conformance_tests {
                     assert!(response["report"].is_null());
                 }
             }
+        });
+    }
+
+    /// core#1708: the install-time harness stops when the engine that was live at the call's start
+    /// shuts down. The jail's process (a stand-in that records its pid and sleeps) is killed and
+    /// reaped within seconds of the `Core` dropping, and the call returns. Red on main: the stop was
+    /// `|| None`, so the harness ran to its own deadline (here the stand-in's 60 s sleep).
+    #[cfg(unix)]
+    #[test]
+    fn an_install_harness_is_killed_when_its_engine_shuts_down() {
+        with_host_inputs(|root| {
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let pidfile = root.join("harness.pid");
+            let before = crate::power::live_actor_gens();
+            let core = crate::Core::spawn(":memory:");
+            // The actor registers itself on its own thread: a reply proves it is up.
+            let _ = core.sessions();
+            let ours: Vec<uuid::Uuid> = crate::power::live_actor_gens()
+                .into_iter()
+                .filter(|g| !before.contains(g))
+                .collect();
+            assert!(!ours.is_empty(), "the engine registered its actor");
+            let stop = install_conformance_stop(ours);
+            assert_eq!(stop(), None, "a live engine does not stop the harness");
+            let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+            let request = serde_json::json!({ "packRoot": pack, "timeoutS": 120 }).to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let jail = |_: &[&Path], _: u16| crate::validator::SandboxLauncher {
+                    wrapper: vec!["sh".into(), "-c".into(), script.clone(), "sh".into()],
+                    level: crate::validator::SandboxLevel::Sandboxed,
+                };
+                let raw = run_editor_conformance_with(&request, &jail, &stop).unwrap();
+                tx.send(raw).unwrap();
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let pid: i32 = loop {
+                if let Some(p) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok())
+                {
+                    break p;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the harness never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            // SAFETY: signal 0 only probes that the pid exists.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the harness runs");
+            drop(core);
+            let raw = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the call returned once its engine shut down, not at the deadline");
+            worker.join().unwrap();
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["outcome"], "refused", "{response}");
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "the jailed process is gone (killed and reaped)"
+            );
         });
     }
 
@@ -16647,7 +16733,7 @@ mod editor_install_conformance_tests {
             };
             let check = |path: &Path| {
                 let request = serde_json::json!({ "packRoot": path }).to_string();
-                let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                let raw = run_editor_conformance_with(&request, &jail, &|| None).unwrap();
                 let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 assert_eq!(response["record"]["outcome"], "refused");
                 assert_eq!(response["record"]["cause"], "engine_refused");
@@ -31346,7 +31432,10 @@ mod request_changes_tests {
                 None => std::env::remove_var(k),
             }
         }
-        std::fs::remove_dir_all(&home).unwrap();
+        // (core#1730) Best effort: the test checks what was created, not that the temp dir is
+        // removable. On Windows a handle still open under it (the indexer, antivirus) made this
+        // `remove_dir_all` fail with DirectoryNotEmpty before any assertion ran.
+        let _ = std::fs::remove_dir_all(&home);
 
         assert!(
             empty_after_read,
@@ -39265,6 +39354,141 @@ mod terminal_worktree_reap_tests {
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
+    }
+
+    /// core#1780 (coord review N3 on core#1760): the dispatch re-entry claim, driven through a
+    /// real engine rather than a source guard. Three runs are persisted in live worktrees: two
+    /// `executing` (one tree minted unmarked, as before core#1373, one marked by another daemon)
+    /// and one paused at its `failure` gate in an unmarked tree. A fresh engine on the same store
+    /// redrives the executing two (exec mode): the unmarked tree ends with THIS daemon's marker
+    /// (the store's own id), and the other daemon's marker is left as it was. The paused run's
+    /// tree stays unmarked until the gate is continued; the continue's dispatch claims it.
+    /// Red if `dispatch_unit_with` stops handing the claim to `spawn_bound`: both unmarked trees
+    /// stay unmarked.
+    #[test]
+    fn a_boot_redrive_and_a_gate_continue_claim_the_tree_they_reenter() {
+        use crate::domain::{UnitStatus, WorkUnit};
+        struct NoDispatcher;
+        impl wicked_council::types::Dispatcher for NoDispatcher {
+            fn dispatch(
+                &self,
+                _cli: &wicked_council::types::AgenticCli,
+                _task: &wicked_council::CouncilTask,
+            ) -> Option<wicked_council::types::Vote> {
+                None
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-1780-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let estate_db = dir.join("estate.db").to_string_lossy().into_owned();
+        let bus_db = dir.join("bus.db").to_string_lossy().into_owned();
+        let (roots, legacy, theirs, gated) = {
+            let mut store = open_store(Some(&estate_db)).unwrap();
+            let (root_a, legacy) = {
+                let _none = crate::repo::DaemonOwnerScope::bind(None);
+                seeded(&mut store, "claim-legacy", "r-claim-legacy")
+            };
+            let (root_b, theirs) = {
+                let _other = crate::repo::DaemonOwnerScope::bind(Some("daemon-other".into()));
+                seeded(&mut store, "claim-theirs", "r-claim-theirs")
+            };
+            let (root_c, gated) = {
+                let _none = crate::repo::DaemonOwnerScope::bind(None);
+                seeded(&mut store, "claim-gated", "r-claim-gated")
+            };
+            for run in ["r-claim-legacy", "r-claim-theirs", "r-claim-gated"] {
+                let mut unit = WorkUnit::pending(format!("{run}:u1"), run, 1, "work");
+                unit.assigned_cli = Some("claude".into());
+                unit.status = if run == "r-claim-gated" {
+                    UnitStatus::Rejected
+                } else {
+                    UnitStatus::Distributed
+                };
+                put_node(&mut store, unit.to_node()).unwrap();
+            }
+            // The gated run paused at its `failure` gate the way the fold pauses one.
+            let mut s = crate::domain::get_session(&store, "r-claim-gated")
+                .unwrap()
+                .unwrap();
+            let (tx, _rx) = channel::<Command>();
+            pause_for_human(
+                &mut store,
+                &mut crate::event_log::EventSink::default(),
+                &tx,
+                &mut s,
+                1,
+                Some(1),
+                "failure",
+                "Unit 1 failed. Approve to run it again, or reject to stop the run.".into(),
+            )
+            .unwrap();
+            ([root_a, root_b, root_c], legacy, theirs, gated)
+        };
+        assert_eq!(
+            crate::repo::worktree_daemon(&legacy),
+            None,
+            "minted unmarked"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&gated),
+            None,
+            "minted unmarked"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other")
+        );
+        let core = crate::Core::spawn_with_engine_exec(
+            estate_db.clone(),
+            Arc::new(NoDispatcher),
+            Arc::new(NoopRunner),
+            bus_db,
+        );
+        // The actor answers a read only after its boot (the redrive) is done.
+        let _ = core.sessions();
+        let me = crate::repo::daemon_owner_of_store(&estate_db);
+        let wait_claimed = |wt: &Path, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while crate::repo::worktree_daemon(wt).as_deref() != Some(me.as_str()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} never claimed the tree: {:?}",
+                    crate::repo::worktree_daemon(wt)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        wait_claimed(&legacy, "the boot redrive");
+        // Both redrive claims were handed off by the same boot; give the second its turn.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other"),
+            "another daemon's marker is never replaced"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&gated),
+            None,
+            "a run held at its gate is not re-entered at boot"
+        );
+        core.confirm_gate(
+            "r-claim-gated",
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        wait_claimed(&gated, "the gate continue");
+        drop(core);
+        for root in roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reap runs on its own thread; wait for the checkout to vanish. The generous bound is

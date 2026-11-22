@@ -190,6 +190,26 @@ pub(crate) fn admit(
     store: &dyn wicked_apps_core::GraphRead,
     f: &LaunchFacts<'_>,
 ) -> anyhow::Result<Option<AppsContract>> {
+    // (core#1343) A `run-cost` launch's facts step is crew's Tool, which runs only with its unit's
+    // capability token ([`crate::actor::crew_tool_channel`], keyed on the same preset name). That
+    // token needs input governance and a broker URL; without either the step refused late, after
+    // the run had started. Refused here instead, typed and with nothing persisted, as an Apps
+    // launch is.
+    if f.workflow == Some(crate::actor::RUN_COST_PRESET) && !(f.governed && f.crew_url) {
+        let missing = match (f.governed, f.crew_url) {
+            (false, false) => {
+                "input governance is not armed on this engine and the daemon has no \
+                               broker URL (WICKED_CREW_URL)"
+            }
+            (false, true) => "input governance is not armed on this engine (a file-backed store)",
+            _ => "the daemon has no broker URL (WICKED_CREW_URL)",
+        };
+        return Err(anyhow::Error::new(AppsLaunchRefused(format!(
+            "the `{}` launch is refused: its facts step runs crew's Tool only with its unit's \
+             capability token, and none could be armed: {missing}",
+            crate::actor::RUN_COST_PRESET
+        ))));
+    }
     let Some(name) = f.workflow.filter(|w| is_apps_preset(w)) else {
         return Ok(None);
     };
