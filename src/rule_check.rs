@@ -1923,8 +1923,10 @@ fn quotes_in(cite: &str, text: Option<&str>, framed: bool) -> bool {
     let Some(text) = text else {
         return false;
     };
+    // (core#1746) The text as the seat was shown it ([`seat_text`]): a quote across a NUL is
+    // checked against the SUB the judge read there.
     let fold = |s: &str| {
-        let s = if framed { unframed(s) } else { s.to_string() };
+        let s = seat_text(if framed { unframed(s) } else { s.to_string() });
         s.split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")

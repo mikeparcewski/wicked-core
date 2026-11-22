@@ -5287,3 +5287,62 @@ fn a_binary_file_in_the_change_reaches_the_judge_whole_and_the_rule_is_judged() 
         );
     }
 }
+
+/// (core#1746, codex review) A change big enough to be judged in parts, with the binary hunk's NULs
+/// in its LAST part, and a rule the batch leaves out so it is asked alone: every part of every call
+/// reaches the seat whole, with each NUL shown as SUB (one byte for one, nothing deleted).
+#[test]
+fn a_binary_hunk_in_a_later_part_and_an_alone_retry_reach_the_judge_whole() {
+    let big = big_file("scripts/data.txt", 7000, 30);
+    let diff = format!("{big}{BINARY_DIFF}");
+    assert!(diff.len() > 2 * EVIDENCE_CAP, "judged in parts");
+    let paths = [
+        "scripts/data.txt",
+        "scripts/bump.py",
+        "scripts/__pycache__/bump.cpython-313.pyc",
+    ];
+    let c = change_of(&diff, &paths);
+    let rules = [
+        rule("STACK-1", "Use what the chosen stack already provides."),
+        rule("STACK-2", "Keep the bump script's parser in the stdlib."),
+    ];
+    let mut judge = Fake::new(&[
+        ("STACK-1", "KEPT — scripts/bump.py uses the stdlib tomllib"),
+        ("STACK-2", "KEPT — scripts/bump.py imports tomllib"),
+    ]);
+    judge.argv = true;
+    judge.omit_in_batch = Some("STACK-2".into());
+    let r = run_on(&rules, &c, &judge, &NoMachine, None, &[]);
+    for id in ["STACK-1", "STACK-2"] {
+        let row = r.rows.iter().find(|x| x.rule_id == id).unwrap();
+        assert_eq!(row.status, RuleStatus::Kept, "{id}: {}", row.reason);
+    }
+    let prompts = judge.prompts.lock().unwrap();
+    let alone = prompts
+        .iter()
+        .filter(|(_, p)| p.contains("RULE STACK-2 (") && !p.contains("RULE STACK-1 ("))
+        .count();
+    assert!(alone >= 2, "STACK-2 was asked alone, in parts ({alone})");
+    let shown = "+\u{f3}\r\n\u{1a}\u{1a}\u{1a}\u{1a}c\u{1a}\u{1a}after-the-nul tomllib\n";
+    let mut with_hunk = 0;
+    for (_, p) in prompts.iter() {
+        assert!(!p.contains('\0'), "no seat argument holds a NUL");
+        assert!(p.contains("BEGIN VERDICTS "), "the frame arrived: {p:.80}");
+        if p.contains("after-the-nul") {
+            assert!(p.contains(shown), "each NUL is a SUB, in place");
+            with_hunk += 1;
+        }
+    }
+    assert!(with_hunk >= 2, "the hunk's part, in the batch and alone");
+}
+
+/// (core#1746, codex review) A quote is checked against the text as the seat read it: a KEPT that
+/// quotes a record across a NUL (shown as SUB) counts.
+#[test]
+fn a_quote_across_a_nul_counts_as_the_seat_read_it() {
+    let record = "Checked std::fs\0which provides read_to_string for this change";
+    assert!(quotes_text(
+        "\"Checked std::fs\u{1a}which provides read_to_string\"",
+        record
+    ));
+}
