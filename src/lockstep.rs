@@ -427,6 +427,10 @@ mod tests {
             ])
             .arg("--manifest-path")
             .arg(core_ts.join("Cargo.toml"))
+            // Cargo never walks above `CARGO_HOME` looking for a workspace root: bounding it at the
+            // fixture keeps a cargo workspace around the host temp dir out of the answer (a
+            // governed seat's TMPDIR is `<worktree>/tmp`, inside this repo's own workspace).
+            .env("CARGO_HOME", &fixture)
             .current_dir(&fixture)
             .output()
             .expect("cargo runs");
