@@ -382,6 +382,10 @@ pub(crate) enum FloorUnarmed {
     SeatNetworkUnavailable,
     /// Container floor: the seat's image is not defined for this CLI or could not be built.
     NoSeatImage,
+    /// Container floor: the operator's seat base image (`WICKED_SEAT_BASE_IMAGE`) is not on the
+    /// container runtime and no recipe rebuilt it, so the seat image is refused before its build
+    /// (which would pull the base from a registry), core#1053.
+    SeatBaseMissing,
     /// Container floor: native Windows (seat containers mount host paths at the same path).
     ContainerUnsupportedHost,
     /// Container floor: the unit's gate hook is a host command the seat container cannot run, and
@@ -492,6 +496,13 @@ impl FloorUnarmed {
                 "no_seat_image: the seat's container image is not defined for this CLI or could not \
                  be built (`wicked-core seat-image build <cli>` shows why)"
             }
+            FloorUnarmed::SeatBaseMissing => {
+                "seat_base_missing: the container runtime says the operator's seat base image \
+                 (WICKED_SEAT_BASE_IMAGE) is not there and its recipe did not rebuild it (or it has \
+                 none), so the seat image is not built on it (that build would pull it from a \
+                 registry) — build or load the image again, or set WICKED_SEAT_BASE_DOCKERFILE to \
+                 its Dockerfile, then retry (its detail follows)"
+            }
             FloorUnarmed::ContainerUnsupportedHost => {
                 "container_unsupported_host: native Windows cannot run the container floor; run the \
                  daemon and its checkouts inside WSL2 with a local Kubernetes cluster"
@@ -601,7 +612,8 @@ impl FloorUnarmed {
             | FloorUnarmed::ExecStreamLost
             | FloorUnarmed::PidsUnlimited
             | FloorUnarmed::CopyInRefused
-            | FloorUnarmed::PartialClone => true,
+            | FloorUnarmed::PartialClone
+            | FloorUnarmed::SeatBaseMissing => true,
             FloorUnarmed::NotAWorktree
             | FloorUnarmed::SeatArmsItsOwn
             | FloorUnarmed::NoLauncher
@@ -634,6 +646,7 @@ impl FloorUnarmed {
             FloorUnarmed::AddressPoolsExhausted => "address_pools_exhausted",
             FloorUnarmed::SeatNetworkUnavailable => "seat_network_unavailable",
             FloorUnarmed::NoSeatImage => "no_seat_image",
+            FloorUnarmed::SeatBaseMissing => "seat_base_missing",
             FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
             FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
             FloorUnarmed::HostOnlyCarrier => "host_only_carrier",
@@ -1920,6 +1933,7 @@ esac
             FloorUnarmed::PartialClone,
             FloorUnarmed::AddressPoolsExhausted,
             FloorUnarmed::SeatNetworkUnavailable,
+            FloorUnarmed::SeatBaseMissing,
         ] {
             assert!(why.keeps_arm_detail(), "{why:?}");
         }

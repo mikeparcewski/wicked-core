@@ -66,7 +66,8 @@
 //! escape (`base64 | sh`, a script file, a variable holding the verb, a renamed binary) can evade
 //! a scan of the literal command. Layer 3 is what holds then, and what it holds is exactly this:
 //! a `git` that runs with the seat's environment intact cannot push anywhere — https, `ssh://`,
-//! `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path — whether the remote is
+//! `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path (in a seat image, but for a
+//! bare repository strictly inside the seat's own `/tmp`, core#1210) — whether the remote is
 //! spelled on its command line, in the repository's config or through an operator
 //! `pushInsteadOf`, and cannot read a credential helper. Not covered by layer 3: a `git`
 //! carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c

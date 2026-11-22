@@ -561,9 +561,18 @@ pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] = &[
     "BITBUCKET_",
 ];
 
-/// The scheme every seat push is rewritten to — one git has no remote helper for, so the push
+/// The scheme every seat push is rewritten to. A host has no remote helper for it, so the push
 /// fails before any transport is contacted ("unable to find remote helper for 'wicked-nopush'").
+/// A seat image carries the engine's `git-remote-wicked-nopush` (core#1210,
+/// `containers/seats/seat.Dockerfile`), which refuses every push but one to a bare repository
+/// strictly inside the seat's own scratch dir; a local path arrives there as
+/// [`NOPUSH_LOCAL_BASE`]`<path>`, any other remote as `wicked-nopush://<host>/…`.
 pub const NOPUSH_SCHEME: &str = "wicked-nopush://";
+
+/// What an absolute POSIX-path remote (`/…`) is rewritten to for a push: [`NOPUSH_SCHEME`] with
+/// the path's own leading `/` kept, so the helper reads it as a path, never as a host (core#1210).
+/// `file:///…` arrives in the same form through the `file://` prefix.
+pub const NOPUSH_LOCAL_BASE: &str = "wicked-nopush:///";
 
 /// The ssh program a fenced seat's git is given — as `GIT_SSH_COMMAND` in its environment AND
 /// as `core.sshCommand` in its config: a program that does not exist, so an ssh transport git
@@ -624,8 +633,14 @@ pub fn nopush_url_prefixes() -> Vec<String> {
 pub fn nopush_git_config_entries() -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = nopush_url_prefixes()
         .iter()
+        .filter(|p| p.as_str() != "/")
         .map(|p| (format!("url.{NOPUSH_SCHEME}.pushInsteadOf"), p.clone()))
         .collect();
+    // (core#1210) A path remote keeps its leading `/`: `/tmp/r.git` → `wicked-nopush:///tmp/r.git`.
+    entries.push((
+        format!("url.{NOPUSH_LOCAL_BASE}.pushInsteadOf"),
+        "/".to_string(),
+    ));
     entries.push(("credential.helper".to_string(), String::new()));
     entries.push(("core.askPass".to_string(), String::new()));
     entries.push((
@@ -978,8 +993,10 @@ fn seat_global_git_config(copied: &[(String, Option<String>)]) -> String {
          # reads THIS as its global config: the operator's identity and presentation settings are\n\
          # COPIED below (never included — nothing about remotes, URLs, credentials, aliases or\n\
          # transports crosses), then every credential helper and askpass program is reset, every\n\
-         # URL-form push transport is re-aimed at a scheme git has no helper for, ssh is replaced\n\
-         # by a program that does not exist and the ssh/git/ext transports are refused outright.\n\
+         # URL-form push transport is re-aimed at the wicked-nopush scheme (no helper on a host; in\n\
+         # a seat image, one that admits only a bare repository inside the seat's /tmp), ssh is\n\
+         # replaced by a program that does not exist and the ssh/git/ext transports are refused\n\
+         # outright.\n\
          # Fetch over https, file:// and local paths is untouched. Delivery is the deliver phase's\n\
          # job.\n",
     );
@@ -1142,13 +1159,15 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
 ///
 /// What this guarantees, exactly (review of #449, r2): a `git` that runs with the seat's
 /// environment intact cannot push anywhere — https/http, `ssh://`, `git@host:`, `user@host:`,
-/// `host:`, `git://`, `file://` and path remotes alike, whether the remote is spelled on the
-/// command line, in the repository's config or through an operator `pushInsteadOf` — and cannot
-/// read a credential helper. A `git` invocation carrying its OWN override of a fenced key
-/// (`-c protocol.ssh.allow=always`, `-c credential.helper=…`; command-line `-c` outranks the
-/// environment entries) or its own `GIT_SSH_COMMAND` is refused as a literal by the command
-/// filter; one hidden in a script file is the stated limit, as is a seat that scrubs its
-/// environment (`env -i`) before calling git — the literal is refused, the script file is not.
+/// `host:`, `git://`, `file://` and path remotes alike (in a seat image, but for a bare
+/// repository strictly inside the seat's own `/tmp`, core#1210 — [`NOPUSH_SCHEME`]), whether the
+/// remote is spelled on the command line, in the repository's config or through an operator
+/// `pushInsteadOf` — and cannot read a credential helper. A `git` invocation carrying its OWN
+/// override of a fenced key (`-c protocol.ssh.allow=always`, `-c credential.helper=…`;
+/// command-line `-c` outranks the environment entries) or its own `GIT_SSH_COMMAND` is refused as
+/// a literal by the command filter; one hidden in a script file is the stated limit, as is a seat
+/// that scrubs its environment (`env -i`) before calling git — the literal is refused, the script
+/// file is not.
 pub fn fence_remote_credentials(cmd: &mut Command) {
     for key in REMOTE_CREDENTIAL_ENV {
         cmd.env_remove(key);
@@ -2982,6 +3001,14 @@ mod tests {
                 .unwrap();
             if key == format!("url.{NOPUSH_SCHEME}.pushInsteadOf") {
                 assert!(nopush_url_prefixes().contains(&val), "{val}");
+                assert_ne!(
+                    val, "/",
+                    "a path remote keeps its leading slash (core#1210)"
+                );
+                push_kills += 1;
+            }
+            if key == format!("url.{NOPUSH_LOCAL_BASE}.pushInsteadOf") {
+                assert_eq!(val, "/", "only a path remote is re-aimed at the local base");
                 push_kills += 1;
             }
             if key == "credential.helper" {
@@ -3164,6 +3191,12 @@ rebase.autosquash\0";
         assert!(
             fence.contains("pushInsteadOf = \"\\\\\\\\\"\n"),
             "UNC prefix quoted: {fence}"
+        );
+        assert!(
+            fence.contains(&format!(
+                "[url \"{NOPUSH_LOCAL_BASE}\"]\n\tpushInsteadOf = /\n"
+            )),
+            "a path remote keeps its leading slash (core#1210): {fence}"
         );
         // Values git could not read back literally are quoted and escaped; odd keys are dropped.
         assert_eq!(git_config_value("plain"), "plain");

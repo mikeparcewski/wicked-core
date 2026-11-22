@@ -62,5 +62,62 @@ RUN set -eu; \
       install -o root -g root -m 0555 "$d/$CLI_TARBALL_MEMBER" "/usr/local/bin/$CLI"; \
       rm -rf "$d"; \
     fi
+# The seat fence's push helper (core#1210). The fence re-aims every push at the wicked-nopush
+# scheme (crates/wicked-apps-core/src/spawn.rs nopush_git_config_entries): a local-path or file://
+# remote arrives here as wicked-nopush:///<path>, any other remote as wicked-nopush://<host>/...
+# One push is let through: to a bare repository STRICTLY inside the seat's own scratch dir (/tmp,
+# the engine's tmpfs or emptyDir), resolved with every symlink and `..` followed, so a repository's
+# test fixtures can push to a bare remote they made there. Everything else is refused, as before.
+# This is the fence's delivery check, not a filesystem boundary: receive-pack runs as the seat,
+# inside the seat's own floor, so it can write nothing the seat could not write itself.
+RUN cat > /usr/local/bin/git-remote-wicked-nopush <<'EOF'
+#!/bin/sh
+# git-remote-wicked-nopush <remote> <url>: a git remote helper (`connect` only).
+set -u
+unset CDPATH GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
+scratch_root=/tmp
+nl='
+'
+refuse() {
+    printf '%s\n' "wicked-nopush: $1; a worker seat pushes only to a bare repository inside its own scratch dir ($scratch_root), delivery is the deliver phase's job" >&2
+    exit 128
+}
+# The directory a path names, every component resolved (symlinks, `..`), kept byte for byte: a
+# sentinel keeps command substitution from eating a trailing newline of the name.
+resolve() {
+    r=$(cd -P -- "$1" 2>/dev/null && pwd -P && printf x) || return 1
+    r=${r%x}
+    r=${r%"$nl"}
+    case "$r" in *"$nl"*) return 1 ;; esac
+    printf '%s' "$r"
+}
+url=${2-}
+case "$url" in
+    *"$nl"*) refuse "a push URL with a newline refused" ;;
+    wicked-nopush:///*) path=${url#wicked-nopush://} ;;
+    *) refuse "push to a remote ($url) refused" ;;
+esac
+root=$(resolve "$scratch_root") || refuse "the scratch dir is missing"
+[ "$root" = "$scratch_root" ] && [ ! -L "$scratch_root" ] || refuse "the scratch dir $scratch_root is not a real directory"
+real=$(resolve "$path") || refuse "push target $path does not resolve to a directory"
+case "$real" in
+    "$root"/?*) ;;
+    *) refuse "push target $path resolves outside the scratch dir" ;;
+esac
+# receive-pack would enter <dir>/.git before <dir> itself.
+[ ! -e "$real/.git" ] && [ ! -L "$real/.git" ] || refuse "push target $path holds a .git entry"
+[ "$(git --git-dir="$real" rev-parse --is-bare-repository 2>/dev/null)" = true ] || refuse "push target $path is not a bare repository"
+while IFS= read -r line; do
+    case "$line" in
+        capabilities) printf 'connect\n\n' ;;
+        'connect git-receive-pack')
+            printf '\n'
+            exec git receive-pack "$real" ;;
+        '') exit 0 ;;
+        *) refuse "unsupported request: $line" ;;
+    esac
+done
+EOF
+RUN chmod 0755 /usr/local/bin/git-remote-wicked-nopush
 LABEL wicked.seat.cli=${CLI} wicked.seat.package=${CLI_PIN}
 ENTRYPOINT []

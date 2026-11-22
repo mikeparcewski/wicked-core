@@ -17158,7 +17158,45 @@ fn run_tool_cmd_budgeted(
 /// `<wrapper…> <cmd…>` and the child's environment is CLEARED to the validator allowlist before
 /// `extra_env` is applied — the walkthrough recorder is handed exactly the variables its caller
 /// declared, never the daemon's. `None` is today's unjailed spawn, byte-identical.
+///
+/// (core#840) A jail that died BEFORE exec because a directory it masks vanished after the
+/// launcher was built ([`crate::validator::vanished_mask`]: an ssh session ending, tmux exiting)
+/// never ran the tool, so it is run again, once, without the masks whose directory is gone. The
+/// launcher's diagnostic is the output's first line only when the tool printed nothing (it never
+/// started); any other result stands.
 fn run_tool_cmd_jailed(
+    cmd: &[String],
+    workdir: Option<&str>,
+    extra_env: &[(String, String)],
+    jail: Option<&[String]>,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+    let first = run_tool_cmd_jailed_once(cmd, workdir, extra_env, jail, stop, on_spawn, on_done);
+    let Some(wrapper) = jail.filter(|w| !w.is_empty()) else {
+        return first;
+    };
+    let died_on_a_vanished_mask = first.1 == crate::workflow::StepStatus::Failed
+        && first.2.is_none()
+        && crate::validator::vanished_mask(wrapper, first.0.lines().next().unwrap_or("")).is_some();
+    if !died_on_a_vanished_mask {
+        return first;
+    }
+    let rearmed = crate::validator::without_vanished_masks(wrapper);
+    run_tool_cmd_jailed_once(
+        cmd,
+        workdir,
+        extra_env,
+        Some(&rearmed),
+        stop,
+        on_spawn,
+        on_done,
+    )
+}
+
+/// One spawn of [`run_tool_cmd_jailed`].
+fn run_tool_cmd_jailed_once(
     cmd: &[String],
     workdir: Option<&str>,
     extra_env: &[(String, String)],
@@ -43403,6 +43441,79 @@ mod tool_cmd_tests {
     #[cfg(unix)]
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
+    }
+
+    /// A stand-in for bwrap with its pre-exec mount failure: every `--tmpfs` destination must
+    /// exist (a missing one cannot be created on the jail's read-only root), then it execs the
+    /// command after `--`.
+    #[cfg(unix)]
+    fn mask_checking_launcher(dir: &std::path::Path) -> std::path::PathBuf {
+        let launcher = dir.join("bwrap");
+        crate::test_env::install_stub(
+            &launcher,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    \
+             --tmpfs) [ -d \"$2\" ] || { echo \"bwrap: Can't mkdir $2: Read-only file system\" >&2; \
+             exit 1; }; shift 2 ;;\n    --) shift; exec \"$@\" ;;\n    *) shift ;;\n  esac\n\
+             done\nexit 1\n",
+        );
+        launcher
+    }
+
+    /// core#840: a socket directory that vanishes between the jail's mask enumeration and its
+    /// mount fails bwrap before exec; the tool is run again, once, without the vanished mask, and
+    /// a mask still present is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_jail_whose_mask_dir_vanished_before_its_mount_runs_the_tool_again() {
+        let dir = std::env::temp_dir().join(format!("wc-vanished-mask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kept = dir.join("tmux-kept");
+        let gone = dir.join("ssh-gone");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+        let launcher = mask_checking_launcher(&dir);
+        let jail: Vec<String> = vec![
+            launcher.to_string_lossy().into_owned(),
+            "--tmpfs".into(),
+            kept.to_string_lossy().into_owned(),
+            "--tmpfs".into(),
+            gone.to_string_lossy().into_owned(),
+            "--".into(),
+        ];
+        // The ssh session ends after the launcher was built.
+        std::fs::remove_dir(&gone).unwrap();
+        let spawns = std::cell::Cell::new(0);
+        let (out, st, k) = run_tool_cmd_jailed(
+            &sh("printf ran"),
+            None,
+            &[],
+            Some(&jail),
+            &never,
+            &|_| spawns.set(spawns.get() + 1),
+            &noop_done,
+        );
+        assert_eq!((st, out.as_str()), (StepStatus::Ok, "ran"), "{out}");
+        assert!(k.is_none());
+        assert_eq!(spawns.get(), 2, "one retry");
+        // A tool that ran and printed the same line is not run again: its mask dir is still there.
+        std::fs::create_dir_all(&gone).unwrap();
+        let spawns = std::cell::Cell::new(0);
+        let line = format!(
+            "bwrap: Can't mkdir {}: Read-only file system",
+            gone.display()
+        );
+        let (out, st, _) = run_tool_cmd_jailed(
+            &sh(&format!("printf '%s\\n' \"{line}\" >&2; exit 1")),
+            None,
+            &[],
+            Some(&jail),
+            &never,
+            &|_| spawns.set(spawns.get() + 1),
+            &noop_done,
+        );
+        assert_eq!(st, StepStatus::Failed, "{out}");
+        assert_eq!(spawns.get(), 1, "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
