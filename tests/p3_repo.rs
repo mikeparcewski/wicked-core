@@ -281,6 +281,19 @@ fn launch_in_repo_creates_worktree_and_passes_workdir() {
     assert_eq!(v.session.repo_ref.as_deref(), Some(entry.id.as_str()));
 }
 
+/// (core#1434) Wait until `run_id`'s cancel cleanup has ended. The bound only fails a reap that
+/// never ends.
+fn wait_cleanup_settled(core: &Core, run_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while core.worktree_cleanup_pending(run_id).unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{run_id}'s worktree cleanup never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
     // F-E2E-028: cancel used to FORCE-discard the worktree — run 01234444's creator fix (3 files)
@@ -307,7 +320,9 @@ fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
     assert!(wt.is_dir(), "worktree exists while the run is parked");
 
     assert_eq!(core.cancel_run("run2").unwrap(), SessionStatus::Cancelled);
-    // The (synchronous) cancel cleanup reaps a CLEAN worktree.
+    // The cancel's cleanup runs off the actor after the cancel replies (core#1409): wait for it to
+    // end, then a CLEAN worktree is gone.
+    wait_cleanup_settled(&core, "run2");
     assert!(
         !wt.is_dir(),
         "cancelling a run with a clean worktree reaps it (nothing to lose)"
@@ -322,6 +337,7 @@ fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
     assert!(wt.is_dir());
     std::fs::write(wt.join("fix.txt"), "the creator's uncommitted fix\n").unwrap();
     assert_eq!(core.cancel_run("run3").unwrap(), SessionStatus::Cancelled);
+    wait_cleanup_settled(&core, "run3");
     assert!(
         wt.join("fix.txt").is_file(),
         "cancelling a run whose worktree holds uncommitted work keeps the worktree and the work"
