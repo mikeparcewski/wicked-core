@@ -68,8 +68,27 @@
 //! and its rewrite is seen. All three were reproduced escapes (adversarial review on #414): a
 //! redirected `.git` file made both snapshots describe a repository the evaluator controlled, an
 //! inherited `assume-unchanged` bit made a rewrite hash as its cached original, and an empty seed
-//! dropped a committed-but-ignored file from both snapshots. Full re-hash, HEAD-seeded, pinned
-//! directory — on purpose.
+//! dropped a committed-but-ignored file from both snapshots. HEAD-seeded, pinned directory — on
+//! purpose.
+//!
+//! ## The engine's own stat cache (core#1402)
+//!
+//! A HEAD-seeded index has no stat data, so every snapshot re-hashed every file (30–45 s for a
+//! 1,300-file tree on a loaded host). The engine now keeps the scratch index of a tree's last
+//! snapshot IN ITS OWN MEMORY — no file a seat could reach, plant, link or edit — keyed by the
+//! resolved worktree and pinned git dir. The next snapshot of the same tree starts from a fresh
+//! scratch file holding those bytes (created exclusively, its mtime set back to the cached
+//! index's so git's racy-entry check holds) and seeds it with `read-tree -m HEAD`: the index
+//! becomes exactly `HEAD`'s tree, as before, but an entry whose blob is `HEAD`'s keeps the stat
+//! data the engine recorded for it. `add -A` then re-hashes only the files whose stat data changed,
+//! and the entry set (committed paths kept, untracked ones re-judged against today's ignore
+//! rules) is the HEAD-seeded one. An unborn branch, the read-only snapshot (its blobs live in a
+//! throwaway object dir), a filesystem without sub-second timestamps and Windows (whose ctime is
+//! the creation time) take the HEAD-seeded path. A cached attempt that fails is retried once from
+//! HEAD. Stat trust is pinned on the command line ([`STAT_TRUST`]), so a
+//! seat's repository config cannot loosen it: a same-size rewrite with its mtime put back still
+//! moves the ctime, which a seat cannot set, and is re-hashed. The gate hook's write-root witness
+//! is unchanged (its own `ls-files` + `stat` walk).
 //!
 //! ## No exemptions
 //!
@@ -383,18 +402,136 @@ fn plain_path(p: PathBuf) -> PathBuf {
 ///   (adversarial review on #414, first pass: `git update-index --assume-unchanged src/a.ts` +
 ///   rewrite used to snapshot as Clean).
 ///
-/// The full re-hash is the price, paid on purpose.
+/// (core#1402) The re-hash is paid once per tree: a later snapshot of the same tree carries over
+/// the stat data of the engine's in-memory copy of the previous scratch index (see the module's
+/// "stat cache" section), never anything on disk a seat could have written.
 pub(crate) fn snapshot_through(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    snapshot_through_inner(worktree, git_dir, &[])
+    snapshot_through_inner(worktree, git_dir, &[], true)
+}
+
+/// (core#1402) The stat-trust settings every snapshot's `read-tree` and `add -A` run with, on the
+/// command line so they override any repository, worktree or global config (a seat can write its
+/// worktree's git config): ctime and the full stat tuple are compared, no entry is assumed
+/// unchanged, and no fsmonitor, untracked cache or split index can answer for the filesystem.
+const STAT_TRUST: [&str; 14] = [
+    "-c",
+    "core.trustctime=true",
+    "-c",
+    "core.checkStat=default",
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.splitIndex=false",
+    "-c",
+    "index.sparse=false",
+];
+
+/// (core#1402) One tree's last scratch index, as the engine wrote it.
+struct CachedIndex {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    bytes: Vec<u8>,
+    mtime: std::time::SystemTime,
+    used: u64,
+}
+
+/// At most this many trees are cached, and at most [`STAT_CACHE_BYTES`] in all; the least
+/// recently used go first. A tree's index is about 100 bytes a file.
+const STAT_CACHE_TREES: usize = 64;
+const STAT_CACHE_BYTES: usize = 128 << 20;
+
+fn stat_cache() -> &'static std::sync::Mutex<(u64, Vec<CachedIndex>)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(u64, Vec<CachedIndex>)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new((0, Vec::new())))
+}
+
+/// The cache key: the resolved spellings, so two spellings of one tree share an entry and two
+/// trees never do.
+fn stat_cache_key(worktree: &Path, git_dir: &Path) -> (PathBuf, PathBuf) {
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    (resolve(worktree), resolve(git_dir))
+}
+
+/// Whether the tree's filesystem keeps sub-second timestamps. On one that does not, a rewrite in
+/// the same second as the cached stat read would keep its ctime, so the cache is not used there.
+fn fine_grained_times(worktree: &Path) -> bool {
+    std::fs::metadata(worktree)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|d| d.subsec_nanos() != 0)
+}
+
+/// The cached index for `key`, if there is one.
+fn stat_cache_get(key: &(PathBuf, PathBuf)) -> Option<(Vec<u8>, std::time::SystemTime)> {
+    let mut guard = stat_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let (clock, entries) = &mut *guard;
+    *clock += 1;
+    let e = entries
+        .iter_mut()
+        .find(|e| e.worktree == key.0 && e.git_dir == key.1)?;
+    e.used = *clock;
+    Some((e.bytes.clone(), e.mtime))
+}
+
+/// Keep `bytes` as the tree's index, replacing its previous entry.
+fn stat_cache_put(key: (PathBuf, PathBuf), bytes: Vec<u8>, mtime: std::time::SystemTime) {
+    let mut guard = stat_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let (clock, entries) = &mut *guard;
+    entries.retain(|e| !(e.worktree == key.0 && e.git_dir == key.1));
+    if bytes.len() > STAT_CACHE_BYTES / 4 {
+        return;
+    }
+    *clock += 1;
+    entries.push(CachedIndex {
+        worktree: key.0,
+        git_dir: key.1,
+        bytes,
+        mtime,
+        used: *clock,
+    });
+    while entries.len() > STAT_CACHE_TREES
+        || entries.iter().map(|e| e.bytes.len()).sum::<usize>() > STAT_CACHE_BYTES
+    {
+        let Some(oldest) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.used)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        entries.remove(oldest);
+    }
+}
+
+/// Drop the tree's entry (a cached attempt that failed).
+fn stat_cache_drop(key: &(PathBuf, PathBuf)) {
+    let mut guard = stat_cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .1
+        .retain(|e| !(e.worktree == key.0 && e.git_dir == key.1));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY: how many snapshots on this thread started from the stat cache.
+    pub(crate) static SEEDED_FROM_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn snapshot_through_inner(
     worktree: &Path,
     git_dir: &Path,
     extra_env: &[(&str, &Path)],
+    use_cache: bool,
 ) -> anyhow::Result<WorktreeSnapshot> {
     let mut pinned = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     pinned.extend_from_slice(extra_env);
@@ -408,6 +545,58 @@ fn snapshot_through_inner(
     let head_ref = git_string(worktree, &["symbolic-ref", "-q", "HEAD"], &pinned)
         .ok()
         .filter(|r| !r.is_empty());
+    // (core#1402) Windows is never cached: its ctime is the creation time, so a same-size rewrite
+    // with its mtime put back would keep every stat field.
+    let key = (use_cache && cfg!(not(windows)) && !head.is_empty() && fine_grained_times(worktree))
+        .then(|| stat_cache_key(worktree, git_dir));
+    if let Some(key) = &key {
+        if let Some(seed) = stat_cache_get(key) {
+            match tree_of_index(worktree, &pinned, &head, Some(&seed)) {
+                Ok((tree, index)) => {
+                    #[cfg(test)]
+                    SEEDED_FROM_CACHE.with(|c| c.set(c.get() + 1));
+                    if let Some((bytes, mtime)) = index {
+                        stat_cache_put(key.clone(), bytes, mtime);
+                    }
+                    return Ok(WorktreeSnapshot {
+                        head,
+                        head_ref,
+                        tree,
+                        taken_at_ms: now_ms(),
+                        git_dir: Some(git_dir.to_string_lossy().into_owned()),
+                    });
+                }
+                // A cached attempt that fails (its scratch file could not be made new, or git
+                // refused the seeded index) drops the entry, and the snapshot is taken from HEAD
+                // as if there were none; a failure there is the snapshot's error, as before.
+                Err(_) => stat_cache_drop(key),
+            }
+        }
+    }
+    let (tree, index) = tree_of_index(worktree, &pinned, &head, None)?;
+    if let (Some(key), Some((bytes, mtime))) = (key, index) {
+        stat_cache_put(key, bytes, mtime);
+    }
+    Ok(WorktreeSnapshot {
+        head,
+        head_ref,
+        tree,
+        taken_at_ms: now_ms(),
+        git_dir: Some(git_dir.to_string_lossy().into_owned()),
+    })
+}
+
+/// One snapshot's index work: seed a fresh scratch index with `HEAD`'s tree (carrying over the stat
+/// data of `seed`, the cached index bytes and mtime, when given), `add -A` the worktree into it
+/// under [`STAT_TRUST`], and `write-tree`. Returns the tree id and the finished scratch index (its
+/// bytes and mtime), which the caller may cache. The scratch files are removed on every exit.
+#[allow(clippy::type_complexity)]
+fn tree_of_index(
+    worktree: &Path,
+    pinned: &[(&str, &Path)],
+    head: &str,
+    seed: Option<&(Vec<u8>, std::time::SystemTime)>,
+) -> anyhow::Result<(String, Option<(Vec<u8>, std::time::SystemTime)>)> {
     let tmp_index = plain_path(scratch_index_path());
     // A stale scratch file from a crashed run would seed the index — refuse to start from one.
     let _ = std::fs::remove_file(&tmp_index);
@@ -419,52 +608,66 @@ fn snapshot_through_inner(
     let excludes = tmp_index.with_extension("exclude");
     std::fs::write(&excludes, format!("/{ENGINE_SCRATCH_DIR}/\n"))?;
     let excludes_arg = format!("core.excludesFile={}", excludes.display());
-    let mut env = pinned;
+    let mut env = pinned.to_vec();
     env.push(("GIT_INDEX_FILE", tmp_index.as_path()));
     let result = (|| -> anyhow::Result<String> {
-        // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
-        // unborn branch there is nothing to seed: `add -A` builds the index from scratch.
-        // No hook runs for the snapshot: a repository's `core.hooksPath` (a `post-index-change`)
-        // must not run engine-side code on a scratch index (DES-FLOOR-CONTAINER review).
-        if !head.is_empty() {
-            git(
-                worktree,
-                &["-c", "core.hooksPath=/dev/null", "read-tree", "HEAD"],
-                &env,
-            )?;
+        if let Some((bytes, mtime)) = seed {
+            // (core#1402) A NEW file (never one already there, nor a link someone planted at the
+            // scratch path), holding the engine's own bytes, with the cached index's mtime: git
+            // judges an entry racily clean against the index file's mtime, and a fresh one would
+            // vouch for a same-tick rewrite.
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_index)?;
+            f.write_all(bytes)?;
+            f.set_modified(*mtime)?;
+            drop(f);
+            // The single-tree merge: the index becomes HEAD's tree exactly (an entry HEAD lacks is
+            // dropped, to be re-judged by `add -A` below), and an entry whose blob is HEAD's keeps
+            // the stat data the engine recorded for it.
+            let mut read: Vec<&str> = vec!["-c", "core.hooksPath=/dev/null"];
+            read.extend_from_slice(&STAT_TRUST);
+            read.extend_from_slice(&["read-tree", "-m", "HEAD"]);
+            git(worktree, &read, &env)?;
+        } else if !head.is_empty() {
+            // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
+            // unborn branch there is nothing to seed: `add -A` builds the index from scratch.
+            // No hook runs for the snapshot: a repository's `core.hooksPath` (a
+            // `post-index-change`) must not run engine-side code on a scratch index
+            // (DES-FLOOR-CONTAINER review).
+            let mut read: Vec<&str> = vec!["-c", "core.hooksPath=/dev/null"];
+            read.extend_from_slice(&STAT_TRUST);
+            read.extend_from_slice(&["read-tree", "HEAD"]);
+            git(worktree, &read, &env)?;
         }
-        git(
-            worktree,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                &excludes_arg,
-                "add",
-                "-A",
-                "--",
-                ".",
-            ],
-            &env,
-        )?;
+        let mut add: Vec<&str> = vec![
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            excludes_arg.as_str(),
+        ];
+        add.extend_from_slice(&STAT_TRUST);
+        add.extend_from_slice(&["add", "-A", "--", "."]);
+        git(worktree, &add, &env)?;
         git_string(
             worktree,
             &["-c", "core.hooksPath=/dev/null", "write-tree"],
             &env,
         )
     })();
+    // The finished index, for the caller's cache: read before the scratch is removed.
+    let index = result.as_ref().ok().and_then(|_| {
+        let bytes = std::fs::read(&tmp_index).ok()?;
+        let mtime = std::fs::metadata(&tmp_index).ok()?.modified().ok()?;
+        Some((bytes, mtime))
+    });
     // Scratch hygiene on every exit — including `add`'s `<index>.lock` if it was left behind.
     let _ = std::fs::remove_file(&tmp_index);
     let _ = std::fs::remove_file(tmp_index.with_extension("idx.lock"));
     let _ = std::fs::remove_file(&excludes);
-    let tree = result?;
-    Ok(WorktreeSnapshot {
-        head,
-        head_ref,
-        tree,
-        taken_at_ms: now_ms(),
-        git_dir: Some(git_dir.to_string_lossy().into_owned()),
-    })
+    Ok((result?, index))
 }
 
 /// Take the worktree's content snapshot, pinned to the registered repository `repo_root` (see
@@ -494,6 +697,8 @@ pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow:
     )?);
     let temporary_objects = plain_path(scratch_index_path().with_extension("objects"));
     std::fs::create_dir(&temporary_objects)?;
+    // Never cached (core#1402): its new blobs are deleted below, so its index would name objects
+    // the repository never had.
     let result = snapshot_through_inner(
         &worktree,
         &git_dir,
@@ -501,6 +706,7 @@ pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow:
             ("GIT_OBJECT_DIRECTORY", temporary_objects.as_path()),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_path()),
         ],
+        false,
     )
     .map(|snapshot| snapshot.tree);
     // Remove newly written objects on success AND on any snapshot error.
@@ -2019,5 +2225,139 @@ pub(crate) mod tests {
             outcome_for_unit(&unit, Some(&dir)),
             Some(WorktreeGuardOutcome::Unverifiable(_))
         ));
+    }
+
+    fn seeded() -> u64 {
+        SEEDED_FROM_CACHE.with(|c| c.get())
+    }
+
+    /// Set `path`'s mtime, as a seat can (`touch -d`); its ctime moves to now regardless.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// (core#1402) The second snapshot of a tree starts from the engine's stat cache, and comes to
+    /// the same tree as the HEAD-seeded path; so do snapshots after a commit, a new file, a
+    /// deletion and an ignore rule that hides an earlier untracked file (the read-only snapshot is
+    /// never cached, so it is the HEAD-seeded reference).
+    #[cfg(not(windows))]
+    #[test]
+    fn a_snapshot_starts_from_the_stat_cache_and_matches_the_head_seeded_tree_1402() {
+        let wt = creator_worktree("statcache-reuse");
+        let repo = repo_of(&wt);
+        let first = snapshot(&wt, &repo).unwrap();
+        let n = seeded();
+        let again = snapshot(&wt, &repo).unwrap();
+        assert_eq!(
+            seeded(),
+            n + 1,
+            "the second snapshot started from the cache"
+        );
+        assert_eq!(again.tree, first.tree);
+        std::fs::write(wt.join("build.out"), "untracked, not ignored yet\n").unwrap();
+        let steps: [(&str, &dyn Fn()); 4] = [
+            ("an untracked file", &|| ()),
+            ("an ignore rule that now hides it", &|| {
+                std::fs::write(
+                    wt.join(".gitignore"),
+                    "node_modules/\n*.local.json\n*.out\n",
+                )
+                .unwrap()
+            }),
+            ("a commit", &|| {
+                run_git(&wt, &["add", "-A"]);
+                run_git(&wt, &["commit", "-qm", "creator work"]);
+            }),
+            ("a deletion", &|| {
+                std::fs::remove_file(wt.join("src/b.ts")).unwrap()
+            }),
+        ];
+        for (what, step) in steps {
+            step();
+            let n = seeded();
+            let cached = snapshot(&wt, &repo).unwrap();
+            assert_eq!(seeded(), n + 1, "after {what}: started from the cache");
+            assert_eq!(
+                cached.tree,
+                snapshot_readonly(&wt, &repo).unwrap(),
+                "after {what}: the cached snapshot is the HEAD-seeded tree"
+            );
+        }
+    }
+
+    /// (core#1402) A committed file rewritten at the same size with its mtime put back keeps every
+    /// stat field a seat controls; its ctime still moves, and the cached snapshot re-hashes it, even
+    /// with the repository's config told to trust less (a seat can write that config).
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_rewrite_with_its_mtime_put_back_is_seen_through_the_cache_1402() {
+        let wt = creator_worktree("statcache-forge");
+        let repo = repo_of(&wt);
+        let file = wt.join("config/settings.local.json");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        set_mtime(&file, old);
+        for (key, value) in [
+            ("core.trustctime", "false"),
+            ("core.checkStat", "minimal"),
+            ("core.ignoreStat", "true"),
+        ] {
+            run_git(&repo, &["config", key, value]);
+        }
+        let before = snapshot(&wt, &repo).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let original = std::fs::read(&file).unwrap();
+        let forged = b"{\"port\":2}\n";
+        assert_eq!(original.len(), forged.len(), "a same-size rewrite");
+        std::fs::write(&file, forged).unwrap();
+        set_mtime(&file, old);
+        let n = seeded();
+        let m = compare(&wt, &before)
+            .unwrap()
+            .expect("the forged rewrite is a mutation");
+        assert_eq!(seeded(), n + 1, "the comparison started from the cache");
+        assert!(
+            m.changed
+                .iter()
+                .any(|c| c.path == "config/settings.local.json"),
+            "{:?}",
+            m.changed
+        );
+    }
+
+    /// (core#1402) The cache is per tree: another worktree of the same repository never starts
+    /// from it, and the read-only snapshot never fills it.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_stat_cache_is_per_tree_and_the_readonly_snapshot_never_fills_it_1402() {
+        let wt = creator_worktree("statcache-keyed");
+        let repo = repo_of(&wt);
+        snapshot(&wt, &repo).unwrap();
+        let other = wt.parent().unwrap().join("wt-other");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other.to_str().unwrap(),
+                "-b",
+                "wicked/statcache-other",
+            ],
+        );
+        let n = seeded();
+        snapshot_readonly(&other, &repo).unwrap();
+        snapshot(&other, &repo).unwrap();
+        assert_eq!(
+            seeded(),
+            n,
+            "neither another tree's entry nor a read-only snapshot seeded it"
+        );
+        snapshot(&other, &repo).unwrap();
+        assert_eq!(seeded(), n + 1, "its own entry does");
     }
 }

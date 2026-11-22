@@ -3,10 +3,11 @@
 //!
 //! A dispatch used to read the worktree on the actor thread, up to four times: the unit's baseline
 //! snapshot, the tree a new author starts on, the tree a QE unit's floor note is about and the tree
-//! an editor-conformance record must match. Each snapshot re-hashes every tracked file (a fresh
-//! scratch index has no stat cache), 30–45 s for a 1,300-file worktree on a loaded host, and every
-//! read and gate answer of every run waited behind it. A QE unit's diff score (the code graph and
-//! git history) and a reviewer's requirements record (the code graph and git) ran there too.
+//! an editor-conformance record must match. Each snapshot re-hashed every tracked file (a fresh
+//! scratch index had no stat cache, until core#1402's in-memory one), 30–45 s for a 1,300-file
+//! worktree on a loaded host, and every read and gate answer of every run waited behind it. A QE
+//! unit's diff score (the code graph and git history) and a reviewer's requirements record (the
+//! code graph and git) ran there too.
 //!
 //! Now [`super::dispatch_unit`] takes no tree read on the actor. When the unit needs one, it starts
 //! a probe thread and returns. The thread takes ONE snapshot (all four uses read the same tree: no
