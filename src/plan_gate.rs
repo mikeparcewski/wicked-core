@@ -1486,11 +1486,10 @@ pub(crate) fn gate_prompt(p: &PendingPlan, ord: u32, auto: bool) -> String {
         steps.join(" → ")
     );
     if !p.band_why.is_empty() {
-        out.push_str(&format!(
-            ". Band {} from: {}",
-            p.band,
-            p.band_why.join("; ")
-        ));
+        // A reason is free text (a PA's own `RISK` reasons ride the score): an arrow in it would
+        // read as a step separator to a parser of the step list, so it is spelled `->` here.
+        let why = p.band_why.join("; ").replace('\u{2192}', "->");
+        out.push_str(&format!(". Band {} from: {why}", p.band));
     }
     if !p.floor_added.is_empty() {
         out.push_str(&format!(". Floor added: {}", p.floor_added.join(", ")));
@@ -2224,6 +2223,19 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("; 2 declared file(s)"), "{prompt}");
+        // A reason with an arrow (a PA's free-text `RISK` reason) never reads as a step separator.
+        let mut arrowed = held.clone();
+        arrowed
+            .band_why
+            .push("draft \u{2192} customer publication".into());
+        let prompt = gate_prompt(&arrowed, 1, false);
+        let steps_part = prompt.split("): ").nth(1).unwrap();
+        assert_eq!(
+            steps_part.matches('\u{2192}').count(),
+            arrowed.steps.steps.len() - 1,
+            "only the step list carries arrows: {prompt}"
+        );
+        assert!(prompt.contains("draft -> customer publication"), "{prompt}");
         // A row persisted before the field existed reads as no reasons, and the prompt is as before.
         let mut old = serde_json::to_value(held).unwrap();
         old.as_object_mut().unwrap().remove("band_why");
