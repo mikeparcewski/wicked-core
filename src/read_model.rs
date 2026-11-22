@@ -152,7 +152,10 @@ impl ReadModel {
             if let Some(hook) = self.after_quiet.lock().unwrap().take() {
                 hook();
             }
-            // `BEGIN` (deferred), then one SELECT: the snapshot everything `f` reads is pinned here.
+            // `begin_batch`, then one SELECT: the snapshot everything `f` reads is pinned here.
+            // Estate 0.35 begins `IMMEDIATE` (estate#532); on this read-only connection to a WAL
+            // store that is still a read transaction and takes no write lock, so the actor keeps
+            // writing (pinned by `one_read_sees_one_committed_state_even_when_a_write_lands_midway`).
             if store.begin_batch().is_err() || store.meta_get("history_enabled").is_err() {
                 let _ = store.commit_batch();
                 *slot = None;
