@@ -2088,6 +2088,9 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
     let Ok(root) = std::fs::canonicalize(repo_root) else {
         return 0;
     };
+    // (coord review) The plain spelling: Windows' verbatim `\\?\` form never equals what git wrote,
+    // and git refuses it as a link, so every boot would rewrite every tree into a broken one.
+    let root = crate::worktree_guard::plain_path(root);
     let admin_root = root.join(".git").join("worktrees");
     let Ok(entries) = std::fs::read_dir(&admin_root) else {
         return 0;
@@ -2118,11 +2121,23 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
                     .map(|p| PathBuf::from(p.trim()))
             })
             .unwrap_or_default();
+        // `<...>/wicked-worktrees/<name>/.git` and `<...>/.git/worktrees/<name>`: the layout this
+        // walk serves, so a legacy-layout admin dir is never pointed at a tree of the same name.
         let back_pairs = back.file_name().is_some_and(|n| n == ".git")
-            && back.parent().and_then(Path::file_name) == Some(name.as_os_str());
+            && back.parent().and_then(Path::file_name) == Some(name.as_os_str())
+            && back
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                == trees.file_name();
         let pointer_pairs = pointer.file_name() == Some(name.as_os_str())
             && pointer.parent().and_then(Path::file_name)
-                == Some(std::ffi::OsStr::new("worktrees"));
+                == Some(std::ffi::OsStr::new("worktrees"))
+            && pointer
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new(".git"));
         if !back_pairs || !pointer_pairs || (back == dot_git && pointer == admin) {
             continue;
         }
@@ -4873,6 +4888,7 @@ mod tests {
         let b = create_worktree(p, "run-b").unwrap();
         let c = create_worktree(p, "run-c").unwrap();
         create_worktree(p, "run-d").unwrap();
+        create_worktree(p, "run-e").unwrap();
         let canon = std::fs::canonicalize(&old).unwrap();
         let admin_at = |root: &Path, n: &str| root.join(".git").join("worktrees").join(n);
         std::fs::write(
@@ -4903,6 +4919,17 @@ mod tests {
         let d_back = admin_at(&canon, "run-d").join("gitdir");
         std::fs::remove_file(&d_back).unwrap();
         std::os::unix::fs::symlink(&outside_d, &d_back).unwrap();
+        // (coord review) A back-pointer in the pre-crew#276 layout pairs with no tree here.
+        let legacy = format!(
+            "{}\n",
+            canon
+                .join(".wicked")
+                .join("worktrees")
+                .join("run-e")
+                .join(".git")
+                .display()
+        );
+        std::fs::write(admin_at(&canon, "run-e").join("gitdir"), &legacy).unwrap();
 
         let moved = sentinel("moved");
         let _ = std::fs::remove_dir_all(&moved);
@@ -4953,9 +4980,32 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&outside_c).unwrap(), text_c);
         assert_eq!(std::fs::read_to_string(&outside_d).unwrap(), text_d);
+        assert_eq!(
+            std::fs::read_to_string(admin_at(&resolved, "run-e").join("gitdir")).unwrap(),
+            legacy,
+            "a legacy-layout back-pointer is skipped"
+        );
         let _ = std::fs::remove_file(&outside_c);
         let _ = std::fs::remove_file(&outside_d);
         let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    /// core#1662 (coord review): on every OS (Windows' canonical spelling is verbatim), a boot on a
+    /// checkout that did not move leaves this daemon's tree live, and a second boot repairs nothing.
+    #[test]
+    fn an_unmoved_checkouts_trees_stay_live_through_the_boot_repair() {
+        let root = git_repo("unmoved-repair");
+        let p = root.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let wt = create_worktree(p, "run-still").unwrap();
+        repair_moved_worktrees("r", p, Some("daemon-me"));
+        assert!(
+            is_live_worktree(&wt),
+            "the tree is still a worktree after a boot"
+        );
+        assert_eq!(repair_moved_worktrees("r", p, Some("daemon-me")), 0);
+        assert!(is_live_worktree(&wt));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// core#1662 (review): a seat that leaves a FIFO in place of its admin dir's daemon marker or
