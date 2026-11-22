@@ -474,9 +474,10 @@ fn dispute_worker(d: Arc<Splitter>, deadline_at: Instant, stagger: Duration) -> 
 
 #[test]
 fn no_runoff_starts_after_the_absolute_deadline() {
-    // (core#1794) Ordered by events, not by a wall-clock margin: ballot 1 answers at once, long
-    // before the deadline, and ballot 2 is held until just past it. A loaded host that is slow to
-    // run ballot 1 can no longer push it over the deadline (the 300 ms / 520 ms margin it had).
+    // (core#1794) Ballot 2's end is pinned past the deadline by an event (it is held until then),
+    // so only the start of the run is timed: setup, ballot 1 (which answers at once) and ballot 2's
+    // three seats starting must fit in the 2 s before the deadline. That was 300 ms of sleep in a
+    // 520 ms window, which a loaded runner overran.
     let deadline_at = Instant::now() + Duration::from_secs(2);
     let d = Arc::new(Splitter {
         delay: Duration::ZERO,
