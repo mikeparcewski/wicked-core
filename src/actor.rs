@@ -1044,6 +1044,17 @@ pub(crate) fn run(
     let process_gen: uuid::Uuid = uuid::Uuid::new_v4();
     // (program DES-POWER-MODE) A power build's worker reaches this actor by its generation.
     crate::power::register_actor(process_gen, self_tx.clone());
+    // (core#1662) A checkout that moved since its run worktrees were minted: this daemon's trees get
+    // their git links repaired to the checkout's resolved paths before anything else reads them
+    // (a container seat mounts resolved paths), so before the boot cancels below (a cancel starts
+    // its tree's cleanup), the resumed cleanups and the reaper. Nothing is removed. Synchronous,
+    // before any thread that touches a tree starts.
+    if let Ok(repos) = crate::repo::list_repos(&store) {
+        let owner = crate::repo::bound_daemon_owner();
+        for r in &repos {
+            crate::repo::repair_moved_worktrees(&r.id, &r.root_path, owner.as_deref());
+        }
+    }
     // (DES-TEAMING-002 P1) A `team_transport` reject recorded before the restart is finished here,
     // now that the actor's seams exist: the run tombstone is already written (boot reconcile), so
     // the cancel publishes only `path.ended`.
@@ -1150,16 +1161,6 @@ pub(crate) fn run(
         // through the upgrade with no live graph — name each one and the remedy, once, here.
         for notice in repos.iter().filter_map(crate::repo::boot_notice) {
             eprintln!("{notice}");
-        }
-    }
-    // (core#1662) A checkout that moved since its run worktrees were minted: this daemon's trees get
-    // their git links repaired to the checkout's resolved paths before anything else reads them
-    // (a container seat mounts resolved paths), so before the resumed cleanups below and the
-    // reaper. Nothing is removed. Synchronous, before any thread that touches a tree starts.
-    if let Ok(repos) = &boot_repos {
-        let owner = crate::repo::bound_daemon_owner();
-        for r in repos {
-            crate::repo::repair_moved_worktrees(&r.id, &r.root_path, owner.as_deref());
         }
     }
     // (core#1434) A cancel's cleanup the last life of this daemon never heard the end of is reaped
