@@ -78,7 +78,10 @@
 //! from the seat's environment: an https/http endpoint that accepts an anonymous push or takes a
 //! secret the seat already holds (in its own `http.extraHeader`, which it could send without git
 //! as well), or a local path the container floor bounds. This module refuses the `git push`
-//! literal, the `git config url.*` / `remote.*` write and `git remote set-url --push`. Not covered
+//! literal, the `git config url.*` / `remote.*` write (core#1792: also with a trailing `get` /
+//! `list` value), `git clone -c` of a fenced key and `git remote set-url --push`; a direct write
+//! of `.git/config` (a file write, not a command) and a `git send-pack` to a local path (no
+//! https, ssh refused) are the same stated limit as a script. Not covered
 //! either: a `git` carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c
 //! core.sshCommand=ssh` — command-line `-c` outranks the environment entries) or its own
 //! `GIT_SSH_COMMAND`, and a seat that scrubs its environment (`env -i`) first. This module
@@ -1083,6 +1086,12 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     if sub == "config" {
         return judge_git_config(rest);
     }
+    if sub == "clone" {
+        // (core#1792) `git clone -c <k=v>` writes the key into the new repository's config.
+        if let Some(key) = clone_config_keys(rest).find(|k| fenced_config_key(k)) {
+            return Some(format!("clone -c {key} (fenced key)"));
+        }
+    }
     if sub == "remote"
         && rest.iter().any(|r| r == "set-url")
         && rest
@@ -1109,6 +1118,24 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     None
 }
 
+/// The keys of `git clone`'s `-c <k=v>` / `--config <k=v>` (and the attached `-ck=v`,
+/// `--config=k=v`; git's option parser also takes the unambiguous prefixes `--con`, `--conf`, …).
+fn clone_config_keys(rest: &[String]) -> impl Iterator<Item = &str> {
+    let long = |t: &str| t.len() > 4 && "--config".starts_with(t);
+    rest.iter().enumerate().filter_map(move |(i, t)| {
+        let kv = if t == "-c" || long(t) {
+            rest.get(i + 1)?.as_str()
+        } else if let Some((_, v)) = t.split_once('=').filter(|(f, _)| long(f)) {
+            v
+        } else if let Some(v) = t.strip_prefix("-c").filter(|v| !v.is_empty()) {
+            v
+        } else {
+            return None;
+        };
+        Some(kv.split('=').next().unwrap_or(kv))
+    })
+}
+
 /// `git config …`: a READ (`--get*`, `-l`/`--list`, `--show-*`) passes; a write naming a fenced
 /// key — `alias.*`, `url.*`, `remote.*`, `credential.*`, `core.sshCommand`, … — is refused,
 /// whichever file it targets (`--global`, `--system`, `--file`, the repo's).
@@ -1124,10 +1151,19 @@ fn judge_git_config(rest: &[String]) -> Option<String> {
         "--list",
         "--show-origin",
         "--show-scope",
-        "list",
-        "get",
     ];
     if rest.iter().any(|r| READ_FLAGS.contains(&r.as_str())) {
+        return None;
+    }
+    // (core#1792) `get` / `list` name a read only as git's subcommand form, the first positional
+    // (`git config get <key>`); anywhere else it is a value (`git config remote.x.pushurl <url>
+    // get` writes the key).
+    if matches!(
+        rest.iter()
+            .find(|r| !r.starts_with('-'))
+            .map(String::as_str),
+        Some("get" | "list")
+    ) {
         return None;
     }
     rest.iter()
@@ -1485,6 +1521,22 @@ mod tests {
         // …while reads of the same keys, and ordinary config writes, pass.
         assert_eq!(hit("git config --get alias.p"), None);
         assert_eq!(hit("git config --list"), None);
+        // core#1792: `get` / `list` read only as the subcommand; as a value the write is refused.
+        assert_eq!(hit("git config get remote.origin.url"), None);
+        assert_eq!(hit("git config list"), None);
+        for cmd in [
+            "git config remote.x.pushurl https://example.invalid/o/r.git get",
+            "git config url.https://example.invalid/.pushInsteadOf '' list",
+            "git clone -c remote.origin.pushurl=https://example.invalid/o/r.git https://example.invalid/a/b.git",
+            "git clone --config=url.x.pushInsteadOf=y https://example.invalid/a/b.git",
+            "git clone --config remote.origin.pushurl=z src dst",
+            "git clone --conf remote.origin.pushurl=z src dst",
+            "git clone -cremote.origin.pushurl=z src dst",
+        ] {
+            assert!(hit(cmd).is_some(), "not refused: {cmd}");
+        }
+        assert_eq!(hit("git clone -c core.autocrlf=false src dst"), None);
+        assert_eq!(hit("git clone https://example.invalid/a/b.git"), None);
         assert_eq!(hit("git config user.name 'wicked worker'"), None);
         assert_eq!(hit("git config core.autocrlf false"), None);
         assert_eq!(hit("git -c user.email=a@b.invalid commit -m x"), None);

@@ -553,6 +553,9 @@ pub(crate) fn env_file(vars: &[(String, String)]) -> Result<String, String> {
     Ok(s)
 }
 
+/// What std's unix `Command` stores for an argument holding a NUL (`get_args` reads it back).
+const STD_NUL_ARG_PLACEHOLDER: &str = "<string-with-nul>";
+
 /// The `set --` line that hands the wrapper the launcher and CLI argv (pure, single-quoted).
 pub(crate) fn argv_line(argv: &[String]) -> Result<String, String> {
     if argv.is_empty() {
@@ -3563,6 +3566,12 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
     let Some(id) = seat_id_of(&args) else {
         return Ok(None);
     };
+    // (core#1750) std's unix `Command` keeps an argument holding a NUL as this placeholder and
+    // reports it only when that same command spawns. This rebuild never spawns it, so the CLI
+    // would run on the placeholder: refuse it here, with the reason `argv_line` would name.
+    if args.iter().any(|a| a == STD_NUL_ARG_PLACEHOLDER) {
+        return Err("a seat argument holds a NUL".into());
+    }
     let seat = lookup(&id).ok_or("the seat's pod is no longer armed")?;
     if let Some(warm) = seat.warm.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         if !warm.checkout.live() {

@@ -2372,14 +2372,17 @@ while [ "$1" != exec ]; do shift; done
 shift
 while [ "$1" != -- ]; do shift; done
 shift
-if [ ! -f marker ]; then
+case "$*" in
+*pkill*)
+    printf '%s\n' "$@" > cleanup
+    exit 23
+    ;;
+*)
     for arg do marker=$arg; done
     printf '%s' "$marker" > marker
     sleep 30
-else
-    printf '%s\n' "$@" > cleanup
-    exit 23
-fi
+    ;;
+esac
 "#,
         )
         .unwrap();
@@ -2400,7 +2403,10 @@ fi
             "wicked-writer-",
             &confirm_script(true),
             Some(b"test-key\n"),
-            Duration::from_millis(300),
+            // core#1757: the stub picks its branch by the script (cleanup or not), never by a
+            // file the first exec may not have written yet; the limit only has to outlast the
+            // first shell's start on a loaded runner.
+            Duration::from_secs(3),
         );
         assert_eq!(result.code, None);
         let marker = std::fs::read_to_string(dir.path().join("marker")).unwrap();
