@@ -388,13 +388,71 @@ pub(crate) fn snapshot_through(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    snapshot_through_inner(worktree, git_dir, &[])
+    snapshot_through_inner(worktree, git_dir, &[], false)
+}
+
+/// (core#1314) [`snapshot_through`], STRICT, for a read that must see everything the change
+/// holds (the floor's introduced-directory read, `repo_checks::introduced_dir`):
+/// * a path the REAL index tracks that `add -A` left out — one force-added (`git add -f`) under
+///   an ignored directory and not committed — is added too, its content re-hashed from the
+///   worktree (never the real index's cached hash, so no `assume-unchanged` bit is honoured);
+/// * a traversal git reports incomplete on stderr while exiting 0 (`could not open directory`:
+///   an unreadable subtree is silently left out) is an error, never a smaller tree.
+///
+/// The worktree mutation guard keeps [`snapshot_through`]: an engine-side error there would deny
+/// a run on a directory a tool made unreadable.
+pub(crate) fn snapshot_through_strict(
+    worktree: &Path,
+    git_dir: &Path,
+) -> anyhow::Result<WorktreeSnapshot> {
+    snapshot_through_inner(worktree, git_dir, &[], true)
+}
+
+/// Run `git <args>` in `cwd`; `Ok(stderr)` on exit 0 (in the C locale, so it can be read),
+/// `Err` naming the failure otherwise.
+fn git_stderr(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<String> {
+    // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
+    let mut cmd = Command::new("git");
+    cmd.hardened()
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not spawn `git {}`: {e}", args.join(" ")))?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git {}` in {} failed ({}): {}",
+            args.join(" "),
+            cwd.display(),
+            out.status,
+            stderr.trim()
+        );
+    }
+    Ok(stderr)
+}
+
+/// (core#1314) The paths an index lists (`ls-files -z --cached`), as raw bytes.
+fn index_paths(cwd: &Path, env: &[(&str, &Path)]) -> anyhow::Result<Vec<Vec<u8>>> {
+    Ok(
+        git(cwd, &["ls-files", "-z", "--cached", "--full-name"], env)?
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
 }
 
 fn snapshot_through_inner(
     worktree: &Path,
     git_dir: &Path,
     extra_env: &[(&str, &Path)],
+    strict: bool,
 ) -> anyhow::Result<WorktreeSnapshot> {
     let mut pinned = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     pinned.extend_from_slice(extra_env);
@@ -419,7 +477,7 @@ fn snapshot_through_inner(
     let excludes = tmp_index.with_extension("exclude");
     std::fs::write(&excludes, format!("/{ENGINE_SCRATCH_DIR}/\n"))?;
     let excludes_arg = format!("core.excludesFile={}", excludes.display());
-    let mut env = pinned;
+    let mut env = pinned.clone();
     env.push(("GIT_INDEX_FILE", tmp_index.as_path()));
     let result = (|| -> anyhow::Result<String> {
         // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
@@ -433,20 +491,62 @@ fn snapshot_through_inner(
                 &env,
             )?;
         }
-        git(
-            worktree,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                &excludes_arg,
-                "add",
-                "-A",
-                "--",
-                ".",
-            ],
-            &env,
-        )?;
+        let add_all: [&str; 8] = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            excludes_arg.as_str(),
+            "add",
+            "-A",
+            "--",
+            ".",
+        ];
+        if !strict {
+            git(worktree, &add_all, &env)?;
+        } else {
+            let stderr = git_stderr(worktree, &add_all, &env)?;
+            if let Some(line) = stderr
+                .lines()
+                .find(|l| l.contains("could not open directory"))
+            {
+                anyhow::bail!("the worktree could not be read completely: {}", line.trim());
+            }
+            // Tracked in the REAL index (the pinned git dir's own) and left out by `add -A`: a
+            // path force-added under an ignored directory. The engine scratch never counts.
+            let scratch: std::collections::HashSet<Vec<u8>> =
+                index_paths(worktree, &env)?.into_iter().collect();
+            let scratch_prefix = format!("{ENGINE_SCRATCH_DIR}/");
+            let mut forced: Vec<String> = Vec::new();
+            for p in index_paths(worktree, &pinned)? {
+                if scratch.contains(&p) || p.starts_with(scratch_prefix.as_bytes()) {
+                    continue;
+                }
+                let p = String::from_utf8(p).map_err(|e| {
+                    anyhow::anyhow!(
+                        "the index tracks a path that is not UTF-8 ({:?})",
+                        String::from_utf8_lossy(e.as_bytes())
+                    )
+                })?;
+                // Staged, then deleted from the worktree: not in the tree the change holds.
+                if std::fs::symlink_metadata(worktree.join(&p)).is_ok() {
+                    forced.push(p);
+                }
+            }
+            let one = Path::new("1");
+            let mut literal = env.clone();
+            literal.push(("GIT_LITERAL_PATHSPECS", one));
+            for chunk in forced.chunks(256) {
+                let mut args = vec!["-c", "core.hooksPath=/dev/null", "add", "-f", "--"];
+                args.extend(chunk.iter().map(String::as_str));
+                let stderr = git_stderr(worktree, &args, &literal)?;
+                if let Some(line) = stderr
+                    .lines()
+                    .find(|l| l.contains("could not open directory"))
+                {
+                    anyhow::bail!("the worktree could not be read completely: {}", line.trim());
+                }
+            }
+        }
         git_string(
             worktree,
             &["-c", "core.hooksPath=/dev/null", "write-tree"],
@@ -501,6 +601,7 @@ pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow:
             ("GIT_OBJECT_DIRECTORY", temporary_objects.as_path()),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_path()),
         ],
+        false,
     )
     .map(|snapshot| snapshot.tree);
     // Remove newly written objects on success AND on any snapshot error.
@@ -1185,6 +1286,83 @@ pub(crate) mod tests {
             "a repository hook ran during the snapshot: {:?}",
             std::fs::read_to_string(&marker)
         );
+    }
+
+    /// (core#1314) A path force-added (`git add -f`) under an ignored directory is in the STRICT
+    /// snapshot's tree, with the worktree's bytes (not the staged blob), and not in the plain
+    /// one; once deleted from the worktree it is in neither. A subtree git cannot read (`add -A`
+    /// warns and exits 0) is an error from strict, never a smaller tree.
+    #[test]
+    fn the_strict_snapshot_keeps_force_added_paths_and_refuses_an_unreadable_subtree_1314() {
+        let base = scratch("strict-1314");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "."]);
+        run_git(&repo, &["config", "user.email", "t@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "base"]);
+        std::fs::create_dir_all(repo.join("vendor/pkg")).unwrap();
+        std::fs::write(repo.join("vendor/pkg/package.json"), "{}\n").unwrap();
+        run_git(&repo, &["add", "-f", "vendor/pkg/package.json"]);
+        std::fs::write(repo.join("vendor/pkg/package.json"), "{\"v\":2}\n").unwrap();
+        let git_dir = repo.join(".git");
+        let names = |tree: &str| run_git(&repo, &["ls-tree", "-r", "--name-only", tree]);
+        let plain = snapshot_through(&repo, &git_dir).unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert!(
+            !names(&plain.tree).contains("vendor/"),
+            "the plain snapshot"
+        );
+        assert!(
+            names(&strict.tree).contains("vendor/pkg/package.json"),
+            "{}",
+            names(&strict.tree)
+        );
+        assert_eq!(
+            run_git(
+                &repo,
+                &[
+                    "cat-file",
+                    "blob",
+                    &format!("{}:vendor/pkg/package.json", strict.tree)
+                ]
+            ),
+            "{\"v\":2}",
+            "the worktree's bytes, re-hashed"
+        );
+        std::fs::remove_file(repo.join("vendor/pkg/package.json")).unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert_eq!(
+            strict.tree, plain.tree,
+            "staged, then deleted: not in the tree"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = repo.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("f.txt"), "x\n").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                eprintln!("SKIP: this user reads a mode-000 directory (root)");
+            } else {
+                assert!(
+                    snapshot_through(&repo, &git_dir).is_ok(),
+                    "the plain snapshot leaves it out, exit 0"
+                );
+                let err = snapshot_through_strict(&repo, &git_dir)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("could not be read completely"), "{err}");
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A repo with one commit and a linked worktree on `wicked/<tag>` — the engine's real layout —
