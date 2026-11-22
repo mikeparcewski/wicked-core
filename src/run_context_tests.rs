@@ -1527,6 +1527,16 @@ fn the_engine_keeps_the_block_on_the_session_stamps_each_unit_and_survives_a_res
     );
     approve(&core, &run);
     wait(&core, &run, crate::SessionStatus::Completed);
+    // (core#1322) The run ended: the engine dropped its published blocks (the actor does it right
+    // after it persists the terminal status; a read may see the status a moment before).
+    let ended = std::time::Instant::now();
+    while !published(&run).is_empty() && ended.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        current(&run).is_none() && published(&run).is_empty(),
+        "a completed run's blocks outlive it"
+    );
     let second: Vec<StepInput> = seat2
         .seen()
         .into_iter()
