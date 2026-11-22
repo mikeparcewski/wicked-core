@@ -1167,12 +1167,52 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
 
 /// The worktree's git admin directory (`<repo>/.git/worktrees/<name>`) — resolvable only while
 /// the tree is a live worktree.
+///
+/// (core#1436) Found from the REPOSITORY side, never through the tree's own `.git` file, which a
+/// seat can rewrite to point at another tree's admin dir (and so read or plant that tree's owner
+/// markers). The repository is the tree's place in the engine's layout
+/// (`<repo>/wicked-worktrees/<name>`, or the pre-crew#276 `<repo>/.wicked/worktrees/<name>`); the
+/// admin dir is the one of `<repo>/.git/worktrees/*` whose `gitdir` back-pointer names this tree:
+/// the entry with the tree's own name first (git names it so), else the only one that does. A
+/// tree outside the layout, or one no entry (or more than one, besides its own) names, has none.
 fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
-    let p = wt.to_str()?;
-    match git(p, &["rev-parse", "--absolute-git-dir"]) {
-        Ok((true, out, _)) if !out.is_empty() => Some(PathBuf::from(out)),
-        _ => None,
+    let parent = wt.parent()?;
+    let repo = if parent.file_name()? == "wicked-worktrees" {
+        parent.parent()?
+    } else if parent.file_name()? == "worktrees" && parent.parent()?.file_name()? == ".wicked" {
+        parent.parent()?.parent()?
+    } else {
+        return None;
+    };
+    let admin_root = repo.join(".git").join("worktrees");
+    let here = std::fs::canonicalize(wt).ok()?;
+    let names_here = |dir: &Path| {
+        std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+            && std::fs::read_to_string(dir.join("gitdir"))
+                .ok()
+                .and_then(|g| {
+                    let g = Path::new(g.trim());
+                    let g = if g.is_absolute() {
+                        g.to_path_buf()
+                    } else {
+                        dir.join(g)
+                    };
+                    std::fs::canonicalize(g.parent()?).ok()
+                })
+                .as_deref()
+                == Some(here.as_path())
+    };
+    let named = admin_root.join(wt.file_name()?);
+    if names_here(&named) {
+        return Some(named);
     }
+    let mut found = std::fs::read_dir(&admin_root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| names_here(d));
+    let only = found.next()?;
+    found.next().is_none().then_some(only)
 }
 
 /// The RAW run id a live worktree was minted (or adopted) for — `None` when unmarked: a tree from
@@ -1377,6 +1417,18 @@ where
     })
 }
 
+/// (core#1436) A dispatch re-entering the run's persisted worktree (a boot redrive, a gate
+/// continue, the run's next unit) marks it as the calling thread's daemon's when no daemon has
+/// yet, so a tree minted before core#1373 does not stay unmarked (kept by every reaper, adoptable
+/// by any daemon) for as long as its run goes on. A tree another daemon marked is left as it is
+/// and named in the log ([`stamp_worktree_daemon`]); the dispatch goes on, as it did. File reads
+/// and one link, no git: cheap on the actor.
+pub(crate) fn claim_reentered_worktree(wt: &Path) {
+    if wt.join(".git").is_file() {
+        let _ = stamp_worktree_daemon(wt);
+    }
+}
+
 /// (review on #1431) Adopt a live worktree a resume found in place (no mint): it takes the calling
 /// thread's daemon marker when no daemon has marked it yet, so a tree minted before core#1373 is
 /// this daemon's from its first resume on.
@@ -1417,8 +1469,77 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
 /// (review r3 on #1431) One run's tree is minted, removed or reaped by one thread at a time in this
 /// process: an ownership check and the git removal it guards are never split by another thread's
 /// removal and a replacement mint (two cleanups the actor queued for one failed launch, say).
-/// Keyed by the repository and the run's worktree name. Across daemons, the checks above stand.
-struct TreeLock(String);
+/// Keyed by the repository and the run's worktree name.
+///
+/// (core#1436) Across daemons too: a holder that will touch the tree also takes an OS file lock on
+/// `<repo>/.git/wicked-tree-locks/<name>.lock` ([`os_tree_lock`]), so two daemons sharing one
+/// checkout never mint, remove or reap the same tree at once. Released with the in-process lock
+/// (an exiting process releases it too).
+struct TreeLock(String, Option<std::fs::File>);
+
+/// (core#1436) How long a tree operation waits for another daemon's hold on the same tree before it
+/// goes on without the OS lock (the daemon markers still guard the tree). A mint, removal or reap
+/// takes seconds; a hold this long is something stuck, and waiting on it forever would stall the
+/// run.
+const OS_TREE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// (core#1436) The OS lock for the tree `key` ([`tree_key`]: `<repo>\0<name>`), taken with a
+/// bounded wait. `None` when the repository has no `.git` directory (nothing to share), or the lock
+/// cannot be had, which is logged: the operation then goes on as it did before this lock.
+fn os_tree_lock(key: &str) -> Option<std::fs::File> {
+    let (root, name) = key.split_once('\0')?;
+    let git_dir = Path::new(root).join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let dir = git_dir.join("wicked-tree-locks");
+    let path = dir.join(format!("{name}.lock"));
+    let file = std::fs::create_dir_all(&dir).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+    });
+    let file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not open the tree lock {} ({e}); going on without it \
+                 (core#1436)",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let deadline = std::time::Instant::now() + OS_TREE_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!(
+                    "wicked-core: another process has held the tree lock {} for over {}s; going \
+                     on without it (core#1436)",
+                    path.display(),
+                    OS_TREE_LOCK_WAIT.as_secs()
+                );
+                return None;
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                eprintln!(
+                    "wicked-core: could not take the tree lock {} ({e}); going on without it \
+                     (core#1436)",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
+}
 
 /// Per tree: the next ticket to hand out and the ticket now holding the tree.
 type TreeQueues = std::collections::HashMap<String, (u64, u64)>;
@@ -1470,17 +1591,25 @@ impl TreeTicket {
     /// Give the place up without touching the tree: wait for its turn, then pass it on. A ticket
     /// that is never waited for would hold the tree's queue forever.
     pub(crate) fn release(self) {
-        drop(self.wait());
+        drop(self.turn());
     }
 
-    fn wait(mut self) -> TreeLock {
+    /// Wait for the tree, in this process and (core#1436) across daemons: the holder will touch it.
+    fn wait(self) -> TreeLock {
+        let mut lock = self.turn();
+        lock.1 = os_tree_lock(&lock.0);
+        lock
+    }
+
+    /// Wait for this ticket's turn in this process only (a place given up touches nothing).
+    fn turn(mut self) -> TreeLock {
         self.done = true;
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
         while map.get(&self.key).is_some_and(|e| e.1 != self.ticket) {
             map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
         }
-        TreeLock(std::mem::take(&mut self.key))
+        TreeLock(std::mem::take(&mut self.key), None)
     }
 }
 
@@ -1495,7 +1624,7 @@ impl Drop for TreeTicket {
                     ticket: self.ticket,
                     done: false,
                 }
-                .wait(),
+                .turn(),
             );
         }
     }
@@ -1535,6 +1664,8 @@ pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {
 
 impl Drop for TreeLock {
     fn drop(&mut self) {
+        // The other daemons' turn first: closing the file releases the OS lock.
+        drop(self.1.take());
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(e) = map.get_mut(&self.0) {
@@ -4598,6 +4729,129 @@ mod tests {
             !wt_gone.exists(),
             "a worktree no session owns is force-removed, dirty or not"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436: the owner markers are read and written in the admin dir the REPOSITORY says is
+    /// the tree's. A tree whose `.git` file a seat pointed at a sibling's admin dir still reads its
+    /// own run and daemon, and a stamp lands in its own admin dir, never the sibling's. A seat that
+    /// points its own admin dir's back-pointer at the sibling changes nothing for the sibling.
+    #[test]
+    fn a_redirected_dot_git_file_cannot_redirect_the_owner_markers() {
+        let root = git_repo("marker-redirect");
+        let p = root.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let a = create_worktree(p, "run-a").unwrap();
+        let b = {
+            let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+            create_worktree(p, "run-b").unwrap()
+        };
+        let admin = |name: &str| {
+            std::fs::canonicalize(root.join(".git").join("worktrees").join(name)).unwrap()
+        };
+        std::fs::write(
+            a.join(".git"),
+            format!("gitdir: {}\n", admin("run-b").display()),
+        )
+        .unwrap();
+        assert_eq!(worktree_owner(&a).as_deref(), Some("run-a"));
+        assert_eq!(worktree_daemon(&a).as_deref(), Some("daemon-me"));
+        assert!(
+            daemon_may_touch(&a),
+            "its own tree, whatever its .git file says"
+        );
+        std::fs::write(
+            admin("run-a").join("gitdir"),
+            format!("{}\n", b.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(worktree_owner(&b).as_deref(), Some("run-b"));
+        assert_eq!(worktree_daemon(&b).as_deref(), Some("daemon-other"));
+        assert!(
+            !daemon_may_touch(&b),
+            "the sibling stays the other daemon's"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436: a dispatch re-entering a persisted tree that no daemon marked (minted before
+    /// core#1373) marks it as this daemon's; one another daemon marked keeps its marker.
+    #[test]
+    fn a_reentered_unmarked_tree_is_claimed_and_another_daemons_is_not() {
+        let root = git_repo("reentry-claim");
+        let p = root.to_str().unwrap();
+        let legacy = {
+            let _none = DaemonOwnerScope::bind(None);
+            create_worktree(p, "run-legacy").unwrap()
+        };
+        let theirs = {
+            let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+            create_worktree(p, "run-theirs").unwrap()
+        };
+        assert_eq!(worktree_daemon(&legacy), None, "minted unmarked");
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        claim_reentered_worktree(&legacy);
+        claim_reentered_worktree(&theirs);
+        assert_eq!(worktree_daemon(&legacy).as_deref(), Some("daemon-me"));
+        assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436: dispatch admission claims the run's worktree, on every dispatch path.
+    #[test]
+    fn dispatch_admission_claims_the_reentered_worktree() {
+        let actor = include_str!("actor.rs");
+        let start = actor
+            .find("fn dispatch_unit_with(")
+            .expect("the dispatch admission");
+        let end = actor[start + 1..]
+            .find("\nfn ")
+            .map_or(actor.len(), |e| start + 1 + e);
+        let body = &actor[start..end];
+        assert!(
+            body.contains("crate::repo::claim_reentered_worktree("),
+            "dispatch_unit_with claims the tree it re-enters"
+        );
+    }
+
+    /// core#1436: a tree operation waits while another daemon (another process; here, another
+    /// handle on the same lock file) holds the tree's OS lock, and goes on when it is released.
+    /// The lock is the tree's own: another run's tree is not held up.
+    #[test]
+    fn a_tree_operation_waits_for_another_daemons_hold_on_the_tree() {
+        let root = git_repo("os-tree-lock");
+        let p = root.to_str().unwrap().to_string();
+        let dir = root.join(".git").join("wicked-tree-locks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!("{}.lock", sanitize_worktree_id("run-held"))))
+            .unwrap();
+        other.lock().unwrap();
+        drop(TreeLock::take(&p, "run-free"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let p = p.clone();
+            move || {
+                let held = TreeLock::take(&p, "run-held");
+                tx.send(held.1.is_some()).unwrap();
+            }
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(700))
+                .is_err(),
+            "the tree waits while another daemon holds it"
+        );
+        other.unlock().unwrap();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(true),
+            "it takes the OS lock once released"
+        );
+        waiter.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

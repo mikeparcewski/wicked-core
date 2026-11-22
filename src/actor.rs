@@ -13170,6 +13170,13 @@ fn dispatch_unit_with(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
+    // (core#1436) Every dispatch into the run's persisted worktree (a boot redrive, a gate
+    // continue, the run's next unit) marks it as this daemon's when no daemon has: a tree minted
+    // before core#1373 stops being unmarked once its run moves again. Another daemon's marker is
+    // never replaced.
+    if let Some(wd) = session.workdir.as_deref() {
+        crate::repo::claim_reentered_worktree(std::path::Path::new(wd));
+    }
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
