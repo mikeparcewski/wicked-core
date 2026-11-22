@@ -2371,6 +2371,19 @@ fn t6_a_review_whose_result_the_engine_lost_pauses_at_the_failure_gate_and_rerun
         .reassign_unit("t6lr", WRITE, Some("b".into()))
         .expect_err("a PA review is not re-seated");
     assert!(err.to_string().contains("PA's review"), "{err}");
+    // …and a send-back is refused before the gate resolves: it would re-run the PA's review over
+    // the unchanged member output, never send the step back to the member.
+    let err = e
+        .core
+        .confirm_gate(
+            "t6lr",
+            HumanDecision::RequestChanges {
+                note: Some("rework it".into()),
+            },
+        )
+        .expect_err("a send-back at the lost review's gate is refused");
+    assert!(err.to_string().contains("PA's review"), "{err}");
+    assert_eq!(status(&e, "t6lr"), Some(SessionStatus::AwaitingHuman));
     e.core.confirm_gate("t6lr", approve(None)).unwrap();
     wait_status(&e, "t6lr", SessionStatus::Completed);
     let reviews = worker.reviews.lock().unwrap().clone();

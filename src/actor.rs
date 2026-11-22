@@ -21294,6 +21294,26 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (core#1748, codex xreview) A lost PA review's `failure` gate re-runs the review (approve) or
+    // stops the run (reject). A send-back there would rewind onto the same unit with its review
+    // state kept, and re-run the PA's review over the member's unchanged output: sending the
+    // member's step back is the PA's verdict (or the team dispute's answer), never this gate's.
+    if matches!(
+        decision,
+        crate::workflow::HumanDecision::RequestChanges { .. }
+    ) && !team_gate::dispute_gate_open(session)
+        && !team_gate::transport_gate_open(session)
+        && cursor.is_some_and(|u| {
+            u.member_step
+                .as_ref()
+                .is_some_and(|m| m.reviewing.is_some())
+        })
+    {
+        anyhow::bail!(
+            "unit {cursor_ord} is the PA's review of a member's step, and the engine lost its \
+             result: approve to run the review again, or reject to stop the run"
+        );
+    }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
     // provider, with no other seat of the run able to review the work, would run on that seat
     // again and be denied the same way: refused, with the dead end in plain words.
