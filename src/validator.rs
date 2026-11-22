@@ -1853,18 +1853,11 @@ fn wait_bounded(
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     let start = Instant::now();
     loop {
-        if has_exited_unreaped(child)? {
-            // QUIESCE (core#1742, as a tool phase does): the leader exited but is not yet reaped,
-            // so its pid (the group id) is still reserved. Kill the group first, so anything the
-            // script backgrounded dies with the validator; then let a watching run release the
-            // group, and only then collect the status.
-            kill_child_tree(child);
-            watch_done(child.id());
-            return child.wait().map(Some);
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
         }
         if start.elapsed() >= timeout {
             kill_child_tree(child);
-            watch_done(child.id());
             reap_bounded(child);
             return Ok(None);
         }
@@ -1915,7 +1908,6 @@ fn run_bounded_status_capturing_stderr(
     }
     let pgid = child.id();
     let status = wait_bounded(&mut child, timeout);
-    // A wait that failed released nothing yet (a release is a compare-and-remove: idempotent).
     watch_done(pgid);
     let _ = done_rx.recv_timeout(Duration::from_millis(500));
     let kept = head.lock().unwrap_or_else(|p| p.into_inner());
@@ -1932,7 +1924,7 @@ pub(crate) struct SpawnWatch {
     /// Runs the spawn, so the watcher can refuse it (an `Err`: nothing is started) and register
     /// the new group atomically with it.
     pub(crate) spawn: Box<dyn Fn(&mut Spawn<'_>) -> std::io::Result<std::process::Child>>,
-    /// The group is released: its leader exited and the group was killed, not yet reaped.
+    /// The group is released: the wait for its leader has ended.
     pub(crate) on_done: Box<dyn Fn(u32)>,
 }
 

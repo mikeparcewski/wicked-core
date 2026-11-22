@@ -603,37 +603,6 @@ mod tests {
             .take_tool_child_pgroups("r-stop")
             .is_empty());
 
-        // A validator's group dies with it: what the script backgrounded cannot write after the
-        // leader exits and its group is released (codex round 1).
-        let mut detached = unit.clone();
-        detached.validator = Some(crate::validator::DeterministicValidator {
-            criterion: "c".into(),
-            script: "(sleep 2; touch bg-write.txt) & exit 0".into(),
-            approved: true,
-        });
-        let current = maps.lock().unwrap().current_launch_seq("r-stop");
-        let watch = validator_watch(maps.clone(), "r-stop".into(), current);
-        let denial = crate::validator::with_spawn_watch(watch, || {
-            crate::pipeline::pinned_validator_denial_with_env(
-                &detached,
-                Some(wd.as_path()),
-                None,
-                &[],
-            )
-        });
-        assert_eq!(denial, None, "the leader passed");
-        assert!(
-            maps.lock()
-                .unwrap()
-                .take_tool_child_pgroups("r-stop")
-                .is_empty(),
-            "the group is released once it is quiet"
-        );
-        std::thread::sleep(Duration::from_millis(3000));
-        assert!(
-            !wd.join("bg-write.txt").exists(),
-            "the backgrounded writer died with its validator"
-        );
         let _ = std::fs::remove_dir_all(&wd);
     }
 
