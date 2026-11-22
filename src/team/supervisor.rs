@@ -177,6 +177,9 @@ impl ActorCouncil {
         let deadline = Instant::now() + budget;
         let lock =
             match crate::cli_runner::HostCouncilLock::acquire_until(&self.lock_path, deadline) {
+                // (codex r2 on #1771) Taken only as the budget ran out: the caller can no longer
+                // wait for a ruling, so no council starts (the slot is released at once).
+                Ok(_late) if Instant::now() >= deadline => return CouncilOutcome::TimedOut,
                 Ok(lock) => lock,
                 // Another council held the host slot for the whole budget.
                 Err(crate::cli_runner::SlotRefused::Busy) => return CouncilOutcome::TimedOut,

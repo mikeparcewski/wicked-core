@@ -1215,10 +1215,13 @@ impl HostCouncilLock {
                     return Err(SlotRefused::Unavailable(format!("{}: {e}", path.display())))
                 }
             }
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return Err(SlotRefused::Busy);
             }
-            std::thread::sleep(Duration::from_millis(200));
+            // (codex r2 on #1771) Never sleep past the deadline: a retry long after it would take
+            // a slot freed only once the caller's budget was spent.
+            std::thread::sleep(Duration::from_millis(200).min(deadline - now));
         }
     }
 }

@@ -3395,6 +3395,38 @@ fn a_team_council_waits_for_the_host_slot_and_never_reaches_the_engine_while_hel
     let _ = std::fs::remove_file(&path);
 }
 
+/// codex r2 on #1771: a slot freed only after the convene budget ran out starts no council. The
+/// holder releases it at 150 ms; the budget is 50 ms. Before, the 200 ms poll took it then and the
+/// command reached the engine for a ruling nobody would wait for.
+#[test]
+fn a_slot_freed_after_the_budget_starts_no_council() {
+    let path = slot_path("late");
+    let held = crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now())
+        .unwrap_or_else(|_| panic!("the test could not take its own slot"));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let out = council.convene_from(
+        vec![builtin_seat("codex"), builtin_seat("pi")],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_millis(50),
+    );
+    release.join().unwrap();
+    assert_eq!(out, CouncilOutcome::TimedOut);
+    assert!(
+        rx.try_recv().is_err(),
+        "a council started after its budget ran out"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The slot rides in the command: it stays held until the council (the engine side) drops it,
 /// and the seats handed over are the non-party ones.
 #[test]
