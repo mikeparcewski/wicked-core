@@ -999,7 +999,8 @@ pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 /// own config home (an `env_key`, an `experimental_bearer_token`) would otherwise change how this
 /// one authenticates (codex review of core#989).
 ///
-/// Every codex seat also gets [`CODEX_NON_MODEL_OFF`] (core#1478).
+/// Every codex container (k8s) seat also gets [`CODEX_NON_MODEL_OFF`] (core#1478); host seats
+/// never reach this ([`crate::container_floor`] calls it on the online pod path only).
 pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<String> {
     let mut args = seat_route_args(cli, kind);
     if cli == "codex" {
@@ -2704,7 +2705,7 @@ mod tests {
         }
     }
 
-    /// core#1478 (red on main): every codex seat switches off codex's calls that are not model
+    /// core#1478: every codex container seat switches off codex's calls that are not model
     /// turns with codex's own config keys (each a valid `-c key=value` codex parses as TOML), so
     /// none of them is a refused CONNECT to chatgpt.com / ab.chatgpt.com at the gateway. No
     /// other seat gets them.
@@ -2750,7 +2751,7 @@ mod tests {
         }
     }
 
-    /// core#997 (red on main): a codex seat signed in with ChatGPT refreshes at the gate-hook
+    /// core#997: a codex seat signed in with ChatGPT refreshes at the gate-hook
     /// relay (codex's own token-endpoint override), never at auth.openai.com, and the gateway
     /// routes exactly that request to the relay. No other seat is pointed there.
     #[test]

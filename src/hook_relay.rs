@@ -1830,8 +1830,9 @@ exit 2
     /// core#997 end to end on loopback: codex's refresh request (OAuth's JSON body, as codex
     /// 0.162.1 posts it to `CODEX_REFRESH_TOKEN_URL_OVERRIDE`) carrying a live codex unit's key
     /// renews the broker once and is answered `{}` (no token); an unknown key is `invalid_grant`
-    /// and renews nothing; a renewal that fails is a 503 naming why. Red on main: the route did
-    /// not exist (404).
+    /// and renews nothing; a renewal that fails is a 503 naming why. On main the route does not
+    /// exist (404); this test uses this change's `seat_refresh::register`, so it does not compile
+    /// there.
     #[cfg(unix)]
     #[test]
     fn a_codex_seats_refresh_renews_the_broker_and_hands_back_no_token_997() {

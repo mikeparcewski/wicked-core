@@ -689,12 +689,16 @@ fn refusal(status: u16, body: &[u8]) -> String {
 /// refresher, and answers with no token at all: the seat keeps its placeholders, retries, and the
 /// gateway sends the renewed token. The seat never holds or receives a real credential.
 ///
-/// One forced renewal per gateway dir at a time (callers wait for it), and its result stands
-/// for [`RECOVERY_COOLDOWN`]: every seat that got the same 401 shares one renewal, and a seat
-/// that keeps failing cannot make the broker renew more than once a cooldown.
+/// One forced renewal at a time in this process (one lock for every gateway dir; a daemon has
+/// one), callers waiting for it, and a renewal's result stands for its gateway dir for
+/// [`RECOVERY_COOLDOWN`]: every seat that got the same 401 shares one renewal, and a seat that
+/// keeps failing cannot make the broker renew more than once a cooldown. A recovery that only
+/// found the broker busy renewed nothing and is not kept: the next seat's refresh tries again.
 pub(crate) const RECOVERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a forced renewal waits for a pass that holds the broker (the periodic one, a sign-in).
 const RECOVERY_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a forced renewal looks again at a busy broker (each look resolves the gateway).
+const RECOVERY_BUSY_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long a renewal is given to reach the gateway before the seat retries: agentgateway v1.6.0
 /// re-reads a watched `backendAuth` file after a 250 ms debounce and a config reload
 /// (`crates/agentgateway/src/util.rs` `new_debouncer`).
@@ -709,8 +713,8 @@ pub(crate) type Forcer = std::sync::Arc<dyn Fn(&Path) -> Result<Outcome, String>
 /// The gateway dirs this process refreshes, each with its forced codex renewal ([`register`]).
 static FORCERS: std::sync::Mutex<Vec<(PathBuf, Forcer)>> = std::sync::Mutex::new(Vec::new());
 
-/// The last forced renewal of each gateway dir: when it ended and what it gave. Its lock is held
-/// across a renewal, so concurrent recoveries share one.
+/// The last forced renewal of each gateway dir: when it ended and what it gave. Its one lock
+/// (process-wide, not per dir) is held across a renewal, so concurrent recoveries share one.
 type LastRecovery = (std::time::Instant, Result<(), String>);
 static RECOVERED: std::sync::Mutex<Vec<(PathBuf, LastRecovery)>> =
     std::sync::Mutex::new(Vec::new());
@@ -774,7 +778,7 @@ pub(crate) fn recover_with(
     busy_wait: std::time::Duration,
     settle: std::time::Duration,
 ) -> Recovery {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let mut recovered = RECOVERED.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, (at, result))) = recovered.iter().find(|(d, _)| d == dir) {
         if at.elapsed() < RECOVERY_COOLDOWN {
@@ -789,10 +793,15 @@ pub(crate) fn recover_with(
         match force(dir) {
             Ok(Outcome::Refreshed { .. }) => break Ok(()),
             Ok(Outcome::Busy) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(
+                    RECOVERY_BUSY_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
+            // Renewed nothing: answered, never kept (the other pass may have renewed codex).
             Ok(Outcome::Busy) => {
-                break Err("another broker pass held the sign-in past the wait".to_string())
+                return Recovery::Failed(
+                    "another broker pass held the sign-in past the wait; retry".to_string(),
+                )
             }
             Ok(Outcome::NotRefreshable) => {
                 break Err("the broker holds no ChatGPT sign-in for codex; sign codex in".into())
@@ -2216,6 +2225,28 @@ mod tests {
             Recovery::Renewed
         );
         assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        // core#1788 F2: a recovery that only found the broker busy renewed nothing and is not
+        // kept: the next seat's refresh renews (the other pass may have finished meanwhile).
+        let held = std::env::temp_dir().join(format!("c11-held-{}", uuid::Uuid::new_v4().simple()));
+        let looks = AtomicUsize::new(0);
+        let busy_once = |_: &Path| {
+            if looks.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Outcome::Busy)
+            } else {
+                Ok(Outcome::Refreshed { expires_at: None })
+            }
+        };
+        assert!(matches!(
+            recover_with(&held, &busy_once, Duration::ZERO, Duration::ZERO),
+            Recovery::Failed(e) if e.contains("held the sign-in")
+        ));
+        assert_eq!(
+            recover_with(&held, &busy_once, Duration::ZERO, Duration::ZERO),
+            Recovery::Renewed,
+            "a busy result is never answered from the cache"
+        );
+        assert_eq!(looks.load(Ordering::SeqCst), 2);
 
         // A failed renewal names why, and stands for the cooldown (no second renewal).
         let failing =
