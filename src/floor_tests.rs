@@ -751,7 +751,10 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+        // (core#1101) A doctest: its `Doc-tests` section counts `running 1 test`, so `complete`
+        // passes only because the guide's list names it too (`src/lib.rs - f (line 1)`).
+        "/// ```\n/// assert_eq!(1, 1);\n/// ```\npub fn f() {}\n\n\
+         #[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -1502,20 +1505,25 @@ fn doctests_run_under_the_real_floor_sandbox() {
 /// `-- <id> --exact` runs one. Markers: `flaky.list` fails the first list of a probe scratch,
 /// `broken.alone` fails `a` run alone, `red.base` fails `a` always, `alone.all` makes a one-test
 /// run run them all, `plant.link` plants `zz_m` as a link to `$OUTSIDE`, `swallow` exits 0 on a
-/// failure, `dup.list` lists `a` twice.
+/// failure, `dup.list` lists `a` twice. (core#1101) A run prints `running <n> tests` first;
+/// `partial.list` lists `a` alone; `skip.greedy` makes `--skip=m` skip `m2` too; `dup.only`
+/// lists `a` twice and has no `b`.
 #[cfg(unix)]
 const STAND_IN: &str = r#"mode=run; name=; skip=' '
 for a in "$@"; do case "$a" in --list) mode=list;; --skip=*) skip="$skip${a#--skip=} ";; --|--exact) ;; *) name=$a;; esac; done
-all="a b"; [ -f zz_m ] && [ ! -L zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
+[ -f skip.greedy ] && case "$skip" in *" m "*) skip="${skip}m2 ";; esac
+all="a b"; [ -f dup.only ] && all="a"; [ -f zz_m ] && [ ! -L zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
 if [ -n "$name" ] && [ ! -f alone.all ]; then case " $all " in *" $name "*) all=$name;; *) all=;; esac; fi
 [ -n "$name" ] && [ -f broken.alone ] && [ "$name" = a ] && exit 1
 [ -n "$LEAK" ] && [ $mode = list ] && exit 3
 [ -f plant.link ] && [ ! -L zz_m ] && ln -s "$OUTSIDE" zz_m
+[ -f partial.list ] && [ $mode = list ] && all=a
 case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
     for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done
-    [ -f dup.list ] && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
-  *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+    { [ -f dup.list ] || [ -f dup.only ]; } && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
+  *) n=0; f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; n=$((n+1)); case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+    echo "running $n tests"
     if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
     printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'
     [ -f swallow ] && exit 0; exit 101;;
@@ -1529,7 +1537,8 @@ fn stand_in_guide() -> serde_json::Value {
         "name": "test", "run": ["sh", "runner.sh"], "failedExit": [101],
         "results": {"kind": "text"},
         "parser": {"blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
-                               "end": "^test result: FAILED"}]},
+                               "end": "^test result: FAILED"}],
+                   "count": r"^running (?P<n>\d+) tests$"},
         "list": {"run": ["sh", "runner.sh", "--list"], "item": r"^(?P<id>\S+): test$"},
         "alone": {"run": ["sh", "runner.sh", "--", "{id}", "--exact"]},
         "deselect": {"append": ["--skip={id}"]},
@@ -1662,8 +1671,27 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     // deselect of a test listed twice proves nothing.
     let r = with("swallow", &g).unwrap();
     assert!(r["mutation"].starts_with("fail:"), "{r:?}");
+    // (core#1101) …and a list that names a test twice runs more than it lists, or less: not
+    // `complete`. The passing test probed is one whose id is unique (`b`); with none, `alone`
+    // and `deselect` fail.
     let r = with("dup.list", &g).unwrap();
-    assert!(r["deselect"].starts_with("fail:"), "{r:?}");
+    assert!(r["complete"].starts_with("fail:"), "{r:?}");
+    assert!(r["deselect"].starts_with("pass"), "`b` is unique: {r:?}");
+    let r = with("dup.only", &g).unwrap();
+    for p in ["alone", "deselect"] {
+        assert!(r[p].contains("unique across every qualifier"), "{p}: {r:?}");
+    }
+    // (core#1101) A list that names fewer tests than the run executes is not `complete`.
+    let r = with("partial.list", &g).unwrap();
+    assert!(
+        r["complete"].contains("executed 2 test(s); the list names 1"),
+        "{r:?}"
+    );
+    // (core#1101) A deselect that drops the second mutation with the first: deselecting both
+    // runs green, but the first alone no longer fails naming the second.
+    let r = with("skip.greedy", &g).unwrap();
+    assert_eq!(r["mutation"], "pass (retried)", "{r:?}");
+    assert!(r["multi"].starts_with("fail:"), "{r:?}");
     let mut bad2 = g.clone();
     bad2["probes"]["mutation2"]["file"] = "../m2".into();
     let r = with("bad2.marker", &bad2).unwrap();

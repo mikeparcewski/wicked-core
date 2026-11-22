@@ -9507,7 +9507,21 @@ pub(crate) fn results_of(
     scratch: &CheckScratch,
     since: std::time::SystemTime,
 ) -> Result<(Vec<TestId>, Vec<TestId>), String> {
-    let c = g.compile()?;
+    g.compile()?;
+    parse_results(g, &results_text(held, check, g, run, scratch, since)?)
+}
+
+/// (core#1101) The text [`results_of`] parses: the results file `how.path` names (written by this
+/// run, read through the held directory, stored beside the run's logs), else the run's stored
+/// output.
+pub(crate) fn results_text(
+    held: &HeldDir,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    run: &mut CheckRun,
+    scratch: &CheckScratch,
+    since: std::time::SystemTime,
+) -> Result<String, String> {
     let r = match &g.results.how.path {
         Some(path) => {
             let f = open_results(
@@ -9534,17 +9548,25 @@ pub(crate) fn results_of(
     if r.truncated {
         return Err("they were cut at the log cap".into());
     }
-    let text =
-        String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned();
+    Ok(String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned())
+}
+
+/// (DES-BUILD-GUIDE) A results text, parsed as `g` reads it: every testcase (junit) and the
+/// failing ids.
+pub(crate) fn parse_results(
+    g: &GuideCheck,
+    text: &str,
+) -> Result<(Vec<TestId>, Vec<TestId>), String> {
+    let c = g.compile()?;
     match g.results.kind.as_str() {
         "junit" => crate::floor_guide::junit(
-            &text,
+            text,
             &g.results.id,
             g.results.id_join.as_deref().unwrap_or("::"),
             c.keyed(),
         )
         .ok_or_else(|| "the results hold no testsuite".to_string()),
-        _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
+        _ => Ok((Vec::new(), c.failures(text, c.keyed()))),
     }
 }
 

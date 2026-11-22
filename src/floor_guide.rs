@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 /// Where a repository keeps its guide.
 pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
 /// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
-/// when the check has that piece).
-pub const REQUIRED_PROBES: [&str; 7] = [
-    "list", "run", "ids", "alone", "deselect", "mutation", "multi",
+/// when the check has that piece). (core#1101) `complete`: the clean run executes exactly the
+/// tests the list names, so an incomplete list cannot make a shared name look unique.
+pub const REQUIRED_PROBES: [&str; 8] = [
+    "list", "run", "complete", "ids", "alone", "deselect", "mutation", "multi",
 ];
 
 /// A repository's build/test guide (contract v1).
@@ -132,6 +133,11 @@ pub struct Parser {
     pub failed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<Block>,
+    /// (core#1101) Lines that say how many tests ran, with a named group `n` (a number): summed
+    /// over a run's results — in the `section`s the list names — they are what the run executed,
+    /// which the `complete` probe holds to the list's count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,8 +333,8 @@ fn cwd_ok(cwd: &str) -> bool {
 /// naming its `failedExit` (never 0), a `name` of 1-64 `[A-Za-z0-9._-]` (never `.` or `..`),
 /// `results.how.env` names that pass [`env_name_ok`], a
 /// `cwd` inside the repo, and a `deselect` whose
-/// `{ids:re|}` is once-only and never beside `{q}`. Anything else does not parse (detection
-/// decides).
+/// `{ids:re|}` is once-only and never beside `{q}`, and whose per-id tokens hold `{q}` and an
+/// id together or neither (core#1101). Anything else does not parse (detection decides).
 pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
     let guide: BuildGuide =
         serde_json::from_str(raw).map_err(|e| format!("does not parse: {e}"))?;
@@ -369,6 +375,14 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
             Some("`{ids:re|}` among the per-id tokens of `deselect.append` (it is once-only)")
         } else if has(tokens, "{ids:re|}") && has(tokens, "{q}") {
             Some("`{ids:re|}` and `{q}` in one `deselect.append` (the pattern cannot bind ids to qualifiers)")
+        } else if has(tokens, "{q}")
+            && tokens[first..last]
+                .iter()
+                .any(|t| t.contains("{q}") != (t.contains("{id}") || t.contains("{id:re}")))
+        {
+            // (core#1101) A qualifier deselects only bound to its id: `--skip={q}` beside
+            // `--name={id}` would deselect the whole qualifier, or the id in every one.
+            Some("`{q}` and `{id}` in different `deselect.append` tokens (a qualifier is bound to its id only inside one token)")
         } else {
             None
         };
@@ -510,6 +524,7 @@ pub(crate) struct Compiled {
     section: Option<Regex>,
     failed: Vec<Regex>,
     blocks: Vec<(Regex, Regex, Regex, bool)>,
+    count: Option<Regex>,
     list_item: Regex,
     list_section: Option<Regex>,
 }
@@ -527,7 +542,7 @@ impl GuideCheck {
     /// Compile every regex the check's pieces name; `Err` names the first that is missing or bad.
     pub(crate) fn compile(&self) -> Result<Compiled, String> {
         let list = self.list.as_ref().ok_or("no `list` piece")?;
-        let (section, failed, blocks) = match self.results.kind.as_str() {
+        let (section, failed, blocks, count) = match self.results.kind.as_str() {
             "text" => {
                 let p = self
                     .parser
@@ -549,9 +564,15 @@ impl GuideCheck {
                     p.section.as_deref().map(re).transpose()?,
                     p.failed.iter().map(|f| re(f)).collect::<Result<_, _>>()?,
                     blocks,
+                    match p.count.as_deref().map(re).transpose()? {
+                        Some(c) if !c.capture_names().any(|n| n == Some("n")) => {
+                            return Err("`parser.count` has no named group `n`".into())
+                        }
+                        c => c,
+                    },
                 )
             }
-            "junit" => (None, Vec::new(), Vec::new()),
+            "junit" => (None, Vec::new(), Vec::new(), None),
             k @ ("json-lines" | "tap") => {
                 return Err(format!("`results.kind` `{k}` is reserved (not read in v1)"))
             }
@@ -561,6 +582,7 @@ impl GuideCheck {
             section,
             failed,
             blocks,
+            count,
             list_item: re(&list.item)?,
             list_section: list.section.as_deref().map(re).transpose()?,
         })
@@ -872,6 +894,139 @@ impl Compiled {
     pub(crate) fn keyed(&self) -> bool {
         self.list_section.is_some()
     }
+
+    /// (core#1101) How many tests a run's text results say it EXECUTED, per qualifier: every
+    /// `count` line's `n`, summed under the `section` it follows (under `""` without a keyed list,
+    /// or before any section). `None` without a `count` piece; `Err` for an `n` that is not a
+    /// number, or a section with no `count` line.
+    pub(crate) fn executed(
+        &self,
+        text: &str,
+    ) -> Option<Result<std::collections::BTreeMap<String, usize>, String>> {
+        let count = self.count.as_ref()?;
+        let keyed = self.keyed();
+        let mut q = String::new();
+        let mut by = std::collections::BTreeMap::<String, usize>::new();
+        // (review on #1766) Every section the run opens must state its count: a section whose
+        // count line `count` does not match (`running 1 test` against a plural-only regex) is
+        // unknown, never absent.
+        let mut open: Option<String> = None;
+        let uncounted = |open: &Option<String>| -> Option<String> {
+            open.as_ref().map(|q| {
+                format!(
+                    "section `{q}` has no line `parser.count` matches, so what it ran is unknown"
+                )
+            })
+        };
+        for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+            if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
+                if let Some(e) = uncounted(&open) {
+                    return Some(Err(e));
+                }
+                q = s
+                    .name("q")
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                open = Some(q.clone());
+            }
+            let Some(n) = count.captures(l).and_then(|c| c.name("n")) else {
+                continue;
+            };
+            let Ok(n) = n.as_str().parse::<usize>() else {
+                return Some(Err(format!(
+                    "`parser.count` matched `{l}`, whose `n` is not a number"
+                )));
+            };
+            open = None;
+            let at = by
+                .entry(if keyed { q.clone() } else { String::new() })
+                .or_default();
+            *at = at.saturating_add(n);
+        }
+        if let Some(e) = uncounted(&open) {
+            return Some(Err(e));
+        }
+        Some(Ok(by))
+    }
+}
+
+impl GuideCheck {
+    /// (core#1101) The `complete` probe on a clean run's results `text`: the run executed exactly
+    /// the tests `listed` names. The list names no test twice; with junit, the run's testcase ids
+    /// (run or skipped) are the list's, one for one; with text, every qualifier's `parser.count`
+    /// total equals the number of tests the list names under it — a section the list never names
+    /// (a test binary a `--lib` list omits, or doctests a list does not print) fails, since a
+    /// name it shares with a listed test would look unique.
+    pub(crate) fn completeness(&self, text: &str, listed: &[TestId]) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(t) = listed.iter().find(|t| !seen.insert(*t)) {
+            return Err(format!("the list names `{}` (q `{}`) twice", t.id, t.q));
+        }
+        let c = self.compile()?;
+        if self.results.kind == "junit" {
+            let mut ran = junit_ids(
+                text,
+                &self.results.id,
+                self.results.id_join.as_deref().unwrap_or("::"),
+                c.keyed(),
+            )
+            .ok_or("the results hold no testsuite")?;
+            let mut want = listed.to_vec();
+            // Both sorted: the mismatch is found by binary search (coord on #1766).
+            ran.sort();
+            want.sort();
+            if ran == want {
+                return Ok(());
+            }
+            let odd = ran
+                .iter()
+                .find(|t| want.binary_search(t).is_err())
+                .map(|t| {
+                    format!(
+                        "the run has `{}` (q `{}`), which the list does not",
+                        t.id, t.q
+                    )
+                })
+                .or_else(|| {
+                    want.iter()
+                        .find(|t| ran.binary_search(t).is_err())
+                        .map(|t| {
+                            format!(
+                                "the list names `{}` (q `{}`), which the run does not",
+                                t.id, t.q
+                            )
+                        })
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "the clean run has {} testcase(s); the list names {}: {odd}",
+                ran.len(),
+                want.len()
+            ));
+        }
+        let mut ran = c
+            .executed(text)
+            .ok_or("no `parser.count` to count the tests the run executed")??;
+        ran.retain(|_, n| *n > 0);
+        let mut want = std::collections::BTreeMap::<String, usize>::new();
+        for t in listed {
+            *want.entry(t.q.clone()).or_default() += 1;
+        }
+        for q in ran.keys().chain(want.keys()) {
+            let (r, w) = (
+                ran.get(q).copied().unwrap_or(0),
+                want.get(q).copied().unwrap_or(0),
+            );
+            if r != w {
+                return Err(if q.is_empty() {
+                    format!("the clean run executed {r} test(s); the list names {w}")
+                } else {
+                    format!("section `{q}`: the clean run executed {r} test(s); the list names {w}")
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Unique, first-seen order; without a keyed list, the qualifier is dropped.
@@ -914,6 +1069,21 @@ pub(crate) fn junit(
         all.push(t);
     }
     Some((all, dedup(failed, keyed)))
+}
+
+/// (core#1101) Every `<testcase>` with an id, run or skipped.
+pub(crate) fn junit_ids(
+    xml: &str,
+    attrs: &[String],
+    join: &str,
+    keyed: bool,
+) -> Option<Vec<TestId>> {
+    Some(
+        junit_cases(xml, attrs, join, keyed)?
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .collect(),
+    )
 }
 
 /// Every `<testcase>` with an id: (its id, skipped, failed).
@@ -1115,6 +1285,15 @@ mod tests {
                 "deselect",
                 serde_json::json!({"append": ["--suite={q}", "--p=^(?!(?:{ids:re|})$)"]}),
             ),
+            // (core#1101) `{q}` and `{id}` in different tokens.
+            (
+                "deselect",
+                serde_json::json!({"append": ["--suite={q}", "--skip={id}"]}),
+            ),
+            (
+                "deselect",
+                serde_json::json!({"append": ["--skip={id}", "--", "{q}"]}),
+            ),
         ] {
             let mut bad = serde_json::to_value(check("text")).unwrap();
             bad[k] = v.clone();
@@ -1122,11 +1301,98 @@ mod tests {
         }
         let mut ok = serde_json::to_value(check("text")).unwrap();
         ok["cwd"] = "crates/x".into();
+        assert!(guide(ok.clone()).is_ok());
+        // (core#1101) One token binds the qualifier to its id.
+        ok["deselect"] = serde_json::json!({"append": ["--", "--skip={q}::{id}", "--exact"]});
         assert!(guide(ok).is_ok());
         assert_eq!(
             fill(&s(&["--{id}@{q}"]), &t("Q", "a{q}b")),
             s(&["--a{q}b@Q"])
         );
+    }
+
+    /// (core#1101) `complete` holds the clean run to the list, per qualifier: a section the list
+    /// never names (a binary a `--lib` list omits, doctests it does not print) fails; a name
+    /// listed twice fails, even when it balances an omission; junit compares every testcase id,
+    /// skipped ones included; no `count`, no answer; a bad `n` or a `count` with no group `n` is
+    /// an error.
+    #[test]
+    fn complete_holds_the_run_to_the_list_per_qualifier() {
+        let text =
+            "== bin1\nrunning 2 tests\n== docs\nrunning 0 tests\n== bin2\nrunning 1 test\r\n";
+        let listed = [t("bin1", "a"), t("bin1", "b"), t("bin2", "c")];
+        let mut c = check("text");
+        assert!(c
+            .completeness(text, &listed)
+            .is_err_and(|e| e.contains("no `parser.count`")));
+        c.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\d+) tests?$".into());
+        assert_eq!(
+            c.completeness(text, &listed),
+            Ok(()),
+            "an empty section is not one"
+        );
+        // A library-only list beside a full run: `bin2` (and its `c`) never listed.
+        let err = c.completeness(text, &listed[..2]).unwrap_err();
+        assert!(err.contains("section `bin2`"), "{err}");
+        // Equal totals, different qualifiers: bin1 2 + bin2 1 against bin1 1 + bin2 2.
+        let swapped = [t("bin1", "a"), t("bin2", "c"), t("bin2", "d")];
+        let err = c.completeness(text, &swapped).unwrap_err();
+        assert!(err.contains("section `bin1`"), "{err}");
+        // (review on #1766) A section whose count line the regex misses is unknown, not absent.
+        let plural = {
+            let mut p = c.clone();
+            p.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\d+) tests$".into());
+            p
+        };
+        let err = plural.completeness(text, &listed[..2]).unwrap_err();
+        assert!(err.contains("section `bin2` has no line"), "{err}");
+        // Doctests the list does not print.
+        let docs = text.replace("running 0 tests", "running 3 tests");
+        let err = c.completeness(&docs, &listed).unwrap_err();
+        assert!(err.contains("section `docs`"), "{err}");
+        // A duplicate balancing an omission: the totals match, the list does not.
+        let dup = [t("bin1", "a"), t("bin1", "a"), t("bin2", "c")];
+        let err = c.completeness(text, &dup).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+        // Unkeyed: one total.
+        let mut unkeyed = c.clone();
+        unkeyed.list.as_mut().unwrap().section = None;
+        let flat = [t("", "a"), t("", "b"), t("", "c")];
+        assert_eq!(unkeyed.completeness(text, &flat), Ok(()));
+        let err = unkeyed.completeness(text, &flat[..2]).unwrap_err();
+        assert!(
+            err.contains("executed 3 test(s); the list names 2"),
+            "{err}"
+        );
+        c.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\S+) tests?$".into());
+        assert!(c
+            .completeness("== bin1\nrunning many tests\n", &listed)
+            .is_err_and(|e| e.contains("not a number")));
+        // Written back as the author wrote it.
+        let wrote = serde_json::to_value(&c).unwrap();
+        assert!(wrote["parser"]["count"].is_string(), "{wrote}");
+        // A `count` with no group `n` counts nothing: refused, never a silent zero.
+        c.parser.as_mut().unwrap().count = Some(r"^running \d+ tests?$".into());
+        assert!(c
+            .compile()
+            .err()
+            .is_some_and(|e| e.contains("no named group `n`")));
+        // junit: every testcase id, a skipped one included, one for one.
+        let j = check("junit");
+        let xml = r#"<testsuite name="s"><testcase classname="k" name="x"/>
+            <testcase classname="k" name="y"><skipped/></testcase></testsuite>"#;
+        let two = [t("s", "k::x"), t("s", "k::y")];
+        assert_eq!(j.completeness(xml, &two), Ok(()));
+        let err = j.completeness(xml, &two[..1]).unwrap_err();
+        assert!(err.contains("the run has `k::y`"), "{err}");
+        // Same size, different ids: `x, y` run against `x, z` listed.
+        let other = [t("s", "k::x"), t("s", "k::z")];
+        let err = j.completeness(xml, &other).unwrap_err();
+        assert!(err.contains("the run has `k::y`"), "{err}");
+        // A testcase run twice balancing a listed one the run lacks.
+        let twice = r#"<testsuite name="s"><testcase classname="k" name="x"/>
+            <testcase classname="k" name="x"/></testsuite>"#;
+        assert!(j.completeness(twice, &two).is_err());
     }
 
     /// (confirmation round on d32b2b2, codex P1) A check name keys files the engine writes: only
@@ -1242,6 +1508,22 @@ mod tests {
         // floor-nesting failures), so the floor still reads the check as unusable, never as a guide
         // that does not parse.
         assert!(t.version.is_some());
+        // (core#1101, review on #1766) Its list names doctests (ids with spaces), and every
+        // section a run counts, doctests included, is the list's: `complete` can pass on it.
+        let c = t.compile().expect("compiles");
+        let listing = "     Running unittests src/lib.rs (target/debug/deps/wicked_core-0a1b)\n\
+                       t::a: test\n   Doc-tests wicked_core\nsrc/clock.rs - clock (line 7): test\n";
+        let listed = c.list(listing);
+        assert_eq!(
+            listed,
+            [
+                self::t("wicked_core-0a1b", "t::a"),
+                self::t("wicked_core", "src/clock.rs - clock (line 7)")
+            ]
+        );
+        let run = "     Running unittests src/lib.rs (target/debug/deps/wicked_core-0a1b)\n\
+                   running 1 test\ntest t::a ... ok\n   Doc-tests wicked_core\nrunning 1 test\n";
+        assert_eq!(t.completeness(run, &listed), Ok(()));
         let v = t.verified.as_ref().expect("a verified block");
         assert!(v.results.contains_key("version") && !v.runner_version.is_empty());
         // (confirmation round) An npm gate provisions as detection does: an `install` check
