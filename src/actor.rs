@@ -3555,7 +3555,12 @@ pub(crate) fn run(
                     emit_run_error(&mut subscribers, &run_id, e);
                 }
             }
-            Command::ConveneDecision { req, clis, reply } => {
+            Command::ConveneDecision {
+                req,
+                clis,
+                lock,
+                reply,
+            } => {
                 // (operator ruling 2026-10-11) Eligible = the run's unbenched roster intersected
                 // with what the caller handed (which already excludes the dispute's parties, so
                 // evaluator≠creator holds) — `council_roster`.
@@ -3598,6 +3603,8 @@ pub(crate) fn run(
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
+                    // (core#1289) The last ballot has returned: the host slot is free.
+                    drop(lock);
                     let _ = reply.send(result);
                 });
             }

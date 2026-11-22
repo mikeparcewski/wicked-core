@@ -1115,7 +1115,10 @@ impl Core {
                         std::sync::Arc::downgrade(&r)
                     }));
                 let council: std::sync::Arc<dyn crate::team::supervisor::Council> =
-                    std::sync::Arc::new(crate::team::supervisor::ActorCouncil { tx: tx.clone() });
+                    std::sync::Arc::new(crate::team::supervisor::ActorCouncil {
+                        tx: tx.clone(),
+                        lock_path: crate::cli_runner::HostCouncilLock::host_path(),
+                    });
                 let live_tx = tx.clone();
                 let live: crate::team::supervisor::LiveRuns = std::sync::Arc::new(move || {
                     let (reply, rx) = channel();
@@ -2336,9 +2339,29 @@ impl Core {
         req: DecisionRequest,
         clis: Vec<AgenticCli>,
     ) -> anyhow::Result<DecisionVerdict> {
+        // (core#1289) Every council is admitted through the host's one council slot, taken here on
+        // the caller's thread (never the actor's) and dropped by the council after its last ballot.
+        let lock = crate::cli_runner::HostCouncilLock::acquire_until(
+            &crate::cli_runner::HostCouncilLock::host_path(),
+            std::time::Instant::now() + crate::cli_runner::HostCouncilLock::ADMISSION_WAIT,
+        )
+        .map_err(|why| match why {
+            crate::cli_runner::SlotRefused::Busy => anyhow::anyhow!(
+                "the host council slot stayed busy for {:?}",
+                crate::cli_runner::HostCouncilLock::ADMISSION_WAIT
+            ),
+            crate::cli_runner::SlotRefused::Unavailable(e) => {
+                anyhow::anyhow!("the host council slot is unavailable: {e}")
+            }
+        })?;
         let (reply, rx) = channel();
         self.tx
-            .send(Command::ConveneDecision { req, clis, reply })
+            .send(Command::ConveneDecision {
+                req,
+                clis,
+                lock,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
