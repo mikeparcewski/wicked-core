@@ -3335,6 +3335,30 @@ fn a_team_council_excludes_an_alias_of_a_party_by_identity() {
     assert_eq!(seats, vec!["codex".to_string(), "pi".to_string()]);
 }
 
+/// codex r2 on #1771 (core#1775): a Windows record spelling its binary `claude.exe` is the
+/// shipped `claude`. As a party it is verified and excludes the `claude` aliases; as a voter it
+/// sits. Before, the kept suffix made it an unverifiable identity: no council at all.
+#[test]
+fn a_windows_executable_spelling_is_the_same_identity() {
+    let mut party = builtin_seat("claude");
+    party.key = "claude-win".into();
+    party.binary = r"C:\Tools\Claude.EXE".into();
+    party.headless_invocation = party
+        .headless_invocation
+        .replacen("claude", "Claude.EXE", 1);
+    let mut voter = builtin_seat("codex");
+    voter.key = "codex-win".into();
+    voter.binary = "codex.exe".into();
+    voter.headless_invocation = voter.headless_invocation.replacen("codex", "codex.cmd", 1);
+    let roster = vec![builtin_seat("claude"), party, voter, builtin_seat("pi")];
+    let seats: Vec<String> = team_council_seats(roster, &["claude-win#1".to_string()])
+        .expect("a .exe party is verified")
+        .into_iter()
+        .map(|c| c.key)
+        .collect();
+    assert_eq!(seats, vec!["codex-win".to_string(), "pi".to_string()]);
+}
+
 /// codex r1 on #1771: a party whose own record runs a launcher script could be running any CLI
 /// underneath, so no seat can be shown distinct from it: no council (`identity_unknown`), and the
 /// engine is never asked. Before, its wrapper name was its only identity and `claude` sat.
