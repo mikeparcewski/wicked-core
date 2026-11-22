@@ -4872,7 +4872,7 @@ mod tests {
         let a = create_worktree(p, "run-a").unwrap();
         let b = create_worktree(p, "run-b").unwrap();
         let c = create_worktree(p, "run-c").unwrap();
-        let d = create_worktree(p, "run-d").unwrap();
+        create_worktree(p, "run-d").unwrap();
         let canon = std::fs::canonicalize(&old).unwrap();
         let admin_at = |root: &Path, n: &str| root.join(".git").join("worktrees").join(n);
         std::fs::write(
