@@ -2118,10 +2118,17 @@ impl ToNode for WorkUnit {
         {
             node.metadata = map;
         }
+        // (core#1380) A worker failure keeps its output's tail in the denial and the review rounds:
+        // a notes link there names the host temp dir. Scrubbed before and after the redaction,
+        // as the output records are (a redaction can join a path split across a continuation).
+        const NOTES_FIELDS: &[&str] =
+            &["denial_reason", "denial", "denials_behind", "review_rounds"];
+        crate::execute::scrub_notes_fields(&mut node.metadata, NOTES_FIELDS);
         crate::tool_activity::redact_fields(
             &mut node.metadata,
             &["denial_reason", "denial", "denials_behind"],
         );
+        crate::execute::scrub_notes_fields(&mut node.metadata, NOTES_FIELDS);
         node
     }
 }
