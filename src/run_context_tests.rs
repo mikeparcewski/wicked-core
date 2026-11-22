@@ -317,9 +317,54 @@ fn a_stamp_always_overwrites_and_never_reaches_a_tool_step_or_the_seat_reprobe()
     let mut other = WorkUnit::pending("x", "rc-other", 1, "x");
     stamp(&mut other, "rc-other", 1);
     assert!(
-        other.run_context.is_none(),
+        render(&other).is_none() && prefix(&other).is_empty(),
         "another run's seats get nothing"
     );
+}
+
+/// (core#1322 item 4) A FIRST block set while a launch is prepared (nothing was published when the
+/// seat was stamped) reaches that launch at its pin, as a later set does. Before, a seat stamped
+/// with nothing in force carried no stamp at all, so the carrier never looked again.
+#[test]
+fn a_first_block_set_while_the_launch_is_prepared_reaches_it() {
+    let run = "rc-first-block";
+    let mut u = WorkUnit::pending("rc-first-block:build", run, 1, "build it");
+    stamp(&mut u, run, 1);
+    assert!(render(&u).is_none(), "nothing in force yet: byte-identical");
+    publish(run, Some(&block(1, vec![section("goal", "first", 1)])));
+    let handed = pin(&mut u).expect("the first block reaches the launch");
+    assert_eq!(handed.version, 1);
+    assert_eq!(render(&u).map(|(v, _)| v), Some(1));
+    forget(run);
+}
+
+/// (core#1322 item 2) A run's published blocks are dropped when it ends, and an engine's shutdown
+/// drops only the runs its own (actor) thread published.
+#[test]
+fn a_runs_blocks_are_dropped_when_it_ends_and_at_its_engines_shutdown() {
+    let ended = "rc-drain-ended";
+    publish(ended, Some(&block(1, vec![section("goal", "g", 1)])));
+    assert!(current(ended).is_some());
+    forget(ended);
+    assert!(current(ended).is_none(), "the ended run's blocks are gone");
+    assert!(published(ended).is_empty());
+
+    let mine = "rc-drain-mine";
+    let theirs = "rc-drain-theirs";
+    publish(theirs, Some(&block(1, vec![section("goal", "t", 1)])));
+    std::thread::spawn(move || {
+        publish(mine, Some(&block(1, vec![section("goal", "m", 1)])));
+        assert!(current(mine).is_some());
+        forget_published_here();
+        assert!(current(mine).is_none(), "the engine's own run is dropped");
+    })
+    .join()
+    .unwrap();
+    assert!(
+        current(theirs).is_some(),
+        "another engine's run is kept at this one's shutdown"
+    );
+    forget(theirs);
 }
 
 /// The power-turn property: the per-unit runner stamps EVERY launch with the block in force at
@@ -339,7 +384,14 @@ fn the_per_unit_runner_stamps_every_launch_at_launch_time_and_delegates_the_rest
     let judge = WorkUnit::pending("validator-agent", "validator", 1, "judge");
     r.run_unit(&input("validator-xyz", judge));
     let seen = seat.seen();
-    assert!(seen[0].unit.run_context.is_none(), "nothing set yet");
+    assert!(
+        seen[0]
+            .unit
+            .run_context
+            .as_ref()
+            .is_some_and(|s| s.ctx.version == 0 && s.ctx.sections.is_empty()),
+        "nothing set yet: an empty stamp"
+    );
     assert_eq!(seen[1].unit.run_context.as_ref().unwrap().ctx.version, 1);
     let j = seen[2]
         .unit

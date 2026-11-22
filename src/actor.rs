@@ -5037,6 +5037,8 @@ pub(crate) fn run(
                     runner.on_run_complete(&run_id);
                 }
                 runner.on_shutdown();
+                // (core#1322) This engine's published context blocks go with it.
+                crate::run_context::forget_published_here();
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
                 let ids: Vec<String> = terminals.keys().cloned().collect();
@@ -11009,6 +11011,8 @@ fn fail_run(
     );
     notify_campaign(self_tx, &session.id, crate::campaign::NodeOutcome::Failed);
     runner.on_run_complete(&session.id);
+    // (core#1322) The run ended: its published context blocks are dropped.
+    crate::run_context::forget(&session.id);
     StepApplied::Finished
 }
 
@@ -17587,6 +17591,8 @@ fn finalize_run(
     );
     notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Completed);
     runner.on_run_complete(run_id);
+    // (core#1322) The run ended: its published context blocks are dropped.
+    crate::run_context::forget(run_id);
     Ok(())
 }
 
@@ -22803,6 +22809,8 @@ pub(crate) fn cancel_run(
     );
     notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Cancelled);
     runner.on_run_complete(run_id);
+    // (core#1322) The run ended: its published context blocks are dropped.
+    crate::run_context::forget(run_id);
     Ok(SessionStatus::Cancelled)
 }
 

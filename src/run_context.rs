@@ -338,8 +338,15 @@ fn check_author_id(id: &str) -> Result<(), String> {
 /// earlier ones are what a seat launched under them may echo back (`Stamping` strips them all).
 const PUBLISHED_KEPT: usize = 8;
 
-fn live() -> &'static RwLock<HashMap<String, Vec<RunContext>>> {
-    static LIVE: OnceLock<RwLock<HashMap<String, Vec<RunContext>>>> = OnceLock::new();
+/// One run's published blocks, and the thread that published them (the engine's actor thread:
+/// `publish` is actor-only), so an engine's shutdown drops only its own (core#1322).
+struct Published {
+    owner: std::thread::ThreadId,
+    kept: Vec<RunContext>,
+}
+
+fn live() -> &'static RwLock<HashMap<String, Published>> {
+    static LIVE: OnceLock<RwLock<HashMap<String, Published>>> = OnceLock::new();
     LIVE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -350,11 +357,15 @@ pub(crate) fn publish(run_id: &str, ctx: Option<&RunContext>) {
     let mut m = live().write().unwrap_or_else(|p| p.into_inner());
     match ctx {
         Some(c) => {
-            let kept = m.entry(run_id.to_string()).or_default();
-            if kept.last() != Some(c) {
-                kept.push(c.clone());
-                if kept.len() > PUBLISHED_KEPT {
-                    kept.remove(0);
+            let entry = m.entry(run_id.to_string()).or_insert_with(|| Published {
+                owner: std::thread::current().id(),
+                kept: Vec::new(),
+            });
+            entry.owner = std::thread::current().id();
+            if entry.kept.last() != Some(c) {
+                entry.kept.push(c.clone());
+                if entry.kept.len() > PUBLISHED_KEPT {
+                    entry.kept.remove(0);
                 }
             }
         }
@@ -364,13 +375,33 @@ pub(crate) fn publish(run_id: &str, ctx: Option<&RunContext>) {
     }
 }
 
+/// (core#1322) The run ended (completed, failed or cancelled): its published blocks are dropped,
+/// so the map does not grow for the daemon's life. Every launch path publishes the session's
+/// block again before it stamps, so a resumed run's seats lose nothing.
+pub(crate) fn forget(run_id: &str) {
+    live()
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(run_id);
+}
+
+/// (core#1322) The engine is shutting down: drop every run THIS thread (its actor) published,
+/// and only those (another engine in the process keeps its own).
+pub(crate) fn forget_published_here() {
+    let me = std::thread::current().id();
+    live()
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|_, p| p.owner != me);
+}
+
 /// The block published for `run_id`, cleared or not.
 fn latest(run_id: &str) -> Option<RunContext> {
     live()
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .get(run_id)
-        .and_then(|k| k.last().cloned())
+        .and_then(|p| p.kept.last().cloned())
 }
 
 /// Every block recently published for `run_id` (oldest first): what a seat of the run may have
@@ -380,7 +411,7 @@ fn published(run_id: &str) -> Vec<RunContext> {
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .get(run_id)
-        .cloned()
+        .map(|p| p.kept.clone())
         .unwrap_or_default()
 }
 
@@ -411,18 +442,24 @@ pub(crate) fn takes_block(unit: &WorkUnit) -> bool {
 }
 
 /// Stamp `unit` with `run_id`'s block in force now (or clear it): ALWAYS overwrites, so a unit
-/// cloned from an earlier launch never carries an older block.
+/// cloned from an earlier launch never carries an older block. (core#1322) A seat that takes a
+/// block is stamped even when none is published yet, with an empty version-0 block (the shape of
+/// a cleared one: nothing renders), so a FIRST block set while its launch is prepared still
+/// reaches it at the pin, as a later set does.
 pub(crate) fn stamp(unit: &mut WorkUnit, run_id: &str, ord: u32) {
-    unit.run_context = if takes_block(unit) {
-        latest(run_id).map(|ctx| SeatContext {
-            run_id: run_id.to_string(),
-            ord,
-            ctx,
-            pinned: false,
-        })
-    } else {
-        None
-    };
+    unit.run_context = takes_block(unit).then(|| SeatContext {
+        run_id: run_id.to_string(),
+        ord,
+        ctx: latest(run_id).unwrap_or_else(|| RunContext {
+            version: 0,
+            sections: Vec::new(),
+            set_by: ContextAuthor {
+                kind: "system".into(),
+                id: String::new(),
+            },
+        }),
+        pinned: false,
+    });
 }
 
 /// Which seat a unit launches, as `runContextDelivered` names it.
