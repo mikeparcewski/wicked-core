@@ -38278,6 +38278,32 @@ mod seat_failover_tests {
                 "{out}"
             );
         }
+        // (review r2) The swap never changes the reason: it would cut stderr's 2 KiB tail at a new
+        // place (lifting `not logged in` out of `diagnostic: not logged in`) or join an approval
+        // pair across the streams. Then the streams keep their order.
+        let cut = failed(
+            "claude",
+            "usage limit exceeded\n",
+            &format!("diagnostic: not logged in\n{}", "x".repeat(2012)),
+        );
+        let joined = failed(
+            "codex",
+            "exec_command failed\nusage limit exceeded\n",
+            &format!("{}\napproval request failed\n", "x".repeat(4096)),
+        );
+        for text in [&cut, &joined] {
+            assert!(text.find("exceeded") < text.find("xxxx"), "{text}");
+            let reason = SeatFailureReason::classify_refusal(text, true);
+            assert!(
+                !matches!(
+                    reason,
+                    Some(SeatFailureReason::NotLoggedIn | SeatFailureReason::ApprovalUnavailable)
+                ),
+                "{reason:?}"
+            );
+            assert!(crate::cli_runner::judge_refusal("claude", text)
+                .is_none_or(|(_, r)| r.reason == "quota_exhausted"));
+        }
         // A refusal on stderr keeps its place after stdout's progress (core#1612).
         let stderr_refusal = failed(
             "claude",

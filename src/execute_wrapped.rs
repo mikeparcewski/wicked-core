@@ -8095,17 +8095,22 @@ pub(crate) fn spawn_failure_detail(output: &str) -> Option<&str> {
 /// first, so that refusal stays at the end, inside the classifiers' terminal frame: a chatty stderr
 /// (telemetry retries, exporter dumps) would otherwise push it out of the 2 KiB tail they read.
 /// Each stream is judged on its own tail by `classify_refusal`'s own rules, the frame it would get
-/// if it were the only stream, so the order never turns the body of either stream into a frame.
+/// if it were the only stream. The swap is kept only when the swapped detail classifies as stdout
+/// alone does (review r2): the new 2 KiB cut must not lift a line fragment of stderr into a frame,
+/// nor join an approval phrase pair from the two streams.
 pub(crate) fn failed_detail(out: String, err: String, nonzero_exit: bool) -> String {
     use wicked_council::types::SeatFailureReason;
     match (out.trim().is_empty(), err.trim().is_empty()) {
         (false, false) => {
-            let refuses = |s: &str| SeatFailureReason::classify_refusal(s, nonzero_exit).is_some();
-            if refuses(&out) && !refuses(&err) {
-                format!("{err}\n{out}")
-            } else {
-                format!("{out}\n{err}")
+            let classify = |s: &str| SeatFailureReason::classify_refusal(s, nonzero_exit);
+            let own = classify(&out);
+            if own.is_some() && classify(&err).is_none() {
+                let swapped = format!("{err}\n{out}");
+                if classify(&swapped) == own {
+                    return swapped;
+                }
             }
+            format!("{out}\n{err}")
         }
         (false, _) => out,
         _ => err,
