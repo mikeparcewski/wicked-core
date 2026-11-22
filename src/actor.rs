@@ -15714,6 +15714,13 @@ fn run_draft_render_tool(
 mod draft_render_live {
     use super::*;
 
+    /// (core#1762) CI sets `WICKED_REQUIRE_HEADLESS_SHELL` where it provisions a headless shell: a
+    /// real-browser test that would skip there fails instead.
+    #[cfg(unix)]
+    fn required_headless_shell() -> bool {
+        std::env::var_os("WICKED_REQUIRE_HEADLESS_SHELL").is_some_and(|v| !v.is_empty())
+    }
+
     #[test]
     #[ignore = "needs WICKED_TEST_HEADLESS_SHELL and WICKED_TEST_GARDEN_ROOT"]
     fn a_two_page_draft_is_measured_in_the_jail_and_reaches_no_listener() {
@@ -15786,13 +15793,25 @@ mod draft_render_live {
     /// that prints with the browser as garden's `render_pdf` does, and gives up (no report) if it can
     /// read a file beside the draft. A two-page draft is measured as 2 pages, with the counter's
     /// sha256 and the browser's version line on the record.
+    ///
+    /// (core#1762) CI's ubuntu and macOS legs provision the shell and set
+    /// `WICKED_REQUIRE_HEADLESS_SHELL`: there every SKIP below fails instead, so CI cannot report
+    /// this test as passed while it skipped.
     #[cfg(unix)]
     #[test]
     fn a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv() {
         let test = "a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv";
+        let skip = |why: &str| {
+            assert!(
+                !required_headless_shell(),
+                "{test} would SKIP ({why}), but WICKED_REQUIRE_HEADLESS_SHELL requires it to run"
+            );
+            eprintln!("SKIP {test}: {why}");
+        };
         if crate::validator::skip_when_nested(test)
             || crate::validator::skip_in_container_floor(test)
         {
+            skip("no OS jail can arm here");
             return;
         }
         let candidates: Vec<std::path::PathBuf> = std::env::var_os("WICKED_TEST_HEADLESS_SHELL")
@@ -15803,11 +15822,11 @@ mod draft_render_live {
             .into_iter()
             .find(|p| p.is_absolute() && p.is_file())
         else {
-            eprintln!("SKIP {test}: WICKED_TEST_HEADLESS_SHELL names no headless shell");
+            skip("WICKED_TEST_HEADLESS_SHELL names no headless shell");
             return;
         };
         if crate::validator::find_on_path("python3").is_none() {
-            eprintln!("SKIP {test}: no python3 on PATH");
+            skip("no python3 on PATH");
             return;
         }
         let base = std::env::temp_dir().join(format!("wc-dr-browser-{}", std::process::id()));
@@ -15889,8 +15908,8 @@ print(json.dumps({{"check": "pages", "pages": n, "source": "chrome-render", "ver
         );
         eprintln!("{test}: {out}\n{rec:#?}");
         if rec.cause.as_deref() == Some("unjailed_host") {
-            eprintln!("SKIP {test}: no render jail on this host");
             let _ = std::fs::remove_dir_all(&base);
+            skip("no render jail on this host");
             return;
         }
         assert_eq!(st, crate::workflow::StepStatus::Ok);
