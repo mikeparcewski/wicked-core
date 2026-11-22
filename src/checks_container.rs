@@ -532,8 +532,10 @@ pub(crate) fn retire_target_claims(leaf: &Path) -> Result<(), String> {
 /// (core#1542) The run's last floor out of `leaf` deletes the leaf's BASE target claim: the base
 /// pass is over and its results are in the run's log store, while the head claim stays warm for
 /// the next floor's incremental build. Called under the leaf's EXCLUSIVE lock, so no floor of the
-/// run mounts the claim meanwhile; the deletion waits until the claim is gone, so a later floor
-/// never re-applies a claim that is still terminating. A leaf with no base claim registered (a
+/// run mounts the claim meanwhile. (core#1714) The deletion is only MARKED (`--wait=false`): the
+/// run's next floor never waits at its shared lease on a slow API server, and a floor that claims
+/// the same name waits for the terminating claim to be gone before it applies it
+/// ([`crate::k8s::floor::Place::claim`]). A leaf with no base claim registered (a
 /// host floor) has nothing to do. A failure keeps the claim registered: it goes with the leaf or
 /// the run's namespace, as before.
 pub(crate) fn retire_base_target_claim(leaf: &Path) -> Result<(), String> {
@@ -549,7 +551,7 @@ pub(crate) fn retire_base_target_claim(leaf: &Path) -> Result<(), String> {
         };
         (claim.kube.clone(), claim.namespace.clone())
     };
-    kube.delete_owned(Some(&namespace), "pvc", &name, true)?;
+    kube.delete_owned(Some(&namespace), "pvc", &name, false)?;
     let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(registry) = registry.as_mut() {
         if let Some(record) = registry.get_mut(leaf) {
@@ -2157,13 +2159,18 @@ impl ChecksFloor {
                 &target,
                 MAX_TARGET_LEAVES,
             )?;
+            // A claim still terminating (core#1714) is not warm: `claim` waits it out and
+            // creates it afresh.
             let warm = self
                 .place
                 .kube
                 .get_json(Some(&self.place.ns), "pvc", &target)
                 .ok()
                 .flatten()
-                .is_some();
+                .is_some_and(|o| {
+                    o.pointer("/metadata/deletionTimestamp")
+                        .is_none_or(serde_json::Value::is_null)
+                });
             self.place
                 .claim(&target, &format!("{TARGET_CLAIM_GI}Gi"))
                 .map_err(|e| format!("the cargo target claim: {e}"))?;

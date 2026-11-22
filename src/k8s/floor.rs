@@ -34,6 +34,10 @@ pub(crate) const POD_START: Duration = Duration::from_secs(120);
 /// Floor pods whose deletion was not confirmed: (namespace, pod).
 static UNREAPED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
+/// (core#1714) How long a claim about to be applied may still be terminating: the bound a
+/// waited deletion had ([`Kube::delete_owned`]).
+pub(crate) const CLAIM_GONE_BOUND: Duration = Duration::from_secs(180);
+
 /// Where a floor's pods go: the run's namespace, or (no run) one of the floor's own.
 #[derive(Debug)]
 pub(crate) struct Place {
@@ -282,10 +286,15 @@ impl Place {
         Ok(())
     }
 
-    /// Ensure the claim `name` exists in this place (idempotent).
+    /// Ensure the claim `name` exists in this place (idempotent). (core#1714) A claim of that name
+    /// still terminating (a retirement marked it without waiting) is waited out first, at most
+    /// [`CLAIM_GONE_BOUND`]: applied now, it would be a no-op its deletion then undoes, and the
+    /// floor's pod would wait for a claim that is gone.
     pub(crate) fn claim(&self, name: &str, size: &str) -> Result<(), String> {
         let _admission =
             crate::checks_container::admit_dependency_claim(&self.kube, &self.ns, name)?;
+        self.kube
+            .wait_not_terminating(Some(&self.ns), "pvc", name, CLAIM_GONE_BOUND)?;
         self.kube
             .apply(&[render::pvc(&self.ns, &self.kube.owner, name, size)])
             .map_err(|e| {
@@ -446,7 +455,7 @@ mod pr_c2_claim_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let kubectl = dir.join("kubectl");
         crate::test_env::install_stub(&kubectl,
-            "#!/bin/sh\ncat >/dev/null\necho 'exceeded quota: run-budget, requested: persistentvolumeclaims=1' >&2\nexit 1\n");
+            "#!/bin/sh\ncase \"$*\" in *' get '*) exit 0;; esac\ncat >/dev/null\necho 'exceeded quota: run-budget, requested: persistentvolumeclaims=1' >&2\nexit 1\n");
         let place = Place {
             kube: Kube {
                 kubectl,
@@ -461,6 +470,71 @@ mod pr_c2_claim_tests {
         let err = place.claim("target", "64Gi").unwrap_err();
         assert!(err.starts_with("admission_pending:"), "{err}");
         assert!(err.contains("run-budget"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn place_with(dir: &std::path::Path, script: &str) -> Place {
+        let kubectl = dir.join("kubectl");
+        crate::test_env::install_stub(&kubectl, script);
+        Place {
+            kube: Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "me".into(),
+            },
+            ns: "live-run".into(),
+            run: "run".into(),
+            owned: false,
+        }
+    }
+
+    /// (core#1714) The retired base target claim is only marked for deletion; a floor claiming the
+    /// same name sees it terminating, waits until it is NotFound, and only then applies it.
+    #[test]
+    fn a_claim_still_terminating_is_applied_only_once_it_is_gone() {
+        let dir = std::env::temp_dir().join(format!("claim-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let place = place_with(
+            &dir,
+            &format!(
+                "#!/bin/sh\ncd '{0}' || exit 1\ncase \" $* \" in\n\
+                 *' get pvc '*) if [ -f terminating ]; then echo get-terminating >>calls; rm terminating; \
+                 echo '{{\"metadata\":{{\"name\":\"target\",\"deletionTimestamp\":\"2026-11-22T00:00:00Z\"}}}}'; \
+                 else echo get-gone >>calls; fi;;\n\
+                 *' apply '*) cat >/dev/null; echo apply >>calls;;\n\
+                 *) exit 9;;\nesac\n",
+                dir.display()
+            ),
+        );
+        std::fs::write(dir.join("terminating"), "").unwrap();
+        place.claim("target", "64Gi").unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert_eq!(calls, "get-terminating\nget-gone\napply\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// (core#1714) A claim that stays terminating past the bound is an error, never an apply.
+    #[test]
+    fn a_claim_terminating_past_the_bound_is_not_applied() {
+        let dir = std::env::temp_dir().join(format!("claim-stuck-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let place = place_with(
+            &dir,
+            &format!(
+                "#!/bin/sh\ncd '{0}' || exit 1\ncase \" $* \" in\n\
+                 *' get pvc '*) echo '{{\"metadata\":{{\"deletionTimestamp\":\"2026-11-22T00:00:00Z\"}}}}';;\n\
+                 *' apply '*) cat >/dev/null; echo apply >>calls;;\n\
+                 *) exit 9;;\nesac\n",
+                dir.display()
+            ),
+        );
+        let err = place
+            .kube
+            .wait_not_terminating(Some("live-run"), "pvc", "target", Duration::ZERO)
+            .unwrap_err();
+        assert!(err.contains("still terminating"), "{err}");
+        assert!(!dir.join("calls").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

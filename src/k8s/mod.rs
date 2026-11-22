@@ -742,6 +742,40 @@ impl Kube {
         }
     }
 
+    /// (core#1714) Wait, at most `bound`, until `kind/name` is not TERMINATING (it carries a
+    /// `metadata.deletionTimestamp`): absent or live returns at once. An `apply` of a terminating
+    /// object is a no-op its deletion then undoes, so a caller about to apply waits here first.
+    pub(crate) fn wait_not_terminating(
+        &self,
+        ns: Option<&str>,
+        kind: &str,
+        name: &str,
+        bound: Duration,
+    ) -> Result<(), String> {
+        let poll = if cfg!(test) {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_millis(500)
+        };
+        let start = Instant::now();
+        loop {
+            let terminating = self.get_json(ns, kind, name)?.is_some_and(|o| {
+                o.pointer("/metadata/deletionTimestamp")
+                    .is_some_and(|t| !t.is_null())
+            });
+            if !terminating {
+                return Ok(());
+            }
+            if start.elapsed() >= bound {
+                return Err(format!(
+                    "{kind}/{name} is still terminating after {} s",
+                    bound.as_secs()
+                ));
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
     /// Whether the API server answers now (`kubectl version` reaches the server).
     pub(crate) fn answers(&self) -> bool {
         self.call(None, &["version", "-o", "json"], None, PROBE_TIMEOUT)

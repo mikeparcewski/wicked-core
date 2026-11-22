@@ -2535,6 +2535,12 @@ fn core_1542_last_floor_out_drops_the_base_target_claim_and_keeps_the_head() {
         calls.contains(&format!("delete pvc {base_claim}")),
         "{calls}"
     );
+    // (core#1714) Only marked under the leaf's lock: the next floor's claim waits it out.
+    let delete = calls
+        .lines()
+        .find(|l| l.contains(&format!("delete pvc {base_claim}")))
+        .unwrap();
+    assert!(delete.contains("--wait=false"), "{delete}");
     assert!(!calls.contains(&format!("delete pvc {head}")), "{calls}");
     // The head claim is still the leaf's: retiring the leaf deletes it.
     assert!(retire_leaf(&leaf));
