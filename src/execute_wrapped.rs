@@ -5165,6 +5165,10 @@ impl WrappedCliStepRunner {
                 Ok((code, out, err, _, _, tools)) => {
                     // Every failed unit keeps both streams for refusal classification: a CLI
                     // may print progress on stdout and say why it stopped on stderr (core#1612).
+                    // (core#1717) stderr goes into the transcript: cut the secrets a CLI prints
+                    // there (env dumps, auth headers, tokens) with the tool-output redaction,
+                    // keeping its lines as they are for the refusal classifiers.
+                    let err = crate::tool_activity::redact_prose(&err);
                     let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
                         (false, false) => format!("{out}\n{err}"),
                         (false, _) => out,
@@ -11347,6 +11351,34 @@ mod tests {
             .expect("the ordinary unit keeps the stderr refusal verbatim");
         assert!(progress_at < refusal_at, "{}", content.output);
         assert!(crate::acp_runner::is_content_refusal(&content.output));
+        // core#1717: a secret the CLI prints on stderr is cut before it reaches the transcript
+        // (red on main: the failure output carried it verbatim).
+        let token = concat!("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho 'starting the ballot'\n\
+                 echo 'GITHUB_TOKEN={token}' >&2\n\
+                 echo 'Authorization: Bearer {token}' >&2\n\
+                 printf 'diagnostic \\\\\\nNot logged in\\n' >&2\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        let leaky = runner.run_unit(&plain);
+        let _ = std::fs::remove_dir_all(sandbox_for(&plain));
+        assert_eq!(leaky.status, StepStatus::Failed, "{}", leaky.output);
+        assert!(
+            leaky.output.contains("GITHUB_TOKEN=***"),
+            "{}",
+            leaky.output
+        );
+        assert!(!leaky.output.contains(token), "{}", leaky.output);
+        // A trailing backslash in prose is not joined: the next line keeps its line-start frame.
+        assert!(
+            leaky.output.contains("diagnostic \\\nNot logged in"),
+            "{}",
+            leaky.output
+        );
         // Restore the sign-in refusal for the council dispatcher below.
         std::fs::write(&stub, sign_in_stub).unwrap();
         // Through the carrier and the production dispatcher, the refusal is classified.

@@ -78,7 +78,10 @@
 //! from the seat's environment: an https/http endpoint that accepts an anonymous push or takes a
 //! secret the seat already holds (in its own `http.extraHeader`, which it could send without git
 //! as well), or a local path the container floor bounds. This module refuses the `git push`
-//! literal, the `git config url.*` / `remote.*` write and `git remote set-url --push`. Not covered
+//! literal, the `git config url.*` / `remote.*` write (core#1792: also with a trailing `get` /
+//! `list` value), `git clone -c` of a fenced key and `git remote set-url --push`; a direct write
+//! of `.git/config` (a file write, not a command) and a `git send-pack` to a local path (no
+//! https, ssh refused) are the same stated limit as a script. Not covered
 //! either: a `git` carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c
 //! core.sshCommand=ssh` — command-line `-c` outranks the environment entries) or its own
 //! `GIT_SSH_COMMAND`, and a seat that scrubs its environment (`env -i`) first. This module
@@ -1083,6 +1086,15 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     if sub == "config" {
         return judge_git_config(rest);
     }
+    if sub == "clone" {
+        // (core#1792) `git clone -c <k=v>` writes the key into the new repository's config.
+        if let Some(key) = clone_config_keys(rest)
+            .into_iter()
+            .find(|k| fenced_config_key(k))
+        {
+            return Some(format!("clone -c {key} (fenced key)"));
+        }
+    }
     if sub == "remote"
         && rest.iter().any(|r| r == "set-url")
         && rest
@@ -1109,6 +1121,79 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     None
 }
 
+/// `git clone`'s long options that take a separate value (besides `--config`).
+const CLONE_LONG_VALUE_OPTS: &[&str] = &[
+    "--template",
+    "--reference",
+    "--reference-if-able",
+    "--origin",
+    "--branch",
+    "--revision",
+    "--upload-pack",
+    "--depth",
+    "--shallow-since",
+    "--shallow-exclude",
+    "--separate-git-dir",
+    "--jobs",
+    "--server-option",
+    "--filter",
+    "--bundle-uri",
+    "--ref-format",
+];
+
+/// The keys of `git clone`'s `-c <k=v>` / `--config <k=v>`: attached (`-ck=v`, `--config=k=v`),
+/// in a short cluster (`-qc k=v`, `-qck=v`) and as a long prefix (`--con`). Options stop at `--`;
+/// the other options that take a value (`-o -b -u -j`, [`CLONE_LONG_VALUE_OPTS`]) consume it.
+fn clone_config_keys(rest: &[String]) -> Vec<&str> {
+    let long = |t: &str| t.len() > 4 && "--config".starts_with(t);
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let t = rest[i].as_str();
+        i += 1;
+        if t == "--" {
+            break;
+        }
+        // A long option that takes a value consumes it, `--` included (`--template -- -c k=v`).
+        if !long(t) && t.len() > 4 && CLONE_LONG_VALUE_OPTS.iter().any(|o| o.starts_with(t)) {
+            i += 1;
+            continue;
+        }
+        let kv = if long(t) {
+            rest.get(i).map(|v| {
+                i += 1;
+                v.as_str()
+            })
+        } else if let Some((_, v)) = t.split_once('=').filter(|(f, _)| long(f)) {
+            Some(v)
+        } else if t.len() > 1 && t.starts_with('-') && !t.starts_with("--") {
+            let cluster = &t[1..];
+            let at = cluster.find(['c', 'o', 'b', 'u', 'j']);
+            match at {
+                Some(p) => {
+                    let attached = &cluster[p + 1..];
+                    let value = if attached.is_empty() {
+                        rest.get(i).map(|v| {
+                            i += 1;
+                            v.as_str()
+                        })
+                    } else {
+                        Some(attached)
+                    };
+                    value.filter(|_| cluster.as_bytes()[p] == b'c')
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(kv) = kv {
+            keys.push(kv.split('=').next().unwrap_or(kv));
+        }
+    }
+    keys
+}
+
 /// `git config …`: a READ (`--get*`, `-l`/`--list`, `--show-*`) passes; a write naming a fenced
 /// key — `alias.*`, `url.*`, `remote.*`, `credential.*`, `core.sshCommand`, … — is refused,
 /// whichever file it targets (`--global`, `--system`, `--file`, the repo's).
@@ -1124,10 +1209,34 @@ fn judge_git_config(rest: &[String]) -> Option<String> {
         "--list",
         "--show-origin",
         "--show-scope",
-        "list",
-        "get",
     ];
-    if rest.iter().any(|r| READ_FLAGS.contains(&r.as_str())) {
+    // Options that take the next token as their value (`--comment get` is a comment); git also
+    // takes an unambiguous prefix of a long one (`--comm`), so any long-option prefix of at least
+    // three letters counts (failing closed: a prefix that is not one only refuses a read).
+    const VALUE_OPTS: &[&str] = &[
+        "--file",
+        "--blob",
+        "--comment",
+        "--type",
+        "--default",
+        "--value",
+    ];
+    // (core#1792) git's legacy parser stops at the first positional, so only the options before
+    // it select the action: a trailing `--get` is a value pattern and the command still writes.
+    // `get` / `list` read only as that first positional (git's subcommand form), never as a value.
+    let mut i = 0;
+    while i < rest.len() && rest[i].starts_with('-') {
+        if READ_FLAGS.contains(&rest[i].as_str()) {
+            return None;
+        }
+        let t = rest[i].as_str();
+        i += if t == "-f" || (t.len() > 4 && VALUE_OPTS.iter().any(|o| o.starts_with(t))) {
+            2
+        } else {
+            1
+        };
+    }
+    if matches!(rest.get(i).map(String::as_str), Some("get" | "list")) {
         return None;
     }
     rest.iter()
@@ -1485,6 +1594,32 @@ mod tests {
         // …while reads of the same keys, and ordinary config writes, pass.
         assert_eq!(hit("git config --get alias.p"), None);
         assert_eq!(hit("git config --list"), None);
+        // core#1792: `get` / `list` read only as the subcommand; as a value the write is refused.
+        assert_eq!(hit("git config get remote.origin.url"), None);
+        assert_eq!(hit("git config list"), None);
+        for cmd in [
+            "git config remote.x.pushurl https://example.invalid/o/r.git get",
+            "git config url.https://example.invalid/.pushInsteadOf '' list",
+            "git clone -c remote.origin.pushurl=https://example.invalid/o/r.git https://example.invalid/a/b.git",
+            "git clone --config=url.x.pushInsteadOf=y https://example.invalid/a/b.git",
+            "git clone --config remote.origin.pushurl=z src dst",
+            "git clone --conf remote.origin.pushurl=z src dst",
+            "git clone -cremote.origin.pushurl=z src dst",
+            "git clone -qc remote.origin.pushurl=z src dst",
+            "git clone -qcremote.origin.pushurl=z src dst",
+            "git config --comment get remote.origin.pushurl https://example.invalid/o/r.git",
+            "git config remote.origin.pushurl https://example.invalid/o/r.git --get",
+            "git config --comm get remote.origin.pushurl https://example.invalid/o/r.git",
+            "git clone --template -- -c remote.origin.pushurl=z src dst",
+        ] {
+            assert!(hit(cmd).is_some(), "not refused: {cmd}");
+        }
+        assert_eq!(hit("git config --global get user.name"), None);
+        assert_eq!(hit("git config --file f --get remote.origin.url"), None);
+        assert_eq!(hit("git clone -- src -cremote.origin.pushurl=backup"), None);
+        assert_eq!(hit("git clone -b -cmain src dst"), None);
+        assert_eq!(hit("git clone -c core.autocrlf=false src dst"), None);
+        assert_eq!(hit("git clone https://example.invalid/a/b.git"), None);
         assert_eq!(hit("git config user.name 'wicked worker'"), None);
         assert_eq!(hit("git config core.autocrlf false"), None);
         assert_eq!(hit("git -c user.email=a@b.invalid commit -m x"), None);

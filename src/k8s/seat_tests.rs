@@ -6702,3 +6702,29 @@ fn pr_c2_dependency_mount_destination_is_a_directory_before_sandbox_creation() {
     assert!(outside.join("kept").is_file());
     std::fs::remove_dir_all(replica).unwrap();
 }
+
+/// core#1750: a seat argument holding a NUL is refused at finalize with a named reason (red on
+/// main: std kept `<string-with-nul>` in its place, the NUL check never saw it, and the CLI ran
+/// on those 17 bytes; here main failed only later, at the armed-seat lookup).
+#[test]
+fn finalize_refuses_a_seat_argument_holding_a_nul_1750() {
+    // spawn-audit: test-only — never spawned: finalize only reads the launch command's args.
+    let mut cmd = std::process::Command::new("kubectl");
+    cmd.args([
+        "exec",
+        "-i",
+        "-c",
+        "seat",
+        "p",
+        "--",
+        "sh",
+        "-c",
+        seat::WRAPPER,
+    ])
+    .arg(format!("{}nulcheck1750", seat::MARKER_PREFIX))
+    .args(["claude", "-p", "quote a .pyc: \0\u{1}"]);
+    let Err(err) = seat::finalize(&cmd) else {
+        panic!("a NUL argument is refused");
+    };
+    assert_eq!(err, "a seat argument holds a NUL");
+}

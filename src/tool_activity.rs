@@ -1122,7 +1122,41 @@ fn keep_short_flag(cmd: &str, start: usize, head: &str) -> bool {
 /// is cut like one on the same line (core#1577; also inside quotes, where the record then shows
 /// the two lines joined).
 pub fn redact(cmd: &str) -> String {
-    let mut out = continuation().replace_all(cmd, "").into_owned();
+    redact_text(&continuation().replace_all(cmd, ""))
+}
+
+/// (core#1717) [`redact`] for prose (a CLI's stderr), whose line framing the refusal classifiers
+/// read: each line is redacted on its own, so no pattern reaches into the next line
+/// (`Authorization:` then `Not logged in`). A line ending in a continuation is redacted with the
+/// next one joined when the join cuts something the two lines apart do not (a secret continued
+/// onto the next line); otherwise the two lines keep their framing.
+pub(crate) fn redact_prose(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(next) = lines
+            .get(i + 1)
+            .filter(|_| continuation().is_match(lines[i]))
+        {
+            let pair = format!("{}{next}", lines[i]);
+            let joined = redact(&pair);
+            let apart = format!("{}{}", redact_text(lines[i]), redact_text(next));
+            if joined != continuation().replace_all(&apart, "") {
+                out.push_str(&joined);
+                i += 2;
+                continue;
+            }
+        }
+        out.push_str(&redact_text(lines[i]));
+        i += 1;
+    }
+    out
+}
+
+/// [`redact`] without the line-continuation join.
+fn redact_text(text: &str) -> String {
+    let mut out = text.to_string();
     for (re, cut) in redactors() {
         out = match cut {
             Cut::With(with) => re.replace_all(&out, *with).into_owned(),
@@ -1147,6 +1181,28 @@ pub fn redact(cmd: &str) -> String {
         };
     }
     redact_config_pairs(&out)
+}
+
+#[cfg(test)]
+mod redact_prose_tests {
+    use super::redact_prose;
+
+    /// core#1717: stderr prose keeps its lines, and a secret continued onto the next line is cut.
+    #[test]
+    fn prose_redaction_is_line_bound_and_cuts_a_continued_secret() {
+        assert_eq!(
+            redact_prose("Authorization:\nNot logged in\n"),
+            "Authorization:\nNot logged in\n"
+        );
+        assert_eq!(
+            redact_prose("diagnostic \\\nNot logged in"),
+            "diagnostic \\\nNot logged in"
+        );
+        let continued = redact_prose("API_KEY=\\\nOpaqueValue0123456789\nNot logged in\n");
+        assert!(!continued.contains("OpaqueValue0123456789"), "{continued}");
+        assert!(continued.ends_with("\nNot logged in\n"), "{continued}");
+        assert_eq!(redact_prose("TOKEN=abc def\n"), "TOKEN=*** def\n");
+    }
 }
 
 /// core#1653: known text after a cut lets the matcher recognize lead-ins with whitespace.

@@ -2372,14 +2372,17 @@ while [ "$1" != exec ]; do shift; done
 shift
 while [ "$1" != -- ]; do shift; done
 shift
-if [ ! -f marker ]; then
-    for arg do marker=$arg; done
-    printf '%s' "$marker" > marker
-    sleep 30
-else
+case "$*" in
+*pkill*)
     printf '%s\n' "$@" > cleanup
     exit 23
-fi
+    ;;
+*)
+    for arg do marker=$arg; done
+    printf '%s' "$marker" > marker.tmp && mv marker.tmp marker
+    exec sleep 600
+    ;;
+esac
 "#,
         )
         .unwrap();
@@ -2400,14 +2403,25 @@ fi
             "wicked-writer-",
             &confirm_script(true),
             Some(b"test-key\n"),
-            Duration::from_millis(300),
+            // core#1757: the stub picks its branch by the script (cleanup or not), never by a
+            // file the first exec may not have written yet; the limit only has to outlast the
+            // first shell's start on a loaded runner.
+            Duration::from_secs(3),
         );
         assert_eq!(result.code, None);
-        let marker = std::fs::read_to_string(dir.path().join("marker")).unwrap();
         let cleanup = std::fs::read_to_string(dir.path().join("cleanup"))
             .expect("a timed-out exec must issue a bounded cleanup exec");
         // The bracketed pattern avoids killing the cleanup shell itself.
-        assert!(cleanup.contains(&format!("[{}]{}", &marker[..1], &marker[1..])));
+        let pattern = regex::Regex::new(r"\[w\]icked-writer-[0-9a-f]{32}").unwrap();
+        let targeted = pattern
+            .find(&cleanup)
+            .expect("the cleanup names a writer marker")
+            .as_str();
+        // The first exec records the marker it was given once its shell runs (it may not have run
+        // yet on a loaded runner when the limit fires): when it did, it is the one cleaned up.
+        if let Ok(marker) = std::fs::read_to_string(dir.path().join("marker")) {
+            assert_eq!(targeted, format!("[{}]{}", &marker[..1], &marker[1..]));
+        }
         assert!(cleanup.contains("pkill -9 -f"));
         assert!(cleanup.contains("pgrep -f"));
         assert!(result.err_text().contains("cleanup"), "{result:?}");

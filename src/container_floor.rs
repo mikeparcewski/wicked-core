@@ -919,7 +919,12 @@ fn read_seat_facts(path: &Path, id: &str) -> Option<ImageFacts> {
 
 fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     let dir = path.parent().ok_or("seat image facts path has no parent")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // (core#1715) Private like the image exports: every directory this creates is 0700.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec(facts).map_err(|e| e.to_string())?;
     // Shared writer creates a unique 0600 file, syncs it, and renames it over the destination.
     crate::acp_runner::write_atomic(dir, path, &bytes).map_err(|e| e.to_string())
@@ -3886,6 +3891,18 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            // core#1715: the facts directories are 0700 (red on main: the umask's 0755).
+            for d in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(d).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "{}",
+                    d.display()
+                );
+            }
         }
         for version in ["v0", ""] {
             let stale_path = dir
