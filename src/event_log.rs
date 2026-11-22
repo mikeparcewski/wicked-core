@@ -136,10 +136,12 @@ pub fn log_root_for(store_path: &str) -> Option<PathBuf> {
     (!in_memory_spec(store_path)).then(|| log_root(store_path))
 }
 
-/// (core#1131) Does SQLite open `spec` as an in-memory database? `:memory:`; `""` (a private
-/// temporary database, deleted on close); and the URI forms the store accepts (rusqlite opens with
-/// `SQLITE_OPEN_URI`): `file::memory:` with any query, and a `file:` URI whose query sets
-/// `mode=memory` or `vfs=memdb`.
+/// (core#1131) Does SQLite open `spec` as an in-memory (or private temporary) database?
+/// `:memory:`; `""` (a private temporary database, deleted on close); and the URI forms the store
+/// accepts (rusqlite opens with `SQLITE_OPEN_URI`), parsed as SQLite parses them: the fragment
+/// (`#…`) dropped first, an optional `//` authority, the filename and every query key and value
+/// percent-decoded, and the LAST `mode` / `vfs` option winning. A decoded filename `:memory:` or
+/// empty, `mode=memory` or `vfs=memdb` is in memory.
 pub(crate) fn in_memory_spec(spec: &str) -> bool {
     if spec == ":memory:" || spec.is_empty() {
         return true;
@@ -147,13 +149,48 @@ pub(crate) fn in_memory_spec(spec: &str) -> bool {
     let Some(uri) = spec.strip_prefix("file:") else {
         return false;
     };
+    let uri = uri.split_once('#').map_or(uri, |(u, _)| u);
     let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-    let path = path.split_once('#').map_or(path, |(p, _)| p);
-    let query = query.split_once('#').map_or(query, |(q, _)| q);
-    path == ":memory:"
-        || query
-            .split('&')
-            .any(|kv| kv == "mode=memory" || kv == "vfs=memdb")
+    let path = match path.strip_prefix("//") {
+        // `file://<authority>/<path>`: SQLite takes the path after the authority.
+        Some(rest) => rest.find('/').map_or("", |i| &rest[i..]),
+        None => path,
+    };
+    let file = percent_decoded(path);
+    if file.is_empty() || file == b":memory:" {
+        return true;
+    }
+    let (mut mode, mut vfs) = (None, None);
+    for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match percent_decoded(k).as_slice() {
+            b"mode" => mode = Some(percent_decoded(v)),
+            b"vfs" => vfs = Some(percent_decoded(v)),
+            _ => {}
+        }
+    }
+    mode.as_deref() == Some(b"memory".as_slice()) || vfs.as_deref() == Some(b"memdb".as_slice())
+}
+
+/// `%HH` decoded as SQLite's URI parser does; any other byte (a `%` without two hex digits too)
+/// kept as is.
+fn percent_decoded(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// `<root>/<encoded-run-id>.ndjson`.
@@ -944,12 +981,19 @@ mod tests {
         let first = sink.launched_ms("r1").expect("the launch is remembered");
         assert!(first >= before, "{first} >= {before}");
         assert_eq!(sink.launched_ms("r2"), None, "another run keeps its own");
+        // (review on #1765) Launching another run keeps the first's; relaunching the first keeps
+        // the other's.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        sink.emit(started("r2"));
+        let second = sink.launched_ms("r2").expect("r2's launch");
+        assert_eq!(sink.launched_ms("r1"), Some(first));
         std::thread::sleep(std::time::Duration::from_millis(5));
         sink.emit(started("r1"));
         assert!(
             sink.launched_ms("r1").unwrap() > first,
             "a relaunch replaces it"
         );
+        assert_eq!(sink.launched_ms("r2"), Some(second));
         let root = tmp("rootless-launch");
         let mut recording = EventSink::persistent(root.clone());
         recording.emit(started("r3"));
@@ -1247,15 +1291,50 @@ mod tests {
             "file:x?mode=memory",
             "file:x?cache=shared&mode=memory",
             "file:/x/core.db?vfs=memdb",
+            // (review on #1765) Percent-encoded, the last option winning, an empty filename
+            // (a private temporary database), and an authority.
+            "file:%3Amemory%3A",
+            "file:x?mode=mem%6fry",
+            "file:x?m%6fde=memory",
+            "file:x?mode=rwc&mode=memory",
+            "file:/x/core.db?vfs=unix&vfs=memdb",
+            "file:",
+            "file:?cache=private",
+            "file:///x/core.db?mode=memory",
+            "file://localhost/x/core.db?mode=memory",
         ] {
             assert_eq!(log_root_for(spec), None, "{spec:?}");
         }
-        for spec in ["file:/x/core.db", "file:/x/core.db?mode=rwc", "memory.db"] {
+        for spec in [
+            "file:/x/core.db",
+            "file:/x/core.db?mode=rwc",
+            "memory.db",
+            // (review on #1765) A fragment is not the query; a later option overrides.
+            "file:core.db#ignored?mode=memory",
+            "file:/x/core.db?vfs=memdb&vfs=unix",
+            "file:x?mode=memory&mode=rwc",
+            "file:%3Amemory%3Ax",
+        ] {
             assert!(log_root_for(spec).is_some(), "{spec:?}");
         }
         assert_eq!(
             log_root_for("/var/lib/wicked/core.db"),
             Some(log_root("/var/lib/wicked/core.db"))
+        );
+        // (review on #1765) The production root (actor and `Core`) classifies the ORIGINAL spec:
+        // a `file:///…` memory URI holds `://`, which the sidecar fallback would otherwise anchor
+        // at the estate default.
+        assert_eq!(
+            crate::actor::event_log_root("file:///x/core.db?mode=memory"),
+            None
+        );
+        assert_eq!(
+            crate::actor::event_log_root("postgres://h/db"),
+            Some(log_root(".wicked-estate/graph.db"))
+        );
+        assert_eq!(
+            crate::actor::event_log_root("/x/core.db"),
+            Some(log_root("/x/core.db"))
         );
     }
 
