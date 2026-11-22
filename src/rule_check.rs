@@ -32,6 +32,9 @@
 //!   The answers count only inside a `BEGIN VERDICTS <nonce>` block whose nonce is fresh per call, so
 //!   a `RULE` line written into the change (and echoed by a judge) is never a verdict; a KEPT must
 //!   cite a changed file. The whole prompt stays under one argv argument ([`PROMPT_BUDGET`]).
+//!   A change too big for one call is judged in parts, each in its own call ([`diff_parts`]); a rule
+//!   no part broke but the parts could not decide alone is asked again on the whole diff of the
+//!   changed files they named for it, together in one call ([`part_scope`], core#1278 item 4).
 //! * **Machine checks (S3).** A rule carrying `obligations: ["check:test-fails-on-base"]` is checked
 //!   by the engine: no source change is not applicable, a source change with no test is broken (no
 //!   model call, under a step scope; see F11 below), and otherwise the changed tests run on the base
@@ -1439,8 +1442,78 @@ fn part_note(k: usize, n: usize) -> String {
         "PART {k} OF {n} of the change: the change is too big for one call, so it is judged in {n} \
          parts, each in its own call, and the answers are combined (a rule BROKEN in any part is \
          broken). Judge each rule on THIS part only: BROKEN or KEPT on what this part shows, N/A for \
-         a rule this part does not touch, UNKNOWN only when this part cannot decide it.\n\n"
+         a rule this part does not touch, UNKNOWN only when this part cannot decide it. An UNKNOWN \
+         names, by their whole paths as listed in the CHANGED FILES, every changed file the rule \
+         needs, this part's own included: the engine shows a judge those files together.\n\n"
     )
+}
+
+/// (core#1278 item 4) The note that leads a rule's call on the files the parts named for it.
+const SCOPE_NOTE: &str =
+    "THE FILES FOR THIS RULE, TOGETHER: the change is too big for one call, so \
+     it was judged in parts, each in its own call. Every part was read, none found this rule \
+     broken, and the parts could not decide it alone. The EVIDENCE below is the whole diff of each \
+     changed file the judges of those parts named for it (listed in the CHANGED FILES). Judge the \
+     rule on these files together: BROKEN or KEPT on what they show, UNKNOWN when they cannot \
+     decide it.\n\n";
+
+/// (core#1278 item 4) The changed files a rule the parts could not decide alone is asked again on:
+/// the paths (from git's own list, `paths`) named whole in its UNKNOWN words and KEPT cites across
+/// the parts. `None`, and the rule is asked again as before, unless every part answered it with no
+/// BROKEN or holding miss, at least one part was UNKNOWN, and every UNKNOWN named a changed file.
+/// The caller asks only when every part was read (nothing cut).
+fn part_scope(parts: &[Parsed], id: &str, paths: &[&str]) -> Option<Vec<String>> {
+    let mut words: Vec<&str> = Vec::new();
+    let mut unsure = false;
+    for p in parts {
+        match (p.answers.get(id), p.misses.get(id)) {
+            (Some(a), None) if a.status == RuleStatus::Broken => return None,
+            (Some(a), None) => {
+                if a.status == RuleStatus::Kept {
+                    words.push(&a.cite);
+                }
+            }
+            // Each undecided part says what it needs: an UNKNOWN naming no changed file
+            // leaves that part's doubt unknown, so nothing is scoped.
+            (None, Some(Miss::Unsure(w)))
+                if paths.iter().any(|p| p.len() >= 3 && names_whole_path(w, p)) =>
+            {
+                unsure = true;
+                words.push(w);
+            }
+            _ => return None,
+        }
+    }
+    let named: Vec<String> = paths
+        .iter()
+        .filter(|p| p.len() >= 3 && words.iter().any(|w| names_whole_path(w, p)))
+        .map(|p| p.to_string())
+        .collect();
+    (unsure && !named.is_empty()).then_some(named)
+}
+
+/// (core#1278 item 4) The whole sections of `diff` (from each `diff --git` line to the next) whose
+/// header names a path in `scope`, either side of a rename, in the diff's order. A header the engine
+/// cannot match (git quoted it) is left out: the judge then cannot cite it, so a KEPT on it fails
+/// closed.
+fn scoped_sections(diff: &str, scope: &[&str]) -> String {
+    let names = |header: &str| {
+        let h = header.trim_end_matches(['\n', '\r']);
+        scope.iter().any(|p| {
+            h.starts_with(&format!("diff --git a/{p} b/")) || h.ends_with(&format!(" b/{p}"))
+        })
+    };
+    let mut out = String::new();
+    let mut keep = false;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            keep = names(line);
+        }
+        if keep {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// (core#1474) The answers of one batch's parts, combined per rule: BROKEN if any part broke it
@@ -4118,6 +4191,9 @@ struct Retry {
     avoid: String,
     told: String,
     holds: bool,
+    /// (core#1278 item 4) The changed files the parts named for a rule they could not decide
+    /// alone ([`part_scope`]): the retry shows them together in one call when they fit.
+    scope: Option<Vec<String>>,
 }
 
 /// A batch's rules, and the retry context when it is a rule asked again alone.
@@ -4215,24 +4291,47 @@ fn run_pool(
                 let engine = input.engine_record.unwrap_or("");
                 // The records a record call cut (a cut record proves presence, never absence).
                 let mut cut_records: Vec<usize> = Vec::new();
+                // The diff bytes one call on the change can show beside `shown`'s file list: never
+                // more than the prompt itself would show (`prompt_for`'s own cap); the frame
+                // already holds the rules, floor, files and instructions.
+                let cap_beside = |shown: &[&str], lead: usize| {
+                    let frame = prompt_for(
+                        &asked,
+                        "",
+                        shown,
+                        input.floor,
+                        input.instructions,
+                        &nonce,
+                        input.stage,
+                    );
+                    EVIDENCE_CAP
+                        .min(PROMPT_BUDGET.saturating_sub(frame.len() + lead + PROMPT_OVERHEAD))
+                        .max(4 * 1024)
+                };
+                // (core#1278 item 4) A rule the parts could not decide alone, asked again on the
+                // whole diff of the files they named for it, in ONE call, when that fits one call
+                // (else it is asked on the parts again, as before).
+                let scoped: Option<(String, Vec<&str>)> = match (&retry, subject, input.stage) {
+                    (
+                        Some(Retry {
+                            scope: Some(scope), ..
+                        }),
+                        EvidenceSubject::Change,
+                        CheckStage::Review,
+                    ) => {
+                        let shown: Vec<&str> = scope.iter().map(String::as_str).collect();
+                        let slice = scoped_sections(&input.change.diff, &shown);
+                        (!slice.is_empty() && slice.len() <= cap_beside(&shown, SCOPE_NOTE.len()))
+                            .then_some((slice, shown))
+                    }
+                    _ => None,
+                };
                 // (core#1474) The change in parts when it is bigger than this prompt's evidence
                 // budget: nothing is left out, each part is asked in its own call.
                 let parts: Vec<String> = match subject {
+                    EvidenceSubject::Change if scoped.is_some() => Vec::new(),
                     EvidenceSubject::Change => {
-                        let frame = prompt_for(
-                            &asked,
-                            "",
-                            &paths,
-                            input.floor,
-                            input.instructions,
-                            &nonce,
-                            input.stage,
-                        );
-                        // Never more than the prompt itself would show (`prompt_for`'s own cap):
-                        // the frame already holds the rules, floor, files and instructions.
-                        let cap = EVIDENCE_CAP
-                            .min(PROMPT_BUDGET.saturating_sub(frame.len() + PROMPT_OVERHEAD))
-                            .max(4 * 1024);
+                        let cap = cap_beside(&paths, 0);
                         if input.change.diff.len() <= cap {
                             Vec::new()
                         } else {
@@ -4258,9 +4357,21 @@ fn run_pool(
                         )
                     ))
                 };
-                let text = seat_text(match subject {
-                    EvidenceSubject::Change if total_parts > 0 => part_text(0),
-                    EvidenceSubject::Change => prompt_for(
+                let text = seat_text(match (subject, &scoped) {
+                    (EvidenceSubject::Change, Some((slice, shown))) => format!(
+                        "{SCOPE_NOTE}{}",
+                        prompt_for(
+                            &asked,
+                            slice,
+                            shown,
+                            input.floor,
+                            input.instructions,
+                            &nonce,
+                            input.stage,
+                        )
+                    ),
+                    (EvidenceSubject::Change, None) if total_parts > 0 => part_text(0),
+                    (EvidenceSubject::Change, None) => prompt_for(
                         &asked,
                         &input.change.diff,
                         &paths,
@@ -4269,10 +4380,10 @@ fn run_pool(
                         &nonce,
                         input.stage,
                     ),
-                    EvidenceSubject::Process => {
+                    (EvidenceSubject::Process, _) => {
                         process_prompt(&asked, engine, input.instructions, &nonce)
                     }
-                    EvidenceSubject::Record => {
+                    (EvidenceSubject::Record, _) => {
                         let (t, c) =
                             record_prompt(&asked, records, reviewer, input.instructions, &nonce);
                         cut_records = c;
@@ -4330,6 +4441,7 @@ fn run_pool(
                                         avoid: seat.clone(),
                                         told: "the judge first asked ran out of time".into(),
                                         holds: false,
+                                        scope: None,
                                     },
                                 );
                             }
@@ -4404,6 +4516,7 @@ fn run_pool(
                                                 k + 1
                                             ),
                                             holds: false,
+                                            scope: None,
                                         },
                                     );
                                 }
@@ -4417,18 +4530,21 @@ fn run_pool(
                 match got {
                     Some((seat, out)) => {
                         // A KEPT on the change cites a changed file; on a record it quotes it.
-                        let bar: &[&str] = match subject {
-                            EvidenceSubject::Change => &paths,
+                        // (core#1278 item 4) On the named files, only the files shown count.
+                        let bar: &[&str] = match (subject, &scoped) {
+                            (EvidenceSubject::Change, Some((_, shown))) => shown,
+                            (EvidenceSubject::Change, None) => &paths,
                             _ => &[],
                         };
-                        let parsed = if total_parts > 1 {
-                            let mut each = vec![parse_rule_answers(
+                        let mut each: Vec<Parsed> = Vec::new();
+                        let mut parsed = if total_parts > 1 {
+                            each.push(parse_rule_answers(
                                 &out,
                                 &ids,
                                 &nonce,
                                 bar,
                                 input.instructions,
-                            )];
+                            ));
                             each.extend(later.iter().map(|o| {
                                 parse_rule_answers(o, &ids, &nonce, bar, input.instructions)
                             }));
@@ -4436,6 +4552,14 @@ fn run_pool(
                         } else {
                             parse_rule_answers(&out, &ids, &nonce, bar, input.instructions)
                         };
+                        if scoped.is_some() {
+                            for a in parsed.answers.values_mut() {
+                                a.cite = format!(
+                                    "on the files the parts named, read together: {}",
+                                    a.cite
+                                );
+                            }
+                        }
                         // (pi r2) A judge shown only part of the diff can find a rule broken, never
                         // kept or not applicable: what it did not see may break it. (core#1474) In
                         // parts, the change is shown whole unless it needed more than MAX_PARTS, or
@@ -4555,7 +4679,21 @@ fn run_pool(
                                 }
                                 None => parsed.misses.get(*id).cloned().unwrap_or(Miss::NoLine),
                             };
-                            w.insert(batch[j], miss.reason(&seat));
+                            w.insert(
+                                batch[j],
+                                match scoped {
+                                    Some(_) => format!(
+                                        "on the files the parts named, {}",
+                                        miss.reason(&seat)
+                                    ),
+                                    None => miss.reason(&seat),
+                                },
+                            );
+                            // (core#1278 item 4) Every part read, none of them able to decide
+                            // it alone: the retry shows the files they named for it together.
+                            let scope = (!cut && total_parts > 1 && retry.is_none())
+                                .then(|| part_scope(&each, id, &paths))
+                                .flatten();
                             l.insert(
                                 batch[j],
                                 Retry {
@@ -4565,6 +4703,7 @@ fn run_pool(
                                         miss.class()
                                     ),
                                     holds: miss.holds(),
+                                    scope,
                                 },
                             );
                         }
