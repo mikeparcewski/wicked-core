@@ -1829,7 +1829,16 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
         let rig = spawn(&db);
         let run = format!("r{}", name.replace('-', ""));
         rig.core.launch_run(spec(&run, name, None)).unwrap();
-        let units = units_of(&rig.core, &run);
+        // The whole plan, not its first committed units: a read the actor is too busy to answer
+        // between commands reads the last committed state (`read_model::QUIET_BUDGET`), which on
+        // a slow runner can be a plan still landing. A creator plan adds six engine rows (below).
+        let planned = want.len() + if creator { 6 } else { 0 };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut units = units_of(&rig.core, &run);
+        while units.len() < planned && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            units = units_of(&rig.core, &run);
+        }
         let all = rows(&run, &units);
         assert_eq!(
             all.first().map(|r| r.0 == "pa-scope"),
