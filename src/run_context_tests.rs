@@ -336,6 +336,36 @@ fn a_first_block_set_while_the_launch_is_prepared_reaches_it() {
     assert_eq!(handed.version, 1);
     assert_eq!(render(&u).map(|(v, _)| v), Some(1));
     forget(run);
+
+    // codex r1 on #1777: a first block may carry version 0 (accepted when the session had none);
+    // it still replaces the "nothing published" stamp, at the pin and at render.
+    let run = "rc-first-block-v0";
+    let mut u = WorkUnit::pending("rc-first-block-v0:build", run, 1, "build it");
+    stamp(&mut u, run, 1);
+    publish(run, Some(&block(0, vec![section("goal", "zero", 0)])));
+    assert_eq!(
+        render(&u).map(|(v, _)| v),
+        Some(0),
+        "rendered before the pin"
+    );
+    let handed = pin(&mut u).expect("a version-0 first block reaches the launch");
+    assert!(handed.sections.iter().any(|s| s.text == "zero"));
+    forget(run);
+}
+
+/// codex r1 on #1777: a run with no block stamps its seats (so a first block can still reach
+/// them), but nothing was handed, so a seat's answer that happens to read like the framing is
+/// left whole.
+#[test]
+fn a_run_with_no_block_never_strips_a_seats_answer() {
+    let run = "rc-no-block-strip";
+    let framing = frame(&block(0, vec![]), false);
+    let answer = format!("{framing}\nmy own words");
+    let seat = Seat::answering(&answer);
+    let r = Stamping::wrap(seat.clone(), run, 1);
+    let unit = WorkUnit::pending("rc-no-block-strip:build", run, 1, "turn");
+    let out = r.run_unit(&input(run, unit));
+    assert_eq!(out.output, answer);
 }
 
 /// (core#1322 item 2) A run's published blocks are dropped when it ends, and an engine's shutdown
@@ -365,6 +395,26 @@ fn a_runs_blocks_are_dropped_when_it_ends_and_at_its_engines_shutdown() {
         "another engine's run is kept at this one's shutdown"
     );
     forget(theirs);
+
+    // codex r1 on #1777: two engines may share a caller-supplied run id. One engine's end or
+    // shutdown drops only its own slot: the other's seats still read their block.
+    let shared = "rc-drain-shared";
+    publish(shared, Some(&block(1, vec![section("goal", "here", 1)])));
+    std::thread::spawn(move || {
+        publish(shared, Some(&block(1, vec![section("goal", "there", 1)])));
+        forget(shared);
+        publish(shared, Some(&block(2, vec![section("goal", "there", 2)])));
+        forget_published_here();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        current(shared).map(|c| c.version),
+        Some(1),
+        "the other engine's end and shutdown kept this engine's block"
+    );
+    forget(shared);
+    assert!(current(shared).is_none());
 }
 
 /// The power-turn property: the per-unit runner stamps EVERY launch with the block in force at
