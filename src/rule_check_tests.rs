@@ -5353,7 +5353,8 @@ fn a_quote_across_a_nul_counts_as_the_seat_read_it() {
 /// UNKNOWN (naming both files, and `extra`'s words) when it sees one of them, N/A on a part with
 /// neither. Rule by rule: `NAMES-NOTHING`'s UNKNOWN on the server's part names no file; `QUIET`
 /// gets no line on a part that shows the test alone; `OWN-ONLY`'s UNKNOWN names only the file its
-/// part shows; `SCOPED-NA` is N/A when asked on the named files. Every prompt is recorded with its
+/// part shows; `ELSEWHERE-ONLY`'s names only the file outside it, and a view of the test alone
+/// keeps it; `SCOPED-NA` is N/A when asked on the named files. Every prompt is recorded with its
 /// seat.
 struct SpanJudge {
     seen: Mutex<Vec<(String, String)>>,
@@ -5399,6 +5400,12 @@ impl RuleJudge for SpanJudge {
                     format!("UNKNOWN — {s} does not show how the handler checks its caller")
                 }
                 ("OWN-ONLY", false, true) => "N/A — this part does not touch it".to_string(),
+                ("ELSEWHERE-ONLY", true, false) => {
+                    "UNKNOWN — it needs test/server.test.ts".to_string()
+                }
+                ("ELSEWHERE-ONLY", false, true) => {
+                    "KEPT — test/server.test.ts has a test".to_string()
+                }
                 (_, true, false) | (_, false, true) => format!(
                     "UNKNOWN — this part shows only one of {s} and test/server.test.ts; the rule \
                      needs both{}",
@@ -5555,6 +5562,7 @@ fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
             rule("QUIET", "every handler has a test"),
             rule("NAMES-NOTHING", "the handler is documented"),
             rule("OWN-ONLY", "every handler checks its caller"),
+            rule("ELSEWHERE-ONLY", "every handler has a test"),
         ],
         &c,
         &judge,
@@ -5566,13 +5574,17 @@ fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
     // 4. (codex r1) An UNKNOWN naming only the file its own part shows: its doubt is not about
     // evidence elsewhere, and that file alone cannot settle it.
     holds(&r, "OWN-ONLY", &judge);
+    // 4b. (codex r2) An UNKNOWN naming only a file elsewhere: shown that file alone, the judge
+    // keeps the rule without the handler it was unsure about.
+    holds(&r, "ELSEWHERE-ONLY", &judge);
     // 5. The named files are too big for one call together (the data file is named too): asked
     // again on the parts, as before.
     let judge = SpanJudge::new(", and fixtures/data.json");
     let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
     holds(&r, "SPAN", &judge);
-    // 6. (codex r1) A named file git quoted the header of has no section the engine can show: the
-    // rule is not asked on the others alone.
+    // 6. (codex r1) A named file git quoted the header of has no header the engine can match, so
+    // it is neither the part's own file nor a section it could show (scoped_sections gives none
+    // for it: see the unit test below).
     let c = span_change_at(
         4000,
         "src/a\"b.ts",

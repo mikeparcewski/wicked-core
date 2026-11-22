@@ -1443,8 +1443,9 @@ fn part_note(k: usize, n: usize) -> String {
          parts, each in its own call, and the answers are combined (a rule BROKEN in any part is \
          broken). Judge each rule on THIS part only: BROKEN or KEPT on what this part shows, N/A for \
          a rule this part does not touch, UNKNOWN only when this part cannot decide it. An UNKNOWN \
-         names, by their whole paths as listed in the CHANGED FILES, every changed file the rule \
-         needs, this part's own included: the engine shows a judge those files together.\n\n"
+         names, by their whole paths as listed in the CHANGED FILES, the file in this part it could \
+         not decide and every changed file elsewhere the rule needs: the engine shows a judge those \
+         files together.\n\n"
     )
 }
 
@@ -1483,9 +1484,11 @@ fn header_names(line: &str, path: &str) -> bool {
 /// the paths (from git's own list, `paths`) named whole in its UNKNOWN words and KEPT cites across
 /// the parts (`answers[k]` read `parts[k]`). `None`, and the rule is asked again as before, unless
 /// every part answered it with no BROKEN or holding miss, at least one part was UNKNOWN, and every
-/// UNKNOWN names a changed file outside its own part: the parts could not decide it because what
-/// it needs is elsewhere, and they said where. An UNKNOWN about its own part alone is doubt a
-/// narrower view cannot settle. The caller asks only when every part was read (nothing cut).
+/// UNKNOWN names both a changed file its own part shows (what it could not decide) and one outside
+/// it (what it needs): so the files shown together hold each undecided part's doubt and what
+/// settles it. An UNKNOWN naming only its own part's files is doubt a narrower view cannot settle;
+/// one naming only files elsewhere would drop what it was unsure about (codex r2). The caller asks
+/// only when every part was read (nothing cut).
 fn part_scope(
     answers: &[Parsed],
     parts: &[String],
@@ -1515,7 +1518,7 @@ fn part_scope(
             (None, Some(Miss::Unsure(w))) => {
                 let own = |f: &str| text.lines().any(|l| header_names(l, f));
                 let these = named_in(w);
-                if !these.iter().any(|f| !own(f)) {
+                if !these.iter().any(|f| own(f)) || !these.iter().any(|f| !own(f)) {
                     return None;
                 }
                 unsure = true;
