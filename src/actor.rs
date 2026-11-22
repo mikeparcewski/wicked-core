@@ -38130,6 +38130,9 @@ mod seat_failover_tests {
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cyber.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cant-help.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt"),
+            // (core#1718) The API's output filter, in Claude Code's generic `API Error:` frame.
+            include_str!("../tests/fixtures/refusals/claude-2.1.323-content-filter.txt"),
+            "API Error: Output blocked by content filtering policy",
         ] {
             assert!(is_content_refusal(&format!(
                 "(cli `claude` exited 1) {claude}"
@@ -38188,7 +38191,7 @@ mod seat_failover_tests {
         assert!(is_content_refusal(&format!("{codex}\n{stderr_noise}")));
         assert!(!is_content_refusal(&format!(
             "{codex}\n{}",
-            "x".repeat(crate::acp_runner::CONTENT_REFUSAL_TAIL_BYTES + 1)
+            "x".repeat(wicked_council::types::REFUSAL_TAIL_BYTES + 1)
         )));
         assert!(!is_content_refusal(
             "(cli `codex` exited 1) unrelated failure"
@@ -38199,6 +38202,64 @@ mod seat_failover_tests {
              cybersecurity risk.",
             "界".repeat(6000)
         )));
+    }
+
+    /// core#1720: a failed unit keeps stdout THEN stderr (`execute_wrapped`'s failed arm builds
+    /// `(cli `<key>` exited N) {out}\n{err}`), so a sign-in, quota or approval refusal at the end
+    /// of stdout sits behind the whole stderr. The sign-in, approval and quota rules read the same
+    /// 16 KiB tail as the content refusal (red on main: they read the last 2 KiB).
+    #[test]
+    fn a_stdout_sign_in_or_quota_refusal_behind_a_chatty_stderr_still_classifies() {
+        use wicked_council::types::{SeatFailureReason, REFUSAL_TAIL_BYTES};
+        let failed =
+            |key: &str, out: &str, err: &str| format!("(cli `{key}` exited 1) {out}\n{err}");
+        // Claude Code's own sign-in line (its error table: `Not logged in · Please run /login`),
+        // then a stderr of long exporter lines: more than 4 KiB in a few lines.
+        let exporter = format!(
+            "[otel] export failed, retrying: {}\n",
+            "{\"resourceSpans\":[{\"scopeSpans\":[]}]}".repeat(40)
+        )
+        .repeat(3);
+        assert!(exporter.len() > 4096 && exporter.lines().count() < 6);
+        let sign_in = failed("claude", "Not logged in · Please run /login", &exporter);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&sign_in, true),
+            Some(SeatFailureReason::NotLoggedIn),
+            "{sign_in}"
+        );
+        let (_, judged) = crate::cli_runner::judge_refusal("claude", &sign_in)
+            .expect("the judge rotation classifies it too");
+        assert_eq!(judged.reason, "not_logged_in");
+        // pi's captured out-of-usage line, behind two hundred telemetry retry lines.
+        let telemetry = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(telemetry.len() > 4096);
+        let pi = include_str!("../tests/fixtures/refusals/pi-out-of-extra-usage.txt");
+        let quota = format!("{pi}\n{telemetry}");
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&quota, true),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        // codex's host-forced approval refusal, the same way.
+        let approval = failed(
+            "codex",
+            "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \
+             \"Rejected(\\\"approval request failed\\\")\" }",
+            &telemetry,
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&approval, true),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
+        // Pushed out of the window, each is the body again.
+        let gone = "x".repeat(REFUSAL_TAIL_BYTES + 1);
+        for refusal in [&sign_in, &quota, &approval] {
+            let first = refusal.lines().next().unwrap();
+            assert_eq!(
+                SeatFailureReason::classify_refusal(&format!("{first}\n{gone}"), true),
+                None,
+                "{first}"
+            );
+        }
     }
 
     /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier

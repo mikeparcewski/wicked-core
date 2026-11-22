@@ -1150,7 +1150,8 @@ fn sign_in_refusal_frame(text: &str) -> bool {
 /// Claude Code: the line starts with its own `API Error:` label and carries one of its refusal
 /// stems. 2.1.311 assembles `<model>'s safeguards flagged this message` and `... flagged this
 /// session` from one template, plus `can't help with this. Start a new session to continue`;
-/// older builds say `appears to violate our Usage Policy`.
+/// older builds say `appears to violate our Usage Policy`. The API's output filter reaches the
+/// same frame as `API Error: Output blocked by content filtering policy` (core#1718).
 /// Quoted source, Markdown bullets and prose about refusals lead neither frame.
 /// ASCII-case-insensitive; a content refusal concerns this unit, not the seat's run-wide health.
 pub fn content_refusal_frame(tail: &str) -> bool {
@@ -1160,6 +1161,9 @@ pub fn content_refusal_frame(tail: &str) -> bool {
         "safeguards flagged this",
         "can't help with this. start a new session to continue",
         "appears to violate our usage policy",
+        // (core#1718) The API's output filter, as Claude Code names it in its error table
+        // (claude-code 2.1.323: `Output blocked by content filtering policy`).
+        "output blocked by content filtering policy",
     ];
     tail.lines().any(|line| {
         let head = refusal_line_head(line);
@@ -1316,9 +1320,13 @@ const REFUSAL_VERBS: &[&str] = &[
 /// sentence is judged over the whole tail: a stack trace under it does not hide it — r2-N1.)
 pub const REFUSAL_FRAME_LINES: usize = 6;
 
-/// How much of a worker's / judge's transcript tail [`SeatFailureReason::classify_refusal`]
-/// judges the quota refusal frame over.
-pub const REFUSAL_TAIL_BYTES: usize = 2048;
+/// How much of a worker's / judge's transcript tail every refusal rule reads: sign-in, approval and
+/// quota in [`SeatFailureReason::classify_refusal`], and the content refusal (core#1612). One
+/// window for all of them (core#1720): a failed unit keeps stdout THEN stderr, so a refusal at the
+/// end of stdout sits behind the whole stderr; 16 KiB keeps it in view behind a chatty stderr.
+/// Each rule's own frame (a terminal line, a line-leading label, a self-framed phrase) keeps the
+/// wider window from reading the body as the seat's condition.
+pub const REFUSAL_TAIL_BYTES: usize = 16 * 1024;
 
 /// (F-7R3-001, review F1 / r2-N1 / r2-N2) Is `text` a quota refusal? Two rules. A SELF-FRAMED
 /// phrase ([`QUOTA_SELF_FRAMED`] — a provider's own sentence or an API code) counts anywhere in
