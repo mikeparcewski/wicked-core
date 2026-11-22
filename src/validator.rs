@@ -1906,10 +1906,56 @@ fn run_bounded_status_capturing_stderr(
             let _ = done_tx.send(());
         });
     }
+    let pgid = child.id();
+    watch_spawned(pgid);
     let status = wait_bounded(&mut child, timeout);
+    watch_done(pgid);
     let _ = done_rx.recv_timeout(Duration::from_millis(500));
     let kept = head.lock().unwrap_or_else(|p| p.into_inner());
     (status, String::from_utf8_lossy(&kept).into_owned())
+}
+
+/// (core#1742) Who is told about a validator's process group on this thread: the fold's off-actor
+/// reads ([`crate::actor`]'s `fold_reads`) register it under the run, as a tool child is, so a
+/// reassign or a cancel of the run stops it. `on_spawn` runs right after the spawn (the group id is
+/// the child's pid), `on_done` once the wait has ended.
+pub(crate) struct SpawnWatch {
+    pub(crate) on_spawn: Box<dyn Fn(u32)>,
+    pub(crate) on_done: Box<dyn Fn(u32)>,
+}
+
+thread_local! {
+    static SPAWN_WATCH: std::cell::RefCell<Option<SpawnWatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `watch` told of every validator group spawned on this thread meanwhile.
+pub(crate) fn with_spawn_watch<R>(watch: SpawnWatch, f: impl FnOnce() -> R) -> R {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            SPAWN_WATCH.with(|w| *w.borrow_mut() = None);
+        }
+    }
+    SPAWN_WATCH.with(|w| *w.borrow_mut() = Some(watch));
+    let _clear = Clear;
+    f()
+}
+
+fn watch_spawned(pgid: u32) {
+    SPAWN_WATCH.with(|w| {
+        if let Some(w) = w.borrow().as_ref() {
+            (w.on_spawn)(pgid);
+        }
+    });
+}
+
+fn watch_done(pgid: u32) {
+    SPAWN_WATCH.with(|w| {
+        if let Some(w) = w.borrow().as_ref() {
+            (w.on_done)(pgid);
+        }
+    });
 }
 
 /// The deterministic RE-VERIFY (no LLM at run time): run the validator's script in `cwd` and report

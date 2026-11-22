@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use wicked_apps_core::GraphStore;
 
@@ -179,12 +180,57 @@ pub(crate) fn plan(
     })
 }
 
+/// The run's lifecycle maps, where a run's live child process groups are registered.
+pub(crate) type Maps = Arc<Mutex<crate::acp_runner::ElicitationMaps>>;
+
+/// (core#1742) The validator's process group is registered under its run, as a tool child is, so
+/// the run's reassign or cancel stops it before a replacement can be dispatched into the same
+/// worktree. `seq` is the run's launch identity at the hand-off: a reassign, a cancel and a
+/// relaunch each advance it. A group spawned after that (the reassign landed between the hand-off
+/// and the spawn) is stopped at once, since the reassign has already taken the groups it kills.
+fn validator_watch(maps: Maps, run_id: String, seq: u64) -> crate::validator::SpawnWatch {
+    let (m, run) = (maps.clone(), run_id.clone());
+    crate::validator::SpawnWatch {
+        on_spawn: Box::new(move |pgid| {
+            let stale = {
+                let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+                if g.current_launch_seq(&run) == seq {
+                    // A tool child of the same run cannot be live here: the step's result, which
+                    // ends it, is what this read was handed off for.
+                    let _ = g.register_tool_child(&run, pgid);
+                    false
+                } else {
+                    true
+                }
+            };
+            if stale {
+                #[cfg(unix)]
+                crate::validator::kill_pgroup_graceful(pgid);
+            }
+        }),
+        on_done: Box::new(move |pgid| {
+            maps.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .deregister_tool_child(&run_id, pgid);
+        }),
+    }
+}
+
 /// On the actor: register the hand-off, then run `reads` on a thread of their own and post `posted`
-/// back to the actor with them.
-pub(crate) fn start(self_tx: &Sender<Command>, reads: Reads, posted: Posted) {
+/// back to the actor with them. `maps` (the actor's lifecycle maps, when it has them) is where the
+/// validator's process group is registered while it runs ([`validator_watch`]).
+pub(crate) fn start(self_tx: &Sender<Command>, maps: Option<&Maps>, reads: Reads, posted: Posted) {
     let id = NEXT_HANDOFF.fetch_add(1, Ordering::Relaxed);
     HANDED.with(|h| h.borrow_mut().insert(id, handed_for(&posted.output)));
     let tx = self_tx.clone();
+    let run_id = posted.output.run_id.clone();
+    let watch = maps.map(|m| {
+        let seq = m
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .current_launch_seq(&run_id);
+        (m.clone(), seq)
+    });
     std::thread::spawn(move || {
         let Posted {
             output,
@@ -202,22 +248,41 @@ pub(crate) fn start(self_tx: &Sender<Command>, reads: Reads, posted: Posted) {
         if let Some(mut read) = pinned {
             // A validator run that panics still answers, fail-closed: a pinned phase that could not
             // be re-verified is NOT passed.
-            read.denial = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::pipeline::pinned_validator_denial_with_env(
-                    &unit,
-                    read.workdir.as_deref().map(Path::new),
-                    read.db_path.as_deref(),
-                    &read.env,
-                )
-            }))
-            .unwrap_or_else(|_| {
-                Some(format!(
-                    "pinned validator `{}` could not be re-verified: its run panicked \
-                     (fail-closed — an un-re-verifiable pin is treated as NOT-passed)",
-                    read.validator.criterion
-                ))
+            let run = || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::pipeline::pinned_validator_denial_with_env(
+                        &unit,
+                        read.workdir.as_deref().map(Path::new),
+                        read.db_path.as_deref(),
+                        &read.env,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Some(format!(
+                        "pinned validator `{}` could not be re-verified: its run panicked \
+                         (fail-closed — an un-re-verifiable pin is treated as NOT-passed)",
+                        read.validator.criterion
+                    ))
+                })
+            };
+            read.denial = match &watch {
+                Some((maps, seq)) => crate::validator::with_spawn_watch(
+                    validator_watch(maps.clone(), run_id.clone(), *seq),
+                    run,
+                ),
+                None => run(),
+            };
+            // (core#1742) A validator the run's reassign or cancel stopped has no verdict: its read
+            // is not carried, so a fold that still applies runs the validator itself.
+            let superseded = watch.as_ref().is_some_and(|(maps, seq)| {
+                maps.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .current_launch_seq(&run_id)
+                    != *seq
             });
-            evidence.pinned_validator = Some(read);
+            if !superseded {
+                evidence.pinned_validator = Some(read);
+            }
         }
         if let Some((wd, baseline, after)) = creator {
             let paths = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -335,7 +400,7 @@ mod tests {
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        start(&tx, reads, posted(&output));
+        start(&tx, None, reads, posted(&output));
         let mut evidence = back(&rx);
         let read = evidence
             .pinned_validator
@@ -356,7 +421,7 @@ mod tests {
         });
         put_nodes(&mut store, &[unit.to_node()]).unwrap();
         let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
-        start(&tx, reads, posted(&output));
+        start(&tx, None, reads, posted(&output));
         let mut evidence = back(&rx);
         assert!(
             evidence
@@ -372,7 +437,7 @@ mod tests {
         // A second copy of the result (a duplicate delivery) while its hand-off is out is dropped:
         // two validators never run in one worktree for one attempt. The hand-off still folds.
         let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
-        start(&tx, reads, posted(&output));
+        start(&tx, None, reads, posted(&output));
         assert!(
             matches!(
                 returned(&output, &mut UnitEvidence::default()),
@@ -385,7 +450,7 @@ mod tests {
 
         // The run is relaunched while its reads run: the result is dropped on return.
         let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
-        start(&tx, reads, posted(&output));
+        start(&tx, None, reads, posted(&output));
         forget_run("r-fold");
         let mut evidence = back(&rx);
         assert!(
@@ -403,6 +468,142 @@ mod tests {
             forged.pinned_validator.is_none(),
             "a read that was not handed off is not applied"
         );
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// (core#1742) A validator handed off the actor is registered under its run while it runs: the
+    /// run's reassign (advance the launch identity, take the run's groups, stop each) stops it
+    /// before it writes into the worktree a replacement will use, and the result comes back with
+    /// no verdict, so a fold that still applies runs the validator itself. A group spawned after the
+    /// reassign took the run's groups is stopped at its spawn.
+    #[cfg(unix)]
+    #[test]
+    fn a_handed_off_validator_is_stopped_when_its_attempt_is_superseded() {
+        let wd = std::env::temp_dir().join(format!(
+            "wicked-fold-reads-stop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&wd).unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut session = crate::actor::sessions_detail_fold_tests::session("r-stop");
+        session.status = SessionStatus::Executing;
+        session.workdir = Some(wd.to_string_lossy().into_owned());
+        let mut unit = WorkUnit::pending("r-stop:u1", "r-stop", 1, "d");
+        // A validator that writes into the worktree after a while (the coverage validator rewrites
+        // its report; an approved script may write anywhere in the tree).
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "sleep 3; touch late-write.txt".into(),
+            approved: true,
+        });
+        put_nodes(&mut store, &[session.to_node(), unit.to_node()]).unwrap();
+        // The control: run to its end, this validator does write into the tree.
+        assert_eq!(
+            crate::pipeline::pinned_validator_denial_with_env(&unit, Some(wd.as_path()), None, &[]),
+            None
+        );
+        assert!(wd.join("late-write.txt").exists(), "the control run writes");
+        std::fs::remove_file(wd.join("late-write.txt")).unwrap();
+        let output = StepOutput {
+            run_id: "r-stop".into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: "done".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let maps: Maps = Arc::new(Mutex::new(crate::acp_runner::ElicitationMaps::new()));
+        maps.lock().unwrap().advance_launch_seq("r-stop");
+        let posted = Posted {
+            output: output.clone(),
+            agent_verdict: None,
+            evidence: Box::default(),
+            process_gen: None,
+            launch_seq: 1,
+            ack: None,
+        };
+        let reads = plan(&store, &output, &UnitEvidence::default()).expect("handed off");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let began = std::time::Instant::now();
+        start(&tx, Some(&maps), reads, posted);
+        // The validator's group shows up under the run (bounded wait: it spawns on the thread).
+        let pgroups = loop {
+            let mut g = maps.lock().unwrap();
+            let seen = g.take_tool_child_pgroups("r-stop");
+            if !seen.is_empty() {
+                break seen;
+            }
+            drop(g);
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "the validator's group is registered under its run"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // `ReassignUnit`'s order: advance the launch identity, then stop the run's groups. (The
+        // groups were taken above; put back, the reassign takes them itself.)
+        {
+            let mut g = maps.lock().unwrap();
+            for p in &pgroups {
+                let _ = g.register_tool_child("r-stop", *p);
+            }
+            g.advance_launch_seq("r-stop");
+        }
+        let taken = maps.lock().unwrap().take_tool_child_pgroups("r-stop");
+        assert_eq!(taken, pgroups);
+        for pgid in taken {
+            crate::validator::kill_pgroup_graceful(pgid);
+        }
+        let evidence = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Command::ApplyStepResult { evidence, .. }) => evidence,
+            Ok(_) => panic!("only the result is posted back"),
+            Err(e) => panic!("the result is posted back: {e}"),
+        };
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(
+            !wd.join("late-write.txt").exists(),
+            "the stopped validator never wrote into the worktree"
+        );
+        assert!(
+            evidence.pinned_validator.is_none(),
+            "a stopped validator's read is not carried: {:?}",
+            evidence.pinned_validator
+        );
+        assert!(
+            evidence.fold_handoff.is_some(),
+            "it is still this hand-off's result"
+        );
+        assert!(
+            maps.lock()
+                .unwrap()
+                .take_tool_child_pgroups("r-stop")
+                .is_empty(),
+            "nothing is left registered"
+        );
+
+        // A group spawned after the reassign took the run's groups is stopped at its spawn.
+        let late = validator_watch(maps.clone(), "r-stop".into(), 1);
+        let t = std::time::Instant::now();
+        let denial = crate::validator::with_spawn_watch(late, || {
+            crate::pipeline::pinned_validator_denial_with_env(&unit, Some(wd.as_path()), None, &[])
+        });
+        assert!(denial.is_some(), "a stopped validator never passes");
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "stopped at spawn, not run out ({:?})",
+            t.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!wd.join("late-write.txt").exists());
+        assert!(maps
+            .lock()
+            .unwrap()
+            .take_tool_child_pgroups("r-stop")
+            .is_empty());
         let _ = std::fs::remove_dir_all(&wd);
     }
 
