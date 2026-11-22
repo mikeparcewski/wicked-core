@@ -1165,16 +1165,20 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
 // colliding run's cancel/terminal cleanup derives the OWNER's path (actor.rs keys both on
 // `repo_ref` alone), and without the guard it would reap or force-remove a live run's tree.
 
-/// The worktree's git admin directory (`<repo>/.git/worktrees/<name>`) — resolvable only while
-/// the tree is a live worktree.
+/// The worktree's git admin directory (`<common git dir>/worktrees/<name>`) — resolvable only
+/// while the tree is a live worktree.
 ///
-/// (core#1436) Found from the REPOSITORY side, never through the tree's own `.git` file, which a
-/// seat can rewrite to point at another tree's admin dir (and so read or plant that tree's owner
-/// markers). The repository is the tree's place in the engine's layout
-/// (`<repo>/wicked-worktrees/<name>`, or the pre-crew#276 `<repo>/.wicked/worktrees/<name>`); the
-/// admin dir is the one of `<repo>/.git/worktrees/*` whose `gitdir` back-pointer names this tree:
-/// the entry with the tree's own name first (git names it so), else the only one that does. A
-/// tree outside the layout, or one no entry (or more than one, besides its own) names, has none.
+/// (core#1436) Found as the PAIR git itself keeps, checked from both ends, never on the tree's
+/// own `.git` file alone (a seat can rewrite that file, and its own admin dir, to name another
+/// tree's admin dir or another tree): the tree's `.git` names an entry of the REPOSITORY's
+/// `worktrees/` dir, and that entry's `gitdir` back-pointer names this tree's `.git`. The
+/// repository is the tree's place in the engine's layout (`<repo>/wicked-worktrees/<name>`, or the
+/// pre-crew#276 `<repo>/.wicked/worktrees/<name>`), its common git dir found from the checkout
+/// ([`repo_common_dir`]). An admin dir's NAME is never trusted (git suffixes it on a collision, so
+/// one tree's admin dir can carry another tree's name). A seat that breaks its own pair only makes
+/// its own tree read as unmarked, as deleting its own markers would; no seat can make a sibling's
+/// tree resolve to an admin dir other than the sibling's own. Link files are read no-follow,
+/// non-blocking and bounded ([`read_link_file`]).
 fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
     let parent = wt.parent()?;
     let repo = if parent.file_name()? == "wicked-worktrees" {
@@ -1184,42 +1188,85 @@ fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
     } else {
         return None;
     };
-    let admin_root = repo.join(".git").join("worktrees");
+    let admin_root = std::fs::canonicalize(repo_common_dir(repo)?.join("worktrees")).ok()?;
     let here = std::fs::canonicalize(wt).ok()?;
-    let names_here = |dir: &Path| {
-        std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
-            && std::fs::read_to_string(dir.join("gitdir"))
-                .ok()
-                .and_then(|g| {
-                    let g = Path::new(g.trim());
-                    let g = if g.is_absolute() {
-                        g.to_path_buf()
-                    } else {
-                        dir.join(g)
-                    };
-                    std::fs::canonicalize(g.parent()?).ok()
-                })
-                .as_deref()
-                == Some(here.as_path())
-    };
-    let named = admin_root.join(wt.file_name()?);
-    if names_here(&named) {
-        return Some(named);
+    let link = read_link_file(&wt.join(".git")).ok()?;
+    let named = link.trim().strip_prefix("gitdir:")?.trim();
+    let admin = std::fs::canonicalize(resolve_link(wt, named)).ok()?;
+    if admin.parent()? != admin_root || !admin.is_dir() {
+        return None;
     }
-    let mut found = std::fs::read_dir(&admin_root)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|d| names_here(d));
-    let only = found.next()?;
-    found.next().is_none().then_some(only)
+    let back = read_link_file(&admin.join("gitdir")).ok()?;
+    let back = resolve_link(&admin, back.trim());
+    (back.file_name()? == ".git" && std::fs::canonicalize(back.parent()?).ok()? == here)
+        .then_some(admin)
+}
+
+/// (core#1436) The common git dir of the registered checkout at `repo` (which no seat writes): its
+/// `.git` dir; for a checkout whose `.git` is a file (a `--separate-git-dir` repository, or a linked
+/// checkout registered as a repository), the dir that file names, then that dir's `commondir` when
+/// it has one.
+fn repo_common_dir(repo: &Path) -> Option<PathBuf> {
+    let dot = repo.join(".git");
+    let meta = std::fs::metadata(&dot).ok()?;
+    if meta.is_dir() {
+        return Some(dot);
+    }
+    let link = std::fs::read_to_string(&dot).ok()?;
+    let gitdir = resolve_link(repo, link.trim().strip_prefix("gitdir:")?.trim());
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(common) => Some(resolve_link(&gitdir, common.trim())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(gitdir),
+        Err(_) => None,
+    }
+}
+
+/// A path a git link file holds: absolute, or relative to the dir holding the file.
+fn resolve_link(dir: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
+    }
+}
+
+/// The most a link or marker file is read: a path or an id, never more.
+const LINK_FILE_MAX: u64 = 8192;
+
+/// (core#1436) Read a small git link or owner-marker file a seat may have replaced, on the actor:
+/// opened without following a final link and without blocking (a FIFO or a device there never
+/// parks the caller), accepted only as a regular file, and read to at most [`LINK_FILE_MAX`]
+/// bytes. A missing file stays `NotFound`; anything else that is not a regular file is an error.
+fn read_link_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other("a link, not a regular file"));
+        }
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    file.take(LINK_FILE_MAX).read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// The RAW run id a live worktree was minted (or adopted) for — `None` when unmarked: a tree from
 /// a pre-marker engine, or one a downstream pre-provisioned (crew#390/#391).
 fn worktree_owner(wt: &Path) -> Option<String> {
     let marker = worktree_admin_dir(wt)?.join("wicked-run-id");
-    let owner = std::fs::read_to_string(marker).ok()?;
+    let owner = read_link_file(&marker).ok()?;
     let owner = owner.trim();
     if owner.is_empty() {
         return None;
@@ -1318,7 +1365,7 @@ pub(crate) fn daemon_owner_of_store(db_path: &str) -> String {
 /// from an engine before core#1373, or one another engine minted without it).
 fn worktree_daemon(wt: &Path) -> Option<String> {
     let marker = worktree_admin_dir(wt)?.join(DAEMON_MARKER);
-    let owner = match std::fs::read_to_string(marker) {
+    let owner = match read_link_file(&marker) {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         // (review r3 on #1431) A marker that exists and cannot be read is nobody's to touch.
@@ -1370,7 +1417,7 @@ fn stamp_worktree_daemon(wt: &Path) -> bool {
     match published {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read_to_string(&marker).unwrap_or_default();
+            let existing = read_link_file(&marker).unwrap_or_default();
             if existing.trim() == owner {
                 return true;
             }
@@ -1469,77 +1516,8 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
 /// (review r3 on #1431) One run's tree is minted, removed or reaped by one thread at a time in this
 /// process: an ownership check and the git removal it guards are never split by another thread's
 /// removal and a replacement mint (two cleanups the actor queued for one failed launch, say).
-/// Keyed by the repository and the run's worktree name.
-///
-/// (core#1436) Across daemons too: a holder that will touch the tree also takes an OS file lock on
-/// `<repo>/.git/wicked-tree-locks/<name>.lock` ([`os_tree_lock`]), so two daemons sharing one
-/// checkout never mint, remove or reap the same tree at once. Released with the in-process lock
-/// (an exiting process releases it too).
-struct TreeLock(String, Option<std::fs::File>);
-
-/// (core#1436) How long a tree operation waits for another daemon's hold on the same tree before it
-/// goes on without the OS lock (the daemon markers still guard the tree). A mint, removal or reap
-/// takes seconds; a hold this long is something stuck, and waiting on it forever would stall the
-/// run.
-const OS_TREE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// (core#1436) The OS lock for the tree `key` ([`tree_key`]: `<repo>\0<name>`), taken with a
-/// bounded wait. `None` when the repository has no `.git` directory (nothing to share), or the lock
-/// cannot be had, which is logged: the operation then goes on as it did before this lock.
-fn os_tree_lock(key: &str) -> Option<std::fs::File> {
-    let (root, name) = key.split_once('\0')?;
-    let git_dir = Path::new(root).join(".git");
-    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
-        return None;
-    }
-    let dir = git_dir.join("wicked-tree-locks");
-    let path = dir.join(format!("{name}.lock"));
-    let file = std::fs::create_dir_all(&dir).and_then(|()| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-    });
-    let file = match file {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "wicked-core: could not open the tree lock {} ({e}); going on without it \
-                 (core#1436)",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let deadline = std::time::Instant::now() + OS_TREE_LOCK_WAIT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Some(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                eprintln!(
-                    "wicked-core: another process has held the tree lock {} for over {}s; going \
-                     on without it (core#1436)",
-                    path.display(),
-                    OS_TREE_LOCK_WAIT.as_secs()
-                );
-                return None;
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                eprintln!(
-                    "wicked-core: could not take the tree lock {} ({e}); going on without it \
-                     (core#1436)",
-                    path.display()
-                );
-                return None;
-            }
-        }
-    }
-}
+/// Keyed by the repository and the run's worktree name. Across daemons, the checks above stand.
+struct TreeLock(String);
 
 /// Per tree: the next ticket to hand out and the ticket now holding the tree.
 type TreeQueues = std::collections::HashMap<String, (u64, u64)>;
@@ -1591,25 +1569,17 @@ impl TreeTicket {
     /// Give the place up without touching the tree: wait for its turn, then pass it on. A ticket
     /// that is never waited for would hold the tree's queue forever.
     pub(crate) fn release(self) {
-        drop(self.turn());
+        drop(self.wait());
     }
 
-    /// Wait for the tree, in this process and (core#1436) across daemons: the holder will touch it.
-    fn wait(self) -> TreeLock {
-        let mut lock = self.turn();
-        lock.1 = os_tree_lock(&lock.0);
-        lock
-    }
-
-    /// Wait for this ticket's turn in this process only (a place given up touches nothing).
-    fn turn(mut self) -> TreeLock {
+    fn wait(mut self) -> TreeLock {
         self.done = true;
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
         while map.get(&self.key).is_some_and(|e| e.1 != self.ticket) {
             map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
         }
-        TreeLock(std::mem::take(&mut self.key), None)
+        TreeLock(std::mem::take(&mut self.key))
     }
 }
 
@@ -1624,7 +1594,7 @@ impl Drop for TreeTicket {
                     ticket: self.ticket,
                     done: false,
                 }
-                .turn(),
+                .wait(),
             );
         }
     }
@@ -1664,8 +1634,6 @@ pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {
 
 impl Drop for TreeLock {
     fn drop(&mut self) {
-        // The other daemons' turn first: closing the file releases the OS lock.
-        drop(self.1.take());
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(e) = map.get_mut(&self.0) {
@@ -4732,10 +4700,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// core#1436: the owner markers are read and written in the admin dir the REPOSITORY says is
-    /// the tree's. A tree whose `.git` file a seat pointed at a sibling's admin dir still reads its
-    /// own run and daemon, and a stamp lands in its own admin dir, never the sibling's. A seat that
-    /// points its own admin dir's back-pointer at the sibling changes nothing for the sibling.
+    /// core#1436: the owner markers are read and written only in the admin dir git pairs with the
+    /// tree from BOTH ends. A tree whose `.git` file a seat pointed at a sibling's admin dir reads
+    /// none of the sibling's markers and stamps nothing there; a seat that points its own admin
+    /// dir's back-pointer at the sibling (with markers of its own choosing) changes nothing for
+    /// the sibling.
     #[test]
     fn a_redirected_dot_git_file_cannot_redirect_the_owner_markers() {
         let root = git_repo("marker-redirect");
@@ -4754,23 +4723,167 @@ mod tests {
             format!("gitdir: {}\n", admin("run-b").display()),
         )
         .unwrap();
-        assert_eq!(worktree_owner(&a).as_deref(), Some("run-a"));
-        assert_eq!(worktree_daemon(&a).as_deref(), Some("daemon-me"));
-        assert!(
-            daemon_may_touch(&a),
-            "its own tree, whatever its .git file says"
+        assert_ne!(worktree_owner(&a).as_deref(), Some("run-b"));
+        assert_ne!(worktree_daemon(&a).as_deref(), Some("daemon-other"));
+        assert!(stamp_worktree_daemon(&a));
+        assert_eq!(
+            std::fs::read_to_string(admin("run-b").join(DAEMON_MARKER)).unwrap(),
+            "daemon-other",
+            "a stamp through a redirected .git never lands in the sibling's admin dir"
         );
         std::fs::write(
             admin("run-a").join("gitdir"),
             format!("{}\n", b.join(".git").display()),
         )
         .unwrap();
+        std::fs::write(admin("run-a").join(DAEMON_MARKER), "daemon-me").unwrap();
         assert_eq!(worktree_owner(&b).as_deref(), Some("run-b"));
         assert_eq!(worktree_daemon(&b).as_deref(), Some("daemon-other"));
         assert!(
             !daemon_may_touch(&b),
             "the sibling stays the other daemon's"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436 (review on #1760): git suffixes an admin dir whose name is taken, so a tree's admin
+    /// dir can carry ANOTHER tree's name. A seat whose admin dir is named like a sibling tree points
+    /// that admin dir's back-pointer at the sibling and plants its own markers there: the sibling
+    /// still reads its own admin dir's markers, never the namesake's.
+    #[test]
+    fn an_admin_dir_named_like_a_sibling_tree_cannot_stand_in_for_it() {
+        let root = git_repo("admin-namesake");
+        let p = root.to_str().unwrap();
+        let side = root.join("side").join("run-v");
+        assert!(
+            git(
+                p,
+                &["worktree", "add", "-q", "--detach", side.to_str().unwrap()]
+            )
+            .unwrap()
+            .0
+        );
+        let namesake =
+            std::fs::canonicalize(root.join(".git").join("worktrees").join("run-v")).unwrap();
+        let victim = {
+            let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+            create_worktree(p, "run-v").unwrap()
+        };
+        let victim_admin = worktree_admin_dir(&victim).expect("the victim's own admin dir");
+        assert_ne!(
+            victim_admin, namesake,
+            "git suffixed the victim's admin dir"
+        );
+        std::fs::write(
+            namesake.join("gitdir"),
+            format!("{}\n", victim.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(namesake.join("wicked-run-id"), "run-v").unwrap();
+        std::fs::write(namesake.join(DAEMON_MARKER), "daemon-me").unwrap();
+        assert_eq!(worktree_admin_dir(&victim), Some(victim_admin));
+        assert_eq!(worktree_daemon(&victim).as_deref(), Some("daemon-other"));
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        assert!(
+            !daemon_may_touch(&victim),
+            "a namesake admin dir never makes the victim this daemon's"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436 (review on #1760): a registered checkout whose `.git` is a FILE (a
+    /// `--separate-git-dir` repository) keeps its trees' owner markers: the admin dir is found
+    /// under the git dir the checkout names, and another daemon's tree stays untouchable.
+    #[test]
+    fn a_separate_git_dir_checkout_keeps_its_trees_owner_markers() {
+        let base = git_repo("sep-gitdir-base");
+        let root = base.join("checkout");
+        let gitdir = base.join("store.git");
+        assert!(
+            git(
+                base.to_str().unwrap(),
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    gitdir.to_str().unwrap(),
+                    root.to_str().unwrap()
+                ]
+            )
+            .unwrap()
+            .0
+        );
+        let p = root.to_str().unwrap();
+        for args in [
+            &["config", "user.email", "t@example.invalid"][..],
+            &["config", "user.name", "wicked-test"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(git(p, args).unwrap().0, "git {args:?} failed");
+        }
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        assert!(git(p, &["add", "README.md"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "base"]).unwrap().0);
+        assert!(root.join(".git").is_file());
+        let theirs = {
+            let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+            create_worktree(p, "run-sep").unwrap()
+        };
+        assert_eq!(worktree_owner(&theirs).as_deref(), Some("run-sep"));
+        assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        assert!(!daemon_may_touch(&theirs));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#1436 (review on #1760): a seat that replaces its admin dir's back-pointer or its
+    /// daemon marker with a FIFO cannot park the caller (the dispatch claim runs on the actor):
+    /// the reads return, the FIFO marker reads as nobody's to touch, and nothing is re-marked.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_place_of_a_link_or_marker_never_blocks_the_claim() {
+        use std::os::unix::fs::FileTypeExt as _;
+        let root = git_repo("fifo-links");
+        let p = root.to_str().unwrap();
+        let (marked, linked) = {
+            let _none = DaemonOwnerScope::bind(None);
+            (
+                create_worktree(p, "run-fifo-marker").unwrap(),
+                create_worktree(p, "run-fifo-gitdir").unwrap(),
+            )
+        };
+        let mkfifo = |path: &Path| {
+            let _ = std::fs::remove_file(path);
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        };
+        let admin_marked = worktree_admin_dir(&marked).unwrap();
+        mkfifo(&admin_marked.join(DAEMON_MARKER));
+        mkfifo(&worktree_admin_dir(&linked).unwrap().join("gitdir"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (m, l) = (marked.clone(), linked.clone());
+        std::thread::spawn(move || {
+            let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+            claim_reentered_worktree(&m);
+            claim_reentered_worktree(&l);
+            tx.send((
+                worktree_daemon(&m),
+                worktree_daemon(&l),
+                daemon_may_touch(&m),
+            ))
+            .unwrap();
+        });
+        let (daemon_m, daemon_l, may_touch_m) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the claim returned instead of blocking on a FIFO");
+        assert_eq!(daemon_m.as_deref(), Some(UNREADABLE_OWNER));
+        assert!(!may_touch_m, "a FIFO marker is nobody's to touch");
+        assert_eq!(daemon_l, None, "a broken pair reads as unmarked, as before");
+        assert!(std::fs::symlink_metadata(admin_marked.join(DAEMON_MARKER))
+            .unwrap()
+            .file_type()
+            .is_fifo());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4808,51 +4921,13 @@ mod tests {
             .find("\nfn ")
             .map_or(actor.len(), |e| start + 1 + e);
         let body = &actor[start..end];
+        let claim = body
+            .find("crate::repo::claim_reentered_worktree(std::path::Path::new(wd))")
+            .expect("dispatch_unit_with claims the tree it re-enters");
         assert!(
-            body.contains("crate::repo::claim_reentered_worktree("),
-            "dispatch_unit_with claims the tree it re-enters"
+            body[..claim].contains("if let Some(wd) = session.workdir.as_deref()"),
+            "the claim is on the run's persisted worktree"
         );
-    }
-
-    /// core#1436: a tree operation waits while another daemon (another process; here, another
-    /// handle on the same lock file) holds the tree's OS lock, and goes on when it is released.
-    /// The lock is the tree's own: another run's tree is not held up.
-    #[test]
-    fn a_tree_operation_waits_for_another_daemons_hold_on_the_tree() {
-        let root = git_repo("os-tree-lock");
-        let p = root.to_str().unwrap().to_string();
-        let dir = root.join(".git").join("wicked-tree-locks");
-        std::fs::create_dir_all(&dir).unwrap();
-        let other = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(format!("{}.lock", sanitize_worktree_id("run-held"))))
-            .unwrap();
-        other.lock().unwrap();
-        drop(TreeLock::take(&p, "run-free"));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn({
-            let p = p.clone();
-            move || {
-                let held = TreeLock::take(&p, "run-held");
-                tx.send(held.1.is_some()).unwrap();
-            }
-        });
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(700))
-                .is_err(),
-            "the tree waits while another daemon holds it"
-        );
-        other.unlock().unwrap();
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(30)),
-            Ok(true),
-            "it takes the OS lock once released"
-        );
-        waiter.join().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// core#1373: two daemons, each with its own store, register ONE checkout. Daemon A restarts
