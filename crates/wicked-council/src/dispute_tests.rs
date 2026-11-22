@@ -409,10 +409,12 @@ impl RankStore for NoopRank {
 }
 
 /// Splits 2-1 on every ballot (never the 75% bar), after `delay`; counts dispatches.
+/// `hold_ballot: Some((n, at))` holds ballot `n`'s seats until `at` instead of `delay`.
 struct Splitter {
     delay: Duration,
     calls: AtomicU32,
     too_large_on: Option<u32>,
+    hold_ballot: Option<(u32, Instant)>,
 }
 
 impl Dispatcher for Splitter {
@@ -428,7 +430,12 @@ impl Dispatcher for Splitter {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(ctx.frame, BallotFrame::Dispute);
         assert!(ctx.deadline.is_some());
-        std::thread::sleep(self.delay);
+        match self.hold_ballot {
+            Some((n, at)) if n == ctx.ballot => {
+                std::thread::sleep(at.saturating_duration_since(Instant::now()))
+            }
+            _ => std::thread::sleep(self.delay),
+        }
         let outcome = if self.too_large_on == Some(ctx.ballot) {
             DispatchOutcome::Failed(SeatFailure::new(SeatFailureKind::PromptTooLarge, "big"))
         } else {
@@ -467,19 +474,21 @@ fn dispute_worker(d: Arc<Splitter>, deadline_at: Instant, stagger: Duration) -> 
 
 #[test]
 fn no_runoff_starts_after_the_absolute_deadline() {
+    // (core#1794) Ordered by events, not by a wall-clock margin: ballot 1 answers at once, long
+    // before the deadline, and ballot 2 is held until just past it. A loaded host that is slow to
+    // run ballot 1 can no longer push it over the deadline (the 300 ms / 520 ms margin it had).
+    let deadline_at = Instant::now() + Duration::from_secs(2);
     let d = Arc::new(Splitter {
-        delay: Duration::from_millis(300),
+        delay: Duration::ZERO,
         calls: AtomicU32::new(0),
         too_large_on: None,
+        hold_ballot: Some((2, deadline_at + Duration::from_millis(50))),
     });
-    let (w, _) = dispute_worker(
-        d.clone(),
-        Instant::now() + Duration::from_millis(520),
-        Duration::ZERO,
-    );
+    let (w, _) = dispute_worker(d.clone(), deadline_at, Duration::ZERO);
     let id = w.queue_blocking(task());
-    // Ballot 1 ends at ~300 ms (before the deadline): ballot 2 starts and ends at ~600 ms, past it,
-    // so no third ballot — 6 dispatches, not 9.
+    // Ballot 1 ends before the deadline, so ballot 2 starts; it ends past the deadline, so no third
+    // ballot starts: 6 dispatches, not 9.
+    assert!(Instant::now() > deadline_at);
     assert_eq!(d.calls.load(Ordering::SeqCst), 6);
     assert_eq!(w.poll(&id).unwrap().state, crate::types::TaskState::Voted);
 }
@@ -490,6 +499,7 @@ fn a_council_whose_deadline_has_passed_dispatches_nothing() {
         delay: Duration::ZERO,
         calls: AtomicU32::new(0),
         too_large_on: None,
+        hold_ballot: None,
     });
     let (w, _) = dispute_worker(d.clone(), Instant::now(), Duration::ZERO);
     let id = w.queue_blocking(task());
@@ -505,6 +515,7 @@ fn a_seat_whose_stagger_runs_past_the_deadline_never_starts() {
         delay: Duration::ZERO,
         calls: AtomicU32::new(0),
         too_large_on: None,
+        hold_ballot: None,
     });
     let t0 = Instant::now();
     let (w, _) = dispute_worker(
@@ -528,6 +539,7 @@ fn a_runoff_over_its_prompt_budget_ends_the_council_with_no_ruling() {
         delay: Duration::ZERO,
         calls: AtomicU32::new(0),
         too_large_on: Some(2),
+        hold_ballot: None,
     });
     let (w, _) = dispute_worker(
         d.clone(),
