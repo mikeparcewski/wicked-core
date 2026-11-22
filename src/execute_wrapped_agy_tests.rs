@@ -457,6 +457,8 @@ fn the_agy_adapter_and_the_runner_hold_bounded_text() {
 
 /// codex xr-1049 P2, the runner's side: an adapter that hands back one delta bigger than the
 /// retained-output cap (a held answer) is cut to the room left, never retained whole.
+/// (core#1290) Each line stays under the per-line read cap, which drops a longer line before any
+/// adapter sees it; the adapter joins the two lines into one 10 MiB delta.
 #[cfg(unix)]
 #[test]
 fn run_bounded_cuts_one_oversized_delta_to_the_retained_cap() {
@@ -474,9 +476,12 @@ fn run_bounded_cuts_one_oversized_delta_to_the_retained_cap() {
             }
         }
     }
-    // spawn-audit: test-only — a fixture that prints 10 MiB on one line.
+    // spawn-audit: test-only — a fixture that prints two 5 MiB lines.
     let mut cmd = Command::new("sh");
-    cmd.args(["-c", "head -c 10485760 /dev/zero | tr '\\0' a; echo"]);
+    cmd.args([
+        "-c",
+        "for i in 1 2; do head -c 5242880 /dev/zero | tr '\\0' a; echo; done",
+    ]);
     // (core#1194) A stand-in that must ANSWER: a failure guard, not a clock (60 s ran out in a
     // nested floor at host load 35).
     let (code, out, ..) = run_bounded(
