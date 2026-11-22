@@ -1688,7 +1688,9 @@ pub struct BallotRun {
 pub trait BallotCarrier: Send + Sync + std::fmt::Debug {
     /// Run `prompt` on `cli`'s seat for council task `task_id`, bounded by `timeout`. A run that
     /// outlives `timeout` is stopped and reported [`SeatFailureKind::TimedOut`] (with
-    /// `timeout_note` when given), exactly as the host path reports it.
+    /// `timeout_note` when given), exactly as the host path reports it. (core#1290) `stdout_cap`
+    /// is the most stdout the ballot keeps (a dispute ballot's is far below a routing ballot's):
+    /// the carrier bounds its read by it, as the host path bounds its pipe read.
     fn run_ballot(
         &self,
         cli: &AgenticCli,
@@ -1696,6 +1698,7 @@ pub trait BallotCarrier: Send + Sync + std::fmt::Debug {
         prompt: &str,
         timeout: std::time::Duration,
         timeout_note: Option<&str>,
+        stdout_cap: usize,
     ) -> Result<BallotRun, SeatFailure>;
 
     /// Where the ballot ran, as the vote's provenance names it (`"seat container"`).

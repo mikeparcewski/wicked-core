@@ -3578,7 +3578,7 @@ pub(crate) fn run(
                 // (C5 follow-up) The ballots follow the seat floor, as the judges and triage do:
                 // under the container floor each one runs in its seat's container through the
                 // run's step runner (`decision::SeatBallots`); under the host floor nothing changes.
-                let (disp, ballots_in) = ballot_dispatcher(
+                let (disp, ballots_in, reaper) = ballot_dispatcher(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
@@ -3603,9 +3603,13 @@ pub(crate) fn run(
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
-                    // (core#1289) The last ballot has returned: the host slot is free.
-                    drop(lock);
-                    let _ = reply.send(result);
+                    end_council(
+                        reply,
+                        result,
+                        reaper.as_ref(),
+                        (&req.session_id, req.ord),
+                        lock,
+                    );
                 });
             }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
@@ -3634,7 +3638,7 @@ pub(crate) fn run(
                 // grows by the block's bytes in `decision::convene_decision_with`).
                 let context_tx = council_context_primed(session.as_ref(), &self_tx);
                 let pick = crate::decision::CouncilPick::from_env();
-                let (disp, ballots_in) = ballot_dispatcher(
+                let (disp, ballots_in, reaper) = ballot_dispatcher(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
@@ -3664,9 +3668,13 @@ pub(crate) fn run(
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("rule council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
-                    // The last ballot has returned: the host slot is free.
-                    drop(lock);
-                    let _ = reply.send(result);
+                    end_council(
+                        reply,
+                        result,
+                        reaper.as_ref(),
+                        (&req.session_id, req.ord),
+                        lock,
+                    );
                 });
             }
             // ── Presets (DES-TEAMING-002 §8.4, seam C2) ──
@@ -5368,27 +5376,127 @@ fn council_context_delivered(
     }
 }
 
+/// (core#1290, core#1289) The tail of every council thread (decision and rule councils; never the
+/// actor's), in the one order that holds:
+/// 1. The verdict goes first, so the caller's wait (the council's own deadline) is never spent on
+///    a seat still stopping.
+/// 2. Every carried ballot is reaped: one cancelled past its budget may still be stopping in its
+///    seat container. Bounded by [`crate::decision::REAP_BOUND`]; one still running past it is
+///    reported, and the slot is released anyway (a slot held forever would stop every council).
+/// 3. Only then is the host council slot freed, so no next council starts beside a stopping seat.
+fn end_council(
+    reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
+    result: anyhow::Result<crate::decision::DecisionVerdict>,
+    reaper: Option<&crate::decision::BallotReaper>,
+    (session, ord): (&str, u32),
+    lock: crate::cli_runner::HostCouncilLock,
+) {
+    let _ = reply.send(result);
+    if let Some(reaper) = reaper {
+        let left = reaper.reap(crate::decision::REAP_BOUND);
+        if left > 0 {
+            eprintln!(
+                "wicked-core: council {session}#{ord}: {left} carried ballot(s) still running {:?} \
+                 after the council; the host council slot is released without them",
+                crate::decision::REAP_BOUND
+            );
+        }
+    }
+    drop(lock);
+}
+
+#[cfg(test)]
+mod council_tail_tests {
+    use super::end_council;
+    use crate::cli_runner::{HostCouncilLock, SlotRefused};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// (core#1290, coord review of #1774) Both council threads end through `end_council`: the
+    /// verdict arrives while a carried seat is still stopping, the host slot stays held until that
+    /// seat is reaped, and it is free right after. Reaping before the reply holds the verdict back
+    /// until the seat stops; freeing the slot before the reap lets the next council start beside a
+    /// stopping seat. Either wrong order fails here.
+    #[test]
+    fn a_council_replies_then_reaps_then_frees_the_host_slot() {
+        let path = std::env::temp_dir().join(format!(
+            "wicked-1290-council-tail-{}.lock",
+            std::process::id()
+        ));
+        let lock = HostCouncilLock::acquire_until(&path, Instant::now() + Duration::from_secs(5))
+            .expect("the slot is free");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let reaper = crate::decision::BallotReaper::default();
+        let seat = stopped.clone();
+        reaper.hold(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            seat.store(true, Ordering::SeqCst);
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tail = std::thread::spawn(move || {
+            let verdict = Err(anyhow::anyhow!("the verdict"));
+            end_council(tx, verdict, Some(&reaper), ("run-1290", 1), lock);
+        });
+        let verdict = rx.recv_timeout(Duration::from_secs(60)).expect("a verdict");
+        assert!(verdict.is_err());
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "the verdict waited for a seat still stopping"
+        );
+        while !stopped.load(Ordering::SeqCst) {
+            assert_eq!(
+                HostCouncilLock::acquire_until(&path, Instant::now()).err(),
+                Some(SlotRefused::Busy),
+                "the slot was freed while a carried seat was still stopping"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        tail.join().expect("the council tail");
+        assert!(
+            HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+            "the slot is free once the seat is reaped"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// A council's dispatcher, where its ballots run, and (carried ballots only) their reaper.
+type CouncilDispatch = (
+    Arc<dyn Dispatcher + Send + Sync>,
+    Option<&'static str>,
+    Option<crate::decision::BallotReaper>,
+);
+
 /// (C5 follow-up) The dispatcher a decision council's ballots go through, and where they run.
 /// Under the container seat floor the ballots follow the floor, as the run's judges and triage do
 /// (`execute_wrapped::runs_in_seat`): the dispatcher is handed [`crate::decision::SeatBallots`],
 /// so each ballot runs in its seat's container through `runner`, sharing the dispatcher's seat
 /// health. Under any other floor the ballots stay the host CLI subprocesses they always were. A
 /// dispatcher that runs no CLI of its own (a test stub) is kept as it is and names no place.
+/// (core#1290) A carried dispatcher comes with its ballots' reaper.
 fn ballot_dispatcher(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     container_floor: bool,
     parent_run_id: Option<&str>,
-) -> (Arc<dyn Dispatcher + Send + Sync>, Option<&'static str>) {
+) -> CouncilDispatch {
     if !container_floor {
-        return (dispatcher.clone(), Some(crate::decision::BALLOTS_IN_HOST));
+        return (
+            dispatcher.clone(),
+            Some(crate::decision::BALLOTS_IN_HOST),
+            None,
+        );
     }
-    match dispatcher.with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(
-        runner.clone(),
-        parent_run_id,
-    ))) {
-        Some(carried) => (carried, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)),
-        None => (dispatcher.clone(), None),
+    let carrier = crate::decision::SeatBallots::new(runner.clone(), parent_run_id);
+    let reaper = carrier.reaper();
+    match dispatcher.with_ballot_carrier(Arc::new(carrier)) {
+        Some(carried) => (
+            carried,
+            Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER),
+            Some(reaper),
+        ),
+        None => (dispatcher.clone(), None, None),
     }
 }
 
@@ -45464,12 +45572,21 @@ mod council_ballot_tests {
         let real: Arc<dyn Dispatcher + Send + Sync> =
             Arc::new(wicked_council::dispatch::RealDispatcher::default());
         let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
-        let (host, at) = ballot_dispatcher(&real, &runner, false, None);
+        let (host, at, reaper) = ballot_dispatcher(&real, &runner, false, None);
         assert!(Arc::ptr_eq(&host, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_HOST));
-        let (carried, at) = ballot_dispatcher(&real, &runner, true, None);
+        assert!(
+            reaper.is_none(),
+            "host ballots are the dispatcher's own subprocesses"
+        );
+        let (carried, at, reaper) = ballot_dispatcher(&real, &runner, true, None);
         assert!(!Arc::ptr_eq(&carried, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER));
+        assert_eq!(
+            reaper.map(|r| r.running()),
+            Some(0),
+            "carried ballots are reaped"
+        );
     }
 
     /// codex council-r1/r2: a run named `council` (fresh, or persisted before ballots existed)

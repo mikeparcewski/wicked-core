@@ -993,7 +993,14 @@ impl RealDispatcher {
             let run_started = Instant::now();
             let result = match (&self.carrier, &workdir) {
                 (Some(carrier), _) => carrier
-                    .run_ballot(cli, &task.id, prompt, timeout, timeout_note.as_deref())
+                    .run_ballot(
+                        cli,
+                        &task.id,
+                        prompt,
+                        timeout,
+                        timeout_note.as_deref(),
+                        bounds.stdout_cap,
+                    )
                     .map(|mut run| {
                         run.stdout = within(&run.stdout, bounds.stdout_cap);
                         run
@@ -3637,6 +3644,7 @@ mod carrier_tests {
             prompt: &str,
             timeout: Duration,
             _timeout_note: Option<&str>,
+            _stdout_cap: usize,
         ) -> Result<BallotRun, SeatFailure> {
             self.seen.lock().unwrap().push((
                 cli.key.clone(),
