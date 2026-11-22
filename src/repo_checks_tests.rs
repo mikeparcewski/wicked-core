@@ -71,6 +71,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
                    echo 'new: test'; case \"$*\" in *--skip=old*) ;; *) echo 'old: test';; esac; exit 0;;\n\
                  esac\n\
                  echo run >> attempts\n\
+                 echo 'running 2 tests'\n\
                  echo 'No space left on device (os error 28)' >&2\n\
                  exit 101\n",
             )
@@ -136,19 +137,24 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
             fresh: Vec::new(),
         };
         assert!(seed.set_aside_by(&check, &head).is_some());
-        if precise && on_retry {
-            // The two head inventories and the excluded run see plenty; only its retry
-            // sees low space. Inventory probes also use the existing spawn seam.
-            test_seam::before_spawn(|| {
-                test_seam::before_spawn(|| {
-                    test_seam::before_spawn(|| {
-                        test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)))
-                    })
-                })
-            });
-        } else {
-            test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+        // Low space from the `n`th spawn of `decide` on: the head inventory (1), the deselected
+        // head inventory (2), the head's results run (3, core#1767), the excluded run (4) and
+        // its retry (5). Inventory probes also use the existing spawn seam.
+        fn low_from(n: u32) {
+            if n <= 1 {
+                test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+            } else {
+                test_seam::before_spawn(move || low_from(n - 1));
+            }
         }
+        low_from(match (precise, on_retry) {
+            // Everything before the excluded run's retry sees plenty.
+            (true, true) => 5,
+            // The excluded run itself sees low space.
+            (true, false) => 4,
+            // No exclusion: the head's retry is the first spawn.
+            (false, _) => 1,
+        });
         decide(
             &wt,
             None,
@@ -158,7 +164,6 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
             None,
             &Ok(&guide),
             true,
-            Some(&Ok("running 2 tests\n".to_string())),
             &sandbox,
             &scratch,
             None,
@@ -191,7 +196,8 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
                 .unwrap()
                 .lines()
                 .count(),
-            1 + usize::from(precise) + usize::from(on_retry)
+            // The head, (precise) its results run and the excluded run, and the retry.
+            1 + 2 * usize::from(precise) + usize::from(on_retry)
         );
         drop(scratch);
         let _ = std::fs::remove_dir_all(&wt);

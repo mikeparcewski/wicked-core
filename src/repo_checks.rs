@@ -8082,8 +8082,8 @@ impl BaseTree {
                 .exit_code
                 .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
             // The results first: the list must not overwrite them.
-            let text =
-                verdict.then(|| results_text(&self.held, &target, g, &mut run, scratch, since));
+            let text = verdict
+                .then(|| results_text(Some(&self.held), &target, g, &mut run, scratch, since));
             let results = text.as_ref().map(|t| {
                 t.as_ref()
                     .map_err(String::clone)
@@ -8480,7 +8480,7 @@ pub(crate) fn inventory(
 /// since `since` — the run's start — within the log cap, read through the held directory and
 /// stored beside the run's logs), else the run's stored output. Anything else is no results.
 pub(crate) fn results_text(
-    held: &HeldDir,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     g: &GuideCheck,
     run: &mut CheckRun,
@@ -8489,6 +8489,7 @@ pub(crate) fn results_text(
 ) -> Result<String, String> {
     let r = match &g.results.how.path {
         Some(path) => {
+            let held = held.ok_or_else(|| format!("`{path}`: the tree is not held"))?;
             let f = open_results(
                 held,
                 &Path::new(&check.dir).join(path).to_string_lossy(),
