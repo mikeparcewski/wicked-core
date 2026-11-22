@@ -13173,9 +13173,14 @@ fn dispatch_unit_with(
     // (core#1436) Every dispatch into the run's persisted worktree (a boot redrive, a gate
     // continue, the run's next unit) marks it as this daemon's when no daemon has: a tree minted
     // before core#1373 stops being unmarked once its run moves again. Another daemon's marker is
-    // never replaced.
-    if let Some(wd) = session.workdir.as_deref() {
-        crate::repo::claim_reentered_worktree(std::path::Path::new(wd));
+    // never replaced. Once per dispatch (the first pass, before any probe), and off the actor: the
+    // claim runs git and resolves paths the seat wrote, and nothing waits on it.
+    if probe.is_none() {
+        if let Some(wd) = session.workdir.clone() {
+            let _claim = crate::repo::spawn_bound(move || {
+                crate::repo::claim_reentered_worktree(std::path::Path::new(&wd));
+            });
+        }
     }
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written

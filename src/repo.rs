@@ -1205,13 +1205,11 @@ fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
 /// (core#1436) The common git dir of the registered checkout at `repo` (which no seat writes), as
 /// git's own discovery finds it from there: a checkout's `.git` dir, the dir a `.git` file names (a
 /// `--separate-git-dir` repository, a linked checkout) and its `commondir`, the enclosing checkout
-/// of a registered subdirectory.
+/// of a registered subdirectory. Git prints it relative to `repo` or absolute (no
+/// `--path-format`, which git before 2.31 does not know), so it is resolved against `repo`.
 fn repo_common_dir(repo: &Path) -> Option<PathBuf> {
-    match git(
-        repo.to_str()?,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ) {
-        Ok((true, out, _)) if !out.is_empty() => Some(PathBuf::from(out)),
+    match git(repo.to_str()?, &["rev-parse", "--git-common-dir"]) {
+        Ok((true, out, _)) if !out.is_empty() => Some(resolve_link(repo, &out)),
         _ => None,
     }
 }
@@ -1483,12 +1481,40 @@ where
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs between a fresh mint's `git worktree add` and its daemon claim.
+    static AFTER_MINT_ADD: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// (core#1436) A freshly minted tree takes this daemon's marker, or the mint refuses: a claim lost
+/// to another daemon between the `git worktree add` and the stamp (its dispatch re-entering a tree
+/// of the same name) would otherwise leave two runs sharing one tree, as the adopt path refuses.
+fn claim_fresh_mint(wt: &Path, run_id: &str) -> anyhow::Result<()> {
+    #[cfg(test)]
+    AFTER_MINT_ADD.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(wt)
+        }
+    });
+    if !stamp_worktree_daemon(wt) {
+        anyhow::bail!(
+            "worktree {} was just claimed by another daemon on this shared checkout; refusing to \
+             hand it to run {run_id} here (core#1373)",
+            wt.display()
+        );
+    }
+    Ok(())
+}
+
 /// (core#1436) A dispatch re-entering the run's persisted worktree (a boot redrive, a gate
 /// continue, the run's next unit) marks it as the calling thread's daemon's when no daemon has
 /// yet, so a tree minted before core#1373 does not stay unmarked (kept by every reaper, adoptable
 /// by any daemon) for as long as its run goes on. A tree another daemon marked is left as it is
-/// and named in the log ([`stamp_worktree_daemon`]); the dispatch goes on, as it did. File reads
-/// and one link, no git: cheap on the actor.
+/// and named in the log ([`stamp_worktree_daemon`]); the dispatch goes on, as it did. It resolves
+/// the admin dir (one `git rev-parse` in the registered checkout, then paths the seat wrote), so
+/// the actor runs it on a thread of its own ([`spawn_bound`]), never on the actor.
 pub(crate) fn claim_reentered_worktree(wt: &Path) {
     if wt.join(".git").is_file() {
         let _ = stamp_worktree_daemon(wt);
@@ -2047,11 +2073,11 @@ pub fn create_worktree_based(
             anyhow::bail!("git worktree add failed: {err}{err2}");
         }
         stamp_worktree_owner(&wt, run_id);
-        let _ = stamp_worktree_daemon(&wt);
+        claim_fresh_mint(&wt, run_id)?;
         return Ok((wt, None));
     }
     stamp_worktree_owner(&wt, run_id);
-    let _ = stamp_worktree_daemon(&wt);
+    claim_fresh_mint(&wt, run_id)?;
     Ok((wt, Some(base)))
 }
 
@@ -4982,7 +5008,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// core#1436: dispatch admission claims the run's worktree, on every dispatch path.
+    /// core#1436 (coord review F3): a fresh mint whose daemon claim another daemon won between the
+    /// `git worktree add` and the stamp refuses, rather than hand one tree to two runs.
+    #[test]
+    fn a_fresh_mint_that_loses_its_daemon_claim_refuses() {
+        let root = git_repo("mint-claim-lost");
+        let p = root.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        AFTER_MINT_ADD.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|wt: &Path| {
+                let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+                assert!(stamp_worktree_daemon(wt));
+            }))
+        });
+        let minted = create_worktree(p, "run-raced");
+        AFTER_MINT_ADD.with(|h| *h.borrow_mut() = None);
+        let err = minted.expect_err("a lost claim refuses the mint");
+        assert!(
+            err.to_string().contains("claimed by another daemon"),
+            "{err}"
+        );
+        let wt = worktree_path(p, "run-raced");
+        assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-other"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436 (coord review F2): the common git dir resolves whether git prints it relative
+    /// (from the checkout root, `.git`) or not (from a subdirectory), with no `--path-format`.
+    #[test]
+    fn the_common_git_dir_resolves_relative_output_against_the_checkout() {
+        let root = git_repo("common-dir-relative");
+        let sub = root.join("nested").join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (_, printed, _) =
+            git(root.to_str().unwrap(), &["rev-parse", "--git-common-dir"]).unwrap();
+        assert!(Path::new(&printed).is_relative(), "git printed {printed:?}");
+        let want = std::fs::canonicalize(root.join(".git")).unwrap();
+        for at in [&root, &sub] {
+            let got = repo_common_dir(at).expect("a common dir");
+            assert_eq!(
+                std::fs::canonicalize(got).unwrap(),
+                want,
+                "from {}",
+                at.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436: dispatch admission claims the run's worktree, on every dispatch path, off the
+    /// actor and once per dispatch.
     #[test]
     fn dispatch_admission_claims_the_reentered_worktree() {
         let actor = include_str!("actor.rs");
@@ -4993,11 +5068,30 @@ mod tests {
             .find("\nfn ")
             .map_or(actor.len(), |e| start + 1 + e);
         let body = &actor[start..end];
+        assert_eq!(
+            body.matches("claim_reentered_worktree(").count(),
+            1,
+            "one claim per dispatch, and only the one off the actor"
+        );
         let claim = body
-            .find("crate::repo::claim_reentered_worktree(std::path::Path::new(wd))")
+            .find("crate::repo::claim_reentered_worktree(std::path::Path::new(&wd))")
             .expect("dispatch_unit_with claims the tree it re-enters");
+        let before = &body[..claim];
+        // (coord review F1) The claim runs git and resolves paths a seat wrote: on a thread of its
+        // own, never on the actor, and once (the first pass, not again after a probe).
+        let spawn = before
+            .rfind("crate::repo::spawn_bound(move || {")
+            .expect("the claim runs off the actor");
         assert!(
-            body[..claim].contains("if let Some(wd) = session.workdir.as_deref()"),
+            !before[spawn..].contains("});"),
+            "the claim is inside the spawned closure"
+        );
+        assert!(
+            before[..spawn].contains("if probe.is_none() {"),
+            "the claim runs once per dispatch"
+        );
+        assert!(
+            before[..spawn].contains("if let Some(wd) = session.workdir.clone()"),
             "the claim is on the run's persisted worktree"
         );
     }
