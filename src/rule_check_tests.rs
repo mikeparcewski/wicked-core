@@ -140,6 +140,7 @@ impl RuleJudge for Fake {
 /// (core#1746) What a seat receives when `prompt` is its one argument: the argv the container floor
 /// rebuilds from the launch `Command` (`k8s::seat::finalize` reads `get_args`).
 fn seat_received(prompt: &str) -> String {
+    // spawn-audit: test-only — never spawned: only the argv the `Command` holds is read back.
     let mut c = std::process::Command::new("codex");
     c.arg(prompt);
     c.get_args()
