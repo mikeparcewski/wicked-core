@@ -172,8 +172,8 @@ pub(crate) fn in_memory_spec(spec: &str) -> bool {
     mode.as_deref() == Some(b"memory".as_slice()) || vfs.as_deref() == Some(b"memdb".as_slice())
 }
 
-/// `%HH` decoded as SQLite's URI parser does; any other byte (a `%` without two hex digits too)
-/// kept as is.
+/// `%HH` decoded as SQLite's URI parser does: a `%00` ends the component (the rest is dropped);
+/// any other byte (a `%` without two hex digits too) kept as is.
 fn percent_decoded(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
@@ -182,7 +182,12 @@ fn percent_decoded(s: &str) -> Vec<u8> {
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
             if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h << 4) | l);
+                // (review on #1765) SQLite drops the rest of the component at a `%00`.
+                let byte = (h << 4) | l;
+                if byte == 0 {
+                    break;
+                }
+                out.push(byte);
                 i += 3;
                 continue;
             }
@@ -1302,6 +1307,9 @@ mod tests {
             "file:?cache=private",
             "file:///x/core.db?mode=memory",
             "file://localhost/x/core.db?mode=memory",
+            // (review on #1765) `%00` ends a component, as in SQLite.
+            "file:x?mode=memory%00ignored",
+            "file:%3Amemory%3A%00junk",
         ] {
             assert_eq!(log_root_for(spec), None, "{spec:?}");
         }
@@ -1314,6 +1322,7 @@ mod tests {
             "file:/x/core.db?vfs=memdb&vfs=unix",
             "file:x?mode=memory&mode=rwc",
             "file:%3Amemory%3Ax",
+            "file:core.db?mode=memory&mode%00ignored=rwc",
         ] {
             assert!(log_root_for(spec).is_some(), "{spec:?}");
         }
@@ -1327,6 +1336,10 @@ mod tests {
         assert_eq!(
             crate::actor::event_log_root("file:///x/core.db?mode=memory"),
             None
+        );
+        assert_eq!(
+            crate::actor::event_log_root("file:core.db?mode=memory&mode%00ignored=rwc"),
+            Some(log_root("file:core.db?mode=memory&mode%00ignored=rwc"))
         );
         assert_eq!(
             crate::actor::event_log_root("postgres://h/db"),
