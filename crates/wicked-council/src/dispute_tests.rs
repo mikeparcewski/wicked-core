@@ -63,11 +63,13 @@ fn nonce_in(prompt: &str) -> String {
     prompt[at..].split('`').next().unwrap().to_string()
 }
 
-/// A carrier whose seat answers by `answer(prompt)`, recording each prompt and timeout.
+/// A carrier whose seat answers by `answer(prompt)`, recording each prompt and timeout (and each
+/// stdout cap it was handed).
 #[derive(Debug)]
 struct Scripted {
     answer: fn(&str) -> String,
     seen: Mutex<Vec<(String, Duration)>>,
+    caps: Mutex<Vec<usize>>,
 }
 
 impl Scripted {
@@ -75,6 +77,7 @@ impl Scripted {
         Arc::new(Scripted {
             answer,
             seen: Mutex::new(Vec::new()),
+            caps: Mutex::new(Vec::new()),
         })
     }
 }
@@ -87,7 +90,9 @@ impl BallotCarrier for Scripted {
         prompt: &str,
         timeout: Duration,
         _timeout_note: Option<&str>,
+        stdout_cap: usize,
     ) -> Result<BallotRun, SeatFailure> {
+        self.caps.lock().unwrap().push(stdout_cap);
         self.seen
             .lock()
             .unwrap()
@@ -117,6 +122,16 @@ fn carried(carrier: Arc<Scripted>) -> Arc<dyn Dispatcher + Send + Sync> {
 fn framed(prompt: &str, body: &str) -> String {
     let n = nonce_in(prompt);
     format!("thinking…\nBEGIN BALLOT {n}\n{body}\nEND BALLOT {n}\n")
+}
+
+/// (core#1290) A carried dispute ballot hands the carrier its own stdout cap, so the carrier can
+/// bound its read by it rather than cut the output only after it returns.
+#[test]
+fn a_carried_dispute_ballot_hands_the_carrier_its_stdout_cap() {
+    let carrier = Scripted::new(|p| framed(p, "RECOMMENDATION: 1 b"));
+    let d = carried(carrier.clone());
+    let _ = d.dispatch_ballot_timed(&cli("a"), &task(), &dispute_ctx());
+    assert_eq!(*carrier.caps.lock().unwrap(), vec![DISPUTE_STDOUT_CAP]);
 }
 
 #[test]

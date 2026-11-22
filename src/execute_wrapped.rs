@@ -8083,6 +8083,62 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
     code.trim().parse().ok()
 }
 
+thread_local! {
+    /// (core#1290) The retained-stdout cap this thread's caller set ([`with_stdout_cap`]).
+    static STDOUT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// (core#1290) Run `f` with every [`run_bounded`] on THIS thread keeping at most `cap` bytes of
+/// stdout text (never more than the runner's own cap): a carried council ballot runs its seat
+/// with its own output cap, bounded while it is read rather than cut after the carrier returns.
+pub(crate) fn with_stdout_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STDOUT_CAP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(STDOUT_CAP.with(|c| c.replace(Some(cap))));
+    f()
+}
+
+/// (core#1290) Read one line of `r` into `buf` (its `\n`, and a `\r` before it, dropped),
+/// holding at most `cap` bytes of it: `Ok(None)` at the end of input, else `Ok(Some(over))`, with
+/// `over` when the line ran past `cap`. The rest of an over-long line is read and dropped, never
+/// held: `BufRead::lines` held a whole line, however long, before any cap applied.
+pub(crate) fn read_line_capped(
+    r: &mut impl std::io::BufRead,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let (mut over, mut any) = (false, false);
+    loop {
+        let avail = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            return Ok(any.then_some(over));
+        }
+        any = true;
+        let end = avail.iter().position(|&b| b == b'\n');
+        let chunk = &avail[..end.unwrap_or(avail.len())];
+        let room = cap.saturating_sub(buf.len());
+        over |= chunk.len() > room;
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let used = end.map_or(avail.len(), |i| i + 1);
+        r.consume(used);
+        if end.is_some() {
+            if !over && buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(over));
+        }
+    }
+}
+
 pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,
@@ -8172,6 +8228,10 @@ pub(crate) fn run_bounded(
     // Cap the ACCUMULATED buffers so a runaway/verbose CLI can't OOM the orchestrator. Streaming via
     // `emit` is unaffected (every delta still streams); only the retained string is bounded.
     const MAX_OUT: usize = 8 * 1024 * 1024;
+    // (core#1290) A carried ballot's own cap, when its thread set one; never above MAX_OUT.
+    let out_cap = STDOUT_CAP
+        .with(|c| c.get())
+        .map_or(MAX_OUT, |cap| cap.min(MAX_OUT));
 
     // The seat's "still working" frames, ticked below while it is quiet, and when it last printed.
     let heartbeat = adapter.heartbeat();
@@ -8183,7 +8243,6 @@ pub(crate) fn run_bounded(
         // Stdout: read line-by-line, route through `adapter`, stream each readable delta through `emit`,
         // accumulate the readable text (bounded) + the structured signals (usage/files).
         let out_h = scope.spawn(move || {
-            use std::io::BufRead;
             let mut s = String::new();
             let mut capped = false;
             let mut usage: Option<Usage> = None;
@@ -8194,7 +8253,7 @@ pub(crate) fn run_bounded(
                     emit(&t);
                     // One oversized delta (an adapter's held answer) is cut to the room left,
                     // never let through whole because the buffer was still under the cap.
-                    if s.len() < MAX_OUT && push_within(s, &t, MAX_OUT) {
+                    if s.len() < out_cap && push_within(s, &t, out_cap) {
                         s.push('\n');
                     } else if !*capped {
                         s.push_str("\n… (output truncated)\n");
@@ -8209,12 +8268,25 @@ pub(crate) fn run_bounded(
                 // can emit unboundedly many `tool_use` blocks (FINDING-046 review).
                 retain_tools_capped(&mut tools, ao.tools);
             };
-            for line in std::io::BufReader::new(so).lines().map_while(Result::ok) {
+            // (core#1290) Bounded at the read: at most MAX_OUT bytes of one line are held; an
+            // over-long line is read through and dropped, one note in its place.
+            let mut so = std::io::BufReader::new(so);
+            let mut line: Vec<u8> = Vec::new();
+            while let Ok(Some(over)) = read_line_capped(&mut so, &mut line, MAX_OUT) {
                 last_line_w.store(
                     crate::interaction::now_millis().max(0) as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                let ao = adapter.on_line(&line);
+                let ao = if over {
+                    AdapterOut {
+                        text: vec![format!(
+                            "… (a stdout line over {MAX_OUT} bytes was dropped)"
+                        )],
+                        ..AdapterOut::default()
+                    }
+                } else {
+                    adapter.on_line(&String::from_utf8_lossy(&line))
+                };
                 absorb(ao, &mut s, &mut capped);
             }
             let fin = adapter.finish();
@@ -10509,6 +10581,85 @@ mod tests {
             out.contains("alpha") && out.contains("gamma"),
             "the full output is still accumulated alongside streaming"
         );
+    }
+
+    /// (core#1290) One line is bounded as it is read: at most `cap` bytes of it are held, the rest
+    /// is read through and dropped, a `\r\n` ending reads as `\n`, and a last line with no `\n`
+    /// is still a line. Read in 2-byte chunks, so a line spans several buffer fills.
+    #[test]
+    fn read_line_capped_holds_at_most_the_cap_of_a_line() {
+        let mut r = std::io::BufReader::with_capacity(2, &b"ab\r\ncdefgh\n\nij"[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), Some(false));
+        assert_eq!(buf, b"ab");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), Some(true));
+        assert_eq!(buf, b"cde");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), Some(false));
+        assert!(buf.is_empty());
+        assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), Some(false));
+        assert_eq!(buf, b"ij");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 3).unwrap(), None);
+    }
+
+    /// (core#1290) A 9 MiB line with no newline in it is never held whole: it is dropped with a
+    /// note, and the lines after it still arrive. Before, `BufRead::lines` held all 9 MiB and the
+    /// retained output kept 8 MiB of it.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_drops_an_over_long_line_without_holding_it() {
+        // spawn-audit: test-only — a 9 MiB single line from `sh`, then a short one.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 9437184 /dev/zero | tr '\\000' a; printf '\\nafter\\n'");
+        let (code, out, _err, ..) = run_bounded(
+            cmd,
+            Duration::from_secs(60),
+            &|_: &str| {},
+            Box::new(Passthrough),
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            out.len() < 64 * 1024,
+            "the over-long line was held: {} bytes",
+            out.len()
+        );
+        assert!(out.contains("was dropped"), "{out}");
+        assert!(out.contains("after"), "{out}");
+    }
+
+    /// (core#1290) A caller's own stdout cap (a carried council ballot's) bounds what is kept, on
+    /// its thread and only for its call.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_keeps_at_most_the_callers_stdout_cap() {
+        let lines = || {
+            // spawn-audit: test-only — 2000 short lines from `sh`.
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("i=0; while [ $i -lt 2000 ]; do echo line-$i; i=$((i+1)); done");
+            cmd
+        };
+        let run = |cmd: Command| {
+            run_bounded(
+                cmd,
+                Duration::from_secs(30),
+                &|_: &str| {},
+                Box::new(Passthrough),
+                None,
+            )
+            .unwrap()
+        };
+        let (code, out, ..) = with_stdout_cap(1024, || run(lines()));
+        assert_eq!(code, 0);
+        assert!(out.len() <= 1024 + 64, "{} bytes kept", out.len());
+        assert!(
+            out.contains("line-0") && out.contains("output truncated"),
+            "{out}"
+        );
+        let (_, out, ..) = run(lines());
+        assert!(out.contains("line-1999"), "the cap outlived its call");
     }
 
     /// FINDING-063. A governed unit routed to a non-claude CLI cannot be armed — gate-hook

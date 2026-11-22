@@ -57,6 +57,64 @@ pub const BALLOTS_IN_HOST: &str = "host";
 pub(crate) struct SeatBallots {
     runner: Arc<dyn crate::workflow::StepRunner>,
     parent_run_id: Option<String>,
+    /// (core#1290) The ballot threads not yet joined: a ballot that timed out and did not stop
+    /// within [`BALLOT_CANCEL_DRAIN`] stays here until [`BallotReaper::reap`] joins it.
+    inflight: BallotReaper,
+    /// How long a cancelled ballot is given to stop before its timeout is reported.
+    drain: std::time::Duration,
+}
+
+/// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
+/// every ballot of the council goes through its one [`SeatBallots`]). The council thread reaps
+/// before it releases the host council slot and reports the council's end, so no ballot's seat
+/// is still running when the caller is told the council ended.
+#[derive(Clone, Default)]
+pub(crate) struct BallotReaper(Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>);
+
+/// (core#1290) The longest the council thread waits to reap its carried ballots: a cancelled
+/// ballot's container is removed within about 20 s of [`BALLOT_CANCEL_DRAIN`].
+pub(crate) const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+
+impl BallotReaper {
+    fn hold(&self, ballot: std::thread::JoinHandle<()>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(ballot);
+    }
+
+    /// How many carried ballots are still running.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|h| !h.is_finished())
+            .count()
+    }
+
+    /// Join every held ballot, waiting no longer than `bound`: how many were still running past it
+    /// (they stay held, and a later reap may join them).
+    pub(crate) fn reap(&self, bound: std::time::Duration) -> usize {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let (done, left) = {
+                let mut held = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                let (done, running): (Vec<_>, Vec<_>) =
+                    held.drain(..).partition(|h| h.is_finished());
+                *held = running;
+                (done, held.len())
+            };
+            for h in done {
+                let _ = h.join();
+            }
+            if left == 0 || std::time::Instant::now() >= deadline {
+                return left;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 impl std::fmt::Debug for SeatBallots {
@@ -73,7 +131,20 @@ impl SeatBallots {
         SeatBallots {
             runner,
             parent_run_id: parent_run_id.map(str::to_string),
+            inflight: BallotReaper::default(),
+            drain: BALLOT_CANCEL_DRAIN,
         }
+    }
+
+    /// (core#1290) The handle that reaps this carrier's ballots.
+    pub(crate) fn reaper(&self) -> BallotReaper {
+        self.inflight.clone()
+    }
+
+    #[cfg(test)]
+    fn with_drain(mut self, drain: std::time::Duration) -> Self {
+        self.drain = drain;
+        self
     }
 }
 
@@ -103,6 +174,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         prompt: &str,
         timeout: std::time::Duration,
         timeout_note: Option<&str>,
+        stdout_cap: usize,
     ) -> Result<wicked_council::types::BallotRun, wicked_council::types::SeatFailure> {
         use crate::workflow::StepStatus;
         use wicked_council::types::{BallotRun, InputMode, SeatFailure, SeatFailureKind};
@@ -153,18 +225,31 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = self.runner.clone();
-        std::thread::spawn(move || {
-            let out =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.run_unit(&input)));
+        // (core#1290) The wrapped runner keeps at most `stdout_cap` of this ballot's output, bounded
+        // as it reads (`execute_wrapped::with_stdout_cap`, on this ballot's own thread).
+        let ballot = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::execute_wrapped::with_stdout_cap(stdout_cap, || runner.run_unit(&input))
+            }));
             let _ = tx.send(out);
         });
         let out = match rx.recv_timeout(timeout) {
-            Ok(out) => out.ok(),
+            Ok(out) => {
+                // The ballot has answered: its thread ends with the send.
+                let _ = ballot.join();
+                out.ok()
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Stop the seat (the runner cancels the ballot's container), give it a moment,
-                // and report the timeout as the host path does.
+                // and report the timeout as the host path does. (core#1290) A ballot that has not
+                // stopped by then stays held: the council reaps it before it reports its end.
                 self.runner.on_run_complete(&run_id);
-                let _ = rx.recv_timeout(BALLOT_CANCEL_DRAIN);
+                match rx.recv_timeout(self.drain) {
+                    Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = ballot.join();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.inflight.hold(ballot),
+                }
                 let msg = match timeout_note {
                     Some(note) => format!("exceeded {timeout:?} dispatch budget ({note})"),
                     None => format!("exceeded {timeout:?} dispatch budget"),
@@ -174,7 +259,10 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
                     format!("{msg} in its seat container"),
                 ));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = ballot.join();
+                None
+            }
         };
         // The ballot's process has exited: nothing to cancel (a cancel would leave a tombstone per
         // ballot in the runner for the daemon's life), and an engine-internal session registers no
@@ -1159,6 +1247,7 @@ mod tests {
                 _prompt: &str,
                 _timeout: std::time::Duration,
                 _note: Option<&str>,
+                _stdout_cap: usize,
             ) -> Result<wicked_council::types::BallotRun, wicked_council::types::SeatFailure>
             {
                 Ok(wicked_council::types::BallotRun {
@@ -1913,6 +2002,7 @@ mod tests {
                 "ballot",
                 std::time::Duration::from_secs(5),
                 None,
+                1024,
             )
             .expect("the seat answered");
         assert!(run.exit_ok);
@@ -1928,11 +2018,78 @@ mod tests {
                 "ballot",
                 std::time::Duration::from_millis(100),
                 Some("40s × 1.00"),
+                1024,
             )
             .unwrap_err();
         assert_eq!(f.kind, SeatFailureKind::TimedOut);
         assert!(f.detail.contains("in its seat container"), "{f:?}");
         assert_eq!(late.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    /// (core#1290) A ballot that outlives its budget AND the cancel drain is still running when
+    /// `run_ballot` reports its timeout: the reaper holds it, and the council's reap waits it out
+    /// (bounded: one that outlives the bound is reported, and a later reap still joins it).
+    #[test]
+    fn a_ballot_still_stopping_past_the_drain_is_held_and_reaped() {
+        use std::time::{Duration, Instant};
+        use wicked_council::types::{BallotCarrier, SeatFailureKind};
+        let late = slow(1200);
+        let carrier = SeatBallots::new(late.clone(), None).with_drain(Duration::from_millis(50));
+        let reaper = carrier.reaper();
+        let f = carrier
+            .run_ballot(
+                &seat("pi"),
+                "t-reap",
+                "ballot",
+                Duration::from_millis(50),
+                None,
+                1024,
+            )
+            .unwrap_err();
+        assert_eq!(f.kind, SeatFailureKind::TimedOut);
+        assert_eq!(late.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reaper.running(),
+            1,
+            "the ballot's seat is still running past the drain"
+        );
+        let started = Instant::now();
+        assert_eq!(reaper.reap(Duration::from_secs(10)), 0);
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert_eq!(reaper.running(), 0);
+
+        let stuck = slow(3000);
+        let carrier = SeatBallots::new(stuck, None).with_drain(Duration::from_millis(10));
+        let reaper = carrier.reaper();
+        let _ = carrier.run_ballot(
+            &seat("pi"),
+            "t-stuck",
+            "ballot",
+            Duration::from_millis(10),
+            None,
+            1024,
+        );
+        assert_eq!(reaper.reap(Duration::from_millis(200)), 1, "bounded");
+        assert_eq!(reaper.reap(Duration::from_secs(10)), 0);
+    }
+
+    /// (core#1290) A ballot that answers in time leaves nothing to reap.
+    #[test]
+    fn a_ballot_that_answers_leaves_nothing_to_reap() {
+        use wicked_council::types::BallotCarrier;
+        let carrier = SeatBallots::new(slow(0), None);
+        let reaper = carrier.reaper();
+        carrier
+            .run_ballot(
+                &seat("pi"),
+                "t-quick",
+                "ballot",
+                std::time::Duration::from_secs(5),
+                None,
+                1024,
+            )
+            .expect("the seat answered");
+        assert_eq!(reaper.reap(std::time::Duration::ZERO), 0);
     }
 
     // (core#1413) The council's asking run reaches every carried ballot.
@@ -1948,6 +2105,7 @@ mod tests {
                     "ballot",
                     std::time::Duration::from_secs(5),
                     None,
+                    1024,
                 )
                 .expect("the seat answered");
         }
@@ -1968,7 +2126,14 @@ mod tests {
             let mut s = seat("pi");
             s.input_mode = mode;
             let f = carrier
-                .run_ballot(&s, "t3", "ballot", std::time::Duration::from_secs(5), None)
+                .run_ballot(
+                    &s,
+                    "t3",
+                    "ballot",
+                    std::time::Duration::from_secs(5),
+                    None,
+                    1024,
+                )
                 .unwrap_err();
             assert!(f.detail.contains("command line only"), "{f:?}");
             if mode == InputMode::PtySession {

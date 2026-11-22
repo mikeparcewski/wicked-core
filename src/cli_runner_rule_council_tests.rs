@@ -905,8 +905,9 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
     }
     assert_eq!(overlaps.load(Ordering::SeqCst), 0);
 
-    // The production port: the caller gives up at deadline + grace; the "actor" still holds the
-    // slot it was handed until its council ends.
+    // The production port: the caller gives up at deadline + grace + the reap bound (core#1290:
+    // the council reaps its carried ballots before it replies); the "actor" still holds the slot
+    // it was handed until its council ends.
     let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
     let actor = std::thread::spawn(move || {
         if let Ok(crate::command::Command::ConveneRuleCouncil { lock, reply, .. }) = rx.recv() {
@@ -920,7 +921,9 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
     // instant before its exec closes it (the production wait retries until its deadline too).
     let soon = || std::time::Instant::now() + Duration::from_secs(5);
     let lock = HostCouncilLock::acquire_until(&path, soon()).expect("the slot is free");
-    let past = std::time::Instant::now() - crate::rule_check::COUNCIL_REPLY_GRACE
+    let past = std::time::Instant::now()
+        - crate::rule_check::COUNCIL_REPLY_GRACE
+        - crate::decision::REAP_BOUND
         + Duration::from_millis(100);
     let req = DecisionRequest {
         session_id: "s".into(),

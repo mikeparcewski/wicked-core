@@ -1067,8 +1067,8 @@ pub(crate) trait DisputeCouncil: Sync {
 pub(crate) enum DisputeOutcome {
     Ruled(crate::decision::DecisionVerdict),
     Failed(String),
-    /// No answer by the deadline plus [`crate::rule_check::COUNCIL_REPLY_GRACE`]: the late result
-    /// is dropped.
+    /// No answer by the deadline plus [`crate::rule_check::COUNCIL_REPLY_GRACE`] and the ballots'
+    /// reap bound ([`crate::decision::REAP_BOUND`]): the late result is dropped.
     TimedOut,
 }
 
@@ -1117,8 +1117,10 @@ impl DisputeCouncil for ActorDisputeCouncil {
         {
             return DisputeOutcome::Failed("the engine stopped".into());
         }
-        let wait = (deadline + crate::rule_check::COUNCIL_REPLY_GRACE)
-            .saturating_duration_since(std::time::Instant::now());
+        // (core#1290) The council reaps its carried ballots before it replies.
+        let wait =
+            (deadline + crate::rule_check::COUNCIL_REPLY_GRACE + crate::decision::REAP_BOUND)
+                .saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Ok(v)) => DisputeOutcome::Ruled(v),
             Ok(Err(e)) => DisputeOutcome::Failed(format!("{e:#}")),
@@ -1949,7 +1951,9 @@ fn settle_rule_disputes(
             }
             DisputeOutcome::TimedOut => hold(format!(
                 "timeout: the council gave no answer within {} s",
-                (crate::rule_check::COUNCIL_DEADLINE + crate::rule_check::COUNCIL_REPLY_GRACE)
+                (crate::rule_check::COUNCIL_DEADLINE
+                    + crate::rule_check::COUNCIL_REPLY_GRACE
+                    + crate::decision::REAP_BOUND)
                     .as_secs()
             )),
             DisputeOutcome::Failed(e) => hold(format!("error: {e}")),
