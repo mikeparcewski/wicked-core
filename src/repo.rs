@@ -972,7 +972,7 @@ pub fn graph_kinds_for_repo(
 /// purely from location (express `send` 404s any path containing a dot-segment; two
 /// wicked-interactive export tests failed in every governed worktree). A worker diagnosing
 /// phantom failures the operator can't reproduce is a workflow hazard, not a cosmetic one.
-fn worktrees_root(repo_root: &str) -> PathBuf {
+pub(crate) fn worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join("wicked-worktrees")
 }
 

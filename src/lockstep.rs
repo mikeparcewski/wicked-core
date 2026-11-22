@@ -367,4 +367,74 @@ mod tests {
             optional.difference(&expected).collect::<Vec<_>>()
         );
     }
+
+    /// (core#1109) The engine checks a run on this repo out at `<clone>/wicked-worktrees/<id>`
+    /// ([`crate::repo::worktrees_root`]), INSIDE the main clone. Cargo finds a package's
+    /// workspace by walking up to the first `[workspace]` that does not exclude it: from the
+    /// worktree's `crates/wicked-core-ts` it passes the worktree's own root (which excludes
+    /// core-ts) and reaches the main clone's manifest. Unless that manifest excludes the worktrees
+    /// directory, it claims core-ts and cargo refuses the package ("believes it's in a workspace
+    /// when it's not"). The fixture lays out that nesting with this repo's real `[workspace]`
+    /// table at both levels and asks cargo itself.
+    #[test]
+    fn a_run_worktree_core_ts_is_outside_the_clone_workspace_1109() {
+        let manifest = read("Cargo.toml");
+        let mut table = String::new();
+        let mut inside = false;
+        for line in manifest.lines() {
+            if line.starts_with('[') {
+                inside = line.trim() == "[workspace]";
+            }
+            if inside {
+                table.push_str(line);
+                table.push('\n');
+            }
+        }
+        assert!(
+            table.contains("exclude"),
+            "the root [workspace] table: {table}"
+        );
+        let fixture = std::env::temp_dir().join(format!(
+            "wicked-1109-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let clone = fixture.join("clone");
+        let tree = crate::repo::worktrees_root(&clone.to_string_lossy()).join("run-1");
+        let core_ts = tree.join("crates").join("wicked-core-ts");
+        std::fs::create_dir_all(&core_ts).unwrap();
+        std::fs::write(clone.join("Cargo.toml"), &table).unwrap();
+        std::fs::write(tree.join("Cargo.toml"), &table).unwrap();
+        std::fs::write(
+            core_ts.join("Cargo.toml"),
+            "[package]\nname = \"wicked-core-ts\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [lib]\npath = \"lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(core_ts.join("lib.rs"), "").unwrap();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        // spawn-audit: test-only (cargo itself, on a fixture manifest; it reads no engine state).
+        let out = std::process::Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+            ])
+            .arg("--manifest-path")
+            .arg(core_ts.join("Cargo.toml"))
+            .current_dir(&fixture)
+            .output()
+            .expect("cargo runs");
+        let _ = std::fs::remove_dir_all(&fixture);
+        assert!(
+            out.status.success(),
+            "cargo refused core-ts in a run worktree nested in the clone: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
