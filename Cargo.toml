@@ -10,6 +10,13 @@
 # of the workspace root's. Folding it in would silently drop LTO from every release build. It keeps
 # its own lockfile and `.cargo/` config for the same reason. Its single test runs from an explicit
 # `--manifest-path` in CI instead.
+#
+# `wicked-worktrees` is excluded for the engine's own run worktrees (core#1109): a run on this repo
+# checks it out at `<clone>/wicked-worktrees/<id>`, and cargo looks for a package's workspace by
+# walking up to the first `[workspace]` that does not exclude it. From a worktree's core-ts that
+# walk passes the worktree's own root (which excludes core-ts) and reached THIS file in the main
+# clone, which then claimed the package and refused it. Excluding the directory sends the walk on.
+# `lockstep::tests::a_run_worktree_core_ts_is_outside_the_clone_workspace_1109` pins it.
 [workspace]
 members = [
     "crates/wicked-apps-core",
@@ -17,7 +24,7 @@ members = [
     "crates/wicked-orchestration",
     "crates/wicked-council",
 ]
-exclude = ["crates/wicked-core-ts"]
+exclude = ["crates/wicked-core-ts", "wicked-worktrees"]
 resolver = "2"
 
 [package]

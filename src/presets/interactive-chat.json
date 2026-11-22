@@ -15,6 +15,13 @@
     "understand"
    ],
    "skill_ref": "wicked-garden-draft"
+  },
+  {
+   "catalog": "draft_render",
+   "id": "measure-pages",
+   "depends_on": [
+    "revise"
+   ]
   }
  ]
 }

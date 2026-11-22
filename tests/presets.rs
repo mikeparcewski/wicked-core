@@ -732,12 +732,18 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
         // (DES-CATALOG-002 §5.1) `migration` gains ONLY its parity steps over its mapping: verify
         // checks parity, and a final `parity` test checks it again after cleanup.
         // (PLAN G12) `interactive-draft` gains ONLY its page-count step over its mapping: the engine
-        // prints the draft after it is written, before the review.
-        if name == "interactive-draft" {
+        // prints the draft after it is written, before the review. (core#1334) `interactive-chat`
+        // gains the same step after its revision.
+        let creator = match name {
+            "interactive-draft" => Some("draft"),
+            "interactive-chat" => Some("revise"),
+            _ => None,
+        };
+        if let Some(creator) = creator {
             want.push(PlanStep {
                 catalog: "draft_render".to_string(),
                 id: "measure-pages".to_string(),
-                depends_on: Some(vec!["draft".to_string()]),
+                depends_on: Some(vec![creator.to_string()]),
                 ..PlanStep::default()
             });
         }
@@ -1155,19 +1161,38 @@ fn m9_interactive_presets_launch_repo_less_with_the_draft_skill() {
             "{name}: a non-code run owes no build and no security_review: {ids:?}"
         );
         // (PLAN G12) The draft's page count: the engine's Tool right after the draft, and the
-        // floor's review after it (so the review is handed the count).
-        if name == "interactive-draft" {
+        // floor's review after it (so the review is handed the count). (core#1334) A chat revision
+        // is measured the same way, right after `revise`; an edit writes fragments, not a document,
+        // so there is nothing to print.
+        let creator = match name {
+            "interactive-draft" => Some("draft"),
+            "interactive-chat" => Some("revise"),
+            _ => None,
+        };
+        if let Some(creator) = creator {
             let at = |id: &str| ids.iter().position(|i| *i == id);
-            let (draft, measure) = (at("draft").unwrap(), at("measure-pages"));
-            assert_eq!(measure, Some(draft + 1), "{ids:?}");
-            let m = &units[draft + 1];
-            assert_eq!(m.catalog.as_deref(), Some("draft_render"), "{ids:?}");
-            assert!(m.tool_cmd.is_some() && m.skill_ref.is_none(), "{ids:?}");
+            let (made, measure) = (at(creator).unwrap(), at("measure-pages"));
+            assert_eq!(measure, Some(made + 1), "{name}: {ids:?}");
+            let m = &units[made + 1];
+            assert_eq!(
+                m.catalog.as_deref(),
+                Some("draft_render"),
+                "{name}: {ids:?}"
+            );
+            assert!(
+                m.tool_cmd.is_some() && m.skill_ref.is_none(),
+                "{name}: {ids:?}"
+            );
             let review = units
                 .iter()
                 .position(|u| u.catalog.as_deref() == Some("critique"))
-                .unwrap_or_else(|| panic!("a reviewed draft: {ids:?}"));
-            assert!(review > draft + 1, "the review follows the count: {ids:?}");
+                .unwrap_or_else(|| panic!("{name}: a reviewed document: {ids:?}"));
+            assert!(
+                review > made + 1,
+                "{name}: the review follows the count: {ids:?}"
+            );
+        } else {
+            assert!(!ids.contains(&"measure-pages"), "{name}: {ids:?}");
         }
     }
 }

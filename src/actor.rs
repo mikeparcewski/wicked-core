@@ -13170,6 +13170,18 @@ fn dispatch_unit_with(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
+    // (core#1436) Every dispatch into the run's persisted worktree (a boot redrive, a gate
+    // continue, the run's next unit) marks it as this daemon's when no daemon has: a tree minted
+    // before core#1373 stops being unmarked once its run moves again. Another daemon's marker is
+    // never replaced. Once per dispatch (the first pass, before any probe), and off the actor: the
+    // claim runs git and resolves paths the seat wrote, and nothing waits on it.
+    if probe.is_none() {
+        if let Some(wd) = session.workdir.clone() {
+            let _claim = crate::repo::spawn_bound(move || {
+                crate::repo::claim_reentered_worktree(std::path::Path::new(&wd));
+            });
+        }
+    }
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
@@ -14596,12 +14608,12 @@ fn dispatch_unit_with(
                                 },
                             };
                         let (o, st, k, rec) = run_draft_render_tool(
-                            &cmd,
                             r,
                             garden
                                 .as_ref()
                                 .map(Option::as_deref)
                                 .map_err(String::as_str),
+                            crate::draft_render::renderer(),
                             attempt,
                             &crate::validator::render_jail,
                             &stop,
@@ -15379,18 +15391,23 @@ struct RenderDispatch {
 
 /// (PLAN G12) Run the `draft_render` Tool: read the draft (opened beneath its root, no link followed,
 /// capped), hash those bytes, and run garden's page counter on the draft at its own path in the
-/// no-network render jail (`validator::render_jail`), with a cleared environment plus the renderer, the
-/// garden root and the temp dir, killed past [`crate::draft_render::DEADLINE`]. The counter's stdout
-/// goes to a report file in the temp dir, which the engine judges; the draft is read again after the
-/// print, and a change between the reads measures nothing (`draft_changed`). Every outcome is `StepStatus::Ok`
-/// with its record (a fact, never a failed command); only a cancel keeps the Cancelled path.
+/// no-network render jail (`validator::render_jail`), with a cleared environment plus the renderer and
+/// the temp dir (also its `HOME`), killed past [`crate::draft_render::DEADLINE`]. (core#1336) The
+/// counter is `page_count.py` itself, run with a resolved interpreter ([`crate::draft_render::interpreter`]),
+/// never the garden launcher (whose `uv` path writes a cache and needs the network); (core#1335) the
+/// jail reads only the system's directories and [`crate::draft_render::render_read_roots`]; (core#1337)
+/// a measured record names the counter's sha256 and the renderer's `--version` line. The counter's
+/// stdout goes to a report file in the temp dir, which the engine judges; the draft is read again
+/// after the print, and a change between the reads measures nothing (`draft_changed`). Every outcome
+/// is `StepStatus::Ok` with its record (a fact, never a failed command); only a cancel keeps the
+/// Cancelled path.
 #[allow(clippy::too_many_arguments)]
 fn run_draft_render_tool(
-    cmd: &[String],
     d: &RenderDispatch,
     garden: Result<Option<&std::path::Path>, &str>,
+    chrome: Result<std::path::PathBuf, (String, String)>,
     attempt: u32,
-    jail: &dyn Fn(&[&std::path::Path]) -> crate::validator::SandboxLauncher,
+    jail: &dyn Fn(&[&std::path::Path], &[&std::path::Path]) -> crate::validator::SandboxLauncher,
     stop: &dyn Fn() -> Option<&'static str>,
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
@@ -15428,24 +15445,40 @@ fn run_draft_render_tool(
     };
     rec.sha256 = Some(dr::sha256_hex(&bytes));
     rec.bytes = Some(bytes.len() as u64);
-    let chrome = match dr::renderer() {
+    let chrome = match chrome {
         Ok(c) => c,
         Err((cause, why)) => return done(not(rec, &cause, why)),
     };
-    // The admitted generation (else the ladder's); a ladder that found NO garden runs the fixed
-    // command from PATH, as the other host Tools do, and a PATH without it is `no_garden`.
+    // The admitted generation (else the ladder's); a ladder that found NO garden runs the counter of
+    // the `wicked-garden` on PATH (its root), as the other host Tools run that launcher, and a PATH
+    // without one is `no_garden`.
     let garden_root = match garden {
-        Ok(Some(g)) => Some(g.to_path_buf()),
-        Ok(None) if crate::validator::find_on_path(dr::RENDER_CMD[0]).is_some() => None,
-        Ok(None) => {
-            return done(not(
-                rec,
-                "no_garden",
-                "no wicked-garden on this daemon (no skills generation, none on PATH) to run the page \
-                 counter from"
-                    .into(),
-            ))
-        }
+        Ok(Some(g)) => g.to_path_buf(),
+        Ok(None) => match crate::validator::find_on_path(dr::RENDER_CMD[0]) {
+            Some(launcher) => match dr::root_of_launcher(&launcher) {
+                Some(root) => root,
+                None => {
+                    return done(not(
+                        rec,
+                        "no_garden",
+                        format!(
+                            "the wicked-garden on PATH ({}) has no {} in its root to count pages with",
+                            launcher.display(),
+                            dr::COUNTER_SCRIPT
+                        ),
+                    ))
+                }
+            },
+            None => {
+                return done(not(
+                    rec,
+                    "no_garden",
+                    "no wicked-garden on this daemon (no skills generation, none on PATH) to run the \
+                     page counter from"
+                        .into(),
+                ))
+            }
+        },
         Err(why) => {
             return done(not(
                 rec,
@@ -15456,13 +15489,12 @@ fn run_draft_render_tool(
     };
     // The jail hides the credential directories; a garden that lives under one cannot run in it.
     let real_garden = garden_root
-        .as_ref()
-        .map(|g| g.canonicalize().unwrap_or_else(|_| g.clone()));
-    if let Some(mask) = real_garden.as_ref().and_then(|real_garden| {
-        crate::validator::secret_read_block_dirs()
-            .into_iter()
-            .find(|m| real_garden.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
-    }) {
+        .canonicalize()
+        .unwrap_or_else(|_| garden_root.clone());
+    if let Some(mask) = crate::validator::secret_read_block_dirs()
+        .into_iter()
+        .find(|m| real_garden.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+    {
         return done(not(
             rec,
             "no_garden",
@@ -15473,6 +15505,36 @@ fn run_draft_render_tool(
             ),
         ));
     }
+    // (core#1337) The counter's identity: the sha256 of its bytes as the engine reads them here, just
+    // before the run (an admitted skills generation is published once, not rewritten in place).
+    let counter = real_garden.join(dr::COUNTER_SCRIPT);
+    let counter_sha256 = match std::fs::read(&counter) {
+        Ok(b) => dr::sha256_hex(&b),
+        Err(e) => {
+            return done(not(
+                rec,
+                "no_garden",
+                format!(
+                    "the page counter {} could not be read: {e}",
+                    counter.display()
+                ),
+            ))
+        }
+    };
+    // (core#1336) The interpreter: the root's `.venv`, else python3/python on PATH (the counter is
+    // stdlib only), by its real path. Never the launcher's `uv run`, which writes a cache and needs
+    // the network.
+    let Some(python) = dr::interpreter(&real_garden, &crate::validator::find_on_path) else {
+        return done(not(
+            rec,
+            "no_python",
+            format!(
+                "no Python 3 to run the page counter with: no {}/.venv, and no python3 or python on \
+                 the daemon's PATH",
+                real_garden.display()
+            ),
+        ));
+    };
     if let Some(r) = stop() {
         return done(not(
             rec,
@@ -15490,7 +15552,26 @@ fn run_draft_render_tool(
             ))
         }
     };
-    let launcher = jail(&[tmp.path()]);
+    // The renderer runs by its real path too (a link elsewhere is not in the jail's reads).
+    let chrome_real = chrome.canonicalize().unwrap_or_else(|_| chrome.clone());
+    let xcode_select = cfg!(target_os = "macos")
+        .then(|| std::fs::read_link("/private/var/db/xcode_select_link").ok())
+        .flatten();
+    let reads = dr::render_read_roots(
+        &draft.real,
+        &real_garden,
+        &python,
+        &chrome_real,
+        xcode_select.as_deref(),
+    );
+    let read_refs: Vec<&std::path::Path> = reads.iter().map(std::path::PathBuf::as_path).collect();
+    // The temp dir by its real path: the jail binds that path, so every file and variable inside it
+    // names it the same way.
+    let tmp_real = tmp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| tmp.path().to_path_buf());
+    let launcher = jail(&[tmp_real.as_path()], &read_refs);
     if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
         return done(not(
             rec,
@@ -15510,44 +15591,38 @@ fn run_draft_render_tool(
         .map(|n| n.to_string_lossy().into_owned())
         .find(|n| n == "bwrap" || n == "sandbox-exec")
         .unwrap_or_else(|| launcher.wrapper[0].clone());
-    let out_file = tmp.path().join("report.json");
-    let tmp_s = tmp.path().to_string_lossy().into_owned();
-    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+    let out_file = tmp_real.join("report.json");
+    let version_file = tmp_real.join("renderer-version.txt");
+    let tmp_s = tmp_real.to_string_lossy().into_owned();
+    // The temp dir is the render's whole writable world, its home included: nothing in a print needs
+    // the user's home, and the jail cannot read it.
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP", "HOME"]
         .iter()
         .map(|k| ((*k).to_string(), tmp_s.clone()))
         .collect();
-    if let Some(h) = std::env::var_os("HOME").filter(|v| std::path::Path::new(v).is_absolute()) {
-        env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
-    }
     env.push((
         dr::CHROME_ENV.to_string(),
-        chrome.to_string_lossy().into_owned(),
+        chrome_real.to_string_lossy().into_owned(),
     ));
-    if let Some(groot) = &garden_root {
-        env.push((
-            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
-            groot.to_string_lossy().into_owned(),
-        ));
-        env.push((
-            "PATH".to_string(),
-            crate::skills_snapshot::prepend_path_entry(
-                &groot.join(crate::skills_snapshot::SCRIPTS_DIR),
-                std::env::var_os("PATH").as_deref(),
-                crate::skills_snapshot::PATH_LIST_SEPARATOR,
-            )
-            .to_string_lossy()
-            .into_owned(),
-        ));
-    }
-    // The counter's stdout (its JSON report) goes to the report file; stderr stays the Tool's output.
+    // The renderer's `--version` line to its file (core#1337), then the counter, whose stdout (its
+    // JSON report) goes to the report file; stderr stays the Tool's output.
     let mut argv: Vec<String> = vec![
         "/bin/sh".into(),
         "-c".into(),
-        "out=$1; shift; exec \"$@\" >\"$out\"".into(),
+        format!(
+            "out=$1; ver=$2; shift 2; \"${}\" --version >\"$ver\" 2>/dev/null </dev/null; \
+             exec \"$@\" >\"$out\"",
+            dr::CHROME_ENV
+        ),
         "sh".into(),
         out_file.to_string_lossy().into_owned(),
+        version_file.to_string_lossy().into_owned(),
+        python.to_string_lossy().into_owned(),
+        "-I".into(),
+        "-B".into(),
+        counter.to_string_lossy().into_owned(),
     ];
-    argv.extend(cmd.iter().cloned());
+    argv.extend(dr::COUNTER_ARGS.iter().map(|a| a.to_string()));
     argv.push(draft.real.to_string_lossy().into_owned());
     let started = std::time::Instant::now();
     let over = std::cell::Cell::new(false);
@@ -15596,6 +15671,7 @@ fn run_draft_render_tool(
         status == StepStatus::Ok,
         &chrome,
     );
+    let renderer_version = dr::read_version(&version_file);
     drop(tmp);
     // A report the engine could not use: the command's last lines say why (the launcher's, the
     // counter's; never the page's, which prints nothing there).
@@ -15623,12 +15699,9 @@ fn run_draft_render_tool(
         rec.profile = None;
     }
     if rec.measured() {
-        rec.counter = Some(
-            garden_root
-                .as_ref()
-                .map(|g| g.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "PATH".to_string()),
-        );
+        rec.counter = Some(real_garden.to_string_lossy().into_owned());
+        rec.counter_sha256 = Some(counter_sha256);
+        rec.renderer_version = renderer_version;
     }
     (rec.summary(), StepStatus::Ok, None, rec)
 }
@@ -15671,22 +15744,16 @@ mod draft_render_live {
              fetch('http://127.0.0.1:{port}/fetch').catch(function(){{}});</script></body></html>"
         );
         std::fs::write(&draft, &html).unwrap();
-        // SAFETY of the env write: this ignored test runs alone (`--ignored --exact`).
-        std::env::set_var(crate::draft_render::CHROME_ENV, &shell);
         let d = RenderDispatch {
             producer: Some(1),
             declared: vec![draft.to_string_lossy().into_owned()],
             cwd: dir.clone(),
             write_roots: vec![dir.to_string_lossy().into_owned()],
         };
-        let cmd: Vec<String> = crate::draft_render::RENDER_CMD
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
         let (out, st, killed, rec) = run_draft_render_tool(
-            &cmd,
             &d,
             Ok(Some(std::path::Path::new(&garden))),
+            Ok(std::path::PathBuf::from(&shell)),
             0,
             &crate::validator::render_jail,
             &|| None,
@@ -15707,6 +15774,150 @@ mod draft_render_live {
             "the page reached the loopback listener from inside the jail"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1335 #1336 #1337) The render step with a REAL browser in the read-allowlisted jail, on
+    /// a host that names a headless shell in `WICKED_TEST_HEADLESS_SHELL` (the renderer crew
+    /// provisions: Playwright's `chrome-headless-shell`), else a stated SKIP. Not a full Chrome such
+    /// as CI's `CHROME_BIN`: on Linux its process singleton needs `socket(AF_UNIX)`, which the
+    /// Isolated jail's seccomp program refuses (on main's `--ro-bind / /` jail as well), so it
+    /// aborts before printing. The garden root has NO `.venv` (the counter
+    /// runs with the PATH's python3) and its launcher fails if anything runs it; the counter is a stub
+    /// that prints with the browser as garden's `render_pdf` does, and gives up (no report) if it can
+    /// read a file beside the draft. A two-page draft is measured as 2 pages, with the counter's
+    /// sha256 and the browser's version line on the record.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv() {
+        let test = "a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv";
+        if crate::validator::skip_when_nested(test)
+            || crate::validator::skip_in_container_floor(test)
+        {
+            return;
+        }
+        let candidates: Vec<std::path::PathBuf> = std::env::var_os("WICKED_TEST_HEADLESS_SHELL")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect();
+        let Some(chrome) = candidates
+            .into_iter()
+            .find(|p| p.is_absolute() && p.is_file())
+        else {
+            eprintln!("SKIP {test}: WICKED_TEST_HEADLESS_SHELL names no headless shell");
+            return;
+        };
+        if crate::validator::find_on_path("python3").is_none() {
+            eprintln!("SKIP {test}: no python3 on PATH");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("wc-dr-browser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (inbox, garden) = (base.join("inbox"), base.join("garden"));
+        std::fs::create_dir_all(garden.join("scripts/draft")).unwrap();
+        std::fs::create_dir_all(&inbox).unwrap();
+        // Beside the draft: a script that adds three printed pages if the browser can load it, and the
+        // counter gives up if it can read it.
+        let secret = base.join("beside.js");
+        std::fs::write(
+            &secret,
+            "for (let i = 0; i < 3; i++) { const e = document.createElement('div'); \
+             e.className = 'p'; e.textContent = 'Extra'; document.body.prepend(e); }",
+        )
+        .unwrap();
+        let launcher = garden.join("scripts/wicked-garden");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho 'the launcher ran' >&2\nexit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let counter = format!(
+            r#"import json, os, pathlib, re, subprocess, sys, tempfile
+try:
+    open({secret:?}).read()
+    print("the counter read a file beside the draft", file=sys.stderr)
+    sys.exit(0)
+except OSError:
+    pass
+draft = pathlib.Path(sys.argv[-1])
+work = pathlib.Path(tempfile.mkdtemp())
+pdf = work / "o.pdf"
+cmd = [os.environ["WICKED_CHROME"], "--headless=new", "--disable-gpu", "--no-sandbox",
+       "--no-pdf-header-footer", "--disable-extensions", "--user-data-dir=" + str(work / "profile"),
+       "--host-resolver-rules=MAP * ~NOTFOUND", "--run-all-compositor-stages-before-draw",
+       "--virtual-time-budget=5000", "--print-to-pdf=" + str(pdf), draft.as_uri()]
+p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+if not pdf.exists():
+    tail = " | ".join(p.stderr.strip().splitlines()[-4:])
+    print(json.dumps({{"check": "pages", "pages": 0, "source": "html-estimate", "verified": False,
+        "notes": ["chrome exited %d without writing a PDF: %s" % (p.returncode, tail)]}}))
+    sys.exit(3)
+counts = [int(m) for m in re.findall(rb"/Count (\d+)", pdf.read_bytes())]
+n = max(counts) if counts else 0
+print(json.dumps({{"check": "pages", "pages": n, "source": "chrome-render", "verified": n > 0,
+    "notes": [] if n else ["no page count in the PDF"]}}))
+"#,
+            secret = secret.to_string_lossy()
+        );
+        std::fs::write(garden.join(crate::draft_render::COUNTER_SCRIPT), &counter).unwrap();
+        let draft = inbox.join("doc-v1.html");
+        let html = format!(
+            "<!doctype html><html><head><style>@page{{size:A4;margin:10mm}} \
+             .p{{page-break-after:always}}</style></head><body><div class=\"p\">One</div>\
+             <div>Two</div><script src=\"{}\"></script></body></html>",
+            url_of(&secret)
+        );
+        std::fs::write(&draft, &html).unwrap();
+        let d = RenderDispatch {
+            producer: Some(1),
+            declared: vec![draft.to_string_lossy().into_owned()],
+            cwd: base.clone(),
+            write_roots: vec![inbox.to_string_lossy().into_owned()],
+        };
+        let (out, st, killed, rec) = run_draft_render_tool(
+            &d,
+            Ok(Some(garden.as_path())),
+            Ok(chrome.clone()),
+            0,
+            &crate::validator::render_jail,
+            &|| None,
+            &|_| {},
+            &|_| {},
+        );
+        eprintln!("{test}: {out}\n{rec:#?}");
+        if rec.cause.as_deref() == Some("unjailed_host") {
+            eprintln!("SKIP {test}: no render jail on this host");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert_eq!(st, crate::workflow::StepStatus::Ok);
+        assert!(killed.is_none());
+        assert!(rec.measured(), "{rec:?}");
+        assert_eq!(rec.pages, Some(2), "{rec:?}");
+        assert_eq!(
+            rec.counter_sha256.as_deref(),
+            Some(crate::draft_render::sha256_hex(counter.as_bytes()).as_str())
+        );
+        assert!(
+            rec.renderer_version
+                .as_deref()
+                .is_some_and(|v| v.chars().any(|c| c.is_ascii_digit())),
+            "{rec:?}"
+        );
+        assert_eq!(
+            rec.counter.as_deref(),
+            Some(garden.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `file://` URL for a test path (no escaping needed for the temp paths these tests use).
+    #[cfg(unix)]
+    fn url_of(p: &std::path::Path) -> String {
+        format!("file://{}", p.display())
     }
 }
 
