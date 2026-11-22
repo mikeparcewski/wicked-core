@@ -2637,7 +2637,7 @@ mod tests {
     fn every_planned_unit_is_named_under_its_run() {
         let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
             "id": "d",
-            "phases": [{"id": "understand", "kind": "understand"}, {"id": "build", "kind": "build"}]
+            "phases": [{"id": "understand", "kind": "recon"}, {"id": "build", "kind": "build"}]
         }))
         .unwrap();
         let mut units = crate::plan::plan_units("build the thing", "run-q");
