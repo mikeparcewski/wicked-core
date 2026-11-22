@@ -6708,6 +6708,7 @@ fn pr_c2_dependency_mount_destination_is_a_directory_before_sandbox_creation() {
 /// on those 17 bytes; here main failed only later, at the armed-seat lookup).
 #[test]
 fn finalize_refuses_a_seat_argument_holding_a_nul_1750() {
+    // spawn-audit: test-only — never spawned: finalize only reads the launch command's args.
     let mut cmd = std::process::Command::new("kubectl");
     cmd.args([
         "exec",
