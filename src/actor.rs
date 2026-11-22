@@ -2710,6 +2710,7 @@ pub(crate) fn run(
                 if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
                     fold_reads::start(
                         &self_tx,
+                        lifecycle_maps.as_ref(),
                         reads,
                         fold_reads::Posted {
                             output,
