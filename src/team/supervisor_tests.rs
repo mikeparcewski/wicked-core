@@ -3320,6 +3320,7 @@ fn a_team_council_excludes_an_alias_of_a_party_by_identity() {
         builtin_seat("pi"),
     ];
     let seats: Vec<String> = team_council_seats(roster, &["claude#2".to_string()])
+        .expect("every party's launch is verified")
         .into_iter()
         .map(|c| c.key)
         .collect();
@@ -3332,6 +3333,37 @@ fn a_team_council_excludes_an_alias_of_a_party_by_identity() {
         "a seat whose launch cannot be verified sits: {seats:?}"
     );
     assert_eq!(seats, vec!["codex".to_string(), "pi".to_string()]);
+}
+
+/// codex r1 on #1771: a party whose own record runs a launcher script could be running any CLI
+/// underneath, so no seat can be shown distinct from it: no council (`identity_unknown`), and the
+/// engine is never asked. Before, its wrapper name was its only identity and `claude` sat.
+#[test]
+fn a_team_council_refuses_a_party_whose_launch_cannot_be_verified() {
+    let mut wrapped = builtin_seat("codex");
+    wrapped.key = "wrapped-worker".into();
+    wrapped.binary = "my-wrapper".into();
+    wrapped.headless_invocation = "my-wrapper -p \"{PROMPT}\"".into();
+    let roster = vec![builtin_seat("claude"), builtin_seat("pi"), wrapped];
+    let why = team_council_seats(roster.clone(), &["wrapped-worker#1".to_string()])
+        .expect_err("a party running a wrapper is refused");
+    assert!(why.starts_with("identity_unknown"), "{why}");
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: slot_path("unknown"),
+    };
+    let out = council.convene_from(
+        roster,
+        council_request(),
+        &["wrapped-worker#1".to_string()],
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(&out, CouncilOutcome::NoSeats(w) if w.starts_with("identity_unknown")),
+        "{out:?}"
+    );
+    assert!(rx.try_recv().is_err(), "the engine was asked");
 }
 
 /// While another council holds the host slot, a team council waits within its budget, then times

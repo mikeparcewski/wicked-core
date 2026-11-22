@@ -164,7 +164,10 @@ impl ActorCouncil {
         excluded: &[String],
         budget: Duration,
     ) -> CouncilOutcome {
-        let clis = team_council_seats(roster, excluded);
+        let clis = match team_council_seats(roster, excluded) {
+            Ok(clis) => clis,
+            Err(why) => return CouncilOutcome::NoSeats(why),
+        };
         if clis.is_empty() {
             return CouncilOutcome::NoSeats(format!(
                 "no council seat is left after excluding the parties [{}] by key and by identity",
@@ -213,12 +216,31 @@ impl ActorCouncil {
 /// party, none of the identities it may execute is one a party may execute (an alias: a second
 /// key that runs a party's binary), and its launch can be verified (its invocation runs its own
 /// declared binary or carrier, one the engine ships; a launcher script cannot be shown distinct).
+/// `Err` (`identity_unknown`, no council) when a party's own record launches something that
+/// cannot be seen through (a wrapper could run any CLI, so no seat can be shown distinct from it).
+/// A party with no record keeps its key as its identity.
 pub(crate) fn team_council_seats(
     roster: Vec<wicked_council::AgenticCli>,
     excluded: &[String],
-) -> Vec<wicked_council::AgenticCli> {
+) -> Result<Vec<wicked_council::AgenticCli>, String> {
+    for party in excluded {
+        let cli = wicked_apps_core::spawn::seat_cli_key(party);
+        let record = roster
+            .iter()
+            .find(|c| &c.key == party)
+            .or_else(|| roster.iter().find(|c| c.key == cli));
+        if let Some(c) = record {
+            let launched = crate::cli_runner::invocation_identity(&c.headless_invocation);
+            if !crate::cli_runner::launches_its_own_binary(c, &launched) {
+                return Err(format!(
+                    "identity_unknown: the party `{party}` runs `{launched}`, which is no shipped \
+                     CLI, so no seat can be shown distinct from it"
+                ));
+            }
+        }
+    }
     let party_ids = crate::cli_runner::excluded_identities(excluded, &roster);
-    roster
+    Ok(roster
         .into_iter()
         .filter(|c| {
             !super::runner::is_excluded(&c.key, excluded)
@@ -230,7 +252,7 @@ pub(crate) fn team_council_seats(
                     .iter()
                     .all(|i| !party_ids.contains(i))
         })
-        .collect()
+        .collect())
 }
 
 /// The live teamed runs (P1's replay set, `Core::live_team_runs`).
