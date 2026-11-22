@@ -2789,6 +2789,7 @@ mod tests {
                           are stated (each file is closed with status '00').";
         let lost = crate::execute_wrapped::settle_failure_output(
             "claude",
+            ("t", 0, 0),
             &format!(
                 "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
                 crate::execute_wrapped::SETTLE_FAILED

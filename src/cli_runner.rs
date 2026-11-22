@@ -3314,6 +3314,17 @@ pub(crate) fn verdict_completes_the_turn(
     if output.status != StepStatus::Failed || !evaluator_says_fail(unit, &output.output) {
         return output;
     }
+    // (core#1743, codex xreview #2) A result the engine lost in settlement stays a failure: its
+    // `failure` gate, not a verdict over work that did not come back.
+    if crate::execute_wrapped::lost_result_reason(
+        &output.output,
+        (&output.run_id, output.unit_ix, output.attempt),
+        false,
+    )
+    .is_some()
+    {
+        return output;
+    }
     engine_note(
         emit_delta,
         "the seat's process reported a failure after it answered VERDICT: FAIL; that FAIL is the \

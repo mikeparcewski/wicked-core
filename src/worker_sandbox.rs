@@ -1541,6 +1541,11 @@ pub(crate) struct SeatLaunch<'a> {
     pub(crate) own_ports: &'a [u16],
 }
 
+/// (core#1743) A container seat's own temp: the container's `/tmp`, which every container floor
+/// grants rwx and which is never a host bind or a replica root (so never written back). A
+/// full-posture claude seat's `CLAUDE_CODE_TMPDIR`.
+pub(crate) const SEAT_LOCAL_TMP: &str = "/tmp";
+
 /// Plan the floor for one governed seat spawn whose write roots are `write_roots`.
 pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>) -> SeatFloorPlan {
     use wicked_apps_core::spawn::{SeatCli, SeatConfig};
@@ -1581,7 +1586,13 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             env.push(("CARGO_TARGET_DIR", scratch.join("target")));
             tmp
         }
-        _ => launch.cwd.join("tmp"),
+        // (core#1743) The full posture's claude temp is the CONTAINER's own `/tmp`, never
+        // `<cwd>/tmp`: there claude's Agent-tool task links (`claude-<uid>/…/tasks/<id>.output`,
+        // pointing at the transcript outside the tree) sat in the pod's replica of the tree, and
+        // the write-back refused them and lost the unit's result. Every container floor grants
+        // `/tmp` rwx (`container_floor::landrun_prefix`); a pod's is an in-memory dir that is
+        // never a replica root, so it is never written back. No mount and no write root is added.
+        _ => PathBuf::from(SEAT_LOCAL_TMP),
     };
     // claude ignores `TMPDIR` for its Bash tool's temp dir (`/private/tmp/claude-<uid>`), which
     // the floor denies: every Bash call failed EPERM without this (DES-PROC-GOVERNANCE §3.1).

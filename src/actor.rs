@@ -7851,6 +7851,96 @@ fn apply_step_result(
         // self-heal and the triage judge), so a check that fails again parks at triage again.
         let first_try = output.attempt == 0
             || crate::interaction::redispatched_by_triage(&*store, &run_id, ord, output.attempt);
+        // (core#1743, train-11 J6 run c38b8c59) The ENGINE lost the result of a seat that ran (its
+        // pod's write-back was refused, or its exit code could not be confirmed): no verdict on
+        // the work and no seat failure, so neither the triage judge nor the failover ladder rules
+        // on it, and it never ends the run (#1518). It pauses at the `failure` gate on EVERY
+        // human_confirm, as a denial does (core#464): approve re-dispatches at a fresh attempt,
+        // reject stops. "Keep the captured output" is not offered: the work did not come back.
+        // The reason is the engine's own record (never the seat's text), whole and redacted; only
+        // the seat's own words are bounded.
+        if let Some(lost) = (unit.tool_cmd.is_none())
+            .then(|| {
+                crate::execute_wrapped::lost_result_reason(
+                    &output.output,
+                    (&output.run_id, output.unit_ix, output.attempt),
+                    true,
+                )
+            })
+            .flatten()
+        {
+            let reason = crate::deliver_lift::redact_log_text(&lost);
+            let cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            let seat_words = output
+                .output
+                .lines()
+                .filter(|l| !l.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let seat_words = seat_words.trim();
+            let why = format!(
+                "Unit {ord} ({cli}) ran on attempt {}, but the engine lost its result: {reason}",
+                output.attempt + 1
+            );
+            // (codex xreview #7) A governed attempt's hook claims are conformed, as on the
+            // terminal path this arm replaces.
+            if output.governed {
+                let phase = crate::scope::unit_phase(ord);
+                let _ = crate::gate_hook::fold_input_denial(
+                    store,
+                    &run_id,
+                    output.attempt,
+                    &phase,
+                    true,
+                );
+            }
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(if seat_words.is_empty() {
+                why.clone()
+            } else {
+                format!(
+                    "{why}\nThe seat's own output: {}",
+                    crate::deliver_lift::redact_log_text(&failure_detail_excerpt(seat_words))
+                )
+            });
+            unit.denial = Some(crate::domain::UnitDenial::new(
+                "worker_failure",
+                why.clone(),
+            ));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            eprintln!("wicked-core: run {run_id} unit {ord}: {why}");
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: format!("{why} — pausing for operator decision"),
+                    failure_kind: crate::event::StepFailureKind::WorkerError,
+                },
+            );
+            // (codex xreview #4) A failure while the write-back applied can leave some of it in
+            // the tree; the reason says how far it got, and the prompt never promises a clean one.
+            let prompt = format!(
+                "{why}. The reason says whether any of its work reached the run's tree. Approve to \
+                 run the unit again (optionally amend), or reject to stop the run."
+            );
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                Some(ord),
+                "failure",
+                prompt,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
@@ -36422,6 +36512,7 @@ mod seat_failover_tests {
         );
         let lost = crate::execute_wrapped::settle_failure_output(
             "claude",
+            (&run_id, 0, 3),
             &format!(
                 "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
                 crate::execute_wrapped::SETTLE_FAILED
@@ -36453,6 +36544,95 @@ mod seat_failover_tests {
             detail.contains("rc file is missing") && !detail.contains("failing over"),
             "the cause is in the event: {detail}"
         );
+    }
+
+    /// core#1743 (train-11 J6, run c38b8c59, attempts 9 and 10): a seat pod whose write-back was
+    /// refused lost its result, and the run ended `sessionFailed` on an autonomous run (the
+    /// fall-through `fail_run`), against #1518's "never fails the unit". The reason was elided too:
+    /// the long host path ate the 300-char head and `[… N chars elided …]` cut the reason itself.
+    /// Now a lost result pauses at the `failure` gate on EVERY human_confirm, before the triage
+    /// judge (an engine settlement failure is not the seat's to rule on), and the stepFailed and
+    /// the unit's denial carry the engine's whole reason. Red on main: `none` failed the run,
+    /// `all` on a first try went to the triage judge, and the detail was elided mid-reason.
+    #[test]
+    fn core_1743_a_refused_write_back_pauses_at_the_failure_gate_with_the_whole_reason() {
+        for (case, confirm) in [
+            ("none", HumanConfirm::None),
+            ("all-first-try", HumanConfirm::All),
+        ] {
+            let run_id = format!("lost-wb-{case}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "pi"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.human_confirm = confirm;
+            put_node(&mut store, session.to_node()).unwrap();
+            seed_unit(
+                &mut store,
+                &run_id,
+                6,
+                "extract",
+                "claude",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            let long = "w".repeat(140);
+            let reason = format!(
+                "the write-back of /srv/seat-host/.wicked-crew/worktrees/{long} was refused: \
+                 `tmp/claude-1000/-srv-seat-host--wicked-crew-worktrees-{long}/0b1c/tasks/a1.output` \
+                 is a symlink that leaves its root"
+            );
+            let lost = crate::execute_wrapped::settle_failure_output(
+                "claude",
+                (&run_id, 0, 0),
+                &format!("{}{reason}", crate::execute_wrapped::SETTLE_FAILED),
+                &"the seat's own report of its extraction page\n".repeat(200),
+            );
+            let (applied, session, units, events) =
+                fold_failed_capturing(&mut store, &run_id, &lost);
+            assert!(matches!(applied, StepApplied::Paused), "{case}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+                "{case}: never sessionFailed"
+            );
+            let kind = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::AwaitingHuman { gate_kind, .. } => Some(gate_kind.clone()),
+                    _ => None,
+                })
+                .expect("awaitingHuman");
+            assert_eq!(kind, "failure", "{case}");
+            let detail = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::StepFailed { detail, .. } => Some(detail.clone()),
+                    _ => None,
+                })
+                .expect("stepFailed");
+            assert!(
+                detail.contains("is a symlink that leaves its root") && !detail.contains("elided"),
+                "{case}: the whole reason rides the event: {detail}"
+            );
+            let denial = units[0].denial_reason.clone().unwrap_or_default();
+            assert!(
+                denial.contains("is a symlink that leaves its root"),
+                "{case}: the gate's reason is whole: {denial}"
+            );
+            assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
+            assert!(units[0].worker_failed_clis.is_empty(), "{case}");
+        }
     }
 
     /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run
