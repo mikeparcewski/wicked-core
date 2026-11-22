@@ -1088,7 +1088,10 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     }
     if sub == "clone" {
         // (core#1792) `git clone -c <k=v>` writes the key into the new repository's config.
-        if let Some(key) = clone_config_keys(rest).find(|k| fenced_config_key(k)) {
+        if let Some(key) = clone_config_keys(rest)
+            .into_iter()
+            .find(|k| fenced_config_key(k))
+        {
             return Some(format!("clone -c {key} (fenced key)"));
         }
     }
@@ -1118,22 +1121,53 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     None
 }
 
-/// The keys of `git clone`'s `-c <k=v>` / `--config <k=v>` (and the attached `-ck=v`,
-/// `--config=k=v`; git's option parser also takes the unambiguous prefixes `--con`, `--conf`, …).
-fn clone_config_keys(rest: &[String]) -> impl Iterator<Item = &str> {
+/// The keys of `git clone`'s `-c <k=v>` / `--config <k=v>`: attached (`-ck=v`, `--config=k=v`),
+/// in a short cluster (`-qc k=v`, `-qck=v`) and as a long prefix (`--con`). Options stop at `--`;
+/// the other short options that take a value (`-o -b -u -j`) consume it. A long option's value
+/// is not skipped, so a value spelled like a fenced `-c` fails closed.
+fn clone_config_keys(rest: &[String]) -> Vec<&str> {
     let long = |t: &str| t.len() > 4 && "--config".starts_with(t);
-    rest.iter().enumerate().filter_map(move |(i, t)| {
-        let kv = if t == "-c" || long(t) {
-            rest.get(i + 1)?.as_str()
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let t = rest[i].as_str();
+        i += 1;
+        if t == "--" {
+            break;
+        }
+        let kv = if long(t) {
+            rest.get(i).map(|v| {
+                i += 1;
+                v.as_str()
+            })
         } else if let Some((_, v)) = t.split_once('=').filter(|(f, _)| long(f)) {
-            v
-        } else if let Some(v) = t.strip_prefix("-c").filter(|v| !v.is_empty()) {
-            v
+            Some(v)
+        } else if t.len() > 1 && t.starts_with('-') && !t.starts_with("--") {
+            let cluster = &t[1..];
+            let at = cluster.find(['c', 'o', 'b', 'u', 'j']);
+            match at {
+                Some(p) => {
+                    let attached = &cluster[p + 1..];
+                    let value = if attached.is_empty() {
+                        rest.get(i).map(|v| {
+                            i += 1;
+                            v.as_str()
+                        })
+                    } else {
+                        Some(attached)
+                    };
+                    value.filter(|_| cluster.as_bytes()[p] == b'c')
+                }
+                None => None,
+            }
         } else {
-            return None;
+            None
         };
-        Some(kv.split('=').next().unwrap_or(kv))
-    })
+        if let Some(kv) = kv {
+            keys.push(kv.split('=').next().unwrap_or(kv));
+        }
+    }
+    keys
 }
 
 /// `git config …`: a READ (`--get*`, `-l`/`--list`, `--show-*`) passes; a write naming a fenced
@@ -1152,18 +1186,31 @@ fn judge_git_config(rest: &[String]) -> Option<String> {
         "--show-origin",
         "--show-scope",
     ];
-    if rest.iter().any(|r| READ_FLAGS.contains(&r.as_str())) {
-        return None;
+    // Options that take the next token as their value (`--comment get` is a comment).
+    const VALUE_OPTS: &[&str] = &[
+        "-f",
+        "--file",
+        "--blob",
+        "--comment",
+        "--type",
+        "--default",
+        "--value",
+    ];
+    // (core#1792) git's legacy parser stops at the first positional, so only the options before
+    // it select the action: a trailing `--get` is a value pattern and the command still writes.
+    // `get` / `list` read only as that first positional (git's subcommand form), never as a value.
+    let mut i = 0;
+    while i < rest.len() && rest[i].starts_with('-') {
+        if READ_FLAGS.contains(&rest[i].as_str()) {
+            return None;
+        }
+        i += if VALUE_OPTS.contains(&rest[i].as_str()) {
+            2
+        } else {
+            1
+        };
     }
-    // (core#1792) `get` / `list` name a read only as git's subcommand form, the first positional
-    // (`git config get <key>`); anywhere else it is a value (`git config remote.x.pushurl <url>
-    // get` writes the key).
-    if matches!(
-        rest.iter()
-            .find(|r| !r.starts_with('-'))
-            .map(String::as_str),
-        Some("get" | "list")
-    ) {
+    if matches!(rest.get(i).map(String::as_str), Some("get" | "list")) {
         return None;
     }
     rest.iter()
@@ -1532,9 +1579,17 @@ mod tests {
             "git clone --config remote.origin.pushurl=z src dst",
             "git clone --conf remote.origin.pushurl=z src dst",
             "git clone -cremote.origin.pushurl=z src dst",
+            "git clone -qc remote.origin.pushurl=z src dst",
+            "git clone -qcremote.origin.pushurl=z src dst",
+            "git config --comment get remote.origin.pushurl https://example.invalid/o/r.git",
+            "git config remote.origin.pushurl https://example.invalid/o/r.git --get",
         ] {
             assert!(hit(cmd).is_some(), "not refused: {cmd}");
         }
+        assert_eq!(hit("git config --global get user.name"), None);
+        assert_eq!(hit("git config --file f --get remote.origin.url"), None);
+        assert_eq!(hit("git clone -- src -cremote.origin.pushurl=backup"), None);
+        assert_eq!(hit("git clone -b -cmain src dst"), None);
         assert_eq!(hit("git clone -c core.autocrlf=false src dst"), None);
         assert_eq!(hit("git clone https://example.invalid/a/b.git"), None);
         assert_eq!(hit("git config user.name 'wicked worker'"), None);

@@ -5166,8 +5166,9 @@ impl WrappedCliStepRunner {
                     // Every failed unit keeps both streams for refusal classification: a CLI
                     // may print progress on stdout and say why it stopped on stderr (core#1612).
                     // (core#1717) stderr goes into the transcript: cut the secrets a CLI prints
-                    // there (env dumps, auth headers, tokens) with the tool-output redaction.
-                    let err = crate::tool_activity::redact(&err);
+                    // there (env dumps, auth headers, tokens) with the tool-output redaction,
+                    // keeping its lines as they are for the refusal classifiers.
+                    let err = crate::tool_activity::redact_text(&err);
                     let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
                         (false, false) => format!("{out}\n{err}"),
                         (false, _) => out,
@@ -11358,7 +11359,8 @@ mod tests {
             format!(
                 "#!/bin/sh\necho 'starting the ballot'\n\
                  echo 'GITHUB_TOKEN={token}' >&2\n\
-                 echo 'Authorization: Bearer {token}' >&2\nexit 1\n"
+                 echo 'Authorization: Bearer {token}' >&2\n\
+                 printf 'diagnostic \\\\\\nNot logged in\\n' >&2\nexit 1\n"
             ),
         )
         .unwrap();
@@ -11371,6 +11373,12 @@ mod tests {
             leaky.output
         );
         assert!(!leaky.output.contains(token), "{}", leaky.output);
+        // A trailing backslash in prose is not joined: the next line keeps its line-start frame.
+        assert!(
+            leaky.output.contains("diagnostic \\\nNot logged in"),
+            "{}",
+            leaky.output
+        );
         // Restore the sign-in refusal for the council dispatcher below.
         std::fs::write(&stub, sign_in_stub).unwrap();
         // Through the carrier and the production dispatcher, the refusal is classified.

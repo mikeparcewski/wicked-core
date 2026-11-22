@@ -1122,7 +1122,13 @@ fn keep_short_flag(cmd: &str, start: usize, head: &str) -> bool {
 /// is cut like one on the same line (core#1577; also inside quotes, where the record then shows
 /// the two lines joined).
 pub fn redact(cmd: &str) -> String {
-    let mut out = continuation().replace_all(cmd, "").into_owned();
+    redact_text(&continuation().replace_all(cmd, ""))
+}
+
+/// [`redact`] without the line-continuation join: for prose (a CLI's stderr, core#1717), whose
+/// line framing the refusal classifiers read, so a trailing `\` never fuses two lines.
+pub(crate) fn redact_text(text: &str) -> String {
+    let mut out = text.to_string();
     for (re, cut) in redactors() {
         out = match cut {
             Cut::With(with) => re.replace_all(&out, *with).into_owned(),

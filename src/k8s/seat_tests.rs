@@ -6722,8 +6722,8 @@ fn finalize_refuses_a_seat_argument_holding_a_nul_1750() {
     ])
     .arg(format!("{}nulcheck1750", seat::MARKER_PREFIX))
     .args(["claude", "-p", "quote a .pyc: \0\u{1}"]);
-    let err = seat::finalize(&cmd)
-        .err()
-        .expect("a NUL argument is refused");
+    let Err(err) = seat::finalize(&cmd) else {
+        panic!("a NUL argument is refused");
+    };
     assert_eq!(err, "a seat argument holds a NUL");
 }
