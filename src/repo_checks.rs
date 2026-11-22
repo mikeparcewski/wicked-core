@@ -1345,6 +1345,12 @@ struct JournalEntry {
     name: String,
     argv: Vec<String>,
     run: CheckRun,
+    /// (core#1152) Set when the run ran on a guarded clean checkout of the key's tree, never the
+    /// live worktree (where an untracked or ignored file could have steered it, core#417): the
+    /// boundary it ran under ([`CheckScratch::posture_level`]). A resumed creator floor under the
+    /// same boundary may publish it for verify. Absent (an older journal) = not known, never.
+    #[serde(default)]
+    guarded_under: Option<String>,
 }
 
 /// An open floor journal ([`FloorJournal`]): the record this floor writes, and what it may reuse
@@ -1435,7 +1441,8 @@ impl OpenJournal {
     /// in the store: a check that timed out, could not start or could not run is run again. The
     /// `install` check always runs again: its receipt is not its output (`node_modules`, a venv),
     /// and a guarded floor runs on a fresh checkout that has none of it (xreview).
-    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+    /// The second value is the entry's [`JournalEntry::guarded_under`].
+    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<(CheckRun, Option<String>)> {
         if is_provisioning(&check.name) {
             return None;
         }
@@ -1444,19 +1451,26 @@ impl OpenJournal {
             .iter()
             .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
         let entry = self.prior.remove(at);
-        let run = entry.run;
+        let (run, guarded) = (entry.run, entry.guarded_under);
         finished_whole(&run, logs).then(|| {
             if let Some(r) = self.resume.as_mut() {
                 r.reused.push(check.name.clone());
             }
-            run
+            (run, guarded)
         })
     }
 
     /// Record a finished check (written through at once: the process may die before the next).
     /// `untouched` answers whether the checkout still holds exactly the journal's tree; a check
     /// that changed it spoils the journal (its pass ran on other content: xreview P1).
-    fn record(&mut self, check: &RepoCheck, run: &CheckRun, untouched: Option<&dyn Fn() -> bool>) {
+    /// `guarded_under`: [`JournalEntry::guarded_under`].
+    fn record(
+        &mut self,
+        check: &RepoCheck,
+        run: &CheckRun,
+        untouched: Option<&dyn Fn() -> bool>,
+        guarded_under: Option<String>,
+    ) {
         if self.spoiled {
             return;
         }
@@ -1471,6 +1485,7 @@ impl OpenJournal {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: run.clone(),
+            guarded_under,
         });
         self.persist();
     }
@@ -6374,9 +6389,12 @@ fn run_detected(
     // (`again`), and after the fresh checks the checkout must still hold exactly the tree the
     // reused results stand for (below), or they are void and the floor fails.
     let mut again: Option<String> = None;
-    // The checks this floor RAN itself, for a creator floor's record: never one reused from an
-    // interrupted floor's journal, which may have run in the live worktree (xreview r1).
+    // The checks this floor RAN itself, for a creator floor's record, and (core#1152) the ones it
+    // took from an interrupted floor's journal that ran them on a guarded clean checkout: never
+    // one that may have run in the live worktree (xreview r1).
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
+    // (core#1152) The boundary this floor's runs are journaled and published under.
+    let posture_level = scratch.posture_level(&sandbox_level);
     for check in detected.iter() {
         // (core#1731) Once the disk watch stopped a run, no further check starts: the floor is
         // that environment refusal ([`disk_stopped`]).
@@ -6393,13 +6411,14 @@ fn run_detected(
                 eprintln!("{}", s.log_line(&run));
             }
             failed = run.denies();
+            // A verify floor's reuse: never a creator record's entry.
             if let Some(j) = journal.as_mut() {
-                j.record(check, &run, untouched);
+                j.record(check, &run, untouched, None);
             }
             checks.push(run);
             continue;
         }
-        if let Some(run) = journal.as_mut().and_then(|j| j.reuse(check, &scratch.logs)) {
+        if let Some((run, guarded)) = journal.as_mut().and_then(|j| j.reuse(check, &scratch.logs)) {
             if let Some(resume) = journal.as_ref().and_then(|j| j.resume.as_ref()) {
                 eprintln!(
                     "wicked-core: repo checks floor — `{}` {} on this tree in the floor \
@@ -6415,8 +6434,24 @@ fn run_detected(
             if again.is_none() {
                 again = seed.as_ref().and_then(|s| s.set_aside_by(check, &run));
             }
+            // (core#1152) A resumed creator floor publishes what the interrupted floor ran on a
+            // guarded clean checkout of this tree under this floor's boundary, beside what it
+            // runs itself, so its record covers the set; an entry that may have run in the live
+            // worktree, or under another boundary, stays out.
+            let publishable = ctx.stage == FloorStage::Creator
+                && untouched.is_some()
+                && guarded.as_deref() == Some(posture_level.as_str());
             if let Some(j) = journal.as_mut() {
-                j.record(check, &run, untouched);
+                j.record(check, &run, untouched, guarded);
+            }
+            if publishable {
+                ran_here.push(CreatorEntry {
+                    dir: check.dir.clone(),
+                    name: check.name.clone(),
+                    argv: check.argv.clone(),
+                    timeout_s: check.timeout_s,
+                    run: run.clone(),
+                });
             }
             checks.push(run);
             continue;
@@ -6750,7 +6785,12 @@ fn run_detected(
         // its retry's, its base's or an inventory's) is no evidence for a later floor.
         let stopped_for_disk = scratch.disk_stop.get().is_some();
         if let Some(j) = journal.as_mut().filter(|_| !stopped_for_disk) {
-            j.record(check, &run, untouched);
+            j.record(
+                check,
+                &run,
+                untouched,
+                untouched.is_some().then(|| posture_level.clone()),
+            );
         }
         if ctx.stage == FloorStage::Creator && !stopped_for_disk {
             ran_here.push(CreatorEntry {
@@ -6833,7 +6873,7 @@ fn run_detected(
                     ord: j.ord,
                     attempt: j.attempt,
                     phase: j.phase.clone(),
-                    sandbox_level: scratch.posture_level(&sandbox_level),
+                    sandbox_level: posture_level,
                     exclude,
                     checks: ran_here,
                 },
@@ -8430,7 +8470,7 @@ impl BaseTree {
     }
 
     /// [`Self::cache_path`]; `failing_set` (core#1198) names the record of a run of a failing set
-    /// only, never the whole check's.
+    /// only, never the whole check's, one per set (its argv names the set, core#1217).
     fn cache_path_of(
         scratch: &CheckScratch,
         head: &str,
@@ -8451,6 +8491,12 @@ impl BaseTree {
         }
         if failing_set {
             h.update(b"failing-set\0");
+            // (core#1217) One record per failing set on a base, not only the latest set: a later
+            // floor whose failures match an earlier set's reads that set's base run back.
+            for arg in &check.argv {
+                h.update(arg.as_bytes());
+                h.update([0u8]);
+            }
         }
         let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         scratch.logs.join(format!("base-{key}.json"))
@@ -17765,6 +17811,62 @@ exit 1
         assert_eq!(records, seen.len());
         assert!(!scratch_dir.root.join("escaped").exists());
         assert!(!wt.join("escaped").exists());
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// core#1217: a failing set's base run is kept per set on a base, not only the latest set's:
+    /// a later floor whose failures match an earlier set reads that set's base back instead of
+    /// running the base again. The whole check's record is keyed as before.
+    #[test]
+    fn core_1217_each_failing_sets_base_run_is_kept_per_set() {
+        let wt = scratch("cache-per-set");
+        let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+        let head = "0123456789abcdef0123";
+        let set = |ids: &[&str]| {
+            let mut argv = s(&["cargo", "test", "--workspace", "--", "--exact"]);
+            argv.extend(s(ids));
+            RepoCheck {
+                name: "cargo-test".into(),
+                argv,
+                source: "Cargo.toml".into(),
+                timeout_s: None,
+                dir: String::new(),
+            }
+        };
+        let (a, b) = (set(&["t::a"]), set(&["t::b"]));
+        assert_ne!(
+            BaseTree::cache_path_of(&scratch_dir, head, &a, true),
+            BaseTree::cache_path_of(&scratch_dir, head, &b, true),
+            "one record per set"
+        );
+        assert_eq!(
+            BaseTree::cache_path_of(&scratch_dir, head, &a, false),
+            BaseTree::cache_path_of(&scratch_dir, head, &b, false),
+            "the whole check's record is keyed by the check, not its argv"
+        );
+        for check in [&a, &b] {
+            let mut ran = failed_run(&[check.argv.last().unwrap().as_str()], &[]);
+            ran.argv = check.argv.clone();
+            let rec = BaseRecord {
+                floor_policy: FLOOR_POLICY_VERSION,
+                head_argv: check.argv.clone(),
+                guide: None,
+                run: ran,
+                toc: None,
+                posture: scratch_dir.posture(),
+            };
+            let path = BaseTree::cache_path_of(&scratch_dir, head, check, true);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        }
+        // Set `b` was cached after `a`: `a`'s base run is still read back, and each is its own.
+        for check in [&a, &b] {
+            let side = BaseTree::cached_of(&scratch_dir, head, check, None, true)
+                .unwrap_or_else(|| panic!("{:?} is cached", check.argv));
+            assert!(side.base.cached);
+            assert_eq!(side.base.run.unwrap().argv, check.argv);
+        }
+        assert!(BaseTree::cached_of(&scratch_dir, head, &set(&["t::c"]), None, true).is_none());
         let _ = std::fs::remove_dir_all(&wt);
     }
 

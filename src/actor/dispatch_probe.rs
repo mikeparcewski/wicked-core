@@ -77,9 +77,39 @@ pub(crate) struct DispatchProbe {
     pub(crate) snapshot: Result<WorktreeSnapshot, String>,
     pub(crate) qe: Option<ScoredQe>,
     pub(crate) requirements: Option<Requirements>,
+    /// (core#1418) The project graph's vouch (`project_code_graph_db`) for a governed,
+    /// project-bound run, and what it was read for.
+    pub(crate) project_graph: Option<ProjectGraphRead>,
+}
+
+/// (core#1418) What a project-graph vouch reads from, decided on the actor ([`ProbeJob`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectGraphJob {
+    pub(crate) binding: crate::project::ProjectGraphBinding,
+    /// The engine's operational store: the vouch refuses a binding to it (FINDING-067).
+    pub(crate) operational_db: Option<String>,
+}
+
+/// (core#1418) The vouch the probe thread read, and the inputs it was read for.
+pub(crate) struct ProjectGraphRead {
+    pub(crate) job: ProjectGraphJob,
+    /// The vouched graph, or `None` when the binding is refused (the run repo's graph then).
+    pub(crate) db: Option<String>,
 }
 
 impl DispatchProbe {
+    /// (core#1418) The probe's project-graph vouch, if it was read for exactly this binding and
+    /// operational store: `Some(None)` = refused.
+    pub(crate) fn project_graph_for(
+        &self,
+        binding: Option<&crate::project::ProjectGraphBinding>,
+        operational_db: Option<&str>,
+    ) -> Option<Option<String>> {
+        let read = self.project_graph.as_ref()?;
+        (Some(&read.job.binding) == binding && read.job.operational_db.as_deref() == operational_db)
+            .then(|| read.db.clone())
+    }
+
     /// The fresh tree, when the snapshot succeeded.
     pub(crate) fn tree(&self) -> Option<&str> {
         self.snapshot.as_ref().ok().map(|s| s.tree.as_str())
@@ -151,6 +181,8 @@ pub(crate) struct ProbeJob {
     pub(crate) score_qe: bool,
     /// Read the reviewer's requirements record.
     pub(crate) requirements: bool,
+    /// (core#1418) Vouch for the run's project graph (a governed, project-bound run).
+    pub(crate) project_graph: Option<ProjectGraphJob>,
 }
 
 /// Start `job`'s probe: it supersedes any probe of the same run still out.
@@ -198,6 +230,7 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
                 snapshot: Err("the worktree probe panicked".into()),
                 qe: None,
                 requirements: None,
+                project_graph: None,
             });
         let _ = tx.send(Command::DispatchProbed {
             run_id,
@@ -270,6 +303,15 @@ fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
         }),
         _ => None,
     };
+    let project_graph = job.project_graph.clone().map(|pg| ProjectGraphRead {
+        db: super::project_code_graph_db(
+            Some(&pg.binding),
+            job.session.repo_ref.as_deref(),
+            pg.operational_db.as_deref(),
+            &job.run_id,
+        ),
+        job: pg,
+    });
     DispatchProbe {
         seq,
         unit_id: job.unit.id.clone(),
@@ -280,6 +322,7 @@ fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
         snapshot,
         qe,
         requirements,
+        project_graph,
     }
 }
 

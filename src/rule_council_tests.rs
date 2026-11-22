@@ -449,6 +449,31 @@ fn the_request_carries_both_readings_bounded_inside_a_fresh_fence() {
     assert!(dispute_request("s", 2, &r, "", &ev, None, &pos).is_none());
 }
 
+/// (core#1746) A council ballot carries the change as one argument too: a binary hunk's NULs never
+/// ride it (a NUL argument reaches the seat as `<string-with-nul>`), and nothing of the hunk is cut.
+#[test]
+fn a_dispute_over_a_binary_change_carries_no_nul_and_keeps_the_hunk() {
+    let r = rule("STACK-1", "Use what the chosen stack already provides.");
+    let paths = [
+        "scripts/bump.py",
+        "scripts/__pycache__/bump.cpython-313.pyc",
+    ];
+    let c = change_of(super::BINARY_DIFF, &paths);
+    let row = judged(
+        "STACK-1",
+        RuleStatus::Broken,
+        "scripts/bump.py rewrites a parser",
+    );
+    let ev = Evidence::of_change(&row, &c, None);
+    let pos = positions_for(&row, RuleStatus::Kept);
+    let req = dispute_request("s", 3, &r, "", &ev, None, &pos).unwrap();
+    assert!(!req.evidence.contains('\0'), "no NUL in a ballot");
+    assert!(
+        req.evidence.contains("after-the-nul tomllib"),
+        "the hunk, whole"
+    );
+}
+
 // ── A.5 reuse ───────────────────────────────────────────────────────────────────────────────────
 
 #[test]

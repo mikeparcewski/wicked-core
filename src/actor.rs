@@ -38,6 +38,7 @@ use wicked_apps_core::HardenedCommand;
 
 mod dead_seat_reprobe;
 mod dispatch_probe;
+mod fold_reads;
 pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
@@ -224,14 +225,13 @@ fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<
     Some(path.to_string_lossy().into_owned())
 }
 
-thread_local! {
-    /// Project-graph refusals already reported on this actor thread. A refused binding is
-    /// re-evaluated on EVERY unit dispatch, so without this an operator whose graph was never
-    /// built reads the same paragraph once a step. Keyed on the whole message, so a binding that
-    /// later fails for a DIFFERENT reason still gets its own line.
-    static GRAPH_BIND_WARNED: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
-}
+/// Project-graph refusals already reported. A refused binding is re-evaluated on EVERY unit
+/// dispatch, so without this an operator whose graph was never built reads the same paragraph once
+/// a step. Keyed on the whole message, so a binding that later fails for a DIFFERENT reason still
+/// gets its own line. (core#1418) Process-wide, not per thread: the vouch now runs on the dispatch
+/// probe's thread, a new one each dispatch.
+static GRAPH_BIND_WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// How many distinct refusal messages the dedup set remembers before it starts over.
 ///
@@ -265,15 +265,13 @@ fn warn_bind_refused(run_id: &str, db: &str, why: &str) {
          governed workers fall back to the run repo's OWN graph, or to no estate tools at all if \
          that repo has never been indexed."
     );
-    GRAPH_BIND_WARNED.with(|w| {
-        let mut seen = w.borrow_mut();
-        if seen.len() >= GRAPH_BIND_WARN_CAP {
-            seen.clear();
-        }
-        if seen.insert(msg.clone()) {
-            eprintln!("{msg}");
-        }
-    });
+    let mut seen = GRAPH_BIND_WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.len() >= GRAPH_BIND_WARN_CAP {
+        seen.clear();
+    }
+    if seen.insert(msg.clone()) {
+        eprintln!("{msg}");
+    }
 }
 
 /// Resolve `p` to a comparable absolute path: canonical when it exists, lexically absolute when it
@@ -1581,6 +1579,9 @@ pub(crate) fn run(
                     // (core#1390) A probe of an earlier, ended life of this run id is never
                     // this launch's.
                     dispatch_probe::forget(&run_id);
+                    // (core#1418) Nor is a step result of that life still out for its fold reads:
+                    // it would fold into this one (the relaunch resets the cursor and attempt).
+                    fold_reads::forget_run(&run_id);
                     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
                     // Extra write roots (core#259) are judged in the sync fast path like the
                     // project/preflight checks above: an invalid root is a synchronous Err with
@@ -2615,9 +2616,11 @@ pub(crate) fn run(
             Command::ApplyStepResult {
                 output,
                 agent_verdict,
-                evidence,
-                process_gen: _, // stale-result guard — consumed by bus consumer; ignored here
-                launch_seq: _,
+                mut evidence,
+                // Stale-result guards: consumed by the bus consumer; carried here only so a result
+                // handed to the fold reads below comes back whole.
+                process_gen: step_gen,
+                launch_seq,
                 ack,
             } => {
                 let run_id = output.run_id.clone();
@@ -2665,6 +2668,37 @@ pub(crate) fn run(
                             text,
                         },
                     );
+                }
+                // (core#1418) The worker's stream is flushed above when its result ARRIVES, before
+                // any hand-off: its tail is never held behind the fold's reads, and a dropped
+                // result still finishes it (core#1653). A result back from a hand-off its run
+                // outlived (relaunched while its reads ran) is dropped: the relaunch reset the
+                // cursor and attempt the fold's guards compare. So is a second copy of a result
+                // whose hand-off is still out.
+                if let fold_reads::Arrival::Drop = fold_reads::returned(&output, &mut evidence) {
+                    if let Some(ack_tx) = ack {
+                        let _ = ack_tx.send(());
+                    }
+                    continue;
+                }
+                // (core#1418) A result whose fold would run the unit's pinned validator (up to
+                // 120 s) or a creator floor's diff on the actor: those run on a thread first,
+                // bound to the inputs the fold would use, and the result comes back with them in
+                // its evidence (once: a result that carries them is folded as it is).
+                if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
+                    fold_reads::start(
+                        &self_tx,
+                        reads,
+                        fold_reads::Posted {
+                            output,
+                            agent_verdict,
+                            evidence,
+                            process_gen: step_gen,
+                            launch_seq,
+                            ack,
+                        },
+                    );
+                    continue;
                 }
                 match apply_step_result(
                     &mut store,
@@ -5661,6 +5695,10 @@ pub(crate) fn launch_run_inner(
             return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
+    // (core#1418) A step result of an earlier life of this id still out for its fold reads never
+    // folds into this one. (The campaign's node launch; the interactive `LaunchRun` arm forgets in
+    // its fast path.)
+    fold_reads::forget_run(&run_id);
     // FRESH (re-)launch: clear any prior TERMINAL run's per-run governance dir so a stale Deny from that
     // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner
     // / redrive do NOT clear — they continue the same run's log. A brand-new id has no dir (harmless no-op).
@@ -7898,6 +7936,96 @@ fn apply_step_result(
         // self-heal and the triage judge), so a check that fails again parks at triage again.
         let first_try = output.attempt == 0
             || crate::interaction::redispatched_by_triage(&*store, &run_id, ord, output.attempt);
+        // (core#1743, train-11 J6 run c38b8c59) The ENGINE lost the result of a seat that ran (its
+        // pod's write-back was refused, or its exit code could not be confirmed): no verdict on
+        // the work and no seat failure, so neither the triage judge nor the failover ladder rules
+        // on it, and it never ends the run (#1518). It pauses at the `failure` gate on EVERY
+        // human_confirm, as a denial does (core#464): approve re-dispatches at a fresh attempt,
+        // reject stops. "Keep the captured output" is not offered: the work did not come back.
+        // The reason is the engine's own record (never the seat's text), whole and redacted; only
+        // the seat's own words are bounded.
+        if let Some(lost) = (unit.tool_cmd.is_none())
+            .then(|| {
+                crate::execute_wrapped::lost_result_reason(
+                    &output.output,
+                    (&output.run_id, output.unit_ix, output.attempt),
+                    true,
+                )
+            })
+            .flatten()
+        {
+            let reason = crate::deliver_lift::redact_log_text(&lost);
+            let cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            let seat_words = output
+                .output
+                .lines()
+                .filter(|l| !l.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let seat_words = seat_words.trim();
+            let why = format!(
+                "Unit {ord} ({cli}) ran on attempt {}, but the engine lost its result: {reason}",
+                output.attempt + 1
+            );
+            // (codex xreview #7) A governed attempt's hook claims are conformed, as on the
+            // terminal path this arm replaces.
+            if output.governed {
+                let phase = crate::scope::unit_phase(ord);
+                let _ = crate::gate_hook::fold_input_denial(
+                    store,
+                    &run_id,
+                    output.attempt,
+                    &phase,
+                    true,
+                );
+            }
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(if seat_words.is_empty() {
+                why.clone()
+            } else {
+                format!(
+                    "{why}\nThe seat's own output: {}",
+                    crate::deliver_lift::redact_log_text(&failure_detail_excerpt(seat_words))
+                )
+            });
+            unit.denial = Some(crate::domain::UnitDenial::new(
+                "worker_failure",
+                why.clone(),
+            ));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            eprintln!("wicked-core: run {run_id} unit {ord}: {why}");
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: format!("{why} — pausing for operator decision"),
+                    failure_kind: crate::event::StepFailureKind::WorkerError,
+                },
+            );
+            // (codex xreview #4) A failure while the write-back applied can leave some of it in
+            // the tree; the reason says how far it got, and the prompt never promises a clean one.
+            let prompt = format!(
+                "{why}. The reason says whether any of its work reached the run's tree. Approve to \
+                 run the unit again (optionally amend), or reject to stop the run."
+            );
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                Some(ord),
+                "failure",
+                prompt,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
@@ -12976,6 +13104,16 @@ fn dispatch_probe_job(
     // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
     let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
+    // (core#1418) A governed, project-bound run's dispatch vouches for the project graph (it opens
+    // the graph and reads its file list): it rides the probe when the dispatch takes one (every
+    // agent unit's first attempt does, for its baseline). It starts none of its own: a probe
+    // snapshots the worktree, which costs far more than the vouch.
+    let project_graph = in_process_governance()
+        .and(session.project_graph.clone())
+        .map(|binding| dispatch_probe::ProjectGraphJob {
+            binding,
+            operational_db: GOV_DB_PATH.with(|c| c.borrow().clone()),
+        });
     let checkout_indexing =
         crate::code_graph::checkout_index_in_flight(std::path::Path::new(&repo.code_graph_db));
     if !(checkout_indexing
@@ -13000,6 +13138,7 @@ fn dispatch_probe_job(
         state_home: crate::code_graph::bound_state_home(),
         score_qe,
         requirements,
+        project_graph,
     })
 }
 
@@ -13990,11 +14129,20 @@ fn dispatch_unit_with(
             // repo's own — see `run_code_graph_db`. The operational store path comes from the
             // actor's thread-local so the FINDING-067 guard has something to compare against; this
             // closure runs on the actor thread, where it is always armed.
-            code_graph_db: run_code_graph_db(
-                store,
-                &session,
-                GOV_DB_PATH.with(|c| c.borrow().clone()).as_deref(),
-            ),
+            // (core#1418) The vouch opens the project graph and reads its file list: the dispatch
+            // probe read it off the actor, for this binding and operational store, when it ran;
+            // otherwise (no probe: a repo-less run, a retry) it is read here.
+            code_graph_db: {
+                let operational = GOV_DB_PATH.with(|c| c.borrow().clone());
+                match probe.as_ref().and_then(|p| {
+                    p.project_graph_for(session.project_graph.as_ref(), operational.as_deref())
+                }) {
+                    Some(vouched) => {
+                        vouched.or_else(|| repo_code_graph_db(store, session.repo_ref.as_deref()))
+                    }
+                    None => run_code_graph_db(store, &session, operational.as_deref()),
+                }
+            },
             // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
             // declared and validated (core#259; the read mirror is core#294) — plus THIS unit's
             // notes root (core#464): an engine-derived, per-unit widening under the temp dir, so
@@ -14661,6 +14809,9 @@ fn dispatch_unit_with(
                     worktree_clean: tool_worktree_clean,
                     tree_after_failure: None,
                     phase_scope: None,
+                    pinned_validator: None,
+                    creator_paths: None,
+                    fold_handoff: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -36476,6 +36627,7 @@ mod seat_failover_tests {
         );
         let lost = crate::execute_wrapped::settle_failure_output(
             "claude",
+            (&run_id, 0, 3),
             &format!(
                 "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
                 crate::execute_wrapped::SETTLE_FAILED
@@ -36507,6 +36659,95 @@ mod seat_failover_tests {
             detail.contains("rc file is missing") && !detail.contains("failing over"),
             "the cause is in the event: {detail}"
         );
+    }
+
+    /// core#1743 (train-11 J6, run c38b8c59, attempts 9 and 10): a seat pod whose write-back was
+    /// refused lost its result, and the run ended `sessionFailed` on an autonomous run (the
+    /// fall-through `fail_run`), against #1518's "never fails the unit". The reason was elided too:
+    /// the long host path ate the 300-char head and `[… N chars elided …]` cut the reason itself.
+    /// Now a lost result pauses at the `failure` gate on EVERY human_confirm, before the triage
+    /// judge (an engine settlement failure is not the seat's to rule on), and the stepFailed and
+    /// the unit's denial carry the engine's whole reason. Red on main: `none` failed the run,
+    /// `all` on a first try went to the triage judge, and the detail was elided mid-reason.
+    #[test]
+    fn core_1743_a_refused_write_back_pauses_at_the_failure_gate_with_the_whole_reason() {
+        for (case, confirm) in [
+            ("none", HumanConfirm::None),
+            ("all-first-try", HumanConfirm::All),
+        ] {
+            let run_id = format!("lost-wb-{case}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "pi"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.human_confirm = confirm;
+            put_node(&mut store, session.to_node()).unwrap();
+            seed_unit(
+                &mut store,
+                &run_id,
+                6,
+                "extract",
+                "claude",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            let long = "w".repeat(140);
+            let reason = format!(
+                "the write-back of /srv/seat-host/.wicked-crew/worktrees/{long} was refused: \
+                 `tmp/claude-1000/-srv-seat-host--wicked-crew-worktrees-{long}/0b1c/tasks/a1.output` \
+                 is a symlink that leaves its root"
+            );
+            let lost = crate::execute_wrapped::settle_failure_output(
+                "claude",
+                (&run_id, 0, 0),
+                &format!("{}{reason}", crate::execute_wrapped::SETTLE_FAILED),
+                &"the seat's own report of its extraction page\n".repeat(200),
+            );
+            let (applied, session, units, events) =
+                fold_failed_capturing(&mut store, &run_id, &lost);
+            assert!(matches!(applied, StepApplied::Paused), "{case}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+                "{case}: never sessionFailed"
+            );
+            let kind = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::AwaitingHuman { gate_kind, .. } => Some(gate_kind.clone()),
+                    _ => None,
+                })
+                .expect("awaitingHuman");
+            assert_eq!(kind, "failure", "{case}");
+            let detail = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::StepFailed { detail, .. } => Some(detail.clone()),
+                    _ => None,
+                })
+                .expect("stepFailed");
+            assert!(
+                detail.contains("is a symlink that leaves its root") && !detail.contains("elided"),
+                "{case}: the whole reason rides the event: {detail}"
+            );
+            let denial = units[0].denial_reason.clone().unwrap_or_default();
+            assert!(
+                denial.contains("is a symlink that leaves its root"),
+                "{case}: the gate's reason is whole: {denial}"
+            );
+            assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
+            assert!(units[0].worker_failed_clis.is_empty(), "{case}");
+        }
     }
 
     /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run

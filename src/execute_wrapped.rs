@@ -3124,7 +3124,16 @@ impl WrappedCliStepRunner {
         // A run's governed unit only: the engine's own judge / triage / ballot sessions keep their
         // own failure handling and budgets, and are never benched for a runtime fault (xreview on
         // #1129 — a judge rotation would otherwise wait a whole window per judge seat).
+        // (core#1743, codex xreview r2) A result the engine lost in settlement is no runtime
+        // blip to ride out: re-running could repeat a half-applied write-back, and an expired wait
+        // would replace its reason. It goes to its own gate as it is.
         if first.status != StepStatus::Failed
+            || lost_result_reason(
+                &first.output,
+                (&input.run_id, input.unit_ix, input.attempt),
+                false,
+            )
+            .is_some()
             || input.governance.is_none()
             || is_engine_internal(&input.unit)
             || !uses_container_seat(
@@ -4920,9 +4929,12 @@ impl WrappedCliStepRunner {
                 // `assemble_read_roots`. A mis-shaped `code_graph_db` — an in-tree
                 // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
                 // widened (the helper's shape check), reported here so the operator sees why.
+                // (core#1743) A container claude seat's own temp (its task outputs) is outside
+                // the tree: readable through the hook, never mounted (it is the container's own).
                 let read_roots: Vec<std::ffi::OsString> = g
                     .read_roots(self.operational_home.as_deref())
                     .into_iter()
+                    .chain(seat_temp_read_root(&floor_env))
                     .map(PathBuf::into_os_string)
                     .collect();
                 if let Some(db) = g.code_graph_db.as_deref() {
@@ -5131,7 +5143,12 @@ impl WrappedCliStepRunner {
                 ),
                 Ok((-1, out, err, usage, files, tools)) if err.starts_with(SETTLE_FAILED) => (
                     StepStatus::Failed,
-                    settle_failure_output(&cli_key, &err, &out),
+                    settle_failure_output(
+                        &cli_key,
+                        (&input.run_id, input.unit_ix, input.attempt),
+                        &err,
+                        &out,
+                    ),
                     usage,
                     files,
                     tools,
@@ -5538,6 +5555,19 @@ pub(crate) fn redirect_scratch_into_boundary(cmd: &mut Command, cwd: &Path) {
         cmd.env("TMP", &unit_tmp);
         cmd.env("TEMP", &unit_tmp);
     }
+}
+
+/// (core#1743) The governed hook's read root for a container claude seat's own temp: the
+/// `CLAUDE_CODE_TMPDIR` the floor plan set when it is the container-local dir
+/// ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]), which no mount backs. A fenced unit's temp (its
+/// mounted scratch) and every host-floor seat get none.
+pub(crate) fn seat_temp_read_root(floor_env: &[(&'static str, PathBuf)]) -> Option<PathBuf> {
+    floor_env
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == "CLAUDE_CODE_TMPDIR")
+        .map(|(_, v)| v.clone())
+        .filter(|v| v == Path::new(crate::worker_sandbox::SEAT_LOCAL_TMP))
 }
 
 /// Rule-check and agent-gate judges share a trust domain, keyed by parent and exact seat.
@@ -7843,10 +7873,25 @@ const CANCELLED: &str = "__wicked_cancelled__";
 /// write-back). Framed as could-not-run, it read as a seat that failed to start, so the failover
 /// ladder moved the unit to another seat with no cause in the event (J6 run d32f3b9a: claude's
 /// attempt stated all 500 units, `--check-rules` exited 0, and the unit failed over to codex).
-pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
+pub(crate) fn settle_failure_output(
+    cli: &str,
+    owner: LostOwner<'_>,
+    err: &str,
+    out: &str,
+) -> String {
     let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
     let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
-    let mut text = format!("{RESULT_LOST_PREFIX}{cli}`: {why})");
+    // (core#1743) The reason is the frame's ONE line (a codec error carries line breaks), and the
+    // engine keeps it whole under an unguessable reference the frame names, bound to the step it
+    // belongs to ([`lost_result_reason`]), so no reader parses it back out of the seat's text.
+    let why = why
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let token = record_lost_result(owner, &why);
+    let mut text = format!("{RESULT_LOST_PREFIX}{cli}{LOST_REF_OPEN}{token}]: {why})");
     if !out.trim().is_empty() {
         text.push('\n');
         text.push_str(out);
@@ -7856,6 +7901,89 @@ pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
         text.push_str(stderr);
     }
     text
+}
+
+/// (core#1743) The step a lost result belongs to: its run, unit index and attempt (the
+/// `StepInput` that ran it, the `StepOutput` that reports it).
+pub(crate) type LostOwner<'a> = (&'a str, usize, u32);
+
+/// (core#1743) Where a result-lost frame names the engine's record of its reason, right after the
+/// CLI key.
+const LOST_REF_OPEN: &str = "` [lost-result ";
+
+/// (core#1743) Settlement failures the engine framed and no reader has consumed yet: reference,
+/// owning step, whole reason. Bounded far above the seats one daemon runs at once, so a pending
+/// record is never pushed out by others; past the bound the oldest goes (an engine-internal
+/// judge's record is never consumed by the actor).
+static LOST_RESULTS: std::sync::Mutex<Vec<LostRecord>> = std::sync::Mutex::new(Vec::new());
+
+/// One [`LOST_RESULTS`] entry.
+struct LostRecord {
+    token: String,
+    run_id: String,
+    unit_ix: usize,
+    attempt: u32,
+    why: String,
+}
+const LOST_RESULTS_KEPT: usize = 4096;
+
+fn record_lost_result(owner: LostOwner<'_>, why: &str) -> String {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let mut kept = LOST_RESULTS.lock().unwrap_or_else(|p| p.into_inner());
+    if kept.len() >= LOST_RESULTS_KEPT {
+        kept.remove(0);
+    }
+    kept.push(LostRecord {
+        token: token.clone(),
+        run_id: owner.0.to_string(),
+        unit_ix: owner.1,
+        attempt: owner.2,
+        why: why.to_string(),
+    });
+    token
+}
+
+/// (core#1743) The engine's whole reason for a result it lost in settlement, read from ITS OWN
+/// record through the reference its frame carries, wherever the frame sits in `output` (a power
+/// turn folds earlier summaries ahead of it), and only for the step `owner` that it was recorded
+/// for. A seat cannot forge one (the reference is random) nor replay another step's. `take`
+/// consumes the record (the step's one report). The scan is linear: each frame's reference is
+/// looked for in a short window after it, never the rest of the text.
+pub(crate) fn lost_result_reason(output: &str, owner: LostOwner<'_>, take: bool) -> Option<String> {
+    const CLI_KEY_MAX: usize = 64;
+    let mut refs: Vec<&str> = Vec::new();
+    for (at, _) in output.match_indices(RESULT_LOST_PREFIX) {
+        let from = at + RESULT_LOST_PREFIX.len();
+        let mut to = (from + CLI_KEY_MAX + LOST_REF_OPEN.len()).min(output.len());
+        while !output.is_char_boundary(to) {
+            to -= 1;
+        }
+        let Some(open) = output[from..to].find(LOST_REF_OPEN) else {
+            continue;
+        };
+        let start = from + open + LOST_REF_OPEN.len();
+        if let Some(token) = output.get(start..start + 32) {
+            refs.push(token);
+        }
+        if refs.len() >= 16 {
+            break;
+        }
+    }
+    if refs.is_empty() {
+        return None;
+    }
+    let mut kept = LOST_RESULTS.lock().unwrap_or_else(|p| p.into_inner());
+    let ix = kept.iter().position(|r| {
+        refs.contains(&r.token.as_str())
+            && r.run_id == owner.0
+            && r.unit_ix == owner.1
+            && r.attempt == owner.2
+    })?;
+    Some(if take {
+        kept.remove(ix).why
+    } else {
+        kept[ix].why.clone()
+    })
 }
 
 /// Between a settlement failure's reason and the CLI's stderr in the sentinel.
@@ -8187,6 +8315,15 @@ pub(crate) fn run_bounded(
             // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
             // minutes of output, usage and tool records.
             Err(e) => {
+                // (core#1743) The whole reason in the daemon log: the step's own report bounds the
+                // seat's output, and this is where an operator greps for why a result was lost.
+                // Credentials cut: the reason may name a seat-made path (codex xreview #6).
+                eprintln!(
+                    "wicked-core: the engine lost a seat's result in settlement: {}",
+                    crate::deliver_lift::redact_log_text(&e)
+                );
+                // The reason never carries the separator (a file name may): it stays whole.
+                let e = e.replace(SETTLE_SEP, " ");
                 // The reason, then the CLI's own stderr (review r4: it may say why it failed).
                 return Ok((
                     -1,
@@ -14651,6 +14788,90 @@ mod tests {
              graph — `wicked-core coverage` falls back to the empty global store and the coverage \
              gate denies genuinely-covered repos (#229 × #9b)"
         );
+    }
+
+    /// core#1743: a container claude seat's temp is the container's own `/tmp`, outside the tree,
+    /// so the governed hook's READ roots (and only those: never the mount read roots, which would
+    /// mount a host path) carry it, or a Read of a task output is a boundary block. Red on main:
+    /// the temp was `<tree>/tmp`, inside the write root, and nothing wires it.
+    #[test]
+    fn core_1743_the_hook_read_roots_carry_the_container_claude_temp_and_only_there() {
+        let src = include_str!("execute_wrapped.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            production.contains(".chain(seat_temp_read_root(&floor_env))"),
+            "the governed hook's WICKED_READ_ROOTS no longer carries the container claude temp"
+        );
+        assert_eq!(
+            production.matches("seat_temp_read_root(").count(),
+            2,
+            "defined once and used once: in the hook env, never the mount read roots"
+        );
+    }
+
+    /// core#1743: only the container-local claude temp becomes a hook read root; a fenced unit's
+    /// mounted scratch temp, a seat with no claude temp and a host path never do. The lost-result
+    /// reason is the frame's whole first line, and only a lost result has one.
+    #[test]
+    fn core_1743_the_seat_temp_read_root_and_the_lost_result_reason() {
+        let local = PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP);
+        assert_eq!(
+            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", local.clone())]),
+            Some(local.clone())
+        );
+        assert_eq!(
+            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", PathBuf::from("/w/scratch/tmp"))]),
+            None
+        );
+        assert_eq!(seat_temp_read_root(&[("TMPDIR", local)]), None);
+        assert_eq!(seat_temp_read_root(&[]), None);
+        let owner = ("run-1743", 2, 1);
+        let out = settle_failure_output(
+            "claude",
+            owner,
+            &format!("{SETTLE_FAILED}the write-back was refused:\n`a` leaves its root"),
+            "seat words\nmore",
+        );
+        let whole = "the write-back was refused: `a` leaves its root";
+        assert!(
+            out.lines().next().unwrap().ends_with(&format!("{whole})")),
+            "{out}"
+        );
+        assert_eq!(
+            lost_result_reason(&out, owner, false).as_deref(),
+            Some(whole)
+        );
+        // (codex xreview #1) A power turn folds summaries ahead of the frame: still found.
+        let folded = format!("[power checkpoint 1] summary\n{out}");
+        assert_eq!(
+            lost_result_reason(&folded, owner, false).as_deref(),
+            Some(whole)
+        );
+        // (codex xreview #5) A seat's forged frame names no record the engine kept.
+        let forged = format!(
+            "{RESULT_LOST_PREFIX}claude` [lost-result {}]: nothing landed)",
+            "0".repeat(32)
+        );
+        assert_eq!(lost_result_reason(&forged, owner, false), None);
+        assert_eq!(
+            lost_result_reason("(cli `claude` exited 1) x", owner, false),
+            None
+        );
+        // (codex xreview r2 #4) A real frame replayed into another step's output is not its own.
+        for other in [("run-1743", 2, 2), ("run-1743", 3, 1), ("run-other", 2, 1)] {
+            assert_eq!(lost_result_reason(&out, other, false), None, "{other:?}");
+        }
+        // (codex xreview r2 #3) Many forged prefixes scan in linear time and find nothing.
+        let flood = RESULT_LOST_PREFIX.repeat(200_000);
+        let t = std::time::Instant::now();
+        assert_eq!(lost_result_reason(&flood, owner, false), None);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // Taken once: the step's one report.
+        assert_eq!(
+            lost_result_reason(&out, owner, true).as_deref(),
+            Some(whole)
+        );
+        assert_eq!(lost_result_reason(&out, owner, true), None);
     }
 
     #[test]
