@@ -3472,8 +3472,16 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
                     Err(crate::cli_runner::SlotRefused::Busy)
                 );
                 drop(lock);
-                let free = crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now())
-                    .is_ok();
+                // (core#1794) The slot is a `flock` on an open file. A child another test forks
+                // while the council holds it keeps a duplicate of that descriptor until it execs,
+                // so for that moment the slot still reads as held after `drop(lock)`. Wait a short
+                // deadline out (the real council path waits for its own deadline too); a slot the
+                // council never let go stays held past it and still fails.
+                let free = crate::cli_runner::HostCouncilLock::acquire_until(
+                    &path,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .is_ok();
                 let _ = reply.send(Err(anyhow::anyhow!("stub engine")));
                 let keys: Vec<String> = clis.into_iter().map(|c| c.key).collect();
                 (keys, busy, free)

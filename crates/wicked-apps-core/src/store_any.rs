@@ -89,6 +89,10 @@ impl GraphRead for AnyStore {
     fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
         on_backend!(self, s => s.find_structural_symbols(query))
     }
+    // estate 0.35 (#358): both backends answer from a name index; the default scans every symbol.
+    fn find_symbols_by_name_prefix(&self, prefix: &str, limit: Option<usize>) -> Result<Vec<Node>> {
+        on_backend!(self, s => s.find_symbols_by_name_prefix(prefix, limit))
+    }
     fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
         on_backend!(self, s => s.neighbors(id, dir))
     }
@@ -106,6 +110,11 @@ impl GraphRead for AnyStore {
     }
     fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
         on_backend!(self, s => s.unresolved_refs_for_name(name))
+    }
+    // The trait default answers `None` (count unknown), so an unforwarded wrapper would turn
+    // every proven absence into "unknown".
+    fn count_unresolved_refs_from(&self, from: &[SymbolId]) -> Result<Option<u64>> {
+        on_backend!(self, s => s.count_unresolved_refs_from(from))
     }
     fn indexed_files(&self) -> Result<Vec<String>> {
         on_backend!(self, s => s.indexed_files())
@@ -139,6 +148,11 @@ impl GraphRead for AnyStore {
     }
     fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
         on_backend!(self, s => s.node_semantics(symbol))
+    }
+    // core#1668 (estate#438/#460): the re-extract snapshot. Both backends answer with one query
+    // and serialize it with `set_node_semantics` inside the batch (estate#463).
+    fn semantics_in_files(&self, files: &[&str]) -> Result<Vec<(String, SymbolId, NodeSemantics)>> {
+        on_backend!(self, s => s.semantics_in_files(files))
     }
     fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
         on_backend!(self, s => s.find_by_requirement(requirement))
@@ -220,6 +234,28 @@ impl GraphWrite for AnyStore {
         validation: Option<&wicked_estate_core::ValidationClaim>,
     ) -> Result<()> {
         on_backend!(self, s => s.set_node_semantics(symbol, description, requirement, validation))
+    }
+    // core#1668: the trait defaults say "cannot restore" and refuse the write, so an unforwarded
+    // wrapper makes a re-extract drop every description, requirement and validation claim in
+    // the re-extracted files.
+    fn can_restore_node_semantics(&self) -> bool {
+        on_backend!(self, s => s.can_restore_node_semantics())
+    }
+    fn restore_node_semantics(
+        &mut self,
+        symbol: &SymbolId,
+        semantics: &NodeSemantics,
+    ) -> Result<()> {
+        on_backend!(self, s => s.restore_node_semantics(symbol, semantics))
+    }
+    // estate 0.35: SQLite keeps a search-miss log; the default records nothing.
+    fn record_search_miss(
+        &mut self,
+        query: &str,
+        searched_at: i64,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        on_backend!(self, s => s.record_search_miss(query, searched_at, session_id))
     }
     fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
         on_backend!(self, s => s.annotate(symbol, annotation))
@@ -360,6 +396,85 @@ mod tests {
         support_plane_round_trip(&mut store, "s2a");
     }
 
+    /// core#1668: a re-extract keeps a file's semantic fields. The indexer's own order (estate
+    /// `index_path_inner`): inside one batch, snapshot the file's fields with
+    /// `semantics_in_files`, `remove_file`, re-upsert the re-extracted node, then
+    /// `restore_node_semantics` when the store says it can. Driven through `&mut dyn GraphStore`,
+    /// the type the engine lends, so an unforwarded default ("cannot restore") drops the
+    /// requirement and the validation claim.
+    fn re_extract_keeps_semantics(store: &mut dyn GraphStore, tag: &str) {
+        use wicked_estate_core::ValidationClaim;
+        let file = format!("anystore_test/{tag}");
+        let sym = synthetic_symbol("anystore_test", tag);
+        let node = Node::new(
+            sym.clone(),
+            NodeKind::Other("anystore_test".to_string()),
+            tag.to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(file.clone(), Span::ZERO),
+        );
+        store.begin_batch().unwrap();
+        store.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+        store
+            .set_node_semantics(
+                &sym,
+                Some("totals the ledger"),
+                Some("REQ-1668"),
+                Some(&ValidationClaim::new(true, "reviewer-1668").unwrap()),
+            )
+            .unwrap();
+        store.commit_batch().unwrap();
+        let before = store
+            .node_semantics(&sym)
+            .unwrap()
+            .expect("seeded semantics");
+        assert_eq!(before.requirement.as_deref(), Some("REQ-1668"));
+
+        assert!(
+            store.can_restore_node_semantics(),
+            "AnyStore must report its backend's restore support"
+        );
+        store.begin_batch().unwrap();
+        let snapshot = store.semantics_in_files(&[file.as_str()]).unwrap();
+        assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+        assert_eq!(
+            (snapshot[0].0.as_str(), &snapshot[0].1),
+            (file.as_str(), &sym)
+        );
+        store.remove_file(&file).unwrap();
+        store.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+        for (_, symbol, semantics) in &snapshot {
+            store.restore_node_semantics(symbol, semantics).unwrap();
+        }
+        store.commit_batch().unwrap();
+        assert_eq!(
+            store.node_semantics(&sym).unwrap(),
+            Some(before),
+            "re-extract must keep the requirement and the original validation claim"
+        );
+    }
+
+    #[test]
+    fn any_store_sqlite_re_extract_keeps_requirements_1668() {
+        let mut store = open_store_any(Some(":memory:")).expect("open in-memory AnyStore");
+        re_extract_keeps_semantics(&mut store, "re-extract");
+    }
+
+    /// core#1668: estate's own store contract, run on the wrapper. It asserts the restore
+    /// capability first and covers the snapshot/restore, redaction and name-prefix cases, so a
+    /// defaulted method AnyStore fails to forward shows up here, not in a re-index.
+    #[test]
+    fn any_store_sqlite_passes_estate_graph_store_suite_1668() {
+        // History on, as estate's own SQLite conformance run sets it: the suite asserts that
+        // `remove_file` archives edges into `edge_history`.
+        let mut sqlite = crate::SqliteStore::in_memory().expect("open in-memory sqlite");
+        sqlite
+            .set_history_enabled(true)
+            .expect("enable edge history");
+        let mut store = super::AnyStore::sqlite(sqlite);
+        wicked_estate_core::conformance::graph_store_suite(&mut store);
+    }
+
     // §5 backend-parity: AnyStore must bridge the SAME generic→dyn call styles through Postgres.
     // Skips when TEST_POSTGRES_URL is absent (local dev without a running Postgres); the CI
     // `postgres-parity` job always sets it so this is a hard runtime assertion there (core#30).
@@ -396,6 +511,11 @@ mod tests {
         support_plane_round_trip(
             &mut store,
             &format!("s2a-pid{}-{nanos}", std::process::id()),
+        );
+        // core#1668: the semantics restore forwards through the Postgres arm too.
+        re_extract_keeps_semantics(
+            &mut store,
+            &format!("re-extract-pid{}-{nanos}", std::process::id()),
         );
     }
 

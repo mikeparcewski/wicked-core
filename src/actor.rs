@@ -7559,7 +7559,20 @@ fn apply_step_result(
     // DES-TEAMING-002 §8.8 (T6): the PA's review of a member's step is team evidence, never the
     // gate — it never reaches the failure ladder or the fold. Its verdict (and the attempt's
     // ledger) decide whether the member's step counts; anything missing pauses `team_dispute`.
-    if team_gate::is_review(unit) {
+    // (core#1748) Except a review turn whose result the ENGINE lost (its pod's write-back refused,
+    // its exit code unconfirmed): that is no verdict and no answer, so it takes the core#1743
+    // lost-result arm below like every other lost result. The gate there carries the engine's
+    // whole reason, and its Approve runs the review again at a fresh attempt: the unit keeps its
+    // member-step state (`reviewing`), so the re-dispatch is the PA's review, never the member's
+    // output counted. Peeked here (`take: false`); the arm below takes the record.
+    let review_result_lost = unit.tool_cmd.is_none()
+        && crate::execute_wrapped::lost_result_reason(
+            &output.output,
+            (&output.run_id, output.unit_ix, output.attempt),
+            false,
+        )
+        .is_some();
+    if team_gate::is_review(unit) && !review_result_lost {
         let ix = output.unit_ix;
         let mut act = team_gate::Act {
             store,
@@ -8151,7 +8164,12 @@ fn apply_step_result(
                 why.clone(),
             ));
             put_node(store, unit.to_node())?;
-            persist_rejected_transcript(store, &session, unit, &output.output);
+            // (core#1748, codex xreview) A PA review turn's transcript is not the unit's work: the
+            // unit's one output record holds the MEMBER's output, which the re-run review reads
+            // and which counts if it is accepted. Never overwritten by the lost review's text.
+            if !team_gate::is_review(unit) {
+                persist_rejected_transcript(store, &session, unit, &output.output);
+            }
             eprintln!("wicked-core: run {run_id} unit {ord}: {why}");
             emit(
                 subscribers,
@@ -8186,6 +8204,16 @@ fn apply_step_result(
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
         // took the gate's own reassign-and-retry, the retried attempt refused identically, and
         // the old `attempt == 0` guard sent it to `sessionFailed` with no route back.
+        // (core#1740, train-11 runs 557faf4e / b8afee79) A launch the seat's OWN carrier refused
+        // (core#718: managed settings silence the engine's gate hook, so a governed unit is refused
+        // rather than run ungoverned) is a condition the operator fixes outside the run: no judge
+        // can rule it away and a retry on the same seat meets it again. So it takes the gate below
+        // on the FIRST try too, and on every human_confirm, as a denial does (core#464): the card
+        // names the setting and the seats it may be reassigned to. It used to reach that gate
+        // only on a retried attempt with an operator present; a first refusal went to the triage
+        // judge or, on an autonomous run, straight to `sessionFailed`, losing every unit before.
+        let seat_specific_refusal =
+            unit.tool_cmd.is_none() && seat_specific_launch_failure(&output.output);
         if !deliver_strand {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
@@ -8285,14 +8313,18 @@ fn apply_step_result(
                     )?;
                     return Ok(StepApplied::Paused);
                 }
-            } else if human_present
+            } else if (human_present || seat_specific_refusal)
                 && seat_refusal.is_none()
                 && !content_refused
-                && !first_try
+                && (!first_try || seat_specific_refusal)
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
                 // with no seat failover for a Tool, skipping this gate would end the run.
                 && (unit.tool_cmd.is_some()
+                    // (core#1740, codex xreview) The engine's own refusal frame names a settings
+                    // path, which may hold a word the worker-failure classifier keys on
+                    // (`managed-settings.d/network.json`): a recognised refusal is never the CLI's.
+                    || seat_specific_refusal
                     || !crate::acp_runner::is_worker_originated_failure(&output.output))
             {
                 // (core#556) A RETRIED attempt that failed again without starting work (a launch
@@ -8307,7 +8339,7 @@ fn apply_step_result(
                 // governed unit on this host) is not the environment's: another seat does not
                 // meet it, so the gate names the seat and offers the reassign instead of
                 // withholding it.
-                let seat_specific = seat_specific_launch_failure(&output.output);
+                let seat_specific = seat_specific_refusal;
                 let why = if seat_specific {
                     format!(
                         "Unit {ord} ({failed_cli}) could not start on attempt {}: the cause is \
@@ -11843,6 +11875,19 @@ pub(crate) fn parked_reseat_refusal(
         anyhow::bail!(
             "unit {ord} of run {run_id} already completed; approving the gate advances past it, \
              so there is nothing to reassign"
+        );
+    }
+    // (core#1748, codex xreview) The PA's review of a member's step runs on the PA's seat: a lost
+    // review's `failure` gate re-runs it there. Re-seating it would let another seat (the member
+    // under review included) give the team's verdict on the step.
+    if unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some())
+    {
+        anyhow::bail!(
+            "unit {ord} of run {run_id} is the PA's review of a member's step and runs on the \
+             PA's seat; approve to run the review again, or reject to stop the run"
         );
     }
     refuse_author_reassign(session, units, session.unit_ix, cli)?;
@@ -19235,6 +19280,13 @@ mod answer_tx {
         fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
             self.inner.find_structural_symbols(query)
         }
+        fn find_symbols_by_name_prefix(
+            &self,
+            prefix: &str,
+            limit: Option<usize>,
+        ) -> Result<Vec<Node>> {
+            self.inner.find_symbols_by_name_prefix(prefix, limit)
+        }
         fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
             self.inner.neighbors(id, dir)
         }
@@ -19252,6 +19304,9 @@ mod answer_tx {
         }
         fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
             self.inner.unresolved_refs_for_name(name)
+        }
+        fn count_unresolved_refs_from(&self, from: &[SymbolId]) -> Result<Option<u64>> {
+            self.inner.count_unresolved_refs_from(from)
         }
         fn indexed_files(&self) -> Result<Vec<String>> {
             self.inner.indexed_files()
@@ -19282,6 +19337,12 @@ mod answer_tx {
         }
         fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
             self.inner.node_semantics(symbol)
+        }
+        fn semantics_in_files(
+            &self,
+            files: &[&str],
+        ) -> Result<Vec<(String, SymbolId, NodeSemantics)>> {
+            self.inner.semantics_in_files(files)
         }
         fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
             self.inner.find_by_requirement(requirement)
@@ -19372,6 +19433,25 @@ mod answer_tx {
             self.inner
                 .set_node_semantics(symbol, description, requirement, validation)
         }
+        fn can_restore_node_semantics(&self) -> bool {
+            self.inner.can_restore_node_semantics()
+        }
+        fn restore_node_semantics(
+            &mut self,
+            symbol: &SymbolId,
+            semantics: &NodeSemantics,
+        ) -> Result<()> {
+            self.inner.restore_node_semantics(symbol, semantics)
+        }
+        fn record_search_miss(
+            &mut self,
+            query: &str,
+            searched_at: i64,
+            session_id: Option<&str>,
+        ) -> Result<()> {
+            self.inner
+                .record_search_miss(query, searched_at, session_id)
+        }
         fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
             self.inner.annotate(symbol, annotation)
         }
@@ -19390,6 +19470,46 @@ mod answer_tx {
             facts: &[SupportFact],
         ) -> Result<SupportReplacement> {
             self.inner.replace_edge_supports(owner, generation, facts)
+        }
+    }
+
+    /// core#1668: the answer transaction keeps the backend's semantics restore (estate 0.35
+    /// defaulted methods), so a re-extract driven through it keeps a file's requirements.
+    #[cfg(test)]
+    mod tests {
+        use super::AnswerTx;
+        use wicked_estate_core::*;
+
+        #[test]
+        fn answer_tx_forwards_semantics_restore_1668() {
+            let mut store = wicked_apps_core::open_store_any(Some(":memory:")).unwrap();
+            let sym = wicked_apps_core::synthetic_symbol("answer_tx_test", "n1");
+            let node = Node::new(
+                sym.clone(),
+                NodeKind::Other("answer_tx_test".to_string()),
+                "n1",
+                Language::new(wicked_apps_core::SYMBOL_SCHEME),
+                Location::new("answer_tx_test/n1", Span::ZERO),
+            );
+            let mut tx = AnswerTx::open(&mut store).unwrap();
+            tx.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+            tx.set_node_semantics(&sym, None, Some("REQ-1668"), None)
+                .unwrap();
+            assert!(tx.can_restore_node_semantics());
+            let snapshot = tx.semantics_in_files(&["answer_tx_test/n1"]).unwrap();
+            assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+            tx.remove_file("answer_tx_test/n1").unwrap();
+            tx.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+            tx.restore_node_semantics(&sym, &snapshot[0].2).unwrap();
+            tx.finish().unwrap();
+            drop(tx);
+            assert_eq!(
+                store
+                    .node_semantics(&sym)
+                    .unwrap()
+                    .and_then(|s| s.requirement),
+                Some("REQ-1668".to_string())
+            );
         }
     }
 }
@@ -21249,6 +21369,26 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (core#1748, codex xreview) A lost PA review's `failure` gate re-runs the review (approve) or
+    // stops the run (reject). A send-back there would rewind onto the same unit with its review
+    // state kept, and re-run the PA's review over the member's unchanged output: sending the
+    // member's step back is the PA's verdict (or the team dispute's answer), never this gate's.
+    if matches!(
+        decision,
+        crate::workflow::HumanDecision::RequestChanges { .. }
+    ) && !team_gate::dispute_gate_open(session)
+        && !team_gate::transport_gate_open(session)
+        && cursor.is_some_and(|u| {
+            u.member_step
+                .as_ref()
+                .is_some_and(|m| m.reviewing.is_some())
+        })
+    {
+        anyhow::bail!(
+            "unit {cursor_ord} is the PA's review of a member's step, and the engine lost its \
+             result: approve to run the review again, or reject to stop the run"
+        );
+    }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
     // provider, with no other seat of the run able to review the work, would run on that seat
     // again and be denied the same way: refused, with the dead end in plain words.
@@ -31346,7 +31486,10 @@ mod request_changes_tests {
                 None => std::env::remove_var(k),
             }
         }
-        std::fs::remove_dir_all(&home).unwrap();
+        // (core#1730) Best effort: the test checks what was created, not that the temp dir is
+        // removable. On Windows a handle still open under it (the indexer, antivirus) made this
+        // `remove_dir_all` fail with DirectoryNotEmpty before any assertion ran.
+        let _ = std::fs::remove_dir_all(&home);
 
         assert!(
             empty_after_read,
@@ -37246,6 +37389,99 @@ mod seat_failover_tests {
         }
     }
 
+    /// core#1740 (train-11 runs 557faf4e, unit 6 after a host-floor restart, and b8afee79, unit 1):
+    /// a governed unit's FIRST launch refused because managed settings silence the engine's gate
+    /// hook went to `sessionFailed` in the same second, with no card, and every earlier unit's
+    /// progress was lost. Only a RETRIED attempt with an operator present reached the core#718
+    /// seat-specific gate. Now a first refusal pauses at the `failure` gate on every human_confirm,
+    /// names the setting and offers the other eligible seats. Red on main: `none` failed the run
+    /// and `all` went to the triage judge (no gate). The output is the wrapped carrier's own
+    /// refusal, as `execute_wrapped::governance_refusal` frames
+    /// `managed_hooks_only_refusal_reason` (src/execute_wrapped.rs:7697-7718).
+    #[test]
+    fn core_1740_a_first_try_managed_hooks_refusal_pauses_with_a_card() {
+        let refusal = |settings: &str| {
+            format!(
+                "(input governance refused the launch: {}: settings in {settings} silence the \
+                 engine's gate hook (`allowManagedHooksOnly: true` or `disableAllHooks: true`); \
+                 refusing the governed unit rather than running it ungoverned. Remove that \
+                 setting for the seat (core#653, C5))",
+                crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL
+            )
+        };
+        for (case, confirm, settings) in [
+            (
+                "none",
+                HumanConfirm::None,
+                "/srv/worker-home/claude/remote-settings.json",
+            ),
+            (
+                "all",
+                HumanConfirm::All,
+                "/srv/worker-home/claude/remote-settings.json",
+            ),
+            // (codex xreview) A settings path with a word the worker-failure classifier keys on.
+            (
+                "none-network-path",
+                HumanConfirm::None,
+                "/etc/claude-code/managed-settings.d/network.json",
+            ),
+        ] {
+            let run_id = format!("managed-hooks-{case}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "pi"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.human_confirm = confirm;
+            put_node(&mut store, session.to_node()).unwrap();
+            seed_unit(
+                &mut store,
+                &run_id,
+                6,
+                "extract",
+                "claude",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            let (applied, session, units, events) =
+                fold_failed_capturing(&mut store, &run_id, &refusal(settings));
+            assert!(matches!(applied, StepApplied::Paused), "{case}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+                "{case}: never sessionFailed"
+            );
+            let (kind, prompt) = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::AwaitingHuman {
+                        gate_kind, prompt, ..
+                    } => Some((gate_kind.clone(), prompt.clone())),
+                    _ => None,
+                })
+                .expect("awaitingHuman");
+            assert_eq!(kind, "failure", "{case}");
+            assert!(
+                prompt.contains("specific to seat 'claude'")
+                    && prompt.contains("allowManagedHooksOnly")
+                    && prompt.contains("'codex'"),
+                "{case}: the card names the setting and a seat to reassign to: {prompt}"
+            );
+            assert_eq!(units[0].status, UnitStatus::Rejected, "{case}");
+            assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
+        }
+    }
+
     /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run
     /// cdf4462a: opencode exited 1 on "no compatible V2 health response" for scope, the scope
     /// retry and triage, and plan rev 2 still seated it everywhere). The signature ignores the
@@ -39265,6 +39501,147 @@ mod terminal_worktree_reap_tests {
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
+    }
+
+    /// core#1780 (coord review N3 on core#1760): the dispatch re-entry claim, driven through a
+    /// real engine rather than a source guard. Three runs are persisted in live worktrees: two
+    /// `executing` (one tree minted unmarked, as before core#1373, one marked by another daemon)
+    /// and one paused at its `failure` gate in an unmarked tree. A fresh engine on the same store
+    /// redrives the executing two (exec mode): the unmarked tree ends with THIS daemon's marker
+    /// (the store's own id), and the other daemon's marker is left as it was. The paused run's
+    /// tree stays unmarked until the gate is continued; the continue's dispatch claims it.
+    /// Red if `dispatch_unit_with` stops handing the claim to `spawn_bound`: both unmarked trees
+    /// stay unmarked.
+    #[test]
+    fn a_boot_redrive_and_a_gate_continue_claim_the_tree_they_reenter() {
+        use crate::domain::{UnitStatus, WorkUnit};
+        struct NoDispatcher;
+        impl wicked_council::types::Dispatcher for NoDispatcher {
+            fn dispatch(
+                &self,
+                _cli: &wicked_council::types::AgenticCli,
+                _task: &wicked_council::CouncilTask,
+            ) -> Option<wicked_council::types::Vote> {
+                None
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-1780-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let estate_db = dir.join("estate.db").to_string_lossy().into_owned();
+        let bus_db = dir.join("bus.db").to_string_lossy().into_owned();
+        let (roots, legacy, theirs, gated) = {
+            let mut store = open_store(Some(&estate_db)).unwrap();
+            let (root_a, legacy) = {
+                let _none = crate::repo::DaemonOwnerScope::bind(None);
+                seeded(&mut store, "claim-legacy", "r-claim-legacy")
+            };
+            let (root_b, theirs) = {
+                let _other = crate::repo::DaemonOwnerScope::bind(Some("daemon-other".into()));
+                seeded(&mut store, "claim-theirs", "r-claim-theirs")
+            };
+            let (root_c, gated) = {
+                let _none = crate::repo::DaemonOwnerScope::bind(None);
+                seeded(&mut store, "claim-gated", "r-claim-gated")
+            };
+            for run in ["r-claim-legacy", "r-claim-theirs", "r-claim-gated"] {
+                let mut unit = WorkUnit::pending(format!("{run}:u1"), run, 1, "work");
+                unit.assigned_cli = Some("claude".into());
+                unit.status = if run == "r-claim-gated" {
+                    UnitStatus::Rejected
+                } else {
+                    UnitStatus::Distributed
+                };
+                put_node(&mut store, unit.to_node()).unwrap();
+            }
+            // The gated run paused at its `failure` gate the way the fold pauses one.
+            let mut s = crate::domain::get_session(&store, "r-claim-gated")
+                .unwrap()
+                .unwrap();
+            let (tx, _rx) = channel::<Command>();
+            pause_for_human(
+                &mut store,
+                &mut crate::event_log::EventSink::default(),
+                &tx,
+                &mut s,
+                1,
+                Some(1),
+                "failure",
+                "Unit 1 failed. Approve to run it again, or reject to stop the run.".into(),
+            )
+            .unwrap();
+            ([root_a, root_b, root_c], legacy, theirs, gated)
+        };
+        assert_eq!(
+            crate::repo::worktree_daemon(&legacy),
+            None,
+            "minted unmarked"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&gated),
+            None,
+            "minted unmarked"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other")
+        );
+        let core = crate::Core::spawn_with_engine_exec(
+            estate_db.clone(),
+            Arc::new(NoDispatcher),
+            Arc::new(NoopRunner),
+            bus_db,
+        );
+        // The actor answers a read only after its boot (the redrive) is done.
+        let _ = core.sessions();
+        let me = crate::repo::daemon_owner_of_store(&estate_db);
+        let wait_claimed = |wt: &Path, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while crate::repo::worktree_daemon(wt).as_deref() != Some(me.as_str()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} never claimed the tree: {:?}",
+                    crate::repo::worktree_daemon(wt)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        wait_claimed(&legacy, "the boot redrive");
+        // Both redrive claims were handed off by the same boot; give the second its turn.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other"),
+            "another daemon's marker is never replaced"
+        );
+        assert_eq!(
+            crate::repo::worktree_daemon(&gated),
+            None,
+            "a run held at its gate is not re-entered at boot"
+        );
+        core.confirm_gate(
+            "r-claim-gated",
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        wait_claimed(&gated, "the gate continue");
+        // Long after both boot claims ran (a gate round trip later), the other daemon's marker is
+        // still its own.
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other")
+        );
+        drop(core);
+        for root in roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reap runs on its own thread; wait for the checkout to vanish. The generous bound is

@@ -1380,7 +1380,7 @@ pub(crate) fn daemon_owner_of_store(db_path: &str) -> String {
 
 /// The daemon id a live worktree was minted (or adopted) by — `None` when it carries none (a tree
 /// from an engine before core#1373, or one another engine minted without it).
-fn worktree_daemon(wt: &Path) -> Option<String> {
+pub(crate) fn worktree_daemon(wt: &Path) -> Option<String> {
     let marker = worktree_admin_dir(wt)?.join(DAEMON_MARKER);
     let owner = match read_link_file(&marker) {
         Ok(o) => o,
