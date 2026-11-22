@@ -2380,6 +2380,25 @@ fn t6_a_review_whose_result_the_engine_lost_pauses_at_the_failure_gate_and_rerun
     let reviewed = payloads(&rig, "t6lr", tev::STEP_REVIEWED);
     assert_eq!(reviewed.len(), 1, "one verdict, from the re-run review");
     assert_eq!(reviewed[0]["verdict"], "accepted");
+    // (codex xreview) Both review turns read the member's own output (the lost review's
+    // transcript never replaced it), and the counted unit carries no standing denial.
+    for (n, r) in reviews.iter().enumerate() {
+        assert!(
+            r.prior_outputs
+                .iter()
+                .any(|p| p.label == "[team step — write by b]"
+                    && p.output.starts_with("done")
+                    && !p.output.contains("the PA's review transcript")),
+            "review {n} reads the member's output: {:?}",
+            r.prior_outputs
+                .iter()
+                .map(|p| (&p.label, &p.output))
+                .collect::<Vec<_>>()
+        );
+    }
+    let u = unit_view(&e, "t6lr", WRITE);
+    assert_eq!(u.status, crate::domain::UnitStatus::Done);
+    assert!(u.denial.is_none() && u.denial_reason.is_none(), "{u:?}");
 }
 
 // ── (k) restart mid-step ─────────────────────────────────────────────────────────────────────────

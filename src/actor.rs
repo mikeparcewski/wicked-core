@@ -8164,7 +8164,12 @@ fn apply_step_result(
                 why.clone(),
             ));
             put_node(store, unit.to_node())?;
-            persist_rejected_transcript(store, &session, unit, &output.output);
+            // (core#1748, codex xreview) A PA review turn's transcript is not the unit's work: the
+            // unit's one output record holds the MEMBER's output, which the re-run review reads
+            // and which counts if it is accepted. Never overwritten by the lost review's text.
+            if !team_gate::is_review(unit) {
+                persist_rejected_transcript(store, &session, unit, &output.output);
+            }
             eprintln!("wicked-core: run {run_id} unit {ord}: {why}");
             emit(
                 subscribers,
