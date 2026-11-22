@@ -5037,6 +5037,8 @@ pub(crate) fn run(
                     runner.on_run_complete(&run_id);
                 }
                 runner.on_shutdown();
+                // (core#1322) This engine's published context blocks go with it.
+                crate::run_context::forget_published_here();
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
                 let ids: Vec<String> = terminals.keys().cloned().collect();
@@ -5295,9 +5297,25 @@ fn council_context_primed(
     session: Option<&AgentSession>,
     self_tx: &Sender<Command>,
 ) -> Option<(Sender<Command>, u64)> {
-    let s = session?;
+    // (core#1322, codex r1 on #1777) A council on a run that has ended republishes nothing: the
+    // run's blocks were dropped when it ended, and a publish here would outlive it.
+    let s = session.filter(|s| {
+        !matches!(
+            s.status,
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+        )
+    })?;
     crate::run_context::publish(&s.id, s.run_context.as_ref());
     crate::run_context::current(&s.id).map(|c| (self_tx.clone(), c.version))
+}
+
+/// A run reached a terminal status (called right AFTER it is persisted, on the actor): the team
+/// side is told (`team_gate::run_ended`), and (core#1322) the run's published context blocks are
+/// dropped, so the process-wide map does not grow for the daemon's life. Every terminal
+/// transition goes through here.
+fn run_terminal(store: &dyn GraphStore, run_id: &str, status: crate::team::events::PathStatus) {
+    crate::run_context::forget(run_id);
+    team_gate::run_ended(store, run_id, status);
 }
 
 /// (program context-block-core) One `runContextDelivered` per seat the council seated: each was
@@ -6272,7 +6290,7 @@ pub(crate) fn resume_run_inner(
         session.status = SessionStatus::Failed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Failed);
+        run_terminal(&*store, run_id, crate::team::events::PathStatus::Failed);
         reap_terminal_worktree(&*store, &session);
         emit(
             subscribers,
@@ -7386,7 +7404,7 @@ fn apply_step_result(
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
+        run_terminal(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
         drop_run_floor_cache(&session);
         emit(
             subscribers,
@@ -10994,7 +11012,7 @@ fn fail_run(
     session.finished_at = Some(crate::interaction::now_millis());
     power_gate::set_outcome(&*store, session, "failed");
     let _ = put_node(store, session.to_node());
-    team_gate::run_ended(
+    run_terminal(
         &*store,
         &session.id,
         crate::team::events::PathStatus::Failed,
@@ -17587,7 +17605,7 @@ fn finalize_run(
         power_gate::set_outcome(&*store, &mut session, "completed");
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
+        run_terminal(&*store, run_id, crate::team::events::PathStatus::Completed);
         // (F-7R2-013) A completed run's worktree is RETAINED — the files view, the delivered
         // PR's review cycle and any uncommitted leftover need it — until the run is archived or
         // the retention window elapses (`completed_worktree_retention`); `0` days restores the
@@ -22784,7 +22802,7 @@ pub(crate) fn cancel_run(
     // (core#1390) Only once the cancel is on the store: a dispatch probe still out for this run is
     // no longer its dispatch (a cancel that failed before this leaves the probe to land).
     dispatch_probe::forget(run_id);
-    team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
+    run_terminal(&*store, run_id, crate::team::events::PathStatus::Cancelled);
     // (core#1122) The floor build cache goes whether or not the repository still resolves (the
     // worktree reap below needs it).
     drop_run_floor_cache(&session);
