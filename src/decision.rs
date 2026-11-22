@@ -66,14 +66,15 @@ pub(crate) struct SeatBallots {
 
 /// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
 /// every ballot of the council goes through its one [`SeatBallots`]). The council thread reaps
-/// before it releases the host council slot and reports the council's end, so no ballot's seat
-/// is still running when the caller is told the council ended.
+/// before it releases the host council slot, so no council starts while an earlier one's seat is
+/// still running.
 #[derive(Clone, Default)]
 pub(crate) struct BallotReaper(Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>);
 
 /// (core#1290) The longest the council thread waits to reap its carried ballots: a cancelled
-/// ballot's container is removed within about 20 s of [`BALLOT_CANCEL_DRAIN`].
-pub(crate) const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+/// ballot's runner returns once its seat is gone (a seat pod's delete waits up to 90 s, plus the
+/// cluster calls around it).
+pub(crate) const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
 
 impl BallotReaper {
     fn hold(&self, ballot: std::thread::JoinHandle<()>) {

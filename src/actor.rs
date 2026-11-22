@@ -3575,9 +3575,11 @@ pub(crate) fn run(
                         })
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
-                    reap_carried_ballots(reaper.as_ref(), &req);
                     council_context_delivered(context_tx, &req, &result);
+                    // (core#1290) The verdict goes first; then every carried ballot is reaped, on
+                    // this council thread (a host council slot is released only after it).
                     let _ = reply.send(result);
+                    reap_carried_ballots(reaper.as_ref(), &req.session_id, req.ord);
                 });
             }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
@@ -3635,11 +3637,12 @@ pub(crate) fn run(
                         })
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("rule council thread panicked")));
-                    reap_carried_ballots(reaper.as_ref(), &req);
                     council_context_delivered(context_tx, &req, &result);
-                    // The last ballot has returned and been reaped: the host slot is free.
-                    drop(lock);
                     let _ = reply.send(result);
+                    // (core#1290) The verdict is not held back by a seat still stopping, but the
+                    // host slot is: it is free only once every carried ballot is reaped.
+                    reap_carried_ballots(reaper.as_ref(), &req.session_id, req.ord);
+                    drop(lock);
                 });
             }
             // ── Presets (DES-TEAMING-002 §8.4, seam C2) ──
@@ -5323,22 +5326,19 @@ fn council_context_delivered(
     }
 }
 
-/// (core#1290) Reap a council's carried ballots on the COUNCIL thread (never the actor's), before
-/// it releases the host council slot and replies: a ballot cancelled past its budget may still be
-/// stopping in its seat container. Bounded by [`crate::decision::REAP_BOUND`]; one still running
-/// past it is reported, and the council ends anyway.
-fn reap_carried_ballots(
-    reaper: Option<&crate::decision::BallotReaper>,
-    req: &crate::decision::DecisionRequest,
-) {
+/// (core#1290) Reap a council's carried ballots on the COUNCIL thread (never the actor's), after
+/// it replies and before it releases the host council slot: a ballot cancelled past its budget
+/// may still be stopping in its seat container, and the slot is what bounds the host's councils.
+/// The verdict is not held back for it (the caller's wait is the council's own deadline). Bounded
+/// by [`crate::decision::REAP_BOUND`]; one still running past it is reported, and the slot is
+/// released anyway (a slot held forever would stop every council on the host).
+fn reap_carried_ballots(reaper: Option<&crate::decision::BallotReaper>, session: &str, ord: u32) {
     let Some(reaper) = reaper else { return };
     let left = reaper.reap(crate::decision::REAP_BOUND);
     if left > 0 {
         eprintln!(
-            "wicked-core: council {}#{}: {left} carried ballot(s) still running {:?} past the \
-             council's end; the council ends without them",
-            req.session_id,
-            req.ord,
+            "wicked-core: council {session}#{ord}: {left} carried ballot(s) still running {:?} \
+             after the council; the host council slot is released without them",
             crate::decision::REAP_BOUND
         );
     }
