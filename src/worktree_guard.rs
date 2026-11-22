@@ -574,13 +574,176 @@ pub(crate) fn snapshot_through(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    snapshot_through_inner(worktree, git_dir, &[])
+    snapshot_through_inner(worktree, git_dir, &[], false)
+}
+
+/// (core#1314) [`snapshot_through`], STRICT, for a read that must see everything the change
+/// holds (the floor's introduced-directory read, `repo_checks::introduced_dir`):
+/// * a path the REAL index tracks that `add -A` left out — one force-added (`git add -f`) under
+///   an ignored directory and not committed — is added too, its content re-hashed from the
+///   worktree (never the real index's cached hash, so no `assume-unchanged` bit is honoured);
+/// * a traversal git reports incomplete on stderr while exiting 0 (`could not open directory`:
+///   an unreadable subtree is silently left out) is an error, never a smaller tree.
+///
+/// The worktree mutation guard keeps [`snapshot_through`]: an engine-side error there would deny
+/// a run on a directory a tool made unreadable.
+pub(crate) fn snapshot_through_strict(
+    worktree: &Path,
+    git_dir: &Path,
+) -> anyhow::Result<WorktreeSnapshot> {
+    snapshot_through_inner(worktree, git_dir, &[], true)
+}
+
+/// Run `git <args>` in `cwd`; `Ok(stderr)` on exit 0 (in the C locale, so it can be read),
+/// `Err` naming the failure otherwise.
+fn git_stderr(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+    stdin: Option<Vec<u8>>,
+) -> anyhow::Result<String> {
+    // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
+    let mut cmd = Command::new("git");
+    cmd.hardened()
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let spawned =
+        |e: std::io::Error| anyhow::anyhow!("could not spawn `git {}`: {e}", args.join(" "));
+    let mut child = cmd.spawn().map_err(spawned)?;
+    // Fed from its own thread, so a child that fills its output pipes first never deadlocks.
+    let feeder = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = pipe.write_all(&bytes);
+        })),
+        _ => None,
+    };
+    let out = child.wait_with_output().map_err(spawned)?;
+    if let Some(f) = feeder {
+        let _ = f.join();
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git {}` in {} failed ({}): {}",
+            args.join(" "),
+            cwd.display(),
+            out.status,
+            stderr.trim()
+        );
+    }
+    Ok(stderr)
+}
+
+/// (core#1314) `add`'s own warning that a directory could not be read (`LC_ALL=C`): the read was
+/// incomplete. Matched at the start of a line only, so a warning that quotes a file name holding
+/// the words is not one.
+fn unread(stderr: &str) -> anyhow::Result<()> {
+    match stderr
+        .lines()
+        .find(|l| l.starts_with("warning: could not open directory '"))
+    {
+        Some(line) => anyhow::bail!("the worktree could not be read completely: {}", line.trim()),
+        None => Ok(()),
+    }
+}
+
+/// (core#1314) A path in the engine scratch: `tmp` itself or under it. A case variant (`TMP`) is
+/// the scratch only where it resolves to the scratch directory, on a filesystem that folds case;
+/// on a case-sensitive one it is a directory of the change's own (review on #1764).
+fn in_engine_scratch(worktree: &Path, p: &[u8]) -> bool {
+    let first = p.split(|b| *b == b'/').next().unwrap_or_default();
+    if first == ENGINE_SCRATCH_DIR.as_bytes() {
+        return true;
+    }
+    if !first.eq_ignore_ascii_case(ENGINE_SCRATCH_DIR.as_bytes()) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(first) = std::str::from_utf8(first) else {
+            return false;
+        };
+        match (
+            std::fs::metadata(worktree.join(first)),
+            std::fs::metadata(worktree.join(ENGINE_SCRATCH_DIR)),
+        ) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    // NTFS folds case.
+    #[cfg(not(unix))]
+    {
+        let _ = worktree;
+        true
+    }
+}
+
+/// (core#1314) A worktree entry git reads as a directory: a directory, and on Windows any
+/// directory reparse point too (a junction, which Rust reports as a link and git traverses).
+fn dir_like(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        if m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return true;
+        }
+    }
+    m.is_dir()
+}
+
+/// (core#1314) Where the index entry `p` (`/`-separated) lives under `worktree`, built one
+/// component at a time. `None` for an entry that is empty, absolute, or has a component that is
+/// empty, `.`, `..` or not one plain name on this platform (a drive or a `\` on Windows): the
+/// seat can write such entries into the index, and none of them is a path inside the tree.
+fn index_entry_path(worktree: &Path, p: &str) -> Option<PathBuf> {
+    if p.is_empty() {
+        return None;
+    }
+    let mut at = worktree.to_path_buf();
+    for c in p.split('/') {
+        let mut parts = Path::new(c).components();
+        match (parts.next(), parts.next()) {
+            (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(c) => {
+                at.push(c)
+            }
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
+/// (core#1314) The paths an index lists (`ls-files -z --cached`), as raw bytes.
+fn index_paths(cwd: &Path, env: &[(&str, &Path)]) -> anyhow::Result<Vec<Vec<u8>>> {
+    Ok(
+        git(cwd, &["ls-files", "-z", "--cached", "--full-name"], env)?
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
 }
 
 fn snapshot_through_inner(
     worktree: &Path,
     git_dir: &Path,
     extra_env: &[(&str, &Path)],
+    strict: bool,
 ) -> anyhow::Result<WorktreeSnapshot> {
     let mut pinned = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     pinned.extend_from_slice(extra_env);
@@ -605,7 +768,7 @@ fn snapshot_through_inner(
     let excludes = tmp_index.with_extension("exclude");
     std::fs::write(&excludes, format!("/{ENGINE_SCRATCH_DIR}/\n"))?;
     let excludes_arg = format!("core.excludesFile={}", excludes.display());
-    let mut env = pinned;
+    let mut env = pinned.clone();
     env.push(("GIT_INDEX_FILE", tmp_index.as_path()));
     let result = (|| -> anyhow::Result<String> {
         // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
@@ -619,20 +782,76 @@ fn snapshot_through_inner(
                 &env,
             )?;
         }
-        git(
-            worktree,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                &excludes_arg,
-                "add",
-                "-A",
-                "--",
-                ".",
-            ],
-            &env,
-        )?;
+        let add_all: [&str; 8] = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            excludes_arg.as_str(),
+            "add",
+            "-A",
+            "--",
+            ".",
+        ];
+        if !strict {
+            git(worktree, &add_all, &env)?;
+        } else {
+            unread(&git_stderr(worktree, &add_all, &env, None)?)?;
+            // Tracked in the REAL index (the pinned git dir's own) and left out by `add -A`: a
+            // path force-added under an ignored directory. The engine scratch never counts.
+            let scratch: std::collections::HashSet<Vec<u8>> =
+                index_paths(worktree, &env)?.into_iter().collect();
+            let mut forced: Vec<u8> = Vec::new();
+            for p in index_paths(worktree, &pinned)? {
+                if scratch.contains(&p) || in_engine_scratch(worktree, &p) {
+                    continue;
+                }
+                let p = String::from_utf8(p).map_err(|e| {
+                    anyhow::anyhow!(
+                        "the index tracks a path that is not UTF-8 ({:?})",
+                        String::from_utf8_lossy(e.as_bytes())
+                    )
+                })?;
+                // (coord r1 on #1764) Joined by component (a Windows `\\?\` worktree takes no
+                // `/`), and an entry that is absolute or climbs is refused before any stat.
+                let at = index_entry_path(worktree, &p).ok_or_else(|| {
+                    anyhow::anyhow!("the index tracks a path outside the worktree ({p:?})")
+                })?;
+                match std::fs::symlink_metadata(&at) {
+                    // A file or a link: force-added as the worktree holds it. A staged entry the
+                    // worktree replaced with a directory (or, on Windows, a junction) is `add
+                    // -A`'s to read: forcing it would import the directory's ignored contents.
+                    Ok(m) if !dir_like(&m) => {
+                        forced.extend_from_slice(p.as_bytes());
+                        forced.push(0);
+                    }
+                    Ok(_) => {}
+                    // Staged, then deleted from the worktree (or a parent replaced by a file):
+                    // not in the tree the change holds.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) => {}
+                    // Unreadable (a parent without search permission): never silently dropped.
+                    Err(e) => anyhow::bail!("the worktree could not be read completely: {p}: {e}"),
+                }
+            }
+            if !forced.is_empty() {
+                let one = Path::new("1");
+                let mut literal = env.clone();
+                literal.push(("GIT_LITERAL_PATHSPECS", one));
+                // On stdin, NUL-separated: no command-line length limit (Windows' is 32k chars).
+                let args = [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "add",
+                    "-f",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ];
+                unread(&git_stderr(worktree, &args, &literal, Some(forced))?)?;
+            }
+        }
         git_string(
             worktree,
             &["-c", "core.hooksPath=/dev/null", "write-tree"],
@@ -687,6 +906,7 @@ pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow:
             ("GIT_OBJECT_DIRECTORY", temporary_objects.as_path()),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_path()),
         ],
+        false,
     )
     .map(|snapshot| snapshot.tree);
     // Remove newly written objects on success AND on any snapshot error.
@@ -1371,6 +1591,246 @@ pub(crate) mod tests {
             "a repository hook ran during the snapshot: {:?}",
             std::fs::read_to_string(&marker)
         );
+    }
+
+    /// (core#1314) A path force-added (`git add -f`) under an ignored directory is in the STRICT
+    /// snapshot's tree, with the worktree's bytes (not the staged blob), and not in the plain
+    /// one; once deleted from the worktree it is in neither. A subtree git cannot read (`add -A`
+    /// warns and exits 0) is an error from strict, never a smaller tree.
+    #[test]
+    fn the_strict_snapshot_keeps_force_added_paths_and_refuses_an_unreadable_subtree_1314() {
+        let base = scratch("strict-1314");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "."]);
+        run_git(&repo, &["config", "user.email", "t@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "base"]);
+        std::fs::create_dir_all(repo.join("vendor/pkg")).unwrap();
+        std::fs::write(repo.join("vendor/pkg/package.json"), "{}\n").unwrap();
+        run_git(&repo, &["add", "-f", "vendor/pkg/package.json"]);
+        std::fs::write(repo.join("vendor/pkg/package.json"), "{\"v\":2}\n").unwrap();
+        let git_dir = repo.join(".git");
+        let names = |tree: &str| run_git(&repo, &["ls-tree", "-r", "--name-only", tree]);
+        let plain = snapshot_through(&repo, &git_dir).unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert!(
+            !names(&plain.tree).contains("vendor/"),
+            "the plain snapshot"
+        );
+        assert!(
+            names(&strict.tree).contains("vendor/pkg/package.json"),
+            "{}",
+            names(&strict.tree)
+        );
+        assert_eq!(
+            run_git(
+                &repo,
+                &[
+                    "cat-file",
+                    "blob",
+                    &format!("{}:vendor/pkg/package.json", strict.tree)
+                ]
+            ),
+            "{\"v\":2}",
+            "the worktree's bytes, re-hashed"
+        );
+        std::fs::remove_file(repo.join("vendor/pkg/package.json")).unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert_eq!(
+            strict.tree, plain.tree,
+            "staged, then deleted: not in the tree"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = repo.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("f.txt"), "x\n").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                eprintln!("SKIP: this user reads a mode-000 directory (root)");
+            } else {
+                assert!(
+                    snapshot_through(&repo, &git_dir).is_ok(),
+                    "the plain snapshot leaves it out, exit 0"
+                );
+                let err = snapshot_through_strict(&repo, &git_dir)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("could not be read completely"), "{err}");
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1314, review on #1764) The strict snapshot's force-add pass: a staged `tmp` the
+    /// worktree replaced with a directory never imports the engine scratch; a force-added path
+    /// git cannot stat (a parent without search permission) is an error, never dropped; hundreds
+    /// of long force-added paths are added in one stdin-fed call (no command-line limit, which a
+    /// 256-path argv batch exceeded on Windows); and a warning that only QUOTES a name holding
+    /// "could not open directory" is not an unreadable directory.
+    #[test]
+    fn the_strict_force_add_skips_scratch_refuses_unstatable_and_has_no_argv_limit_1314() {
+        let base = scratch("strict-1314-review");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "."]);
+        run_git(&repo, &["config", "user.email", "t@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "base"]);
+        let git_dir = repo.join(".git");
+        let names = |tree: &str| run_git(&repo, &["ls-tree", "-r", "--name-only", tree]);
+        // A staged `tmp` FILE, replaced by the scratch directory.
+        std::fs::write(repo.join("tmp"), "staged\n").unwrap();
+        run_git(&repo, &["add", "-f", "tmp"]);
+        std::fs::remove_file(repo.join("tmp")).unwrap();
+        std::fs::create_dir_all(repo.join("tmp/scratch")).unwrap();
+        std::fs::write(repo.join("tmp/scratch/log.txt"), "engine\n").unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert!(
+            !names(&strict.tree)
+                .lines()
+                .any(|n| n == "tmp" || n.starts_with("tmp/")),
+            "{}",
+            names(&strict.tree)
+        );
+        // (review on #1764) On a case-sensitive filesystem `TMP` is the change's own directory:
+        // a path force-added under it is in the tree. Where `TMP` folds to `tmp`, it is scratch.
+        std::fs::create_dir_all(repo.join("TMP")).unwrap();
+        if repo.join("TMP").exists()
+            && std::fs::read_dir(&repo)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name() == "TMP")
+        {
+            std::fs::write(repo.join(".gitignore"), "vendor/\nTMP/\n").unwrap();
+            std::fs::write(repo.join("TMP/own.txt"), "own\n").unwrap();
+            run_git(&repo, &["add", "-f", "TMP/own.txt"]);
+            let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+            assert!(
+                names(&strict.tree).lines().any(|n| n == "TMP/own.txt"),
+                "{}",
+                names(&strict.tree)
+            );
+            run_git(&repo, &["rm", "-q", "--cached", "TMP/own.txt"]);
+            std::fs::remove_dir_all(repo.join("TMP")).unwrap();
+            std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        } else {
+            eprintln!("SKIP: this filesystem folds `TMP` to `tmp`");
+        }
+        // (review on #1764) Windows: a staged file replaced by a JUNCTION to the scratch is a
+        // directory to git, never force-added.
+        #[cfg(windows)]
+        {
+            std::fs::write(repo.join("alias"), "staged\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), "vendor/\nalias\n").unwrap();
+            run_git(&repo, &["add", "-f", "alias"]);
+            std::fs::remove_file(repo.join("alias")).unwrap();
+            // spawn-audit: test-only — `cmd /C mklink /J` builds the junction fixture; reads no engine state.
+            let made = Command::new("cmd")
+                .args(["/C", "mklink", "/J", "alias", "tmp"])
+                .current_dir(&repo)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if made {
+                let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+                assert!(
+                    !names(&strict.tree).lines().any(|n| n.starts_with("alias/")),
+                    "{}",
+                    names(&strict.tree)
+                );
+                let _ = std::fs::remove_dir(repo.join("alias"));
+            } else {
+                eprintln!("SKIP: no junction could be made");
+            }
+            run_git(&repo, &["rm", "-q", "--cached", "alias"]);
+            std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        }
+        run_git(&repo, &["rm", "-q", "--cached", "tmp"]);
+        std::fs::remove_dir_all(repo.join("tmp")).unwrap();
+        // Hundreds of long force-added paths: 300 x ~130 chars is past 32,767 in any 256-path
+        // batch.
+        let long = format!("vendor/{}", "d".repeat(115));
+        std::fs::create_dir_all(repo.join(&long)).unwrap();
+        for i in 0..300 {
+            std::fs::write(repo.join(format!("{long}/f{i:03}.txt")), format!("{i}\n")).unwrap();
+        }
+        run_git(&repo, &["add", "-f", "vendor"]);
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert_eq!(
+            names(&strict.tree)
+                .lines()
+                .filter(|n| n.starts_with(&format!("{long}/")))
+                .count(),
+            300
+        );
+        #[cfg(unix)]
+        {
+            // Force-added under an ignored parent, behind a directory without search permission.
+            use std::os::unix::fs::PermissionsExt;
+            let locked = repo.join(&long);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::symlink_metadata(locked.join("f000.txt")).is_ok() {
+                eprintln!("SKIP: this user stats through a mode-000 directory (root)");
+            } else {
+                let err = snapshot_through_strict(&repo, &git_dir)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("could not be read completely"), "{err}");
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A line-ending warning that quotes a name holding the words is not an unreadable
+        // directory.
+        run_git(&repo, &["config", "core.autocrlf", "true"]);
+        std::fs::write(repo.join("could not open directory.txt"), "lf\n").unwrap();
+        let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+        assert!(
+            names(&strict.tree).contains("could not open directory.txt"),
+            "{}",
+            names(&strict.tree)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (coord r1 on #1764) An index entry maps under the worktree one component at a time
+    /// (a Windows `\\?\` worktree takes no `/`); an entry that is absolute or climbs is
+    /// refused before any stat.
+    #[test]
+    fn an_index_entry_maps_by_component_and_never_leaves_the_tree_1314() {
+        let w = Path::new("w");
+        assert_eq!(
+            index_entry_path(w, "a/b.txt"),
+            Some(w.join("a").join("b.txt"))
+        );
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "./a", "a/."] {
+            assert_eq!(index_entry_path(w, bad), None, "{bad:?}");
+        }
+        #[cfg(windows)]
+        {
+            let verbatim = Path::new(r"\\?\C:\w");
+            assert_eq!(
+                index_entry_path(verbatim, "a/b.txt"),
+                Some(PathBuf::from(r"\\?\C:\w\a\b.txt"))
+            );
+            for bad in ["C:/x", "C:x", r"a\..\b", r"\\srv\share"] {
+                assert_eq!(index_entry_path(verbatim, bad), None, "{bad:?}");
+            }
+        }
+        // (git's own plumbing refuses to write such an entry, so it is reached only through a
+        // raw index write: covered here at the mapping, which every stat goes through.)
     }
 
     /// A repo with one commit and a linked worktree on `wicked/<tag>` — the engine's real layout —

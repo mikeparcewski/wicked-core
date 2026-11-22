@@ -8328,7 +8328,7 @@ pub(crate) enum NewDir {
 /// (F24) Did the change introduce `dir` (repo-relative, `/`-separated)? Read through the PINNED
 /// `git_dir` only: the base side from the base COMMIT (a literal pathspec, so no pathspec magic
 /// in a repo-controlled name), the head side from a fresh snapshot of the worktree's tree
-/// (tracked + untracked-not-ignored, [`crate::worktree_guard::snapshot_through`]), and the
+/// (tracked + untracked-not-ignored + force-added, [`crate::worktree_guard::snapshot_through_strict`]), and the
 /// rename guard from git's own rename detection between the two trees. `Err` when git cannot
 /// answer: the caller then makes no claim.
 pub(crate) fn introduced_dir(
@@ -8393,7 +8393,9 @@ pub(crate) fn introduced_dir(
             return Ok(NewDir::No);
         }
     }
-    let head = crate::worktree_guard::snapshot_through(worktree, git_dir)
+    // (core#1314) Strict: a package force-added under an ignored path is in the head's tree, and
+    // a subtree git could not read is an error (no claim), never a smaller tree.
+    let head = crate::worktree_guard::snapshot_through_strict(worktree, git_dir)
         .map_err(|e| format!("the head's tree could not be read: {e}"))?;
     let is_tree = |e: &String| e.split_whitespace().nth(1) == Some("tree");
     if !at(&head.tree)?.iter().any(is_tree) {
@@ -16971,6 +16973,23 @@ exit 1
         );
         assert!(c.regressions.is_empty(), "{c:#?}");
         eprintln!("repo_checks: F24 comparable-red floor asserted");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (core#1314) A package force-added (`git add -f`) under an ignored path is one the change
+    /// introduced: pre-fix, the head's snapshot (`add -A`) left it out and `introduced_dir` made
+    /// no claim.
+    #[test]
+    fn a_force_added_package_under_an_ignored_path_is_introduced_1314() {
+        let repo = f24_repo("f24-forced");
+        std::fs::write(repo.join(".gitignore"), "tmp/\nvendor/\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        f24_red_package(&repo, "vendor/pkg", "pkg::adds");
+        git(&repo, &["add", "-f", "vendor/pkg"]);
+        assert_eq!(
+            introduced_dir(&repo, &repo.join(".git"), &base, "vendor/pkg").unwrap(),
+            NewDir::Introduced
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
