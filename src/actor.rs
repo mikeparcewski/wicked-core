@@ -14689,7 +14689,7 @@ fn dispatch_unit_with(
                                 .map(Option::as_deref)
                                 .map_err(String::as_str),
                             attempt,
-                            &crate::validator::loopback_jail,
+                            &crate::validator::serve_jail,
                             &stop,
                             &on_spawn,
                             &on_done,
@@ -15110,8 +15110,10 @@ fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
     refs
 }
 
-/// (WT-C2, DES-walkthrough-proof §4.4) Run the `walkthrough_review` Tool: jailed, loopback-only,
-/// writing only its proof root and a private temp dir, handed exactly the declared variables.
+/// (WT-C2, DES-walkthrough-proof §4.4) Run the `walkthrough_review` Tool: jailed to one loopback port
+/// the engine reserves here for its fixture (core#1297, handed over as
+/// [`crate::walkthrough::FIXTURE_PORT_ENV`]), writing only its proof root and a private temp dir,
+/// handed exactly the declared variables.
 ///
 /// It returns `StepStatus::Ok` whenever it did not spawn the recorder, saying why: the verdict is
 /// the pinned result validator's (§4.3), and a failed Tool unit would go through the failover
@@ -15125,7 +15127,7 @@ fn run_walkthrough_record(
     rec: &crate::walkthrough::RecordLaunch,
     garden: Result<Option<&std::path::Path>, &str>,
     attempt: u32,
-    jail: &dyn Fn(&[&std::path::Path]) -> crate::validator::SandboxLauncher,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
     stop: &dyn Fn() -> Option<&'static str>,
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
@@ -15216,7 +15218,19 @@ fn run_walkthrough_record(
             )
         }
     };
-    let launcher = jail(&[proof_root.as_path(), tmp.path()]);
+    // (core#1297) The fixture's port, reserved outside the jail (the conformance Tool's idiom): the
+    // jail opens it and no other. A process that takes it first fails the take's fixture start, and
+    // the next take reserves another.
+    let port = match crate::editor_conformance::free_port() {
+        Ok(p) => p,
+        Err(e) => {
+            return refused(
+                wt::ENGINE_REFUSED,
+                format!("no loopback port could be reserved for the fixture: {e}"),
+            )
+        }
+    };
+    let launcher = jail(&[proof_root.as_path(), tmp.path()], port);
     if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
         let reason = format!(
             "this host has no OS jail for the walkthrough recorder (sandbox level {}): a \
@@ -15246,6 +15260,7 @@ fn run_walkthrough_record(
         .map(|k| ((*k).to_string(), tmp_s.clone()))
         .collect();
     env.extend(rec.env.iter().cloned());
+    env.push((wt::FIXTURE_PORT_ENV.to_string(), port.to_string()));
     // (core#798) Tell the recorder it is jailed, and by what: only reached with a `Sandboxed`
     // launcher armed above, so the variable is never set on an unjailed run.
     // The launcher by NAME — past a `sh` prefix that opens the seccomp program (core#703).
@@ -15419,8 +15434,8 @@ fn run_demo_tool(
             cause,
             format!(
                 "this host has no OS jail that opens exactly the app's port (sandbox level {}): a demo is \
-                 never recorded unjailed. It records on macOS (sandbox-exec); Linux needs a port map into \
-                 the jail, not built yet",
+                 never recorded unjailed. It records on macOS (sandbox-exec) and on Linux with bwrap and \
+                 pasta (the passt package) on PATH",
                 launcher.level.as_wire()
             ),
         );
@@ -42937,7 +42952,8 @@ mod turn_timeout_vs_cancel_tests {
     }
 }
 
-/// WT-C2 (DES-walkthrough-proof §4.4) — the `walkthrough_review` record Tool: jailed, loopback-only,
+/// WT-C2 (DES-walkthrough-proof §4.4) — the `walkthrough_review` record Tool: jailed to its fixture's
+/// one loopback port (core#1297),
 /// writes only in its proof root and private temp dir, handed exactly the declared variables; on a
 /// host with no jail it records nothing and leaves an `unjailed_host` result for the validator.
 #[cfg(test)]
@@ -42981,16 +42997,18 @@ mod walkthrough_record_tests {
         }
     }
 
-    /// The recorder runs in the REAL loopback jail (sandbox-exec on macOS, bwrap on the Linux CI
-    /// leg): its environment is exactly the allowlist plus the declared variables, a loopback bind
-    /// and connect succeed, a connect to a public address fails, and a write outside the proof root
-    /// (into the worktree) is refused while one inside lands.
+    /// The recorder runs in the REAL jail (sandbox-exec on macOS, bwrap on the Linux CI leg): its
+    /// environment is exactly the allowlist plus the declared variables, a bind and connect on the
+    /// fixture port it is handed succeed (core#1297), a host service on another loopback port and a
+    /// public address are unreachable (macOS also refuses a bind on another port; on Linux that
+    /// bind is in the jail's own namespace), and a write outside the proof root (into the
+    /// worktree) is refused while one inside lands.
     #[cfg(unix)]
     #[test]
-    fn the_recorder_runs_jailed_loopback_only_with_exactly_the_declared_env() {
+    fn the_recorder_serves_only_its_fixture_port_with_exactly_the_declared_env() {
         if crate::test_sandbox::skip(
             crate::test_sandbox::Need::Loopback,
-            "the_recorder_runs_jailed_loopback_only_with_exactly_the_declared_env",
+            "the_recorder_serves_only_its_fixture_port_with_exactly_the_declared_env",
         ) {
             return;
         }
@@ -43000,7 +43018,7 @@ mod walkthrough_record_tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(&proof).unwrap();
         let probe_tmp = crate::repo_checks::PrivateTmp::create().unwrap();
-        if crate::validator::loopback_jail(&[proof.as_path(), probe_tmp.path()]).level
+        if crate::validator::serve_jail(&[proof.as_path(), probe_tmp.path()], 18799).level
             != crate::validator::SandboxLevel::Sandboxed
         {
             eprintln!(
@@ -43008,11 +43026,24 @@ mod walkthrough_record_tests {
             );
             return;
         }
+        // A host service on another loopback port (a crew daemon, say): the storyline the
+        // recorder imports must not reach it.
+        let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = host.local_addr().unwrap().port();
         let net = r#"
-import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
-c = socket.create_connection(("127.0.0.1", s.getsockname()[1]), timeout=5)
-a, _ = s.accept(); a.sendall(b"ok"); print("loopback", c.recv(2).decode())
+import os, socket
+port = int(os.environ["WICKED_WALKTHROUGH_PORT"])
+s = socket.socket(); s.bind(("127.0.0.1", port)); s.listen(1)
+c = socket.create_connection(("127.0.0.1", port), timeout=5)
+a, _ = s.accept(); a.sendall(b"ok"); print("fixture", c.recv(2).decode())
+try:
+    socket.create_connection(("127.0.0.1", HOST_PORT), timeout=5); print("host OPEN")
+except OSError as e:
+    print("host refused", type(e).__name__)
+try:
+    b = socket.socket(); b.bind(("127.0.0.1", 0)); b.listen(1); print("other bind OPEN")
+except OSError as e:
+    print("other bind refused", type(e).__name__)
 try:
     socket.create_connection(("1.1.1.1", 80), timeout=5); print("egress OPEN")
 except OSError as e:
@@ -43030,7 +43061,9 @@ except OSError as e:
         std::fs::create_dir_all(&sock_dir).unwrap();
         let sock = sock_dir.join("agent.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let net = net.replace("UNIX_PATH", &format!("{:?}", sock.to_string_lossy()));
+        let net = net
+            .replace("UNIX_PATH", &format!("{:?}", sock.to_string_lossy()))
+            .replace("HOST_PORT", &host_port.to_string());
         let script = format!(
             "env > \"$WICKED_EVIDENCE_ROOT/env.txt\"; \
              python3 -c '{net}' > \"$WICKED_EVIDENCE_ROOT/net.txt\" 2>&1; \
@@ -43045,7 +43078,7 @@ except OSError as e:
             &launch(&proof),
             Ok(None),
             0,
-            &crate::validator::loopback_jail,
+            &crate::validator::serve_jail,
             &never,
             &noop,
             &noop,
@@ -43054,9 +43087,20 @@ except OSError as e:
         assert!(killed.is_none());
         let net = std::fs::read_to_string(proof.join("net.txt")).unwrap();
         assert!(
-            net.contains("loopback ok"),
-            "loopback bind + connect: {net}"
+            net.contains("fixture ok"),
+            "a bind + connect on the fixture port: {net}"
         );
+        assert!(
+            net.contains("host refused"),
+            "a host service on another loopback port must be unreachable: {net}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                net.contains("other bind refused"),
+                "a bind on another port must be refused: {net}"
+            );
+        }
+        drop(host);
         assert!(
             net.contains("egress refused"),
             "public egress must fail: {net}"
@@ -43065,7 +43109,10 @@ except OSError as e:
             net.contains("unix refused"),
             "a host unix socket must be unreachable: {net}"
         );
-        let _ = std::fs::remove_dir_all(&sock_dir);
+        // The socket goes, its directory stays: every Linux jail armed in parallel scans `/tmp` for
+        // socket directories to mask, and one removed between that scan and bwrap's mount fails the
+        // jail (`Can't mkdir /tmp/ssh-wtc2-…`), seen in another test of this crate.
+        let _ = std::fs::remove_file(&sock);
         assert!(
             !worktree.join("escaped.txt").exists(),
             "the worktree is not writable"
@@ -43088,6 +43135,7 @@ except OSError as e:
             "WICKED_TREE",
             "WICKED_WALKTHROUGH_AUTHOR",
             "WICKED_WALKTHROUGH_JAIL",
+            "WICKED_WALKTHROUGH_PORT",
             "TMPDIR",
             "TMP",
             "TEMP",
@@ -43133,7 +43181,7 @@ except OSError as e:
             "-c".to_string(),
             format!("echo ran > '{}'", marker.display()),
         ];
-        let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
+        let no_jail = |_: &[&std::path::Path], _: u16| crate::validator::SandboxLauncher {
             wrapper: Vec::new(),
             level: crate::validator::SandboxLevel::BestEffort,
         };
@@ -43167,7 +43215,7 @@ except OSError as e:
         let proof = dir.join("wr");
         std::fs::create_dir_all(&proof).unwrap();
         std::fs::write(proof.join(RESULT_FILE), r#"{"overall":"PASS"}"#).unwrap();
-        let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
+        let no_jail = |_: &[&std::path::Path], _: u16| crate::validator::SandboxLauncher {
             wrapper: Vec::new(),
             level: crate::validator::SandboxLevel::BestEffort,
         };
@@ -43187,6 +43235,57 @@ except OSError as e:
             .unwrap()
             .contains(UNJAILED_HOST));
         assert!(proof.join("result.before-attempt-2.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1295) A demo Tool asks the jail for exactly the app's port, and a host that cannot arm
+    /// that jail runs nothing: the take is a refusal naming the cause (`no_port_scoped_jail` on
+    /// Linux, where bwrap or `pasta` is missing), never an unjailed recording.
+    #[test]
+    fn a_demo_host_with_no_port_jail_records_nothing_and_says_why() {
+        let dir = scratch("demo-unjailed");
+        let marker = dir.join("ran.txt");
+        let d = crate::demo_record::DemoDispatch {
+            catalog: crate::demo_record::PROBE_CATALOG.to_string(),
+            run_id: "run-demo".to_string(),
+            ord: 1,
+            root: Ok(dir.clone()),
+            launch: Ok(crate::demo_record::DemoLaunch {
+                app_origin: "http://127.0.0.1:4310".to_string(),
+                launch_path: "/".to_string(),
+                target: serde_json::json!({"kind": "loopback_app"}),
+                live_data_to_models: true,
+            }),
+            approved: None,
+        };
+        let asked = std::sync::Mutex::new(Vec::new());
+        let no_jail = |_: &[&std::path::Path], port: u16| {
+            asked.lock().unwrap().push(port);
+            crate::validator::SandboxLauncher {
+                wrapper: Vec::new(),
+                level: crate::validator::SandboxLevel::BestEffort,
+            }
+        };
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran > '{}'", marker.display()),
+        ];
+        let (out, st, _, take) = run_demo_tool(&cmd, &d, Ok(None), &no_jail, &never, &noop, &noop);
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![4310],
+            "the jail opens the app's port"
+        );
+        assert!(!marker.exists(), "the recorder must never run unjailed");
+        let want = if cfg!(target_os = "linux") {
+            "no_port_scoped_jail"
+        } else {
+            "unjailed_host"
+        };
+        assert_eq!(take.cause.as_deref(), Some(want), "{out}");
+        assert!(out.contains("pasta"), "the refusal names the fix: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -43210,7 +43309,7 @@ except OSError as e:
             &rec,
             Ok(None),
             3,
-            &crate::validator::loopback_jail,
+            &crate::validator::serve_jail,
             &never,
             &noop,
             &noop,
@@ -43244,7 +43343,7 @@ except OSError as e:
             &launch(&proof),
             Err("the installed plugin is not a contained tree"),
             0,
-            &crate::validator::loopback_jail,
+            &crate::validator::serve_jail,
             &never,
             &noop,
             &noop,
@@ -43274,7 +43373,7 @@ except OSError as e:
             &rec,
             Ok(None),
             0,
-            &crate::validator::loopback_jail,
+            &crate::validator::serve_jail,
             &never,
             &noop,
             &noop,

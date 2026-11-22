@@ -279,6 +279,9 @@ fn a_passing_walkthrough_completes_and_the_recorder_got_exactly_the_declared_env
         "bwrap"
     };
     assert_eq!(get("WICKED_WALKTHROUGH_JAIL").as_deref(), Some(kind));
+    // core#1297: the one loopback port the jail opens, reserved by the engine for the fixture.
+    let port = get("WICKED_WALKTHROUGH_PORT").expect("the fixture's port");
+    assert!(port.parse::<u16>().is_ok_and(|p| p > 0), "{port}");
     // The daemon's environment does not leak in: the test process's own engine variables (the
     // hermetic emit spool) are set in THIS process and must be absent in the recorder.
     for l in env.lines() {
@@ -292,6 +295,7 @@ fn a_passing_walkthrough_completes_and_the_recorder_got_exactly_the_declared_env
                     "WICKED_TREE",
                     "WICKED_WALKTHROUGH_AUTHOR",
                     "WICKED_WALKTHROUGH_JAIL",
+                    "WICKED_WALKTHROUGH_PORT",
                     "WICKED_GARDEN_ROOT",
                 ]
                 .contains(&k),
