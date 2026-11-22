@@ -1018,8 +1018,11 @@ pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<Stri
 /// - `otel.metrics_exporter="none"`: the built-in Statsig metrics exporter
 ///   (`https://ab.chatgpt.com/otlp/v1/metrics`, `otel/src/config.rs`);
 /// - `features.apps=false`: the ChatGPT apps MCP server (`<chatgpt_base_url>/ps/mcp`);
-/// - `features.plugins=false`: the remote plugin catalogue (`<chatgpt_base_url>/ps/plugins/…`;
-///   a seat's skills come from its engine-minted `CODEX_HOME/skills`, not from plugins);
+/// - `features.plugins=false`: codex's plugin system, the remote catalogue
+///   (`<chatgpt_base_url>/ps/plugins/…`) and installed plugins alike. A seat installs none (its
+///   skills come from its engine-minted `CODEX_HOME/skills`). The narrower
+///   `features.remote_plugin=false` was measured and still syncs the curated catalogue
+///   (chatgpt.com and github.com);
 /// - `chatgpt_base_url` at a closed loopback port: the ChatGPT backend calls with no switch of
 ///   their own (workspace routing discovery `wham/accounts/check`, git attribution's
 ///   `wham/settings/user`) fail inside the seat at once, as they already failed at the gateway,

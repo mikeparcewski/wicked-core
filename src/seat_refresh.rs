@@ -1,6 +1,8 @@
 //! The broker's ONE refresher (DES-CONTAINER-FLOOR §6, item 2): the only place a signed-in
 //! agent's sign-in is renewed. Seats never refresh (their placeholder expiry is far in the
-//! future), so parallel seats never race a refresh.
+//! future), so parallel seats never race a refresh. A codex seat that gets an upstream 401 asks
+//! its token endpoint, which is the gate-hook relay: it forces one pass of this refresher and
+//! hands the seat no token ([`recover_codex`], core#997).
 //!
 //! **The broker renews nothing itself (core#1024).** It makes no token request and never
 //! presents itself as any vendor's client. A sign-in is renewed by the agent's own CLI, the way

@@ -66,6 +66,31 @@ pub(crate) const HOOK_PORT: u16 = 8711;
 pub(crate) const CODEX_REFRESH_PATH: &str = "/codex/refresh";
 /// The largest codex refresh request read (a client id, a grant type and a unit key).
 const MAX_REFRESH_BODY: usize = 16 * 1024;
+/// codex refreshes waiting on the broker at once. A waiting refresh holds none of the gate
+/// hook's [`MAX_CONNS`] slots, so seats waiting on a renewal never refuse a claude unit's tool
+/// call; past this many, a refresh is answered at once with a retryable 503.
+const MAX_REFRESH_WAITS: usize = 16;
+
+static REFRESH_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// One codex refresh waiting on the broker, counted while it lives.
+struct RefreshWait;
+
+impl RefreshWait {
+    fn take() -> Option<Self> {
+        if REFRESH_WAITS.fetch_add(1, Ordering::SeqCst) >= MAX_REFRESH_WAITS {
+            REFRESH_WAITS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(RefreshWait)
+    }
+}
+
+impl Drop for RefreshWait {
+    fn drop(&mut self) {
+        REFRESH_WAITS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 /// How long one tool call's judgement may take before it is denied.
 const HOOK_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(60));
 /// The largest hook payload the relay reads (a tool call's input).
@@ -98,8 +123,7 @@ fn relay() -> Option<&'static Relay> {
                             continue;
                         };
                         spawn_or_fail_closed(conn, "wicked-hook-call", move |conn| {
-                            let _slot = slot;
-                            serve(conn)
+                            serve(conn, slot)
                         });
                     }
                 })
@@ -810,7 +834,9 @@ fn tool_call(body: &[u8]) -> Option<String> {
     (!tool.is_empty()).then(|| tool.to_string())
 }
 
-fn serve(conn: TcpStream) {
+/// Serve one connection holding one of the [`MAX_CONNS`] slots (`slot`, freed when it returns;
+/// a codex refresh frees it before it waits, [`codex_refresh`]).
+fn serve(conn: TcpStream, slot: Slot) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
     let Ok(read_half) = conn.try_clone() else {
         // Unservable (no descriptor to read with): unattributable, so every live unit fails closed.
@@ -887,7 +913,9 @@ fn serve(conn: TcpStream) {
     }
     match route {
         Some(Route::Ping) => return respond(conn, "200 OK", "{\"pong\":true}"),
-        Some(Route::CodexRefresh) => return codex_refresh(conn, &mut reader, length, chunked),
+        Some(Route::CodexRefresh) => {
+            return codex_refresh(conn, &mut reader, length, chunked, slot)
+        }
         Some(Route::Hook(_)) => {}
         None => return respond(conn, "404 Not Found", "{}"),
     }
@@ -937,7 +965,13 @@ fn serve(conn: TcpStream) {
 /// renewed one). An unknown key is `invalid_grant` (codex gives up at once); a renewal that failed
 /// is a 503 naming why (codex reports it as a failed refresh). Nothing in either answer is a
 /// credential.
-fn codex_refresh(conn: TcpStream, reader: &mut impl BufRead, length: Option<usize>, chunked: bool) {
+fn codex_refresh(
+    conn: TcpStream,
+    reader: &mut impl BufRead,
+    length: Option<usize>,
+    chunked: bool,
+    slot: Slot,
+) {
     let body = if chunked {
         read_chunked(reader, MAX_REFRESH_BODY)
     } else {
@@ -949,10 +983,24 @@ fn codex_refresh(conn: TcpStream, reader: &mut impl BufRead, length: Option<usiz
     let presented = body
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| Some(v.get("refresh_token")?.as_str()?.to_string()));
-    let recovery = match presented {
-        Some(token) => crate::seat_refresh::recover_codex(&token),
-        None => crate::seat_refresh::Recovery::UnknownUnit,
+    let Some(token) = presented else {
+        return codex_refresh_answer(conn, crate::seat_refresh::Recovery::UnknownUnit);
     };
+    // A renewal can take seconds: the wait is bounded on its own and frees the gate-hook slot.
+    let Some(_wait) = RefreshWait::take() else {
+        return codex_refresh_answer(
+            conn,
+            crate::seat_refresh::Recovery::Failed(
+                "too many codex seats are waiting on a renewal; retry".into(),
+            ),
+        );
+    };
+    drop(slot);
+    codex_refresh_answer(conn, crate::seat_refresh::recover_codex(&token));
+}
+
+/// The OAuth-shaped answer to a codex refresh ([`codex_refresh`]).
+fn codex_refresh_answer(conn: TcpStream, recovery: crate::seat_refresh::Recovery) {
     match recovery {
         crate::seat_refresh::Recovery::Renewed => respond(conn, "200 OK", "{}"),
         crate::seat_refresh::Recovery::UnknownUnit => respond(
@@ -1797,6 +1845,10 @@ exit 2
         ) {
             return;
         }
+        // The relay's connection counts are process-wide: one relay test at a time.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let port = port().expect("the relay listens");
         let post = |refresh_token: &str| -> (String, serde_json::Value) {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -1876,6 +1928,84 @@ exit 2
         for d in [ok_dir, bad_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// core#997 (codex review r1): codex seats waiting on a renewal hold none of the gate hook's
+    /// connection slots (so they never make a claude unit's tool call overflow and fail closed),
+    /// and their number is bounded: past [`MAX_REFRESH_WAITS`] a refresh is answered at once
+    /// with a retryable 503 and renews nothing.
+    #[cfg(unix)]
+    #[test]
+    fn codex_refresh_waits_hold_no_hook_slot_and_are_bounded_997() {
+        use crate::seat_credentials::{sent_bearer, CredentialKind};
+        use crate::seat_gateway::{configure_gateway, register_unit, GatewayConfig, UnitKey};
+        use crate::seat_refresh::Outcome;
+        use std::sync::atomic::AtomicBool;
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "codex_refresh_waits_hold_no_hook_slot_and_are_bounded_997",
+        ) {
+            return;
+        }
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let port = port().expect("the relay listens");
+        let dir = std::env::temp_dir().join(format!("c11-waits-{}", uuid::Uuid::new_v4().simple()));
+        configure_gateway(&dir, &GatewayConfig::default()).unwrap();
+        let mut u = UnitKey::new("FAKE-run", "FAKE-unit", "codex");
+        let key = u.key.clone();
+        u.key = sent_bearer("codex", CredentialKind::CodexChatgpt, &key);
+        register_unit(&dir, u).unwrap();
+        static HOLD: AtomicBool = AtomicBool::new(true);
+        crate::seat_refresh::register(
+            &dir,
+            std::sync::Arc::new(|_: &std::path::Path| {
+                while HOLD.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(Outcome::Refreshed { expires_at: None })
+            }),
+        );
+        let post = move |key: String| {
+            std::thread::spawn(move || {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let body =
+                    format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{key}\"}}");
+                write!(
+                    s,
+                    "POST /codex/refresh HTTP/1.1\r\nhost: agw\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                let mut resp = String::new();
+                s.read_to_string(&mut resp).unwrap();
+                resp
+            })
+        };
+        let waiting: Vec<_> = (0..MAX_REFRESH_WAITS).map(|_| post(key.clone())).collect();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while REFRESH_WAITS.load(Ordering::SeqCst) < MAX_REFRESH_WAITS {
+            assert!(
+                Instant::now() < deadline,
+                "the refreshes never started waiting"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            ACTIVE.load(Ordering::SeqCst),
+            0,
+            "a waiting refresh holds a hook slot"
+        );
+        let over = post(key.clone()).join().unwrap();
+        assert!(over.starts_with("HTTP/1.1 503"), "{over}");
+        assert!(over.contains("too many codex seats"), "{over}");
+        HOLD.store(false, Ordering::SeqCst);
+        for w in waiting {
+            let resp = w.join().unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The relay end to end on loopback with a fake `gate-hook` (a script that denies when the
