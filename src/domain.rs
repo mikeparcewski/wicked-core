@@ -2178,15 +2178,10 @@ pub fn get_session(
 
 /// Read every [`WorkUnit`] belonging to `session_id`, ordered by `ord`.
 pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<Vec<WorkUnit>> {
-    let query = SymbolQuery {
-        kinds: vec![NodeKind::Other(WORK_UNIT.to_string())],
-        ..Default::default()
-    };
     // (core#1346) Another run's unit is skipped on its raw `session_id` before it is decoded: a
     // per-run read decodes this run's units only. A node without the field is decoded and judged
     // on the decoded id, as before.
-    let mut units: Vec<WorkUnit> = store
-        .find_symbols(&query)?
+    let mut units: Vec<WorkUnit> = run_unit_nodes(store, session_id)?
         .iter()
         .filter(|n| {
             n.metadata
@@ -2201,6 +2196,21 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
     Ok(units)
 }
 
+/// (core#1795) The unit nodes a run's reads start from, found through the store's name index: a
+/// unit is named by its id, `{session_id}:{phase}` (minted in [`crate::plan::plan_units`]), so the
+/// name prefix `{session_id}:` reaches this run's nodes without reading every unit on the store. A
+/// one-run read then costs the same on a store of 4 runs or 4000. The prefix match is ASCII
+/// case-insensitive and also takes other kinds named under the run (its results), so callers still
+/// keep only `WORK_UNIT` nodes and judge each on its `session_id`.
+fn run_unit_nodes(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<Vec<Node>> {
+    let kind = NodeKind::Other(WORK_UNIT.to_string());
+    Ok(store
+        .find_symbols_by_name_prefix(&format!("{session_id}:"), None)?
+        .into_iter()
+        .filter(|n| n.kind == kind)
+        .collect())
+}
+
 /// Read the unit at a session's cursor without dropping undecodable nodes from its ordering.
 /// Raw session identity and ordinals locate the node; only the selected node is decoded.
 /// An unreadable ordinal on any node in this session prevents locating the cursor safely.
@@ -2209,13 +2219,9 @@ pub fn session_unit_at(
     session_id: &str,
     unit_ix: usize,
 ) -> anyhow::Result<Option<WorkUnit>> {
-    let query = SymbolQuery {
-        kinds: vec![NodeKind::Other(WORK_UNIT.to_string())],
-        ..Default::default()
-    };
     let prefix = format!("{session_id}:");
     let mut nodes = Vec::new();
-    for node in store.find_symbols(&query)? {
+    for node in run_unit_nodes(store, session_id)? {
         let belongs = match node.metadata.get("session_id").and_then(|v| v.as_str()) {
             Some(id) => id == session_id,
             None => node.name.starts_with(&prefix),
@@ -2507,6 +2513,106 @@ mod tests {
         assert_eq!(node.metadata["instructions"], prose);
         // Recording must not mutate the unit that the engine executes/replays.
         assert_eq!(unit.denial_reason.as_deref(), Some(prose.as_str()));
+    }
+
+    /// (core#1795) A one-run unit read reaches the run's units through the store's name index: it
+    /// never asks the store for every unit node, so it costs the same on a store of 4 runs or 4000.
+    /// The run's own units come back in `ord` order; a run whose id the asked one prefixes, and a
+    /// result node named under the run, are not units of it.
+    #[test]
+    fn a_one_run_unit_read_never_scans_every_unit_on_the_store() {
+        use std::cell::Cell;
+        use wicked_apps_core::SqliteStore;
+        use wicked_estate_core::*;
+
+        struct ScanProbe {
+            inner: SqliteStore,
+            unit_scans: Cell<usize>,
+        }
+        macro_rules! forward {
+            ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+                $(fn $name(&self, $($arg: $ty),*) -> $ret {
+                    GraphRead::$name(&self.inner, $($arg),*)
+                })*
+            };
+        }
+        impl GraphRead for ScanProbe {
+            forward! {
+                capabilities() -> StoreCapabilities;
+                get_node(id: &SymbolId) -> Result<Option<Node>>;
+                find_symbols_by_name_prefix(prefix: &str, limit: Option<usize>) -> Result<Vec<Node>>;
+                neighbors(id: &SymbolId, dir: Direction) -> Result<Vec<Edge>>;
+                traverse(start: &SymbolId, spec: &TraversalSpec) -> Result<Subgraph>;
+                all_nodes() -> Result<Vec<Node>>;
+                all_edges() -> Result<Vec<Edge>>;
+                unresolved_refs_for_name(name: &str) -> Result<Vec<UnresolvedRef>>;
+                file_digest(file: &str) -> Result<Option<String>>;
+                indexed_files() -> Result<Vec<String>>;
+                file_git_sha(file: &str) -> Result<Option<String>>;
+                repo_info() -> Result<Option<RepoInfo>>;
+                edge_history(file: &str) -> Result<Vec<HistoricalEdge>>;
+                file_content(file: &str) -> Result<Option<String>>;
+                symbol_source(node: &Node) -> Result<Option<String>>;
+                changes_since(cursor: u64) -> Result<Vec<Change>>;
+                node_semantics(symbol: &SymbolId) -> Result<Option<NodeSemantics>>;
+                find_by_requirement(requirement: &str) -> Result<Vec<Node>>;
+                annotations(symbol: &SymbolId) -> Result<Vec<Annotation>>;
+                annotations_by_type(ty: &str) -> Result<Vec<(SymbolId, Annotation)>>;
+                annotations_stale_since(cutoff: i64) -> Result<Vec<(SymbolId, Annotation)>>;
+                symbol_epoch(id: &SymbolId) -> Result<Option<u64>>;
+                edge_supports(source: &SymbolId, target: &SymbolId, kind: &EdgeKind) -> Result<Vec<EdgeSupport>>;
+                support_generation(owner: &SupportOwner) -> Result<Option<u64>>;
+                support_owners() -> Result<Vec<SupportOwnerState>>;
+                stats() -> Result<GraphStats>;
+            }
+            fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                if query
+                    .kinds
+                    .contains(&NodeKind::Other(WORK_UNIT.to_string()))
+                {
+                    self.unit_scans.set(self.unit_scans.get() + 1);
+                }
+                self.inner.find_symbols(query)
+            }
+        }
+
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut nodes = Vec::new();
+        for run in 0..50 {
+            for ord in 1..=3u32 {
+                let id = format!("run-{run}");
+                nodes.push(WorkUnit::pending(format!("{id}:u{ord}"), id, ord, "d").to_node());
+            }
+        }
+        // The asked run, written out of order, and a run whose id it prefixes.
+        for ord in [2u32, 1] {
+            nodes.push(WorkUnit::pending(format!("run-x:u{ord}"), "run-x", ord, "x").to_node());
+        }
+        nodes.push(WorkUnit::pending("run-x:2:u1", "run-x:2", 1, "y").to_node());
+        put_nodes(&mut store, &nodes).unwrap();
+        let probe = ScanProbe {
+            inner: store,
+            unit_scans: Cell::new(0),
+        };
+
+        let units = session_units(&probe, "run-x").unwrap();
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            vec!["run-x:u1", "run-x:u2"],
+            "the run's own units, in ord order"
+        );
+        let at = session_unit_at(&probe, "run-x", 1).unwrap().expect("ix 1");
+        assert_eq!(at.id, "run-x:u2");
+        assert_eq!(
+            session_units(&probe, "run-x:2").unwrap().len(),
+            1,
+            "the prefixed run reads its own unit"
+        );
+        assert_eq!(
+            probe.unit_scans.get(),
+            0,
+            "no per-run read asked the store for every unit node"
+        );
     }
 
     #[test]
