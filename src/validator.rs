@@ -655,6 +655,7 @@ const PS_EXEC_RULE: &str = "(allow process-exec (with no-sandbox) (literal \"/bi
 /// the system temp dir, and the std stdio devices; reads/exec stay open (`allow default`). `None` if the
 /// run dir can't be canonicalized (→ caller degrades to the floor). Canonicalization matters on macOS
 /// where `/var/folders/…` is a symlink to `/private/var/folders/…`; SBPL `subpath` needs the real path.
+#[cfg(test)]
 fn macos_sandbox_profile_for_roots(
     write_roots: &[&Path],
     network: NetworkPolicy,
@@ -694,6 +695,45 @@ const LINUX_READ_SYSTEM: &[&str] = &[
     "/var/cache/fontconfig",
     "/nix/store",
 ];
+
+/// (core#1335) This account's home: `HOME` when set and absolute, else the account database's entry
+/// for this uid (a daemon started without `HOME`). `None` when neither is known.
+fn account_home() -> Option<std::path::PathBuf> {
+    let env = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|h| h.is_absolute());
+    env.or_else(account_home_from_db)
+}
+
+#[cfg(unix)]
+fn account_home_from_db() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
+    // SAFETY: `pwd` and `buf` outlive the call; `getpwuid_r` writes only into them and sets `found`
+    // to `&pwd` or null. The home string is copied out before either is dropped.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        );
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        let home = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir));
+        home.is_absolute().then_some(home)
+    }
+}
+
+#[cfg(not(unix))]
+fn account_home_from_db() -> Option<std::path::PathBuf> {
+    None
+}
 
 /// (core#1335) The read roots a read-allowlisted jail admits: each by its real path, never `/` and
 /// never the home directory or one of its ancestors (an interpreter in `~/bin` must not open the
@@ -1012,8 +1052,15 @@ pub(crate) fn serve_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
 /// (sandbox-exec) and Linux (bwrap + the AF_UNIX seccomp program); elsewhere the caller gets a
 /// non-`Sandboxed` level and renders nothing.
 pub(crate) fn render_jail(write_roots: &[&Path], read_roots: &[&Path]) -> SandboxLauncher {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let reads = admitted_read_roots(read_roots, home.as_deref());
+    // The home guard needs a home: with none known (no `HOME`, no account entry), no jail is armed
+    // and the caller records `unjailed_host` rather than risk admitting a root that holds it.
+    let Some(home) = account_home() else {
+        return SandboxLauncher {
+            wrapper: Vec::new(),
+            level: SandboxLevel::BestEffort,
+        };
+    };
+    let reads = admitted_read_roots(read_roots, Some(&home));
     launcher_for_roots_reading(
         write_roots,
         NetworkPolicy::Isolated,
@@ -5065,6 +5112,17 @@ mod tests {
             assert!(!p.contains("(deny file-read-data)"), "{p}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1335) Without `HOME`, the home guard still has a home: the account database's.
+    #[cfg(unix)]
+    #[test]
+    fn the_account_home_is_known_without_home() {
+        let Some(db) = account_home_from_db() else {
+            eprintln!("SKIP the_account_home_is_known_without_home: no account entry for this uid");
+            return;
+        };
+        assert!(db.is_absolute(), "{db:?}");
     }
 
     /// (core#1335) `/`, the home and its ancestors never become read roots; a missing one is dropped.

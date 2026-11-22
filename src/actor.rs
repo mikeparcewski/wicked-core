@@ -15390,9 +15390,9 @@ fn run_draft_render_tool(
         }
     };
     // (core#1336) The interpreter: the root's `.venv`, else python3/python on PATH (the counter is
-    // stdlib only). Never the launcher's `uv run`, which writes a cache and needs the network.
-    let Some((python, venv)) = dr::interpreter(&real_garden, &crate::validator::find_on_path)
-    else {
+    // stdlib only), by its real path. Never the launcher's `uv run`, which writes a cache and needs
+    // the network.
+    let Some(python) = dr::interpreter(&real_garden, &crate::validator::find_on_path) else {
         return done(not(
             rec,
             "no_python",
@@ -15420,9 +15420,26 @@ fn run_draft_render_tool(
             ))
         }
     };
-    let reads = dr::render_read_roots(&draft.real, &real_garden, &python, venv.as_deref(), &chrome);
+    // The renderer runs by its real path too (a link elsewhere is not in the jail's reads).
+    let chrome_real = chrome.canonicalize().unwrap_or_else(|_| chrome.clone());
+    let xcode_select = cfg!(target_os = "macos")
+        .then(|| std::fs::read_link("/private/var/db/xcode_select_link").ok())
+        .flatten();
+    let reads = dr::render_read_roots(
+        &draft.real,
+        &real_garden,
+        &python,
+        &chrome_real,
+        xcode_select.as_deref(),
+    );
     let read_refs: Vec<&std::path::Path> = reads.iter().map(std::path::PathBuf::as_path).collect();
-    let launcher = jail(&[tmp.path()], &read_refs);
+    // The temp dir by its real path: the jail binds that path, so every file and variable inside it
+    // names it the same way.
+    let tmp_real = tmp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| tmp.path().to_path_buf());
+    let launcher = jail(&[tmp_real.as_path()], &read_refs);
     if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
         return done(not(
             rec,
@@ -15442,9 +15459,9 @@ fn run_draft_render_tool(
         .map(|n| n.to_string_lossy().into_owned())
         .find(|n| n == "bwrap" || n == "sandbox-exec")
         .unwrap_or_else(|| launcher.wrapper[0].clone());
-    let out_file = tmp.path().join("report.json");
-    let version_file = tmp.path().join("renderer-version.txt");
-    let tmp_s = tmp.path().to_string_lossy().into_owned();
+    let out_file = tmp_real.join("report.json");
+    let version_file = tmp_real.join("renderer-version.txt");
+    let tmp_s = tmp_real.to_string_lossy().into_owned();
     // The temp dir is the render's whole writable world, its home included: nothing in a print needs
     // the user's home, and the jail cannot read it.
     let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP", "HOME"]
@@ -15453,7 +15470,7 @@ fn run_draft_render_tool(
         .collect();
     env.push((
         dr::CHROME_ENV.to_string(),
-        chrome.to_string_lossy().into_owned(),
+        chrome_real.to_string_lossy().into_owned(),
     ));
     // The renderer's `--version` line to its file (core#1337), then the counter, whose stdout (its
     // JSON report) goes to the report file; stderr stays the Tool's output.
@@ -15679,8 +15696,15 @@ mod draft_render_live {
         let (inbox, garden) = (base.join("inbox"), base.join("garden"));
         std::fs::create_dir_all(garden.join("scripts/draft")).unwrap();
         std::fs::create_dir_all(&inbox).unwrap();
-        let secret = base.join("beside.txt");
-        std::fs::write(&secret, "not for the page").unwrap();
+        // Beside the draft: a script that adds three printed pages if the browser can load it, and the
+        // counter gives up if it can read it.
+        let secret = base.join("beside.js");
+        std::fs::write(
+            &secret,
+            "for (let i = 0; i < 3; i++) { const e = document.createElement('div'); \
+             e.className = 'p'; e.textContent = 'Extra'; document.body.prepend(e); }",
+        )
+        .unwrap();
         let launcher = garden.join("scripts/wicked-garden");
         std::fs::write(
             &launcher,
@@ -15724,7 +15748,7 @@ print(json.dumps({{"check": "pages", "pages": n, "source": "chrome-render", "ver
         let html = format!(
             "<!doctype html><html><head><style>@page{{size:A4;margin:10mm}} \
              .p{{page-break-after:always}}</style></head><body><div class=\"p\">One</div>\
-             <div>Two</div><iframe src=\"{}\"></iframe></body></html>",
+             <div>Two</div><script src=\"{}\"></script></body></html>",
             url_of(&secret)
         );
         std::fs::write(&draft, &html).unwrap();

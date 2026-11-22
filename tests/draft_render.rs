@@ -59,11 +59,17 @@ def report(n, source="chrome-render", verified=True, notes=(), est=1):
     print(json.dumps({{"check": "pages", "pages": n, "source": source, "verified": verified,
         "notes": list(notes), "estimate": {{"estimate": est}}}}))
 if "MODE:PEEK" in t:
+    import os
     try:
         open({peek:?}).read()
         report(9)
     except OSError:
-        report(1)
+        if any(k.startswith("CLAUDE_") for k in os.environ):
+            report(8)
+        elif os.environ.get("HOME") != os.environ.get("TMPDIR"):
+            report(7)
+        else:
+            report(1)
     sys.exit(0)
 if "MODE:MEASURED" in t:
     report(int(re.search(r"PAGES:(\d+)", t).group(1)))
@@ -541,8 +547,10 @@ fn an_unmeasured_draft_is_recorded_honestly_and_the_run_completes() {
 }
 
 /// (core#1335) The render jail reads an allowlist: a counter that tries to read a file beside the
-/// draft's dir, the garden and the renderer is refused (the stub then reports 1 page; 9 if it could
-/// read it). Without the allowlist every host file outside the secret dirs was readable.
+/// draft's dir, the garden and the renderer is refused. Without the allowlist every host file outside
+/// the secret dirs was readable. The stub reports 1 page when all holds; 9 if it read the file, 8 if
+/// the daemon's environment reached it (this process sets `CLAUDE_CONFIG_DIR`), 7 if its `HOME` is
+/// not the render's temp dir.
 #[test]
 fn the_counter_cannot_read_a_file_beside_its_inputs() {
     let r = run("peek", &["<p>MODE:PEEK</p>"]);

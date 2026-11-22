@@ -374,56 +374,85 @@ pub(crate) fn root_of_launcher(launcher: &std::path::Path) -> Option<std::path::
     root.join(COUNTER_SCRIPT).is_file().then_some(root)
 }
 
-/// (core#1336) The interpreter the counter runs with: the root's `.venv` one (crew's synced venv),
-/// else `python3`, then `python`, from `find` (the daemon's `PATH`). With the canonical `.venv` dir
-/// when that is where it came from (the jail must read it; a snapshot's `.venv` may be a link).
+/// (core#1336) The interpreter the counter runs with, by its REAL path (the jail runs that path, so
+/// no link outside the jail's reads is followed): the root's `.venv` one (crew's synced venv), else
+/// `python3`, then `python`, from `find` (the daemon's `PATH`). The counter is stdlib only, so a venv
+/// whose interpreter is a link runs as its base interpreter, which is all it needs.
 pub(crate) fn interpreter(
     root: &std::path::Path,
     find: &dyn Fn(&str) -> Option<std::path::PathBuf>,
-) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
-    let venv = root.join(".venv");
-    for name in ["python3", "python"] {
-        let p = venv.join("bin").join(name);
-        if p.is_file() {
-            return Some((p, venv.canonicalize().ok()));
-        }
-    }
+) -> Option<std::path::PathBuf> {
+    let venv = root.join(".venv").join("bin");
     ["python3", "python"]
         .iter()
-        .find_map(|n| find(n))
-        .map(|p| (p, None))
+        .map(|n| venv.join(n))
+        .find(|p| p.is_file())
+        .or_else(|| ["python3", "python"].iter().find_map(|n| find(n)))
+        .and_then(|p| p.canonicalize().ok())
+}
+
+/// The outermost `*.app` bundle holding `p`, else `none`.
+fn outermost_app(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    p.ancestors()
+        .filter(|a| a.extension().is_some_and(|e| e == "app"))
+        .last()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// The parts of a Python install the interpreter reads, never the whole prefix (a prefix such as
+/// `~/.local` also holds the user's data): `bin`, `lib`, `lib64`, a framework's `Python` and a venv's
+/// `pyvenv.cfg`, those that exist.
+fn python_install(prefix: &std::path::Path) -> Vec<std::path::PathBuf> {
+    ["bin", "lib", "lib64", "Python", "pyvenv.cfg"]
+        .iter()
+        .map(|p| prefix.join(p))
+        .filter(|p| p.exists())
+        .collect()
 }
 
 /// (core#1335) What the render jail may read beside the system's own directories and its write
-/// roots: the draft file, the garden root, the `.venv` its interpreter came from, the interpreter's
-/// install prefix (its real path's grandparent: `<prefix>/bin/python3`) and the renderer's install
-/// (its outermost `*.app` bundle, else its directory). The jail itself drops `/` and any root that
-/// holds the home directory ([`crate::validator::render_jail`]).
+/// roots: the draft file, the garden root, the interpreter's install and the renderer's install (its
+/// outermost `*.app` bundle, else its directory) and both binaries themselves. `python` and `renderer`
+/// are the real paths the jail runs. The interpreter's install is [`python_install`] of its
+/// grandparent (`<prefix>/bin/python3`); a copied venv's interpreter also names its base install
+/// (`pyvenv.cfg` `home`, a `bin` dir); and a macOS `/usr/bin` shim runs the selected developer dir's
+/// Python (`xcode_select`, the target of `/private/var/db/xcode_select_link`: its `.app`, else the
+/// dir). The jail itself drops `/` and any root that holds the home directory
+/// ([`crate::validator::render_jail`]).
 pub(crate) fn render_read_roots(
     draft: &std::path::Path,
     garden: &std::path::Path,
     python: &std::path::Path,
-    venv: Option<&std::path::Path>,
     renderer: &std::path::Path,
+    xcode_select: Option<&std::path::Path>,
 ) -> Vec<std::path::PathBuf> {
-    let real = |p: &std::path::Path| p.canonicalize().ok();
-    let mut out: Vec<std::path::PathBuf> = vec![draft.to_path_buf(), garden.to_path_buf()];
-    out.extend(venv.map(std::path::Path::to_path_buf));
+    let mut out: Vec<std::path::PathBuf> = vec![
+        draft.to_path_buf(),
+        garden.to_path_buf(),
+        python.to_path_buf(),
+    ];
+    if let Some(prefix) = python.parent().and_then(std::path::Path::parent) {
+        out.extend(python_install(prefix));
+        let base = std::fs::read_to_string(prefix.join("pyvenv.cfg"))
+            .ok()
+            .and_then(|cfg| {
+                cfg.lines().find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == "home").then(|| std::path::PathBuf::from(v.trim()))
+                })
+            })
+            .and_then(|bin| bin.canonicalize().ok());
+        if let Some(base) = base.as_deref().and_then(std::path::Path::parent) {
+            out.extend(python_install(base));
+        }
+    }
+    if python.starts_with("/usr/bin") {
+        out.extend(xcode_select.map(|dev| outermost_app(dev).unwrap_or_else(|| dev.to_path_buf())));
+    }
+    out.push(renderer.to_path_buf());
     out.extend(
-        real(python)
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf),
+        outermost_app(renderer).or_else(|| renderer.parent().map(std::path::Path::to_path_buf)),
     );
-    out.extend(real(renderer).map(|r| {
-        r.ancestors()
-            .filter(|a| a.extension().is_some_and(|e| e == "app"))
-            .last()
-            .or_else(|| r.parent())
-            .unwrap_or(&r)
-            .to_path_buf()
-    }));
     out
 }
 
@@ -782,7 +811,8 @@ mod tests {
     }
 
     /// (core#1336) A root without a `.venv` runs the counter with `python3` (then `python`) from
-    /// `PATH`; a `.venv` interpreter wins and names its venv; none at all is `None`.
+    /// `PATH`; a `.venv` interpreter wins; none at all is `None`. Each is its REAL path (CI's PATH
+    /// python3 is a link in a probe venv; the jail runs the real path).
     #[cfg(unix)]
     #[test]
     fn the_interpreter_is_the_venvs_else_python3_on_path() {
@@ -790,22 +820,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("root")).unwrap();
         let root = d.join("root");
-        let on_path = |n: &str| (n == "python3").then(|| std::path::PathBuf::from("/x/python3"));
-        assert_eq!(
-            interpreter(&root, &on_path),
-            Some((std::path::PathBuf::from("/x/python3"), None))
-        );
-        let only_python = |n: &str| (n == "python").then(|| std::path::PathBuf::from("/x/python"));
-        assert_eq!(
-            interpreter(&root, &only_python).map(|(p, _)| p),
-            Some(std::path::PathBuf::from("/x/python"))
-        );
+        let base = d.join("base/bin");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("python3.12"), "").unwrap();
+        std::fs::create_dir_all(d.join("probe/bin")).unwrap();
+        std::os::unix::fs::symlink(base.join("python3.12"), d.join("probe/bin/python3")).unwrap();
+        let real3 = base.join("python3.12").canonicalize().unwrap();
+        let probe = d.join("probe/bin/python3");
+        let on_path = |n: &str| (n == "python3").then(|| probe.clone());
+        assert_eq!(interpreter(&root, &on_path), Some(real3.clone()));
+        let only_python = |n: &str| (n == "python").then(|| base.join("python3.12"));
+        assert_eq!(interpreter(&root, &only_python), Some(real3.clone()));
         assert_eq!(interpreter(&root, &|_| None), None);
+        let gone = |_: &str| Some(d.join("nowhere/python3"));
+        assert_eq!(interpreter(&root, &gone), None);
         std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
         std::fs::write(root.join(".venv/bin/python"), "").unwrap();
-        let (p, venv) = interpreter(&root, &on_path).unwrap();
-        assert_eq!(p, root.join(".venv/bin/python"));
-        assert_eq!(venv, root.join(".venv").canonicalize().ok());
+        assert_eq!(
+            interpreter(&root, &on_path),
+            root.join(".venv/bin/python").canonicalize().ok()
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -835,55 +869,71 @@ mod tests {
     }
 
     /// (core#1335) The renderer's install is its outermost `.app` bundle, else its directory; the
-    /// interpreter's is its real path's grandparent.
+    /// interpreter's is the parts of its grandparent it reads (never the whole prefix), plus a copied
+    /// venv's base install and a `/usr/bin` shim's developer dir; both binaries are named too.
     #[cfg(unix)]
     #[test]
     fn the_read_roots_name_the_installs_not_the_binaries() {
         let d = std::env::temp_dir().join(format!("wc-dr-reads-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let app = d.join("Chrome.app/Contents/MacOS");
-        let shell = d.join("shell");
-        let py = d.join("py/bin");
-        for x in [&app, &shell, &py] {
-            std::fs::create_dir_all(x).unwrap();
+        for x in ["py/bin", "py/lib/python3.13", "py/share/secrets"] {
+            std::fs::create_dir_all(d.join(x)).unwrap();
         }
-        for f in [
-            app.join("Chrome"),
-            shell.join("headless"),
-            py.join("python3.13"),
-        ] {
-            std::fs::write(f, "").unwrap();
-        }
-        std::os::unix::fs::symlink(py.join("python3.13"), d.join("python3")).unwrap();
-        let real = |p: std::path::PathBuf| p.canonicalize().unwrap();
-        let draft = d.join("doc.html");
-        let garden = d.join("garden");
-        let r = render_read_roots(
-            &draft,
-            &garden,
-            &d.join("python3"),
-            None,
-            &app.join("Chrome"),
-        );
+        std::fs::write(d.join("py/Python"), "").unwrap();
+        let app = d.join("Chrome.app/Contents/MacOS/Chrome");
+        let shell = d.join("shell/headless");
+        let py = d.join("py/bin/python3.13");
+        let (draft, garden) = (d.join("doc.html"), d.join("garden"));
         assert_eq!(
-            r,
+            render_read_roots(&draft, &garden, &py, &app, None),
             vec![
                 draft.clone(),
                 garden.clone(),
-                real(d.join("py")),
-                real(d.join("Chrome.app"))
+                py.clone(),
+                d.join("py/bin"),
+                d.join("py/lib"),
+                d.join("py/Python"),
+                app.clone(),
+                d.join("Chrome.app")
             ]
         );
-        let venv = d.join("venv");
-        let r = render_read_roots(
-            &draft,
-            &garden,
-            &d.join("python3"),
-            Some(&venv),
-            &shell.join("headless"),
+        let r = render_read_roots(&draft, &garden, &py, &shell, None);
+        assert!(
+            !r.contains(&d.join("py")) && !r.contains(&d.join("py/share")),
+            "{r:?}"
         );
-        assert_eq!(r[2], venv);
-        assert_eq!(r[4], real(shell));
+        assert_eq!(r[r.len() - 2..], [shell.clone(), d.join("shell")]);
+        // A copied venv: its own install, and the base install its pyvenv.cfg names.
+        std::fs::create_dir_all(d.join("base/bin")).unwrap();
+        std::fs::create_dir_all(d.join("base/lib")).unwrap();
+        std::fs::create_dir_all(d.join("venv/bin")).unwrap();
+        std::fs::write(
+            d.join("venv/pyvenv.cfg"),
+            format!(
+                "include-system-site-packages = false\nhome = {}\n",
+                d.join("base/bin").display()
+            ),
+        )
+        .unwrap();
+        let r = render_read_roots(&draft, &garden, &d.join("venv/bin/python3"), &shell, None);
+        let base = d.join("base").canonicalize().unwrap();
+        assert!(
+            r.contains(&d.join("venv/pyvenv.cfg"))
+                && r.contains(&base.join("bin"))
+                && r.contains(&base.join("lib")),
+            "{r:?}"
+        );
+        // A macOS /usr/bin shim runs the selected developer dir's Python: a full Xcode's bundle, or
+        // the Command Line Tools dir. Any other interpreter ignores it.
+        let xcode = std::path::Path::new("/Applications/Xcode.app/Contents/Developer");
+        let clt = std::path::Path::new("/Library/Developer/CommandLineTools");
+        let usr = std::path::Path::new("/usr/bin/python3");
+        let xapp = std::path::PathBuf::from("/Applications/Xcode.app");
+        assert!(render_read_roots(&draft, &garden, usr, &shell, Some(xcode)).contains(&xapp));
+        assert!(
+            render_read_roots(&draft, &garden, usr, &shell, Some(clt)).contains(&clt.to_path_buf())
+        );
+        assert!(!render_read_roots(&draft, &garden, &py, &shell, Some(xcode)).contains(&xapp));
         let _ = std::fs::remove_dir_all(&d);
     }
 
