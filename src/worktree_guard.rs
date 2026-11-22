@@ -540,7 +540,7 @@ pub fn pinned_git_dir(worktree: &Path, repo_root: &Path) -> anyhow::Result<PathB
 
 /// `std::fs::canonicalize` on Windows yields a verbatim (`\\?\`) path, which git refuses as a
 /// `GIT_DIR` ("not a git repository"); hand git the plain spelling. A no-op elsewhere.
-fn plain_path(p: PathBuf) -> PathBuf {
+pub(crate) fn plain_path(p: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         let s = p.to_string_lossy();
