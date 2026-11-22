@@ -4353,6 +4353,50 @@ fn the_floors_copies_keep_the_declared_line_endings() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// (core#1131) A path that starts with a space or ends in CR is converted under ITS OWN
+/// attributes: git's batch parser drops the whitespace after the id and reads a trailing CR as the
+/// line ending, so ` x.cmd` and `Icon\r` used to be converted under `x.cmd`'s and `Icon`'s
+/// `-text` and stayed LF. Their neighbours, through the batch, keep theirs.
+#[cfg(unix)]
+#[test]
+fn an_odd_path_is_converted_under_its_own_attributes_1131() {
+    let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs");
+        return;
+    }
+    let repo = scratch("export-odd");
+    std::fs::write(
+        repo.join(".gitattributes"),
+        "*.cmd text eol=crlf\n/x.cmd -text\nIcon* text eol=crlf\n/Icon -text\n",
+    )
+    .unwrap();
+    for name in [" x.cmd", "x.cmd", "Icon\r", "Icon"] {
+        std::fs::write(repo.join(name), "a\nb\n").unwrap();
+    }
+    let head = git_repo_with_commit(&repo);
+    let git_dir = repo.join(".git");
+    let _scratch = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &git_dir, &head).unwrap();
+    let read = |name: &str| std::fs::read(base.dir.join(name)).unwrap();
+    assert_eq!(
+        read(" x.cmd"),
+        b"a\r\nb\r\n",
+        "` x.cmd` under its own `*.cmd`"
+    );
+    assert_eq!(
+        read("Icon\r"),
+        b"a\r\nb\r\n",
+        "`Icon\\r` under its own `Icon*`"
+    );
+    assert_eq!(read("x.cmd"), b"a\nb\n", "`x.cmd` keeps its `-text`");
+    assert_eq!(read("Icon"), b"a\nb\n", "`Icon` keeps its `-text`");
+    drop(base);
+    let _ = remove_base_export(&root);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// On a git without `--attr-source` (older than 2.40) the export falls back to the raw blobs, as
 /// before eol conversion existed, instead of failing every floor export: every entry is still
 /// written, a regular file holds its stored bytes and a symlink keeps its target.

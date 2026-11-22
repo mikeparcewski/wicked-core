@@ -130,10 +130,30 @@ pub fn log_root(store_path: &str) -> PathBuf {
     PathBuf::from(format!("{store_path}.events"))
 }
 
-/// [`log_root`], or `None` for an in-memory store (`:memory:`), which has no sidecar anchor and must
-/// create no directory: `:memory:.events/` would land in the process's working directory.
+/// [`log_root`], or `None` for an in-memory store, which has no sidecar anchor and must create no
+/// directory: `:memory:.events/` would land in the process's working directory.
 pub fn log_root_for(store_path: &str) -> Option<PathBuf> {
-    (store_path != ":memory:").then(|| log_root(store_path))
+    (!in_memory_spec(store_path)).then(|| log_root(store_path))
+}
+
+/// (core#1131) Does SQLite open `spec` as an in-memory database? `:memory:`; `""` (a private
+/// temporary database, deleted on close); and the URI forms the store accepts (rusqlite opens with
+/// `SQLITE_OPEN_URI`): `file::memory:` with any query, and a `file:` URI whose query sets
+/// `mode=memory` or `vfs=memdb`.
+pub(crate) fn in_memory_spec(spec: &str) -> bool {
+    if spec == ":memory:" || spec.is_empty() {
+        return true;
+    }
+    let Some(uri) = spec.strip_prefix("file:") else {
+        return false;
+    };
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let path = path.split_once('#').map_or(path, |(p, _)| p);
+    let query = query.split_once('#').map_or(query, |(q, _)| q);
+    path == ":memory:"
+        || query
+            .split('&')
+            .any(|kv| kv == "mode=memory" || kv == "vfs=memdb")
 }
 
 /// `<root>/<encoded-run-id>.ndjson`.
@@ -543,6 +563,11 @@ pub struct EventSink {
     /// Where this sink records. `None` ⇒ fan out only, for embedders and tests that want no
     /// filesystem writes.
     root: Option<PathBuf>,
+    /// (core#1131) With no `root`: when each run's CURRENT life launched (the epoch millis of its
+    /// last `sessionStarted`, as [`run_started_ms`] reads it from a log), kept in memory so an
+    /// in-memory core's deliverable floor can still date its output. A relaunch replaces the stamp;
+    /// a resume emits no marker and keeps it.
+    launches: std::collections::HashMap<String, i64>,
 }
 
 impl EventSink {
@@ -552,6 +577,7 @@ impl EventSink {
             subscribers: Vec::new(),
             root: Some(root),
             asks: Default::default(),
+            launches: Default::default(),
         }
     }
 
@@ -560,6 +586,13 @@ impl EventSink {
     /// filesystem writes), and a caller that needs the durable trail has to handle that.
     pub(crate) fn log_root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// (core#1131) A sink with no root: when `run_id`'s current life launched, as this sink saw
+    /// its `sessionStarted`. `None` for a run it never saw launch (an embedder that drives the
+    /// fold directly) — and always for a recording sink, whose log is the record.
+    pub(crate) fn launched_ms(&self, run_id: &str) -> Option<i64> {
+        self.launches.get(run_id).copied()
     }
 
     /// Resolve displayed asks and discard queued asks before the actor exits.
@@ -582,6 +615,9 @@ impl EventSink {
     pub fn emit(&mut self, ev: CoreEvent) {
         if let Some(root) = &self.root {
             append(root, &ev);
+        } else if let CoreEvent::SessionStarted { session, .. } = &ev {
+            self.launches
+                .insert(session.clone(), crate::interaction::now_millis());
         }
         self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
         if let CoreEvent::RunCancelled { session, .. }
@@ -887,6 +923,40 @@ mod tests {
         );
     }
 
+    /// (core#1131) A sink with no root (an in-memory core) remembers when each run's current life
+    /// launched, so its deliverable floor can date output; a relaunch replaces the stamp, another
+    /// run keeps its own, and a recording sink keeps none (its log is the record).
+    #[test]
+    fn a_rootless_sink_remembers_each_runs_launch() {
+        let started = |run: &str| CoreEvent::SessionStarted {
+            session: run.to_string(),
+            problem: "p".to_string(),
+            workflow_id: None,
+            cli_count: 1,
+            governed: false,
+            entity_mode: "shared".to_string(),
+            assurance: Default::default(),
+        };
+        let mut sink = EventSink::default();
+        assert_eq!(sink.launched_ms("r1"), None);
+        let before = crate::interaction::now_millis();
+        sink.emit(started("r1"));
+        let first = sink.launched_ms("r1").expect("the launch is remembered");
+        assert!(first >= before, "{first} >= {before}");
+        assert_eq!(sink.launched_ms("r2"), None, "another run keeps its own");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        sink.emit(started("r1"));
+        assert!(
+            sink.launched_ms("r1").unwrap() > first,
+            "a relaunch replaces it"
+        );
+        let root = tmp("rootless-launch");
+        let mut recording = EventSink::persistent(root.clone());
+        recording.emit(started("r3"));
+        assert_eq!(recording.launched_ms("r3"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The whole point of the finding: a run with NO live subscriber must still leave a complete,
     /// ordered, timestamped trail. Under the old fanout-only `emit` this recorded nothing at all.
     ///
@@ -1169,6 +1239,20 @@ mod tests {
     #[test]
     fn an_in_memory_store_has_no_log_root() {
         assert_eq!(log_root_for(":memory:"), None);
+        // (core#1131) Every spelling SQLite opens in memory, and the private temporary database.
+        for spec in [
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:x?mode=memory",
+            "file:x?cache=shared&mode=memory",
+            "file:/x/core.db?vfs=memdb",
+        ] {
+            assert_eq!(log_root_for(spec), None, "{spec:?}");
+        }
+        for spec in ["file:/x/core.db", "file:/x/core.db?mode=rwc", "memory.db"] {
+            assert!(log_root_for(spec).is_some(), "{spec:?}");
+        }
         assert_eq!(
             log_root_for("/var/lib/wicked/core.db"),
             Some(log_root("/var/lib/wicked/core.db"))

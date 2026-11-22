@@ -8993,7 +8993,11 @@ fn apply_step_result(
         // durable trail and cannot be dated from it is refused rather than waved through on
         // whatever was lying in the write root.
         let launch = match subscribers.log_root() {
-            None => crate::path_policy::LaunchClock::Unrecorded,
+            // (core#1131) An in-memory core keeps no log, but its sink saw the launch.
+            None => match subscribers.launched_ms(&run_id) {
+                Some(ms) => crate::path_policy::LaunchClock::At(ms),
+                None => crate::path_policy::LaunchClock::Unrecorded,
+            },
             Some(root) => match crate::event_log::run_started_ms(root, &run_id) {
                 Some(ms) => crate::path_policy::LaunchClock::At(ms),
                 None => crate::path_policy::LaunchClock::Undatable,
@@ -36192,6 +36196,60 @@ mod deliverable_floor_tests {
         let _ = std::fs::remove_dir_all(&logs);
         let _ = std::fs::remove_dir_all(&fresh_logs);
         let _ = std::fs::remove_dir_all(blank_logs.parent().unwrap());
+    }
+
+    /// core#1131: an in-memory core keeps no event log, but its sink saw the launch: the
+    /// deliverable floor dates output against it, so a prior run's leftover in a shared write
+    /// root is refused rather than passed on presence alone. A run the sink never saw launch (an
+    /// embedder driving the fold directly) keeps the presence-only judgement.
+    #[test]
+    fn an_in_memory_cores_deliverable_floor_dates_against_the_launch_its_sink_saw() {
+        let inbox = tmp("mem-stale-inbox");
+        let draft = inbox.join("draft.html");
+        std::fs::write(&draft, "<p>a prior run's draft</p>").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&draft)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3_600))
+            .unwrap();
+        let roots = vec![inbox.to_string_lossy().into_owned()];
+        let run_id = format!("deliv-mem-stale-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            roots.clone(),
+            vec!["draft.html".into()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        subs.emit(CoreEvent::SessionStarted {
+            session: run_id.clone(),
+            problem: "p".into(),
+            workflow_id: None,
+            cli_count: 1,
+            governed: false,
+            entity_mode: "shared".into(),
+            assurance: Default::default(),
+        });
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "{:?}",
+            unit.denial_reason
+        );
+        let why = unit.denial_reason.unwrap_or_default();
+        assert!(why.contains("draft.html") && why.contains("stale"), "{why}");
+
+        let unseen = format!("deliv-mem-unseen-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &unseen, None, roots, vec!["draft.html".into()]);
+        let mut subs = crate::event_log::EventSink::default();
+        let (_session, unit) = fold(&mut store, &mut subs, &unseen);
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        let _ = std::fs::remove_dir_all(&inbox);
     }
 }
 
