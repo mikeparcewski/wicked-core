@@ -4353,6 +4353,133 @@ fn the_floors_copies_keep_the_declared_line_endings() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// (core#1131) A path that starts with a space or ends in CR is converted under ITS OWN
+/// attributes: git's batch parser drops the whitespace after the id and reads a trailing CR as the
+/// line ending, so ` x.cmd` and `Icon\r` used to be converted under `x.cmd`'s and `Icon`'s
+/// `-text` and stayed LF. Their neighbours, through the batch, keep theirs.
+#[cfg(unix)]
+#[test]
+fn an_odd_path_is_converted_under_its_own_attributes_1131() {
+    let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs");
+        return;
+    }
+    let repo = scratch("export-odd");
+    std::fs::write(
+        repo.join(".gitattributes"),
+        "*.cmd text eol=crlf\n/x.cmd -text\nIcon* text eol=crlf\n/Icon -text\n",
+    )
+    .unwrap();
+    for name in [" x.cmd", "x.cmd", "Icon\r", "Icon"] {
+        std::fs::write(repo.join(name), "a\nb\n").unwrap();
+    }
+    let head = git_repo_with_commit(&repo);
+    let git_dir = repo.join(".git");
+    let _scratch = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &git_dir, &head).unwrap();
+    let read = |name: &str| std::fs::read(base.dir.join(name)).unwrap();
+    assert_eq!(
+        read(" x.cmd"),
+        b"a\r\nb\r\n",
+        "` x.cmd` under its own `*.cmd`"
+    );
+    assert_eq!(
+        read("Icon\r"),
+        b"a\r\nb\r\n",
+        "`Icon\\r` under its own `Icon*`"
+    );
+    assert_eq!(read("x.cmd"), b"a\nb\n", "`x.cmd` keeps its `-text`");
+    assert_eq!(read("Icon"), b"a\nb\n", "`Icon` keeps its `-text`");
+    drop(base);
+    let _ = remove_base_export(&root);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (core#1131, coord r1 on #1765) The odd-path routing on EVERY OS: `cat_batch` (which the pod
+/// export shares) converts ` x.cmd` and `Icon\r` under their own attributes and their neighbours
+/// under theirs, straight from blobs (no file is written, so a name Windows cannot hold is fine).
+/// Past [`ODD_PATH_CAP`] odd paths, it fails closed before running any git.
+#[test]
+fn odd_paths_convert_under_their_own_attributes_on_every_os_1131() {
+    let repo = scratch("export-odd-batch");
+    std::fs::write(repo.join("blob.txt"), "a\nb\n").unwrap();
+    git(&repo, &["init", "-q"]);
+    // Git for Windows refuses an index path with a control character (`Icon\r`) under its
+    // default `core.protectNTFS`; this tree is only ever read as blobs.
+    git(&repo, &["config", "core.protectNTFS", "false"]);
+    let attrs = repo.join("attrs.txt");
+    std::fs::write(
+        &attrs,
+        "*.cmd text eol=crlf\n/x.cmd -text\nIcon* text eol=crlf\n/Icon -text\n",
+    )
+    .unwrap();
+    let blob = git(&repo, &["hash-object", "-w", "--no-filters", "blob.txt"]);
+    let attrs_blob = git(&repo, &["hash-object", "-w", "--no-filters", "attrs.txt"]);
+    let names = [" x.cmd", "x.cmd", "Icon\r", "Icon"];
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{attrs_blob},.gitattributes"),
+        ],
+    );
+    for n in names {
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{n}"),
+            ],
+        );
+    }
+    let tree = git(&repo, &["write-tree"]);
+    let git_dir = repo.join(".git");
+    // The cap is checked before any git runs.
+    let many: Vec<String> = (0..=ODD_PATH_CAP)
+        .map(|i| format!("{blob}  odd{i}"))
+        .collect();
+    let mut called = false;
+    let err = cat_batch(&git_dir, &tree, true, many, |_, _| {
+        called = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.contains("at most 64"), "{err}");
+    assert!(!called);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40)");
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
+    let mut got: Vec<(usize, Vec<u8>)> = Vec::new();
+    cat_batch(
+        &git_dir,
+        &tree,
+        true,
+        names.iter().map(|n| format!("{blob} {n}")).collect(),
+        |i, body| {
+            got.push((i, body));
+            Ok(())
+        },
+    )
+    .unwrap();
+    got.sort();
+    let want: Vec<(usize, Vec<u8>)> = vec![
+        (0, b"a\r\nb\r\n".to_vec()),
+        (1, b"a\nb\n".to_vec()),
+        (2, b"a\r\nb\r\n".to_vec()),
+        (3, b"a\nb\n".to_vec()),
+    ];
+    assert_eq!(got, want);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// On a git without `--attr-source` (older than 2.40) the export falls back to the raw blobs, as
 /// before eol conversion existed, instead of failing every floor export: every entry is still
 /// written, a regular file holds its stored bytes and a symlink keeps its target.

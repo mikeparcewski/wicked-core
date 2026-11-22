@@ -7537,6 +7537,10 @@ fn write_private_git_dir(
     Ok(())
 }
 
+/// (core#1131) The most paths [`cat_batch`] converts one git at a time (a path that starts with
+/// whitespace or ends in CR); more fail the export closed.
+const ODD_PATH_CAP: usize = 64;
+
 /// The path given to the end-of-body request (any; the object is missing).
 const SENTINEL_PATH: &str = "wicked-end";
 
@@ -7553,6 +7557,41 @@ fn cat_batch(
     mut each: impl FnMut(usize, Vec<u8>) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::io::{BufRead, Read, Write};
+    // (core#1131) git's batch parser drops the whitespace between the id and the path, and reads
+    // a trailing CR as part of the line ending: a path that starts with a space or a tab, or ends
+    // in CR, would be converted under ANOTHER name's attributes. Each such path is converted on
+    // its own ([`cat_one_filtered`]: the path is an argv element, byte-exact); the rest go
+    // through the batch, each answered under its original index.
+    let odd = |line: &str| {
+        line.split_once(' ')
+            .is_some_and(|(_, p)| p.starts_with([' ', '\t']) || p.ends_with('\r'))
+    };
+    // (coord r1 on #1765) Each odd path costs its own git: past the cap, the export fails closed
+    // (the base is then unknown, never compared) instead of spawning one git per file of a tree
+    // built to hold thousands of them.
+    let odd_count = if filtered {
+        inputs.iter().filter(|l| odd(l)).count()
+    } else {
+        0
+    };
+    if odd_count > ODD_PATH_CAP {
+        return Err(format!(
+            "the tree has {odd_count} paths that start with whitespace or end in CR; the export \
+             converts at most {ODD_PATH_CAP} of them one by one"
+        ));
+    }
+    let mut at: Vec<usize> = Vec::with_capacity(inputs.len());
+    let mut batch: Vec<String> = Vec::with_capacity(inputs.len());
+    for (i, line) in inputs.into_iter().enumerate() {
+        if filtered && odd(&line) {
+            let (oid, path) = line.split_once(' ').expect("an odd line has a path");
+            each(i, cat_one_filtered(conv_git_dir, tree, oid, path)?)?;
+        } else {
+            at.push(i);
+            batch.push(line);
+        }
+    }
+    let inputs = batch;
     if inputs.is_empty() {
         return Ok(());
     }
@@ -7603,7 +7642,7 @@ fn cat_batch(
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
     let mut answer = || -> Result<(), String> {
-        for i in 0..n {
+        for &i in at.iter().take(n) {
             let mut header = String::new();
             out.read_line(&mut header).map_err(|e| e.to_string())?;
             let mut words = header.split_whitespace();
@@ -7641,6 +7680,44 @@ fn cat_batch(
     let _ = feeder.join();
     let _ = child.wait();
     answered
+}
+
+/// (core#1131) One blob `oid`, converted as `git checkout` would write it at `path` under `tree`'s
+/// attributes, by its own `git cat-file --filters --path=<path>` in the private repository
+/// `conv_git_dir` ([`cat_batch`]'s settings): the path reaches git as an argv element, so a
+/// leading space or a trailing CR is part of the name the attributes are matched against.
+fn cat_one_filtered(
+    conv_git_dir: &Path,
+    tree: &str,
+    oid: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let attr_source = format!("--attr-source={tree}");
+    let path_arg = format!("--path={path}");
+    // spawn-audit: hardened — git plumbing over a private repository holding no driver config.
+    let mut cat = Command::new("git");
+    cat.hardened()
+        .args([
+            "-c",
+            "core.bare=true",
+            attr_source.as_str(),
+            "cat-file",
+            "--filters",
+            path_arg.as_str(),
+            oid,
+        ])
+        .current_dir(conv_git_dir)
+        .env("GIT_DIR", conv_git_dir)
+        .stdin(std::process::Stdio::null());
+    isolate_git_config(&mut cat);
+    let out = cat.output().map_err(|e| format!("git cat-file: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file --filters for {path:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
 }
 
 /// Stream blobs, optionally converted under `tree`'s own attributes and only the source
