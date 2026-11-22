@@ -5433,6 +5433,11 @@ impl RuleJudge for SpanJudge {
 /// The server (its header as git writes it), `filler` lines of data between it and its test, then
 /// the test: the two land in different parts.
 fn span_change_at(filler: usize, server_path: &str, server_header: &str) -> Change {
+    span_change_with(filler, server_path, server_header, "fixtures/data.json")
+}
+
+/// [`span_change_at`] with the data file between the server and its test at `data`.
+fn span_change_with(filler: usize, server_path: &str, server_header: &str, data: &str) -> Change {
     let server = format!(
         "{server_header}\nnew file mode 100644\n--- /dev/null\n+++ b/{server_path}\n@@ -0,0 +1 @@\n\
          +export const handler = () => '{SERVER_MARK}';\n"
@@ -5442,14 +5447,8 @@ fn span_change_at(filler: usize, server_path: &str, server_header: &str) -> Chan
          /dev/null\n+++ b/test/server.test.ts\n@@ -0,0 +1 @@\n+test('handler', () => \
          expect(handler()).toBe('{TEST_MARK}'));\n"
     );
-    let diff = format!(
-        "{server}{}{test}",
-        big_file("fixtures/data.json", filler, 30)
-    );
-    change_of(
-        &diff,
-        &[server_path, "fixtures/data.json", "test/server.test.ts"],
-    )
+    let diff = format!("{server}{}{test}", big_file(data, filler, 30));
+    change_of(&diff, &[server_path, data, "test/server.test.ts"])
 }
 
 fn span_change(filler: usize) -> Change {
@@ -5636,12 +5635,12 @@ fn core_1791_a_scoped_kept_silent_on_a_not_shown_file_is_not_counted() {
         &c,
         &judge,
     );
-    let row = row(&r, "SKIPS-LIST");
-    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    let got = row(&r, "SKIPS-LIST");
+    assert_eq!(got.status, RuleStatus::Unchecked, "{got:?}");
     assert!(
-        row.reason.contains("each changed file listed as not shown"),
+        got.reason.contains("each changed file listed as not shown"),
         "{}",
-        row.reason
+        got.reason
     );
     let seen = judge.seen.lock().unwrap();
     let scoped: Vec<&String> = seen
@@ -5655,6 +5654,31 @@ fn core_1791_a_scoped_kept_silent_on_a_not_shown_file_is_not_counted() {
         .nth(1)
         .expect("the not-shown list");
     assert!(list.contains("fixtures/data.json\n"), "{list}");
+    // (codex r1) The engine's own lead on a scoped cite ("…, read together: …") names no file for
+    // the judge: a not-shown file named `together` is still unaddressed.
+    let c = span_change_with(
+        4000,
+        "src/server.ts",
+        "diff --git a/src/server.ts b/src/server.ts",
+        "together",
+    );
+    let judge2 = SpanJudge::new("");
+    let r = span_check(
+        &[rule("SKIPS-LIST", "every handler has a test")],
+        &c,
+        &judge2,
+    );
+    let row2 = row(&r, "SKIPS-LIST");
+    assert_eq!(row2.status, RuleStatus::Unchecked, "{row2:?}");
+    assert!(
+        judge2
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, p)| p.starts_with(SCOPE_NOTE) && p.contains("\ntogether\n")),
+        "asked on the named files with `together` listed as not shown"
+    );
     // The judge is told a KEPT names each listed file.
     assert!(
         scoped[0].contains("A KEPT names EACH of them"),

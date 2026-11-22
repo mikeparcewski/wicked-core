@@ -1479,6 +1479,9 @@ const SCOPE_NOTE: &str =
      a changed file not shown (one CHANGED, NOT SHOWN below among them), answer UNKNOWN and name \
      it.\n\n";
 
+/// (core#1278 item 4) What leads a cite given on the files the parts named.
+const SCOPED_CITE: &str = "on the files the parts named, read together: ";
+
 /// (core#1278 item 4, coord F1) The files the undecided parts showed but no judge named for the
 /// rule, listed after [`SCOPE_NOTE`] (fenced: file names are untrusted data), so the judge on the
 /// named files knows they exist. A KEPT still cites a file shown, and (core#1791) names each file
@@ -4669,10 +4672,7 @@ fn run_pool(
                         };
                         if scoped.is_some() {
                             for a in parsed.answers.values_mut() {
-                                a.cite = format!(
-                                    "on the files the parts named, read together: {}",
-                                    a.cite
-                                );
+                                a.cite = format!("{SCOPED_CITE}{}", a.cite);
                             }
                         }
                         // (pi r2) A judge shown only part of the diff can find a rule broken, never
@@ -4744,9 +4744,16 @@ fn run_pool(
                                 // planted in the change) is no answer.
                                 Some(ans)
                                     if ans.status == RuleStatus::Kept
-                                        && unshown
-                                            .iter()
-                                            .any(|f| !names_whole_path(&ans.cite, f)) =>
+                                        && unshown.iter().any(|f| {
+                                            // The judge's own words, never the engine's lead
+                                            // (codex r1: a file named `together`).
+                                            !names_whole_path(
+                                                ans.cite
+                                                    .strip_prefix(SCOPED_CITE)
+                                                    .unwrap_or(&ans.cite),
+                                                f,
+                                            )
+                                        }) =>
                                 {
                                     Miss::Barred(
                                         "its KEPT did not name, by its whole path, each changed \
