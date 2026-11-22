@@ -4621,6 +4621,83 @@ fn k8s_a_read_only_repo_is_copied_as_git_lists_it_not_whole() {
     let _ = std::fs::remove_dir_all(&replica);
 }
 
+/// core#1781 (run faa858e7): a governed unit on a repository inside a project armed no seat. The
+/// container's read roots carried the bound project's graph directory, the plan made it a plain
+/// root, and its `code-graph.db` (814 MB on the operator's daemon) passed the stream's limit, so
+/// every seat was refused `copy_in_refused` before its first step. The seat reads its graph through
+/// crew's estate relay; its copy-in now carries no project graph. Before the fix: "the unit's
+/// copy-in is larger than 536870912 bytes (at …/project-graphs/<id>/code-graph.db)".
+#[cfg(unix)]
+#[test]
+fn k8s_a_unit_bound_to_an_oversized_project_graph_arms_without_copying_it() {
+    let host = tmp("project-graph");
+    let tree = host.join("wt");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("lib.rs"), "pub fn mode() {}").unwrap();
+    let state_home = host.join("state");
+    let graph_dir = state_home.join("project-graphs").join("proj-a");
+    std::fs::create_dir_all(&graph_dir).unwrap();
+    let db = graph_dir.join("code-graph.db");
+    // Sparse: over the whole stream's limit, with no disk behind it.
+    std::fs::File::create(&db)
+        .unwrap()
+        .set_len(sync::MAX_STREAM + 1)
+        .unwrap();
+    std::fs::write(graph_dir.join("manifest.json"), "{}").unwrap();
+    let extra = host.join("handoff");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(extra.join("brief.md"), "b").unwrap();
+    let gov = crate::workflow::GovernanceContext {
+        human_confirm: Default::default(),
+        db_path: state_home.join("core.db").to_string_lossy().into_owned(),
+        code_graph_db: Some(db.to_string_lossy().into_owned()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: vec![extra.to_string_lossy().into_owned()],
+        project_id: Some("proj-a".to_string()),
+        repo_id: None,
+        apps: None,
+    };
+    // A codex seat (no gate-hook roots) and a claude seat whose gate-hook roots name the graph.
+    for gov_roots in [Vec::new(), vec![graph_dir.clone()]] {
+        let reads = crate::execute_wrapped::seat_read_roots(
+            Some(&gov),
+            None,
+            gov_roots,
+            &[],
+            Some(&state_home),
+        );
+        let mut mounts = vec![PlanMount::Bind {
+            path: tree.clone(),
+            rw: true,
+        }];
+        mounts.extend(
+            reads
+                .into_iter()
+                .map(|path| PlanMount::Bind { path, rw: false }),
+        );
+        let (roots, pod) = seat::plan(&tree, false, &mounts, &[], &[], None);
+        let (body, _, _, _, _) =
+            seat::copy_in_stream(None, &tree, &roots, false, &Default::default())
+                .unwrap_or_else(|e| panic!("the unit's copy-in is refused: {e:?}"));
+        assert!(
+            pod.iter().all(|m| !m.path.starts_with(&graph_dir)),
+            "the pod mounts no project graph: {pod:?}"
+        );
+        let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
+        let graph_replica = seat::replica_of(None, &graph_dir).unwrap();
+        assert!(
+            decoded
+                .iter()
+                .all(|d| !sync::under(&d.replica, &graph_replica)),
+            "the copy-in carries no project graph"
+        );
+        // The unit's other read roots still ride.
+        let extra_replica = seat::replica_of(None, &extra).unwrap();
+        assert!(decoded.iter().any(|d| d.replica == extra_replica));
+    }
+    let _ = std::fs::remove_dir_all(&host);
+}
+
 /// Only a read-only bind is a repository projection: a writable plain root with a `.git` (a
 /// seat's scratch) is still copied whole, as it was.
 #[cfg(unix)]

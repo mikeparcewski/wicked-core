@@ -4249,6 +4249,8 @@ impl WrappedCliStepRunner {
                 // (artifact-runs-fix, review r2) The run's declared WRITE roots are read roots of EVERY
                 // seat, not only a claude one (whose gate-hook env carries them): a codex or pi review
                 // must find the draft it judges mounted read-only too.
+                // (core#1781) Never the code graph's directory: the seat reads its graph through
+                // crew's estate relay, and the k8s floor would copy it into every unit.
                 let homes = declared_root_state_homes(
                     self.operational_home.as_deref(),
                     handed.map(|s| s.root.as_path()),
@@ -6059,7 +6061,9 @@ fn arm_hook_gov_root(cmd: &mut Command) {
 /// operational node (FINDING-067). Left UNSET when the repo was never indexed — no store beats the
 /// wrong store (the shim then refuses an unpinned store, `gate_hook::classify_estate_command`). Since
 /// D-7 (DES-L4 PR-⑦) this env is the ONE graph hand-off on the wrapped carrier — the CLI-registered
-/// estate MCP that also carried the path is gone.
+/// estate MCP that also carried the path is gone. That holds for a HOST seat; a container seat has
+/// no mount of the graph (core#1781, [`seat_read_roots`]) and reads it through crew's estate relay
+/// while its gateway's MCP route is up ([`container_mcp_env`]).
 fn arm_worker_estate_channel(cmd: &mut Command, gov: &GovLaunch) {
     if let Some(db) = gov.code_graph_db.as_deref() {
         cmd.env(crate::gate_hook::ESTATE_DB_ENV, db);
@@ -6132,7 +6136,8 @@ impl GovLaunch {
     /// The read roots this unit's gate hook is handed (`WICKED_READ_ROOTS`): ONE assembly for that
     /// env and for the seat container's read mounts (`container_floor::arm`), so the container
     /// never mounts a read root late (while spawning) that its narrowed fence
-    /// ([`narrow_container_fence`]) did not see.
+    /// ([`narrow_container_fence`]) did not see. The one root the container leaves out is the code
+    /// graph's directory (core#1781, [`seat_read_roots`]).
     ///
     /// (artifact-runs-fix, rig runs 2e6059da / d5374efa) The run's launch-declared WRITE roots are
     /// read roots of every unit too: they hold the run's deliverables (an interactive draft in
@@ -6158,11 +6163,18 @@ impl GovLaunch {
 
 /// What a container seat may read beyond its tree, for EVERY seat kind: the launch's read roots,
 /// its skills delivery, a governed claude unit's gate-hook roots (`gov_roots`, empty for any other
-/// CLI), the run's declared write roots promoted to reads and the graph directory the unit's
-/// `code_graph_db` names ([`repo_read_root`]: a repo graph's key dir or the bound project's graph
-/// dir). core#1571: the graph directory used to arrive only through `gov_roots`, which is claude-only,
-/// so a codex or pi container seat got no project-graph mount at all. Duplicates are harmless (the
-/// mount builder skips a covered path) but dropped here so the list reads as the set it is.
+/// CLI) and the run's declared write roots promoted to reads. Duplicates are harmless (the mount
+/// builder skips a covered path) but dropped here so the list reads as the set it is.
+///
+/// core#1781: never the directory of the unit's own code graph ([`repo_read_root`]: a repo graph's
+/// key dir or the bound project's graph dir), whether the graph-derived root or a claude unit's
+/// gate-hook roots name it. A container seat reads its graph through crew's estate relay
+/// (core#1018, [`crate::gate_hook::ESTATE_BROKER_ENV`]) while its gateway's MCP route is up
+/// ([`container_mcp_env`]); the relay opens the vouched graph on the host, and the default seat
+/// image ships no estate server to open a mounted one. The k8s floor copies every mount into the
+/// replica, so a mounted graph rode every unit's copy-in, and a project graph over the stream's
+/// 512 MiB refused every seat (`copy_in_refused`). A host seat keeps its read grant
+/// (`GovLaunch::read_roots`).
 pub(crate) fn seat_read_roots(
     governance: Option<&crate::workflow::GovernanceContext>,
     handed_root: Option<PathBuf>,
@@ -6184,9 +6196,8 @@ pub(crate) fn seat_read_roots(
                 .iter()
                 .flat_map(|g| promoted_write_roots(&g.extra_write_roots, homes)),
         )
-        .chain(graph_dir)
     {
-        if !out.contains(&r) {
+        if graph_dir.as_ref() != Some(&r) && !out.contains(&r) {
             out.push(r);
         }
     }
@@ -9832,51 +9843,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// crew#1497 (KEY) — every other shape under (or near) `project-graphs` grants nothing: the
-    /// launcher mints this path, so the recogniser is strict.
-    /// core#1571 (KEY) — every container seat kind gets the bound project's graph directory as a
-    /// read mount, not only a claude one. A codex or pi unit has no gate-hook env (`gov_roots`
-    /// empty); before, that left it with no project-graph mount, so its chat could not read the
-    /// graph. Fails on main: the directory came only through the claude-only `GovLaunch`.
+    /// core#1781 (KEY) — no container seat kind gets a code graph's directory as a read mount: not
+    /// the bound project's graph dir, not a repo graph's key dir, and not when a claude unit's
+    /// gate-hook roots carry it. A container seat reads its graph through crew's estate relay; on
+    /// the k8s floor a mount is a copy, so an 814 MB project graph refused every seat. Fails on
+    /// main: `seat_read_roots` added the graph dir for every seat kind (core#1586).
     #[test]
-    fn every_seat_kind_gets_the_project_graph_dir_as_a_read_root() {
+    fn no_container_seat_mounts_a_code_graph_dir() {
         let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
             .read()
             .unwrap_or_else(|p| p.into_inner());
         let (base, sh) = project_graph_home("allseats", &["proj-a", "proj-b"]);
         let dir_a = sh.join("project-graphs").join("proj-a");
-        let gov = crate::workflow::GovernanceContext {
+        let gov = |db: &Path| crate::workflow::GovernanceContext {
             human_confirm: Default::default(),
             db_path: "/abs/estate.db".to_string(),
-            code_graph_db: Some(dir_a.join("code-graph.db").to_string_lossy().into_owned()),
+            code_graph_db: Some(db.to_string_lossy().into_owned()),
             extra_write_roots: Vec::new(),
             extra_read_roots: vec!["/abs/extra".to_string()],
             project_id: Some("proj-a".to_string()),
             repo_id: None,
             apps: None,
         };
-        // A non-claude seat: no gate-hook roots.
-        let codex = seat_read_roots(Some(&gov), None, Vec::new(), &[], Some(&sh));
-        assert!(codex.contains(&dir_a), "{codex:?}");
-        assert!(
-            !codex
-                .iter()
-                .any(|r| r.ends_with("proj-b") || *r == sh.join("project-graphs")),
-            "never a sibling project or the root: {codex:?}"
-        );
-        assert!(codex.contains(&PathBuf::from("/abs/extra")));
-        // A claude seat whose gate-hook roots already carry the directory: listed once.
-        let claude = seat_read_roots(Some(&gov), None, vec![dir_a.clone()], &[], Some(&sh));
+        let project = gov(&dir_a.join("code-graph.db"));
+        // The grant still recognises the directory: a host seat keeps its read root.
         assert_eq!(
-            claude.iter().filter(|r| **r == dir_a).count(),
-            1,
+            repo_read_root(project.code_graph_db.as_deref(), Some(&sh)).map(PathBuf::from),
+            Some(dir_a.clone())
+        );
+        let graphs = sh.join("project-graphs");
+        // A non-claude seat (no gate-hook roots) and a claude seat whose gate-hook roots carry it.
+        for gov_roots in [
+            Vec::new(),
+            vec![dir_a.clone(), PathBuf::from("/abs/plugins")],
+        ] {
+            let reads = seat_read_roots(Some(&project), None, gov_roots, &[], Some(&sh));
+            assert!(
+                reads.iter().all(|r| !r.starts_with(&graphs)),
+                "never a project graph dir in a container: {reads:?}"
+            );
+            assert!(reads.contains(&PathBuf::from("/abs/extra")), "{reads:?}");
+        }
+        let claude = seat_read_roots(
+            Some(&project),
+            None,
+            vec![dir_a.clone(), PathBuf::from("/abs/plugins")],
+            &[],
+            Some(&sh),
+        );
+        assert!(
+            claude.contains(&PathBuf::from("/abs/plugins")),
             "{claude:?}"
         );
-        // No governance, no graph: nothing.
+        // A repo graph's key dir: the same rule (the env override, when set, moves the root).
+        if std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV).is_none_or(|v| v.is_empty()) {
+            let key = crate::code_graph::mint_repo_graph_key("wc-seat-repo");
+            let key_dir = sh.join("repo-graphs").join(&key);
+            let repo = gov(&key_dir.join(crate::code_graph::CODE_GRAPH_DB_FILE));
+            assert_eq!(
+                repo_read_root(repo.code_graph_db.as_deref(), Some(&sh)).map(PathBuf::from),
+                Some(key_dir.clone())
+            );
+            for gov_roots in [Vec::new(), vec![key_dir.clone()]] {
+                let reads = seat_read_roots(Some(&repo), None, gov_roots, &[], Some(&sh));
+                assert!(!reads.contains(&key_dir), "{reads:?}");
+            }
+        }
+        // No governance: nothing.
         assert!(seat_read_roots(None, None, Vec::new(), &[], Some(&sh)).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// crew#1497 (KEY) — every other shape under (or near) `project-graphs` grants nothing: the
+    /// launcher mints this path, so the recogniser is strict.
     #[test]
     fn a_misshaped_project_graph_path_grants_nothing() {
         let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
