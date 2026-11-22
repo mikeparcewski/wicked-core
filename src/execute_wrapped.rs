@@ -5169,11 +5169,7 @@ impl WrappedCliStepRunner {
                     // there (env dumps, auth headers, tokens) with the tool-output redaction,
                     // keeping its lines as they are for the refusal classifiers.
                     let err = crate::tool_activity::redact_prose(&err);
-                    let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
-                        (false, false) => format!("{out}\n{err}"),
-                        (false, _) => out,
-                        _ => err,
-                    };
+                    let detail = failed_detail(out, err, code != 0);
                     // agy documents what its exit codes mean: the record says it, for an exit
                     // agy itself made (a turn the engine settled as not done exited 0).
                     let meaning = (seat_cli == wicked_apps_core::spawn::SeatCli::Agy
@@ -8092,6 +8088,28 @@ pub(crate) fn spawn_failure_detail(output: &str) -> Option<&str> {
     let rest = output.strip_prefix(COULD_NOT_RUN_PREFIX)?;
     let (_program, detail) = rest.split_once("`: ")?;
     Some(detail.trim_end().strip_suffix(')').unwrap_or(detail))
+}
+
+/// (core#1720) A failed unit's detail: both streams, stdout first (core#1612), unless stdout ends
+/// with the CLI's own sign-in, approval or quota refusal and stderr does not. Then stderr goes
+/// first, so that refusal stays at the end, inside the classifiers' terminal frame: a chatty stderr
+/// (telemetry retries, exporter dumps) would otherwise push it out of the 2 KiB tail they read.
+/// Each stream is judged on its own tail by `classify_refusal`'s own rules, the frame it would get
+/// if it were the only stream, so the order never turns the body of either stream into a frame.
+pub(crate) fn failed_detail(out: String, err: String, nonzero_exit: bool) -> String {
+    use wicked_council::types::SeatFailureReason;
+    match (out.trim().is_empty(), err.trim().is_empty()) {
+        (false, false) => {
+            let refuses = |s: &str| SeatFailureReason::classify_refusal(s, nonzero_exit).is_some();
+            if refuses(&out) && !refuses(&err) {
+                format!("{err}\n{out}")
+            } else {
+                format!("{out}\n{err}")
+            }
+        }
+        (false, _) => out,
+        _ => err,
+    }
 }
 
 /// (F-7R3-001, r2-N2) The exit code the wrapped runner's own marker carries — `(cli `<key>`
@@ -11378,6 +11396,29 @@ mod tests {
             leaky.output.contains("diagnostic \\\nNot logged in"),
             "{}",
             leaky.output
+        );
+        // core#1720: a sign-in refusal that ends STDOUT stays last behind a chatty stderr, so the
+        // classifiers read it (red on main: 8 KiB of stderr followed it).
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'Not logged in · Please run /login'\ni=0\n\
+             while [ $i -lt 200 ]; do echo 'warning: retrying the telemetry upload' >&2; \
+             i=$((i+1)); done\nexit 1\n",
+        )
+        .unwrap();
+        let behind = runner.run_unit(&plain);
+        let _ = std::fs::remove_dir_all(sandbox_for(&plain));
+        assert_eq!(behind.status, StepStatus::Failed, "{}", behind.output);
+        assert!(
+            behind.output.contains("retrying the telemetry upload"),
+            "{}",
+            behind.output
+        );
+        assert_eq!(
+            wicked_council::types::SeatFailureReason::classify_refusal(&behind.output, true),
+            Some(wicked_council::types::SeatFailureReason::NotLoggedIn),
+            "{}",
+            behind.output
         );
         // Restore the sign-in refusal for the council dispatcher below.
         std::fs::write(&stub, sign_in_stub).unwrap();

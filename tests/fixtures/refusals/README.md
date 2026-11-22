@@ -27,10 +27,10 @@ real account, which the tests must never need.
 - `claude-2.1.311-cant-help.txt`: the refusal with no model name (`API Error: Claude can't help
   with this. Start a new session to continue.`).
 - `claude-2.1.323-content-filter.txt`: the API's output filter (core#1718). claude-code 2.1.323
-  keeps `Output blocked by content filtering policy` as a constant (its `TN` check reads it in a
-  400's message and tags the error `output_content_filtered`); no dedicated template renders it,
-  so the generic `${Wd}: ${e.message}` branch prints it as `API Error: 400 {...}` with the API's
-  JSON body. Rendered from that branch with a synthetic request id.
+  keeps `Output blocked by content filtering policy` as a constant: its `TN` check reads it in a
+  400 error's message and tags the error `output_content_filtered`. No dedicated template renders
+  it, so the API-error branch prints `${Wd}: ${age(e)}`, and for a JSON error body `age` returns
+  the status and the body's `error.message` (`${e.status} ${k6t(e)}`). Rendered from that branch.
 - `echoed-review.txt`: a failed review that quotes every signature as subject matter (source
   lines, a Markdown bullet, quoted and mid-sentence text) and then fails for an unrelated reason.
   It must never classify as a refusal.

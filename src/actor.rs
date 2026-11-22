@@ -38133,6 +38133,9 @@ mod seat_failover_tests {
             // (core#1718) The API's output filter, in Claude Code's generic `API Error:` frame.
             include_str!("../tests/fixtures/refusals/claude-2.1.323-content-filter.txt"),
             "API Error: Output blocked by content filtering policy",
+            // The raw body, should a build print the API's message unparsed.
+            "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\
+             \"message\":\"Output blocked by content filtering policy\"}}",
         ] {
             assert!(is_content_refusal(&format!(
                 "(cli `claude` exited 1) {claude}"
@@ -38191,7 +38194,7 @@ mod seat_failover_tests {
         assert!(is_content_refusal(&format!("{codex}\n{stderr_noise}")));
         assert!(!is_content_refusal(&format!(
             "{codex}\n{}",
-            "x".repeat(wicked_council::types::REFUSAL_TAIL_BYTES + 1)
+            "x".repeat(crate::acp_runner::CONTENT_REFUSAL_TAIL_BYTES + 1)
         )));
         assert!(!is_content_refusal(
             "(cli `codex` exited 1) unrelated failure"
@@ -38204,24 +38207,25 @@ mod seat_failover_tests {
         )));
     }
 
-    /// core#1720: a failed unit keeps stdout THEN stderr (`execute_wrapped`'s failed arm builds
-    /// `(cli `<key>` exited N) {out}\n{err}`), so a sign-in, quota or approval refusal at the end
-    /// of stdout sits behind the whole stderr. The sign-in, approval and quota rules read the same
-    /// 16 KiB tail as the content refusal (red on main: they read the last 2 KiB).
+    /// core#1720: a failed unit keeps both streams (`execute_wrapped::failed_detail`). A sign-in,
+    /// approval or quota refusal that ends stdout stays at the end of the output behind a chatty
+    /// stderr, where the classifiers' terminal frame reads it (red on main: stderr followed it and
+    /// pushed it out of the 2 KiB tail). The body of either stream is never made terminal.
     #[test]
     fn a_stdout_sign_in_or_quota_refusal_behind_a_chatty_stderr_still_classifies() {
-        use wicked_council::types::{SeatFailureReason, REFUSAL_TAIL_BYTES};
-        let failed =
-            |key: &str, out: &str, err: &str| format!("(cli `{key}` exited 1) {out}\n{err}");
-        // Claude Code's own sign-in line (its error table: `Not logged in · Please run /login`),
-        // then a stderr of long exporter lines: more than 4 KiB in a few lines.
-        let exporter = format!(
-            "[otel] export failed, retrying: {}\n",
-            "{\"resourceSpans\":[{\"scopeSpans\":[]}]}".repeat(40)
-        )
-        .repeat(3);
-        assert!(exporter.len() > 4096 && exporter.lines().count() < 6);
-        let sign_in = failed("claude", "Not logged in · Please run /login", &exporter);
+        use crate::execute_wrapped::failed_detail;
+        use wicked_council::types::SeatFailureReason;
+        // As the wrapped runner's failed arm writes it: `(cli `<key>` exited N) <detail>`.
+        let failed = |key: &str, out: &str, err: &str| {
+            format!(
+                "(cli `{key}` exited 1) {}",
+                failed_detail(out.to_string(), err.to_string(), true)
+            )
+        };
+        let telemetry = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(telemetry.len() > 4096);
+        // Claude Code's own sign-in line (its error table: `Not logged in · Please run /login`).
+        let sign_in = failed("claude", "Not logged in · Please run /login", &telemetry);
         assert_eq!(
             SeatFailureReason::classify_refusal(&sign_in, true),
             Some(SeatFailureReason::NotLoggedIn),
@@ -38230,11 +38234,11 @@ mod seat_failover_tests {
         let (_, judged) = crate::cli_runner::judge_refusal("claude", &sign_in)
             .expect("the judge rotation classifies it too");
         assert_eq!(judged.reason, "not_logged_in");
-        // pi's captured out-of-usage line, behind two hundred telemetry retry lines.
-        let telemetry = "warning: retrying the telemetry upload\n".repeat(200);
-        assert!(telemetry.len() > 4096);
+        assert!(sign_in.contains(telemetry.trim()), "both streams are kept");
+        // pi's captured out-of-usage line (run 290a7fee), the same way.
         let pi = include_str!("../tests/fixtures/refusals/pi-out-of-extra-usage.txt");
-        let quota = format!("{pi}\n{telemetry}");
+        let pi_out = pi.strip_prefix("(cli `pi` exited 1) ").unwrap();
+        let quota = failed("pi", pi_out, &telemetry);
         assert_eq!(
             SeatFailureReason::classify_refusal(&quota, true),
             Some(SeatFailureReason::QuotaExhausted)
@@ -38250,16 +38254,40 @@ mod seat_failover_tests {
             SeatFailureReason::classify_refusal(&approval, true),
             Some(SeatFailureReason::ApprovalUnavailable)
         );
-        // Pushed out of the window, each is the body again.
-        let gone = "x".repeat(REFUSAL_TAIL_BYTES + 1);
-        for refusal in [&sign_in, &quota, &approval] {
-            let first = refusal.lines().next().unwrap();
+        // A stream's body stays the body: a sign-in line 6+ lines before the end of stdout, or a
+        // quota phrase more than 2 KiB before it, is subject matter behind the same stderr.
+        for out in [
+            format!(
+                "Not logged in · Please run /login\n{}",
+                "more work\n".repeat(6)
+            ),
+            format!(
+                "the seat said \"You're out of extra usage\"\n{}",
+                "x".repeat(4096)
+            ),
+        ] {
+            let text = failed("claude", &out, &telemetry);
+            let first = out.lines().next().unwrap();
+            assert!(
+                text.find("warning: retrying") > text.find(first),
+                "stdout keeps its place: {first}"
+            );
             assert_eq!(
-                SeatFailureReason::classify_refusal(&format!("{first}\n{gone}"), true),
+                SeatFailureReason::classify_refusal(&text, true),
                 None,
-                "{first}"
+                "{out}"
             );
         }
+        // A refusal on stderr keeps its place after stdout's progress (core#1612).
+        let stderr_refusal = failed(
+            "claude",
+            "starting the review",
+            "Not logged in · Please run /login",
+        );
+        assert!(
+            stderr_refusal.ends_with("Please run /login"),
+            "{stderr_refusal}"
+        );
     }
 
     /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier
