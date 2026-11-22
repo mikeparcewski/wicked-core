@@ -5314,7 +5314,31 @@ mod tests {
         let connect = |port: u16| {
             format!("import socket; s=socket.create_connection(('127.0.0.1', {port}), timeout=3); s.close()")
         };
-        assert!(run(&connect(ap)), "the allowed port connects");
+        // The HOST app answers through the jail (xreview: on Linux a bare connect completes against
+        // `pasta`'s own listener in the namespace, so only bytes from the host listener prove the
+        // splice reaches it).
+        let nonce = format!("wicked-port-jail-{}", std::process::id());
+        {
+            let host = allowed.try_clone().unwrap();
+            let nonce = nonce.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                if let Ok((mut s, _)) = host.accept() {
+                    let _ = s.write_all(nonce.as_bytes());
+                }
+            });
+        }
+        assert!(
+            run(&format!(
+                "import socket\n\
+                 s = socket.create_connection(('127.0.0.1', {ap}), timeout=3); s.settimeout(3)\n\
+                 d = b''\n\
+                 while len(d) < {n}:\n    c = s.recv(64)\n    if not c: break\n    d += c\n\
+                 assert d == b'{nonce}', d\n",
+                n = nonce.len()
+            )),
+            "the allowed port reaches the host app and reads its bytes"
+        );
         assert!(!run(&connect(op)), "another loopback port is refused");
         assert!(
             !run("import socket; socket.create_connection(('1.1.1.1', 80), timeout=3)"),
