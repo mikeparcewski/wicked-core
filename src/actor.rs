@@ -7559,7 +7559,20 @@ fn apply_step_result(
     // DES-TEAMING-002 §8.8 (T6): the PA's review of a member's step is team evidence, never the
     // gate — it never reaches the failure ladder or the fold. Its verdict (and the attempt's
     // ledger) decide whether the member's step counts; anything missing pauses `team_dispute`.
-    if team_gate::is_review(unit) {
+    // (core#1748) Except a review turn whose result the ENGINE lost (its pod's write-back refused,
+    // its exit code unconfirmed): that is no verdict and no answer, so it takes the core#1743
+    // lost-result arm below like every other lost result. The gate there carries the engine's
+    // whole reason, and its Approve runs the review again at a fresh attempt: the unit keeps its
+    // member-step state (`reviewing`), so the re-dispatch is the PA's review, never the member's
+    // output counted. Peeked here (`take: false`); the arm below takes the record.
+    let review_result_lost = unit.tool_cmd.is_none()
+        && crate::execute_wrapped::lost_result_reason(
+            &output.output,
+            (&output.run_id, output.unit_ix, output.attempt),
+            false,
+        )
+        .is_some();
+    if team_gate::is_review(unit) && !review_result_lost {
         let ix = output.unit_ix;
         let mut act = team_gate::Act {
             store,
@@ -8186,6 +8199,16 @@ fn apply_step_result(
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
         // took the gate's own reassign-and-retry, the retried attempt refused identically, and
         // the old `attempt == 0` guard sent it to `sessionFailed` with no route back.
+        // (core#1740, train-11 runs 557faf4e / b8afee79) A launch the seat's OWN carrier refused
+        // (core#718: managed settings silence the engine's gate hook, so a governed unit is refused
+        // rather than run ungoverned) is a condition the operator fixes outside the run: no judge
+        // can rule it away and a retry on the same seat meets it again. So it takes the gate below
+        // on the FIRST try too, and on every human_confirm, as a denial does (core#464): the card
+        // names the setting and the seats it may be reassigned to. It used to reach that gate
+        // only on a retried attempt with an operator present; a first refusal went to the triage
+        // judge or, on an autonomous run, straight to `sessionFailed`, losing every unit before.
+        let seat_specific_refusal =
+            unit.tool_cmd.is_none() && seat_specific_launch_failure(&output.output);
         if !deliver_strand {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
@@ -8285,10 +8308,10 @@ fn apply_step_result(
                     )?;
                     return Ok(StepApplied::Paused);
                 }
-            } else if human_present
+            } else if (human_present || seat_specific_refusal)
                 && seat_refusal.is_none()
                 && !content_refused
-                && !first_try
+                && (!first_try || seat_specific_refusal)
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
                 // with no seat failover for a Tool, skipping this gate would end the run.
@@ -8307,7 +8330,7 @@ fn apply_step_result(
                 // governed unit on this host) is not the environment's: another seat does not
                 // meet it, so the gate names the seat and offers the reassign instead of
                 // withholding it.
-                let seat_specific = seat_specific_launch_failure(&output.output);
+                let seat_specific = seat_specific_refusal;
                 let why = if seat_specific {
                     format!(
                         "Unit {ord} ({failed_cli}) could not start on attempt {}: the cause is \
@@ -37243,6 +37266,81 @@ mod seat_failover_tests {
             );
             assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
             assert!(units[0].worker_failed_clis.is_empty(), "{case}");
+        }
+    }
+
+    /// core#1740 (train-11 runs 557faf4e, unit 6 after a host-floor restart, and b8afee79, unit 1):
+    /// a governed unit's FIRST launch refused because managed settings silence the engine's gate
+    /// hook went to `sessionFailed` in the same second, with no card, and every earlier unit's
+    /// progress was lost. Only a RETRIED attempt with an operator present reached the core#718
+    /// seat-specific gate. Now a first refusal pauses at the `failure` gate on every human_confirm,
+    /// names the setting and offers the other eligible seats. Red on main: `none` failed the run
+    /// and `all` went to the triage judge (no gate). The output is the wrapped carrier's own
+    /// refusal, as `execute_wrapped::governance_refusal` frames
+    /// `managed_hooks_only_refusal_reason` (src/execute_wrapped.rs:7697-7718).
+    #[test]
+    fn core_1740_a_first_try_managed_hooks_refusal_pauses_with_a_card() {
+        let refusal = format!(
+            "(input governance refused the launch: {}: settings in \
+             /srv/worker-home/claude/remote-settings.json silence the engine's gate hook \
+             (`allowManagedHooksOnly: true` or `disableAllHooks: true`); refusing the governed \
+             unit rather than running it ungoverned. Remove that setting for the seat (core#653, \
+             C5))",
+            crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL
+        );
+        for (case, confirm) in [("none", HumanConfirm::None), ("all", HumanConfirm::All)] {
+            let run_id = format!("managed-hooks-{case}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "pi"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.human_confirm = confirm;
+            put_node(&mut store, session.to_node()).unwrap();
+            seed_unit(
+                &mut store,
+                &run_id,
+                6,
+                "extract",
+                "claude",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            let (applied, session, units, events) =
+                fold_failed_capturing(&mut store, &run_id, &refusal);
+            assert!(matches!(applied, StepApplied::Paused), "{case}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+                "{case}: never sessionFailed"
+            );
+            let (kind, prompt) = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::AwaitingHuman {
+                        gate_kind, prompt, ..
+                    } => Some((gate_kind.clone(), prompt.clone())),
+                    _ => None,
+                })
+                .expect("awaitingHuman");
+            assert_eq!(kind, "failure", "{case}");
+            assert!(
+                prompt.contains("specific to seat 'claude'")
+                    && prompt.contains("allowManagedHooksOnly")
+                    && prompt.contains("'codex'"),
+                "{case}: the card names the setting and a seat to reassign to: {prompt}"
+            );
+            assert_eq!(units[0].status, UnitStatus::Rejected, "{case}");
+            assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
         }
     }
 

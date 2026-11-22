@@ -2251,6 +2251,137 @@ fn t6_a_review_without_a_step_line_pauses_and_never_counts() {
     assert_ne!(u.status, crate::domain::UnitStatus::Done);
 }
 
+/// The member runner, except that the engine LOSES the result of the PA's first review turn: its
+/// pod's write-back was refused, framed exactly as the wrapped runner frames it
+/// (`execute_wrapped::settle_failure_output`, with the engine's own record of the reason).
+struct LostFirstReview {
+    inner: Arc<MemberRunner>,
+    reviews: std::sync::Mutex<Vec<StepInput>>,
+}
+
+impl StepRunner for LostFirstReview {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let review = i
+            .unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some());
+        if review {
+            let mut seen = self.reviews.lock().unwrap();
+            seen.push(i.clone());
+            if seen.len() == 1 {
+                let output = crate::execute_wrapped::settle_failure_output(
+                    "a",
+                    (&i.run_id, i.unit_ix, i.attempt),
+                    &format!(
+                        "{}the write-back of the review's worktree was refused: `notes/x` is a \
+                         symlink that leaves its root",
+                        crate::execute_wrapped::SETTLE_FAILED
+                    ),
+                    "the PA's review transcript",
+                );
+                return StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output,
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+            }
+        }
+        self.inner.run_unit(i)
+    }
+}
+
+/// core#1748: a PA review turn whose result the engine lost took the `is_review` branch before the
+/// core#1743 lost-result arm, so it opened a `team_dispute` that said only "gave no verdict
+/// (status Failed)" and whose Approve counted the member's output unreviewed. Now it takes the
+/// lost-result route: the `failure` gate with the engine's whole reason, the member-step state
+/// kept, and Approve re-runs the PA's review at a fresh attempt. Red on main: the gate was
+/// `team_dispute` and the review ran once.
+#[test]
+fn t6_a_review_whose_result_the_engine_lost_pauses_at_the_failure_gate_and_reruns_the_review() {
+    let rig = rig("t6-lost-review");
+    let inner = MemberRunner::new(|_| "reviewed\nSTEP write: ACCEPT — it covers it".into());
+    let worker = Arc::new(LostFirstReview {
+        inner,
+        reviews: Default::default(),
+    });
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let e = supervised(
+        &rig,
+        &db,
+        worker.clone(),
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        false,
+    );
+    let mut evs = Vec::new();
+    launch_member_run(&e, "t6lr");
+    wait_status(&e, "t6lr", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    let seq = ord_events(&evs, "t6lr", WRITE);
+    assert!(
+        seq.iter().any(|t| t == "awaitingHuman:failure"),
+        "the lost review pauses at the failure gate: {seq:?}"
+    );
+    assert!(
+        !seq.iter().any(|t| t == "awaitingHuman:team_dispute"),
+        "never a team dispute: {seq:?}"
+    );
+    let failed = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::StepFailed {
+                session,
+                ord,
+                detail,
+                ..
+            } if session == "t6lr" && *ord == WRITE => Some(detail.clone()),
+            _ => None,
+        })
+        .expect("stepFailed");
+    assert!(
+        failed.contains("is a symlink that leaves its root"),
+        "the engine's whole reason rides the event: {failed}"
+    );
+    let u = unit_view(&e, "t6lr", WRITE);
+    assert!(
+        u.denial_reason
+            .as_deref()
+            .is_some_and(|d| d.contains("is a symlink that leaves its root")),
+        "{:?}",
+        u.denial_reason
+    );
+    assert!(
+        u.member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some() && !m.counted),
+        "the member-review state is kept: {:?}",
+        u.member_step
+    );
+    e.core.confirm_gate("t6lr", approve(None)).unwrap();
+    wait_status(&e, "t6lr", SessionStatus::Completed);
+    let reviews = worker.reviews.lock().unwrap().clone();
+    assert_eq!(reviews.len(), 2, "approve re-ran the PA's review");
+    assert!(
+        reviews[1].attempt > reviews[0].attempt,
+        "at a fresh attempt"
+    );
+    assert_eq!(
+        reviews[1].unit.assigned_cli.as_deref(),
+        Some("a"),
+        "on the PA"
+    );
+    let reviewed = payloads(&rig, "t6lr", tev::STEP_REVIEWED);
+    assert_eq!(reviewed.len(), 1, "one verdict, from the re-run review");
+    assert_eq!(reviewed[0]["verdict"], "accepted");
+}
+
 // ── (k) restart mid-step ─────────────────────────────────────────────────────────────────────────
 
 /// Attempt 0 of unit 0 plays the supervisor raising one HIGH on it, then hangs (the daemon dies
