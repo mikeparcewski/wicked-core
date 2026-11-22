@@ -417,7 +417,8 @@ fn python_install(prefix: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// grandparent (`<prefix>/bin/python3`); a copied venv's interpreter also names its base install
 /// (`pyvenv.cfg` `home`, a `bin` dir); and a macOS `/usr/bin` shim runs the selected developer dir's
 /// Python (`xcode_select`, the target of `/private/var/db/xcode_select_link`: its `.app`, else the
-/// dir). The jail itself drops `/` and any root that holds the home directory
+/// dir); an interpreter (or base install) inside an `.app` bundle names the bundle. The jail itself
+/// drops `/` and any root that holds the home directory
 /// ([`crate::validator::render_jail`]).
 pub(crate) fn render_read_roots(
     draft: &std::path::Path,
@@ -444,8 +445,12 @@ pub(crate) fn render_read_roots(
             .and_then(|bin| bin.canonicalize().ok());
         if let Some(base) = base.as_deref().and_then(std::path::Path::parent) {
             out.extend(python_install(base));
+            out.extend(outermost_app(base));
         }
     }
+    // An interpreter inside a bundle (a full Xcode's developer Python, which a venv made with the
+    // `/usr/bin` shim points at) reads the bundle's frameworks beside its prefix.
+    out.extend(outermost_app(python));
     if python.starts_with("/usr/bin") {
         out.extend(xcode_select.map(|dev| outermost_app(dev).unwrap_or_else(|| dev.to_path_buf())));
     }
@@ -934,6 +939,11 @@ mod tests {
             render_read_roots(&draft, &garden, usr, &shell, Some(clt)).contains(&clt.to_path_buf())
         );
         assert!(!render_read_roots(&draft, &garden, &py, &shell, Some(xcode)).contains(&xapp));
+        // A venv made with that shim under a full Xcode runs the bundle's own Python directly (not
+        // under /usr/bin): it still reads its bundle.
+        let xpy =
+            std::path::Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/python3");
+        assert!(render_read_roots(&draft, &garden, xpy, &shell, None).contains(&xapp));
         let _ = std::fs::remove_dir_all(&d);
     }
 
