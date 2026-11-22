@@ -1,41 +1,15 @@
-//! ACP (Agent Client Protocol) session runner — multi-CLI extension of wicked-core#13.
+//! The engine's step runner, [`AcpStepRunner`] (the name predates C5). ACP is off the seats
+//! (C5, core#950; core#1106 removed its session registry): every unit runs its CLI's headless mode
+//! on the wrapped carrier ([`WrappedCliStepRunner`]), in a seat container under the container
+//! floor, else on the labelled interim host floor. What stays here:
 //!
-//! Drives persistent multi-turn sessions using the standardised JSON-RPC 2.0 ndjson
-//! (stdin/stdout) ACP protocol. Each CLI runs its own ACP server — a wrapper binary
-//! or the CLI's native ACP mode; wicked-core is the ACP client. The registry maps CLI
-//! keys to their ACP invocation:
-//!
-//! | CLI      | ACP binary / invocation                              | Transport |
-//! |----------|------------------------------------------------------|-----------|
-//! | claude   | claude-agent-acp (@agentclientprotocol, Agent SDK)   | stdio     |
-//! | codex    | codex-acp (@agentclientprotocol, Rust)               | stdio     |
-//! | pi       | pi-acp (community adapter)                           | stdio     |
-//! | agy      | agy-acp (ambiguous bin name — see below)             | stdio     |
-//! | copilot  | copilot --acp (native)                               | stdio     |
-//! | opencode | opencode acp (native)                                | stdio     |
-//!
-//! `agy-acp` is resolved by name off PATH and TWO programs ship that bin: wicked-crew's own
-//! bridge (`packages/agent-acp-bridges`) and a community `agy-acp` on npm (0.5.2,
-//! Apache-2.0, ACP v1 — published, not wicked-maintained). Neither is proven against the agy
-//! seat and PATH order decides which one a spawn gets; see `wicked-council`'s registry note.
-//!
-//! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
-//! discloses it on `CoreEvent::AcpFallback` and in the daemon log, never in the seat's
-//! output (core#970). The run then continues with single-shot fallback.
-//! HTTP transport is not yet implemented (no registry entry uses it today).
-//!
-//! # Session lifecycle
-//! - **Open (lazy)**: on the first unit for a `(run_id, cli_key)` pair, the binary is
-//!   spawned and the `initialize` + `session/new` JSON-RPC handshake completes.
-//! - **Reuse**: subsequent units send `session/prompt` to the same process and stream
-//!   `session/update` text chunks until `stopReason` arrives — sharing prompt-cache
-//!   across governance turns without a per-unit cold start.
-//! - **Close**: [`AcpStepRunner::drop_session`] kills all CLI processes for a `run_id`.
-//!   Call it after the last unit of a run (mirrors [`PersistentStepRunner::drop_session`]).
-//!
-//! # Protocol
-//! JSON-RPC 2.0 ndjson over stdin/stdout. Non-JSON startup banners and log lines
-//! are silently skipped during both handshake and turn execution.
+//! - [`ElicitationMaps`]: the per-run epoch, launch-sequence and tombstone state the actor and the
+//!   bus worker share.
+//! - The worker config home and its settings file (`ensure_worker_config_home`).
+//! - The team carrier half ([`RunnerHost`], `member_turn`): read-only member sessions.
+//! - The failure classifiers the actor's failover ladder reads (`is_transient_cli_failure`,
+//!   `is_worker_originated_failure`, `is_content_refusal`).
+//! - The registry helpers that judge a seat's identity and governance class.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -45,134 +19,10 @@ use serde_json::json;
 // The in-file tests reach these through `use super::*`.
 #[cfg(test)]
 use serde_json::Value;
-#[cfg(all(test, unix))]
-use std::time::Instant;
 
 use crate::command::Command;
 use crate::execute_wrapped::WrappedCliStepRunner;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner};
-
-// ── KillHandle and WriteReg (DES-002 T6) ─────────────────────────────────────
-
-/// A kill handle for an in-flight ACP child process.
-///
-/// Carries an `Arc<Mutex<Option<Child>>>` so that multiple callers (teardown step 1,
-/// step 6 second sweep, `EpochCleanup::drop`) can all safely signal the child without
-/// PID-reuse races. After the first `signal()` takes the child, subsequent calls are no-ops.
-pub struct KillHandle {
-    inner: Mutex<Option<std::process::Child>>,
-    /// (core#936) The bridge's registration as engine infrastructure (`outstanding_work`): held
-    /// exactly while this handle owns the unreaped child, released BEFORE the pid is (codex r4 —
-    /// a reaped pid the OS reuses must never be excused).
-    infra: Mutex<Option<crate::outstanding_work::InfraGuard>>,
-    /// (codex r6) The exit status, once observed: a reaped child answers every later probe with it.
-    exited: Mutex<Option<std::process::ExitStatus>>,
-}
-
-impl KillHandle {
-    /// Construct a no-op handle for tests (no child to kill).
-    pub fn noop() -> Self {
-        Self {
-            inner: Mutex::new(None),
-            infra: Mutex::new(None),
-            exited: Mutex::new(None),
-        }
-    }
-
-    /// Construct a handle that will kill `child` on `signal()`. Not infrastructure.
-    pub fn new(child: std::process::Child) -> Self {
-        Self {
-            inner: Mutex::new(Some(child)),
-            infra: Mutex::new(None),
-            exited: Mutex::new(None),
-        }
-    }
-
-    /// (core#936) A handle for an ACP bridge: the child — and the `levels` of descendants that
-    /// are the bridge's own machinery (a resident launcher's bridge, an adapter's CLI runtime) —
-    /// is registered as engine infrastructure for as long as this handle owns it unreaped.
-    pub fn new_bridge(child: std::process::Child, levels: u8) -> Self {
-        let infra = crate::outstanding_work::InfraGuard::register(child.id(), levels);
-        Self {
-            inner: Mutex::new(Some(child)),
-            infra: Mutex::new(Some(infra)),
-            exited: Mutex::new(None),
-        }
-    }
-
-    /// Whether this handle still holds its infrastructure registration.
-    #[cfg(all(test, unix))]
-    fn is_infra(&self) -> bool {
-        self.infra
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some()
-    }
-
-    fn release_infra(&self) {
-        self.infra.lock().unwrap_or_else(|p| p.into_inner()).take();
-    }
-
-    /// Report the child's exit status if it has ALREADY exited — non-blocking, never killing
-    /// (`try_wait` leaves an unexited child untouched, and reaps one that has exited). `None`
-    /// when the child is still running,
-    /// was already taken by `signal()`, or this is a no-op handle. crew#267: the SESSION_DIED
-    /// arms use this so a bridge death reports HOW the process ended, not only that it stopped
-    /// answering.
-    pub fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut exited = self.exited.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(status) = *exited {
-            return Some(status);
-        }
-        let child = guard.as_mut()?;
-        // (codex r5) Observe the exit WITHOUT reaping, release the registration while the zombie
-        // still reserves the pid, and only then reap: a reused pid is never registered.
-        if !matches!(crate::validator::has_exited_unreaped(child), Ok(true)) {
-            return None;
-        }
-        self.release_infra();
-        *exited = child.try_wait().ok().flatten();
-        *exited
-    }
-
-    /// Kill and reap the child process. Idempotent: the first call kills; subsequent calls
-    /// are no-ops (the child has been taken). Releases the mutex before `wait()` so a
-    /// concurrent `signal()` on another thread never deadlocks.
-    pub fn signal(&self) {
-        let taken = {
-            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            guard.take()
-        };
-        self.release_infra();
-        if let Some(mut child) = taken {
-            // The bridge was spawned in its OWN process group (`process_group(0)` at spawn), so
-            // kill the GROUP — the bridge, the CLI it wraps and anything either backgrounded — and
-            // reap BOUNDED (adversarial review on #414: a direct-child kill left a bridge's shell
-            // children alive to write past a no-code unit's final snapshot).
-            crate::validator::kill_child_tree(&mut child);
-            crate::validator::reap_bounded(&mut child);
-        }
-    }
-}
-
-#[cfg(test)]
-mod runtime_adapter_tests {}
-
-/// Per-session handles stored in the write-lock registry.
-pub type SessionHandles = (Arc<Mutex<()>>, Arc<KillHandle>);
-
-/// The write-lock session registry.
-///
-/// Key: `(run_id, session_key, launch_seq)` — the launch token prevents a torn eviction when
-/// a replacement session has the same `(run_id, cli_key)` pair as the one being evicted.
-/// Value: `(write_lock, kill_handle)` — `shared_run_terminal` uses these to serialise
-/// teardown with in-flight writes and to signal the child process.
-///
-/// Created in `spawn_with_acp_sessions` (NOT in `actor::run`) so the runner and actor
-/// share the same `Arc`. PTY and injected runners receive an empty registry — their
-/// sessions have no ACP child to signal.
-pub type WriteReg = Arc<Mutex<HashMap<(String, String, u64), SessionHandles>>>;
 
 // ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
 
@@ -540,7 +390,9 @@ impl ElicitationMaps {
         launch_seq
     }
 
-    /// Record that a bus-dispatched worker for `(run_id, launch_seq)` is now in-flight.
+    /// Record that a bus-dispatched worker for `(run_id, launch_seq)` is now in-flight. Tests
+    /// only: production marks it inside [`Self::try_next_epoch_bus`].
+    #[cfg(test)]
     pub fn mark_bus_in_flight(&mut self, run_id: &str, launch_seq: u64) {
         self.bus_in_flight_workers
             .insert((run_id.to_string(), launch_seq));
@@ -571,11 +423,6 @@ impl ElicitationMaps {
         }
     }
 
-    /// Returns `true` if ANY bus-dispatched worker is still in-flight (across all runs).
-    pub fn any_bus_worker_in_flight(&self) -> bool {
-        !self.bus_in_flight_workers.is_empty()
-    }
-
     /// Remove and return whether `elicitation_id` was in the creation-suppressed set.
     pub fn take_suppressed_creation(&mut self, elicitation_id: &str) -> bool {
         self.suppressed_creations.remove(elicitation_id)
@@ -588,11 +435,6 @@ impl ElicitationMaps {
         let seq = self.run_launch_seq.entry(run_id.to_string()).or_insert(0);
         *seq += 1;
         *seq
-    }
-
-    /// Restore the per-run launch sequence counter to `seq` (rollback on dispatch failure).
-    pub fn restore_launch_seq(&mut self, run_id: &str, seq: u64) {
-        self.run_launch_seq.insert(run_id.to_string(), seq);
     }
 
     /// Returns `true` if `run_id` has an active epoch (≥ 1) allocated via `next_epoch`.
@@ -617,11 +459,6 @@ impl ElicitationMaps {
     /// Set the shutdown flag. Workers poll this and exit early.
     pub fn set_shutdown_flag(&mut self) {
         self.shutdown_flag = true;
-    }
-
-    /// Whether the shutdown flag has been set.
-    pub fn is_shutdown(&self) -> bool {
-        self.shutdown_flag
     }
 
     /// Whether the shutdown flag has been set (alias used in EmitEvent suppression guard).
@@ -689,7 +526,8 @@ impl ElicitationMaps {
         *self.run_epoch.get(run_id).unwrap_or(&0)
     }
 
-    /// Returns `true` if `(run_id, epoch)` was tombstoned via `cancel_epoch`.
+    /// Returns `true` if `(run_id, epoch)` was tombstoned via `cancel_epoch`. Tests only.
+    #[cfg(test)]
     pub fn is_epoch_cancelled(&self, run_id: &str, epoch: u64) -> bool {
         self.cancelled_epochs
             .iter()
@@ -952,30 +790,6 @@ impl Drop for EpochCleanup {
         }
     }
 }
-
-// ── ACP child process ─────────────────────────────────────────────────────────
-
-// ── Handshake budgets and start concurrency ───────────────────────────────────
-//
-// The two handshake calls are budgeted SEPARATELY because they have different cost profiles.
-// Sweeping bridge-startup concurrency directly (K bridges released simultaneously on a barrier,
-// same host, same binary):
-//
-//   K   initialize (id=1)   session/new (id=2) med / max   trips a 10s budget
-//   1   0.31 – 0.69s        1.67s  /  1.67s                0/1
-//   2   0.31 – 0.69s        1.74s  /  1.75s                0/2
-//   4   0.31 – 0.69s        3.41s  /  5.31s                0/4
-//   8   0.31 – 0.69s        7.12s  / 11.57s                2/8
-//
-// `initialize` is flat at every K; `session/new` scales ~linearly past K=2. A single constant
-// applied to both under-budgets exactly the call that contends — and every ACP timeout observed
-// in the field names id=2. Host load does NOT predict this: K=1 returned 1.67s at load average
-// 37.86, the highest load and the fastest sample in the same experiment.
-//
-// This is a governance defect, not a latency one. A handshake timeout does not fail the unit; it
-// silently downgrades it to the single-shot wrapped-CLI path. So under-budgeting trades the
-// governed execution path for latency without saying so, and does it most often exactly when
-// parallelism is highest — which is when governance matters most. (FINDING-022)
 
 // ── Session startup ───────────────────────────────────────────────────────────
 
@@ -1359,9 +1173,7 @@ pub(crate) fn setting_sources_arg(inherit: bool) -> String {
 pub(crate) const CLAUDE_MD_ADDITIONAL_DIRS_ENV: &str =
     "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
 
-// ── JSON-RPC helpers ──────────────────────────────────────────────────────────
-
-// ── Turn execution ────────────────────────────────────────────────────────────
+// ── pi banner ─────────────────────────────────────────────────────────────────
 
 /// Owned convenience over [`strip_pi_banner`]: returns the ORIGINAL `String` untouched when no
 /// banner was present (equal-length subslice ⇒ no copy), and clones only the stripped remainder
@@ -1435,8 +1247,6 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
         rest = after;
     }
 }
-
-// ── DES-TEAMING-001 S3: monitor→worker advice over `_session/steering` ─────────────────────
 
 // ── Fallback helpers ──────────────────────────────────────────────────────────
 
@@ -1518,46 +1328,11 @@ pub(crate) fn is_content_refusal(output: &str) -> bool {
     wicked_council::types::content_refusal_frame(&output[start..])
 }
 
-// ── ACP input governance ──────────────────────────────────────────────────────
-
-// ── ACP input governance (removed) ────────────────────────────────────────────
-//
-// `arm_acp_governance`, `AcpGovArmed` and `quote_exe_for_hook` lived here. They wrote a per-unit
-// settings file (PreToolUse gate-hook + `permissions.deny`) and handed it to the bridge as
-// `--settings <path>`. The bridge never read that flag, so the whole mechanism was ceremony: armed,
-// announced, never applied (FINDING-060). They are deleted rather than kept behind a feature flag
-// because a governance mechanism that compiles but cannot fire is worse than an absent one — it
-// reads as coverage. Governed claude units now take the wrapped path, which arms the same hook via
-// `execute_wrapped::arm_input_governance` on argv the CLI does read.
-//
-// Restoring governance to the ACP path means finding a channel the bridge honours — see
-// FINDING-062. Whatever that channel turns out to be, the arming code should be written against a
-// verified carrier, not resurrected from here.
-
 // ── AcpStepRunner ─────────────────────────────────────────────────────────────
 
-/// A [`StepRunner`] that drives ACP multi-turn sessions for all registered CLIs.
-///
-/// Sessions are keyed by `(run_id, cli_key)` — each CLI in a multi-CLI run gets its own
-/// persistent ACP process so units are never mis-routed to the wrong agent.
-///
-/// Falls back to [`WrappedCliStepRunner`] (single-shot) when:
-/// - the unit is governed and runs claude — governance only holds on the wrapped path (FINDING-060)
-/// - the CLI has no ACP config in the registry
-/// - the ACP binary is not on PATH
-/// - the handshake fails or the session dies mid-run
-///
-/// Every fallback is disclosed on [`CoreEvent::AcpFallback`] and in the daemon log
-/// (core#970); the seat's output is left untouched, so the disclosure never reads as
-/// part of the agent's answer.
-/// Stable `fallback_kind` slugs carried on [`CoreEvent::AcpFallback`] for UI dispatch.
-pub(crate) mod fallback_kind {
-    // RETIRED: `handshake_failed`. Its only emitter was the governed-ACP branch removed with
-    // FINDING-060. The shared session path reports every startup failure — spawn or handshake — as
-    // `binary_unavailable`, so the slug is no longer produced; a consumer still switching on it is
-    // waiting for an event that cannot arrive.
-}
-
+/// The engine's [`StepRunner`]. Every unit runs its CLI's headless mode on the wrapped carrier
+/// (C5: ACP is removed from the seats); this runner adds the run's elicitation / epoch state and
+/// the team carrier half around it.
 pub struct AcpStepRunner {
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
     tx: std::sync::mpsc::Sender<Command>,
@@ -1570,10 +1345,6 @@ pub struct AcpStepRunner {
     /// Shared elicitation coordination state (DES-002). One Arc per Core instance; also held
     /// by the actor for `Command::ResolveElicitation` dispatch.
     pub elicitation_maps: Arc<Mutex<ElicitationMaps>>,
-    /// Write-lock session registry shared with the actor.
-    /// Key: `(run_id, session_key, launch_seq)`. Value: `(write_lock, kill_handle)`.
-    /// Created in `spawn_with_acp_sessions`; PTY and injected runners hold an empty registry.
-    pub write_reg: WriteReg,
     /// (DES-TEAMING-002 T6) The carrier's handle on team publishing — the engine's bus and team
     /// outbox — installed by `spawn_with_acp_sessions`. A teamed attempt's turn publishes its
     /// `checkpoint.reached` and steer rows through it; `None` = no turn is teamed on this runner.
@@ -1635,8 +1406,7 @@ impl ChatScope {
 impl AcpStepRunner {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>) -> Self {
         let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
-        let write_reg: WriteReg = Arc::new(Mutex::new(HashMap::new()));
-        Self::new_with_maps(tx, maps, write_reg)
+        Self::new_with_maps(tx, maps)
     }
 
     /// [`new`](Self::new) for the runner the engine spawns on a STORE (codex round 8): `db_path`
@@ -1650,14 +1420,13 @@ impl AcpStepRunner {
         runner
     }
 
-    /// Construct with explicitly-provided `ElicitationMaps` and `WriteReg` Arcs.
+    /// Construct with an explicitly-provided `ElicitationMaps` Arc.
     ///
     /// Used by `spawn_with_acp_sessions` so the actor and the runner share the same
     /// `ElicitationMaps` instance. The caller verifies `Arc::ptr_eq` after construction.
     pub(crate) fn new_with_maps(
         tx: std::sync::mpsc::Sender<Command>,
         elicitation_maps: Arc<Mutex<ElicitationMaps>>,
-        write_reg: WriteReg,
     ) -> Self {
         Self {
             // Give the fallback runner the same tx so it can relay GovernanceContextArmed
@@ -1666,7 +1435,6 @@ impl AcpStepRunner {
             tx,
             operational_home: None,
             elicitation_maps,
-            write_reg,
             team_runner: std::sync::OnceLock::new(),
         }
     }
@@ -1675,14 +1443,6 @@ impl AcpStepRunner {
     /// to `Arc::ptr_eq`-verify that the actor and runner share the same instance).
     pub fn elicitation_maps(&self) -> &Arc<Mutex<ElicitationMaps>> {
         &self.elicitation_maps
-    }
-
-    /// Release what a finished run held here: its write-lock registrations.
-    pub fn drop_session(&self, run_id: &str) {
-        self.write_reg
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|(rid, _, _), _| rid != run_id);
     }
 
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
@@ -2329,10 +2089,6 @@ impl StepRunner for AcpStepRunner {
                 maps.cancel_epoch(run_id, epoch);
             }
         }
-        self.write_reg
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|(rid, _, _), _| rid != run_id);
     }
 
     /// ACP can fall back to a one-shot wrapped CLI when its bridge is unavailable. That child has
@@ -2342,30 +2098,10 @@ impl StepRunner for AcpStepRunner {
             .cancel_reassigned_worker(run_id, epoch, launch_seq);
     }
 
-    /// Close a single ACP session for `(run_id, cli_key)` — called by `ReassignUnit` before
-    /// re-dispatching to a different CLI. Registry/session removal is synchronous so the
-    /// replacement cannot race with cleanup; kill/wait remains on a background thread.
+    /// Close the run's sessions on seat `cli_key`, called by `ReassignUnit` before re-dispatching
+    /// to a different CLI: the headless carrier's sessions on that seat go (codex hl-r1).
     fn close_cli_session(&self, run_id: &str, cli_key: &str) {
-        // The container carrier's headless sessions on that seat go too (codex hl-r1).
         self.fallback.forget_seat_sessions(run_id, cli_key);
-        let run_id = run_id.to_string();
-        let cli_key = cli_key.to_string();
-        let kill_handles: Vec<Arc<KillHandle>> = {
-            let mut registry = self.write_reg.lock().unwrap_or_else(|p| p.into_inner());
-            let handles = registry
-                .iter()
-                .filter(|((rid, key, _), _)| rid == &run_id && key == &cli_key)
-                .map(|(_, (_, kill))| Arc::clone(kill))
-                .collect();
-            registry.retain(|(rid, key, _), _| rid != &run_id || key != &cli_key);
-            handles
-        };
-        let _ = (run_id, cli_key);
-        std::thread::spawn(move || {
-            for kill in kill_handles {
-                kill.signal();
-            }
-        });
     }
 }
 
@@ -3089,8 +2825,6 @@ mod tests {
     }
     use super::*;
 
-    // ── FINDING-022: handshake budgets, start gate, stderr capture ──────────────
-
     // ── FINDING-015: the ACP client authenticates when the agent asks it to ─────
 
     /// Every test that drives a REAL `start_acp_process` serialises here.
@@ -3111,47 +2845,7 @@ mod tests {
         dir
     }
 
-    // ── crew#340: liveness probe before cached-session reuse ────────────────────
-
-    // ── crew#290 defense-in-depth: bridge spawns in its own process group ────────
-
-    // ── FINDING-061: an ACP worker must not run under the operator's CLI config ─
-
     // ── core#591 KNOWN GAP (prereq of DES-TEAMING-001 S2): instance seats on the ACP spawn ──
-
-    /// core#936 (codex r4): a bridge is registered infrastructure exactly while its handle owns
-    /// the unreaped child. Reaped by an exit probe or killed by `signal()`, its pid (free for the
-    /// OS to reuse) is no longer excused from a unit's outstanding-work wait.
-    #[cfg(unix)]
-    #[test]
-    fn core_936_a_bridge_pid_is_infrastructure_only_until_it_is_reaped() {
-        // spawn-audit: test-only — short-lived children standing in for a bridge.
-        let quick = std::process::Command::new("true")
-            .spawn()
-            .expect("true runs");
-        let handle = KillHandle::new_bridge(quick, 1);
-        assert!(handle.is_infra());
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while handle.try_exit_status().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // By the handle's own registration, not the pid: a parallel test may already have been
-        // handed the reused pid for its own bridge.
-        assert!(!handle.is_infra(), "a reaped bridge pid is released");
-        assert!(
-            handle.try_exit_status().is_some(),
-            "a reaped bridge keeps answering its exit status (codex r6)"
-        );
-        // spawn-audit: test-only — a long-lived stand-in killed through the handle.
-        let slow = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("sleep runs");
-        let handle = KillHandle::new_bridge(slow, 1);
-        assert!(handle.is_infra());
-        handle.signal();
-        assert!(!handle.is_infra());
-    }
 
     /// (codex round 5) The shared worker-home `settings.json` is REPLACED, never unlinked first:
     /// a reader racing `ensure_worker_config_home` — another engine process's spawn, a CLI already
@@ -4214,14 +3908,6 @@ mod tests {
         assert!(m.active_workers.contains(&("run-b".to_string(), 1)));
     }
 
-    // ── DES-002 T5 tests: rpc_respond, rpc_expect, validate_elicitation_schema ─────
-
-    // ── DES-002 T5 exec_turn_acp arm tests (require a real subprocess, unix only) ──
-
-    // ── core#341: ONE source of truth for elicitation support ─────────────────────────
-
-    // ── core#293: agent request ids cross client prompt ids ───────────────────────
-
     // ── DES-002 T6 tests: tombstone / epoch separation ───────────────────────────
 
     /// Test 25: Tombstone race — `cancel_epoch` before `register` → returns None;
@@ -4706,7 +4392,6 @@ acp_input_governance = true
         );
         assert!(!out.governed);
         assert!(!ran.exists(), "claude must never run ungoverned");
-        runner.drop_session(&input.run_id);
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -4805,8 +4490,6 @@ acp_input_governance = true
         maps.deregister_tool_child("run-c", 999);
         assert_eq!(maps.take_tool_child_pgroups("run-c"), vec![333, 444]);
     }
-
-    // ── crew#998: a governed unit on an admitted seat never falls back to an unchecked carrier ──
 
     // ── DES-TEAMING-002 §8.8: team members on the container floor ──────────────────────────────
 
@@ -5282,19 +4965,3 @@ acp_input_governance = true
         let _ = std::fs::remove_dir_all(&wt);
     }
 }
-
-/// DES-TEAMING-001 S2 (#601) through the REAL ACP turn loop: a scripted bridge drives the
-/// frames, so what is pinned is the carrier's behaviour, not a hand-built event. Kept in its own
-/// module, away from the steering/turn tests S3 adds.
-#[cfg(all(test, unix))]
-mod team_s2_tests {}
-
-/// core#762 through the REAL ACP turn loop: a scripted bridge sends the worker's final message and
-/// then never closes the turn.
-#[cfg(all(test, unix))]
-mod settle_tests {}
-
-/// core#563: the bypass detector's rule — a governed pi seat's tool call that COMPLETES must have
-/// been granted through the pi-governance gate first.
-#[cfg(test)]
-mod pi_bypass_tests {}

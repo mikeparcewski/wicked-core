@@ -26,7 +26,7 @@ use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
 use wicked_governance::{conform, decide, select_any};
 
-use crate::acp_runner::{ElicitationMaps, KillHandle, WriteReg};
+use crate::acp_runner::ElicitationMaps;
 use crate::command::Command;
 use crate::domain::{put_node, AgentSession, SessionStatus};
 use crate::event::CoreEvent;
@@ -818,11 +818,6 @@ fn finish_run_carries(
 /// released. `dispatcher`/`runner` are the injectable council + step-execution seams (real in prod,
 /// stubbed in tests).
 #[allow(clippy::too_many_arguments)]
-/// Lock ordering: `write_reg` must always be acquired BEFORE `elicitation_maps`.
-/// Never hold both simultaneously; acquire `write_reg`, read/snapshot state, release,
-/// then acquire `elicitation_maps` if needed. Violating this ordering risks ABBA deadlock
-/// between `shared_run_terminal` (holds `write_reg`, then acquires `maps`) and
-/// session-start helpers (acquire `maps` alone).
 pub(crate) fn run(
     bus_bridge: crate::bus::BridgeSlot,
     path: String,
@@ -834,7 +829,6 @@ pub(crate) fn run(
     exec_bus: Option<String>,
     is_acp: bool,
     elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    write_reg: WriteReg,
     team_link: crate::team::publish::TeamLink,
     qe_host: crate::assurance::HostQeAcceptance,
     stats: Arc<crate::actor_stats::ActorStats>,
@@ -1041,8 +1035,6 @@ pub(crate) fn run(
     // `actor_maps` — ACP-delivery arc (deliver, cancel_epoch, EmitEvent suppression, epoch ops).
     //   `Some` for ACP runners (is_acp=true, shares the same Arc as lifecycle_maps).
     //   `None` for PTY and injected runners.
-    //
-    // Lock ordering: `write_reg` BEFORE `elicitation_maps` (see module-level doc on `run`).
     let lifecycle_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = elicitation_maps.clone();
     let actor_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = if is_acp {
         elicitation_maps.clone()
@@ -2885,8 +2877,8 @@ pub(crate) fn run(
                 }
             }
             Command::CancelRun { run_id, reply } => {
-                // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
-                shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                // Teardown: tombstone the run and cancel its epoch (no-op for PTY).
+                shared_run_terminal(&run_id, &lifecycle_maps);
                 // core#1653: preserve the raw stream's tail even when throttled text is discarded.
                 for (ord, _, chunk) in finish_run_carries(&mut live_redact, &run_id) {
                     emit(
@@ -5053,9 +5045,8 @@ pub(crate) fn run(
                 stats.mark_stopped();
                 crate::power::unregister_actor(process_gen);
                 subscribers.close_asks();
-                // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
-                // do not poll the elicitation tombstone, so they must be interrupted through
-                // the registered child kill handles; elicitation waits also observe the flag.
+                // Stop in-flight workers before dropping the actor channel: raise the shutdown
+                // flag and tombstone every active run.
                 let mut acp_run_ids = if let Some(ref maps) = lifecycle_maps {
                     let mut maps = maps.lock().unwrap_or_else(|p| p.into_inner());
                     maps.set_shutdown_flag();
@@ -5063,14 +5054,10 @@ pub(crate) fn run(
                 } else {
                     Vec::new()
                 };
-                {
-                    let registry = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-                    acp_run_ids.extend(registry.keys().map(|(run_id, _, _)| run_id.clone()));
-                }
                 acp_run_ids.sort();
                 acp_run_ids.dedup();
                 for run_id in acp_run_ids {
-                    shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                    shared_run_terminal(&run_id, &lifecycle_maps);
                     runner.on_run_complete(&run_id);
                 }
                 runner.on_shutdown();
@@ -22960,73 +22947,21 @@ fn rewind_to_creator_scoped(
     }
 }
 
-/// Ordered ACP teardown helper shared by CancelRun, FailureTriageReady, and Shutdown.
-///
-/// Performs steps 1–3 + 6 of the spec:
-/// 1. Snapshot sessions for `run_id` from the write-lock registry.
-/// 2. Per-session: try_lock the write_lock; tombstone the epoch; signal kill.
-/// 3. Tombstone under maps lock (catches pre-registration workers).
-/// 6. Second registry sweep (catches sessions inserted between step 1 and now).
-///
-/// Steps 4+5 (emit RunCancelled / call on_run_complete) are the caller's responsibility.
-///
-/// Lock ordering: `write_reg` BEFORE `maps` — never hold both simultaneously.
-/// For CancelRun the second sweep uses run_id only; for ReassignUnit it filters
-/// by `(run_id, previous_cli, gen <= old_max_gen)`.
+/// Run teardown shared by CancelRun and Shutdown: tombstone the run's bus
+/// workers and cancel its current epoch, under the maps lock. (The ACP session registry and its
+/// kill handles went with ACP, C5 / core#1106.)
 fn shared_run_terminal(
     run_id: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    write_reg: &WriteReg,
 ) {
     let Some(maps_arc) = lifecycle_maps else {
         return;
     };
-
-    // Step 1: snapshot (run_id, session_key, gen) → (write_lock, kill_handle).
-    let sessions: Vec<(Arc<std::sync::Mutex<()>>, Arc<KillHandle>)> = {
-        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-        reg.iter()
-            .filter(|((r, _, _), _)| r.as_str() == run_id)
-            .map(|(_, (wl, kh))| (Arc::clone(wl), Arc::clone(kh)))
-            .collect()
-    };
-
-    // Step 2: per-session tombstone + kill.
-    for (wl, kh) in &sessions {
-        {
-            // Acquire write_lock to serialise with an in-flight write; then tombstone.
-            // If try_lock fails the write is in-flight — tombstone under maps, then signal.
-            // Either way, the epoch is tombstoned before kh.signal().
-            let _maybe_guard = wl.try_lock();
-            let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
-            if maps.has_active_run(run_id) {
-                let epoch = maps.current_epoch(run_id);
-                maps.cancel_epoch(run_id, epoch);
-            }
-        }
-        kh.signal(); // unconditional — covers rpc_expect suspensions
-    }
-
-    // Step 3: tombstone under maps lock (covers pre-registration workers not yet in write_reg).
-    {
-        let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
-        maps.tombstone_bus_run(run_id);
-        if maps.has_active_run(run_id) {
-            let epoch = maps.current_epoch(run_id);
-            maps.cancel_epoch(run_id, epoch);
-        }
-    }
-
-    // Step 6: second sweep — catches sessions inserted between step 1 and now.
-    let late_sessions: Vec<Arc<KillHandle>> = {
-        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-        reg.iter()
-            .filter(|((r, _, _), _)| r.as_str() == run_id)
-            .map(|(_, (_, kh))| Arc::clone(kh))
-            .collect()
-    };
-    for kh in late_sessions {
-        kh.signal();
+    let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
+    maps.tombstone_bus_run(run_id);
+    if maps.has_active_run(run_id) {
+        let epoch = maps.current_epoch(run_id);
+        maps.cancel_epoch(run_id, epoch);
     }
 }
 
