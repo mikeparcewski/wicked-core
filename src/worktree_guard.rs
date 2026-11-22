@@ -2229,16 +2229,9 @@ pub(crate) mod tests {
             check(&linux, kept, kept);
         }
 
-        // macOS: named with a trailing slash, resolved under /private; both in one text, and the
-        // /tmp spelling of a /private/tmp temp dir.
-        let mac = NotesScrub::new(
-            &[
-                "/var/folders/k3/x_y/T/".into(),
-                "/private/var/folders/k3/x_y/T".into(),
-            ],
-            false,
-            true,
-        );
+        // macOS: named with a trailing slash, its /private spelling in the same text (and a
+        // doubled separator), and the other direction: the /tmp spelling of a /private/tmp temp.
+        let mac = NotesScrub::new(&["/var/folders/k3/x_y/T/".into()], false, true);
         check(
             &mac,
             "a /private/var/folders/k3/x_y/T/wicked-core-notes/r/u/a.md b \
@@ -2248,29 +2241,25 @@ pub(crate) mod tests {
         let mac_tmp = NotesScrub::new(&["/private/tmp".into()], false, true);
         check(
             &mac_tmp,
-            "(/tmp/wicked-core-notes/r/u/a.md) (/private/tmp/wicked-core-notes/r/u/b.md)",
-            "(wicked-core-notes/r/u/a.md) (wicked-core-notes/r/u/b.md)",
+            "(/tmp/wicked-core-notes/r/u/a.md)",
+            "(wicked-core-notes/r/u/a.md)",
         );
 
         // Windows: either separator, any ASCII case, the verbatim form, a space in the user name,
         // and a UNC temp dir; the kept tail uses `/`.
-        let win = NotesScrub::new(
-            &[r"C:\Users\John Smith\AppData\Local\Temp\".into()],
-            true,
-            true,
-        );
+        let win = NotesScrub::new(&[r"C:\Temp Dir\Jo Smith\T\".into()], true, true);
         for input in [
-            r"[r](C:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\run-1\unit-9\a.md)",
-            "[r](C:/Users/John Smith/AppData/Local/Temp/wicked-core-notes/run-1/unit-9/a.md)",
-            r"[r](c:\users\john smith\appdata\local\temp\wicked-core-notes\run-1\unit-9\a.md)",
-            r"[r](\\?\C:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\run-1\unit-9\a.md)",
+            r"[r](C:\Temp Dir\Jo Smith\T\wicked-core-notes\run-1\unit-9\a.md)",
+            "[r](C:/Temp Dir/Jo Smith/T/wicked-core-notes/run-1/unit-9/a.md)",
+            r"[r](c:\temp dir\jo smith\t\wicked-core-notes\run-1\unit-9\a.md)",
+            r"[r](\\?\C:\Temp Dir\Jo Smith\T\wicked-core-notes\run-1\unit-9\a.md)",
         ] {
             check(&win, input, "[r](wicked-core-notes/run-1/unit-9/a.md)");
         }
         check(
             &win,
-            r"D:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\a.md",
-            r"D:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\a.md",
+            r"D:\Temp Dir\Jo Smith\T\wicked-core-notes\a.md",
+            r"D:\Temp Dir\Jo Smith\T\wicked-core-notes\a.md",
         );
         let unc = NotesScrub::new(&[r"\\?\UNC\srv\share\Temp".into()], true, true);
         for input in [
