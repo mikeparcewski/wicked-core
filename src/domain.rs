@@ -2197,7 +2197,8 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
 }
 
 /// (core#1795) The unit nodes a run's reads start from, found through the store's name index: a
-/// unit is named by its id, `{session_id}:{phase}` (minted in [`crate::plan::plan_units`]), so the
+/// unit is named by its id, `{session_id}:{phase}` (minted in [`crate::plan::plan_from_def`] and
+/// [`crate::plan::plan_units`]; every other unit construction clones a planned one), so the
 /// name prefix `{session_id}:` reaches this run's nodes without reading every unit on the store. A
 /// one-run read then costs the same on a store of 4 runs or 4000. The prefix match is ASCII
 /// case-insensitive and also takes other kinds named under the run (its results), so callers still
@@ -2589,6 +2590,16 @@ mod tests {
             nodes.push(WorkUnit::pending(format!("run-x:u{ord}"), "run-x", ord, "x").to_node());
         }
         nodes.push(WorkUnit::pending("run-x:2:u1", "run-x:2", 1, "y").to_node());
+        // A node of another kind named under the run (a check result's id): never a unit of it.
+        let mut result = Node::new(
+            synthetic_symbol("TestResultRecord", "run-x:unit-1:attempt-0:repo_checks"),
+            NodeKind::Other("TestResultRecord".to_string()),
+            "run-x:unit-1:attempt-0:repo_checks".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new("TestResultRecord/run-x:unit-1", Span::ZERO),
+        );
+        result.metadata.insert("session_id".into(), "run-x".into());
+        nodes.push(result);
         put_nodes(&mut store, &nodes).unwrap();
         let probe = ScanProbe {
             inner: store,
@@ -2604,6 +2615,11 @@ mod tests {
         let at = session_unit_at(&probe, "run-x", 1).unwrap().expect("ix 1");
         assert_eq!(at.id, "run-x:u2");
         assert_eq!(
+            session_unit_at(&probe, "run-x", 2).unwrap(),
+            None,
+            "the result node takes no cursor position"
+        );
+        assert_eq!(
             session_units(&probe, "run-x:2").unwrap().len(),
             1,
             "the prefixed run reads its own unit"
@@ -2613,6 +2629,25 @@ mod tests {
             0,
             "no per-run read asked the store for every unit node"
         );
+    }
+
+    /// (core#1795) The name index a one-run unit read uses rests on this: every unit a plan mints
+    /// is named `{session_id}:{phase}` (other unit constructions clone a planned unit).
+    #[test]
+    fn every_planned_unit_is_named_under_its_run() {
+        let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
+            "id": "d",
+            "phases": [{"id": "understand", "kind": "understand"}, {"id": "build", "kind": "build"}]
+        }))
+        .unwrap();
+        let mut units = crate::plan::plan_units("build the thing", "run-q");
+        units.extend(crate::plan::plan_from_def(&def, "build the thing", "run-q"));
+        assert_eq!(units.len(), 3);
+        for u in &units {
+            assert!(u.id.starts_with("run-q:"), "{}", u.id);
+            assert_eq!(u.session_id, "run-q");
+            assert!(u.to_node().name.starts_with("run-q:"), "{}", u.id);
+        }
     }
 
     #[test]

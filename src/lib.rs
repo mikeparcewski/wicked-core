@@ -1409,9 +1409,10 @@ impl Core {
     /// wicked-core#1522).
     ///
     /// (core#1795) Answered off the actor from the read model, in one read transaction, so a gate
-    /// card never waits behind a long command (a worktree snapshot); through the actor only when
-    /// this store has none. The list is advisory: [`Core::confirm_gate`] checks the answer again on
-    /// the actor.
+    /// card does not queue behind a long command (a worktree snapshot). It goes through the actor
+    /// (and waits for it) when the store has no read model, or when the read-model read fails: the
+    /// connection cannot be opened, its transaction fails, or the fold errs (an unknown run). The
+    /// list is advisory: [`Core::confirm_gate`] checks the answer again on the actor.
     pub fn gate_actions(&self, run_id: &str) -> anyhow::Result<Option<GateActions>> {
         if let Some(listed) = self
             .run_read_model

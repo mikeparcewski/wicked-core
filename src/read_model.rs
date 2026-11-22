@@ -54,12 +54,20 @@ pub(crate) const QUIET_BUDGET: Duration = Duration::from_millis(100);
 /// Past this many idle connections, a finished read's connection is closed.
 const IDLE_CONNECTIONS: usize = 4;
 
+/// The idle connections, and whether the pool is closed: once the actor stops, every idle
+/// connection is dropped and none is taken back, so nothing of this core holds the store open.
+#[derive(Default)]
+struct Pool {
+    conns: Vec<SqliteStore>,
+    closed: bool,
+}
+
 pub(crate) struct ReadModel {
     /// The store file, or `None` when this store has no read model (in-memory, Postgres).
     path: Option<String>,
     /// Idle read-only connections ([`IDLE_CONNECTIONS`] at most). The lock is held only to take
     /// or return one, never across a read.
-    idle: Mutex<Vec<SqliteStore>>,
+    idle: Mutex<Pool>,
     /// The actor's command counters: where "between commands" is read from.
     actor: Arc<crate::actor_stats::ActorStats>,
     /// How long a read waits for a between-commands moment ([`QUIET_BUDGET`]; tests widen it so a
@@ -123,7 +131,7 @@ impl ReadModel {
             std::env::var("WICKED_READ_MODEL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
         Self {
             path: (!off).then(|| read_path(spec)).flatten(),
-            idle: Mutex::new(Vec::new()),
+            idle: Mutex::new(Pool::default()),
             actor,
             budget: QUIET_BUDGET,
             #[cfg(test)]
@@ -155,26 +163,37 @@ impl ReadModel {
         // (core#1795) This read's own connection: the pool's lock is released before the read
         // waits or reads, so concurrent reads run side by side. A connection that fails is
         // dropped (never returned), and the next read opens a fresh one.
-        let taken = self.idle.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        let taken = self
+            .idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .conns
+            .pop();
         let mut store = match taken {
             Some(store) => store,
             None => wicked_apps_core::open_store_ro(Some(path)).ok()?,
         };
-        let out = self.read_on(&mut store, f)?;
+        let out = self.read_on(&mut store, f);
+        // A stop seen at any point closes the pool, whatever this read answered.
         if self.actor.is_stopped() {
             self.close_idle();
             return None;
         }
-        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
-        if idle.len() < IDLE_CONNECTIONS {
-            idle.push(store);
+        let out = out?;
+        let mut pool = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the pool's lock: a read that returns after another closed the pool drops
+        // its connection instead of reopening the pool.
+        if !pool.closed && pool.conns.len() < IDLE_CONNECTIONS {
+            pool.conns.push(store);
         }
         Some(out)
     }
 
-    /// Close every idle connection (the actor stopped).
+    /// Close the pool for good (the actor stopped): drop every idle connection, take none back.
     fn close_idle(&self) {
-        self.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let mut pool = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        pool.closed = true;
+        pool.conns.clear();
     }
 
     /// [`ReadModel::read`] on one connection: `None` when the read must go to the actor, and the
@@ -378,10 +397,63 @@ mod tests {
         );
         assert_eq!(slow.join().unwrap(), Some("slow"));
         assert_eq!(
-            rm.idle.lock().unwrap().len(),
+            rm.idle.lock().unwrap().conns.len(),
             2,
             "both connections are kept"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1795, codex round 1) An actor that stops while a read runs closes the whole pool: the
+    /// idle connections are dropped, the running read's connection is not taken back, and no read
+    /// after it reopens one.
+    #[test]
+    fn a_stop_during_a_read_closes_the_pool_and_nothing_is_taken_back() {
+        use std::sync::mpsc::channel;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-close-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let rm = Arc::new(ReadModel::for_store(db.to_str().unwrap(), actor.clone()));
+        let bound = Duration::from_secs(20);
+        let hold = |rm: &Arc<ReadModel>, answer: i32| {
+            let (inside_tx, inside) = channel::<()>();
+            let (release_tx, release) = channel::<()>();
+            let rm = rm.clone();
+            let h = std::thread::spawn(move || {
+                rm.read(|_| {
+                    inside_tx.send(()).unwrap();
+                    release.recv_timeout(bound).expect("released");
+                    Ok(answer)
+                })
+            });
+            inside.recv_timeout(bound).expect("inside its read");
+            (h, release_tx)
+        };
+        // Two connections out at once, both returned: two idle.
+        let (held, release) = hold(&rm, 1);
+        assert_eq!(rm.read(|_| Ok(2)), Some(2));
+        release.send(()).unwrap();
+        assert_eq!(held.join().unwrap(), Some(1));
+        assert_eq!(rm.idle.lock().unwrap().conns.len(), 2);
+        // A read takes one of them; the actor stops while it reads.
+        let (reading, release) = hold(&rm, 3);
+        actor.mark_stopped();
+        release.send(()).unwrap();
+        assert_eq!(reading.join().unwrap(), None, "the actor answers it");
+        let pool = rm.idle.lock().unwrap();
+        assert!(pool.closed, "the stop closed the pool");
+        assert!(
+            pool.conns.is_empty(),
+            "the other idle connection was dropped without another read"
+        );
+        drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
