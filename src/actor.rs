@@ -44636,6 +44636,7 @@ mod plan_gate_confirm_tests {
             touch_source: None,
             rules: Vec::new(),
             done: Vec::new(),
+            band_why: Vec::new(),
         }
     }
 

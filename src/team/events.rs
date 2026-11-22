@@ -618,6 +618,33 @@ pub struct PlanStep {
     /// On `plan.revised.added`: the step's catalog position precedes a done step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late: Option<bool>,
+    // (core#1259) The step's controls, as the plan set them (omitted when unset, so a plan that
+    // sets none serializes as before). What a reader sees; the engine composes from the plan.
+    /// (core#810) The step's worker pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<u8>,
+    /// The step runs code (raised on a step whose entry does not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executes_code: Option<bool>,
+    /// The validator the step pins (an unpinned entry may gain one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_pin: Option<String>,
+    /// (core#649) The step changes no file in the run's tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes_nothing: Option<bool>,
+    /// The step's output is an acceptance requirement of its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_evidence: Option<bool>,
+    /// (core#535) The step's output must end with a capture-report marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_capture_report: Option<bool>,
+    /// (crew#1311) The step's output is an answer its caller reads: the substance floor asks
+    /// only that an answer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_only: Option<bool>,
+    /// The deliverables the step must produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_deliverables: Option<Vec<String>>,
 }
 
 /// A manual-mode override of the floor.

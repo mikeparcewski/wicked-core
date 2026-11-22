@@ -309,6 +309,7 @@ fn an_edit_while_a_plan_awaits_approval_is_refused() {
             touch_source: None,
             rules: Vec::new(),
             done: Vec::new(),
+            band_why: Vec::new(),
         });
     });
     let e = propose_plan(

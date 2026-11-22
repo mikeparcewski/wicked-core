@@ -743,6 +743,8 @@ pub(crate) fn revise(
                 touch_source: Some(touch_source),
                 rules,
                 done: done.to_vec(),
+                // A revision carries no intent score of its own to explain the band with.
+                band_why: Vec::new(),
             });
             Ok(Revised {
                 state,
@@ -1172,6 +1174,8 @@ pub(crate) fn send_back(
         touch_source: held.touch_source,
         rules,
         done: held.done.clone(),
+        // A send-back re-plans under the held plan's score: the same band, for the same reasons.
+        band_why: held.band_why.clone(),
     });
     Ok(Revised {
         state,
