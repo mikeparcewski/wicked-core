@@ -1917,13 +1917,16 @@ fn run_bounded_status_capturing_stderr(
 /// The spawn a [`SpawnWatch`] wraps.
 pub(crate) type Spawn<'a> = dyn FnMut() -> std::io::Result<std::process::Child> + 'a;
 
+/// A watcher's wrapper around a [`Spawn`]: it may refuse (an `Err`) or run it.
+pub(crate) type WatchedSpawn = dyn Fn(&mut Spawn<'_>) -> std::io::Result<std::process::Child>;
+
 /// (core#1742) Who owns a validator's process group on this thread: the fold's off-actor reads
 /// ([`crate::actor`]'s `fold_reads`) register it under the run, as a tool child is, so a reassign
 /// or a cancel of the run stops it.
 pub(crate) struct SpawnWatch {
     /// Runs the spawn, so the watcher can refuse it (an `Err`: nothing is started) and register
     /// the new group atomically with it.
-    pub(crate) spawn: Box<dyn Fn(&mut Spawn<'_>) -> std::io::Result<std::process::Child>>,
+    pub(crate) spawn: Box<WatchedSpawn>,
     /// The group is released: the wait for its leader has ended.
     pub(crate) on_done: Box<dyn Fn(u32)>,
 }
