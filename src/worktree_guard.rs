@@ -474,11 +474,51 @@ fn unread(stderr: &str) -> anyhow::Result<()> {
     }
 }
 
-/// (core#1314) A path in the engine scratch: `tmp` itself or under it. Case-insensitively, since
-/// a case-insensitive filesystem (macOS, Windows) resolves `TMP` to the scratch too.
-fn in_engine_scratch(p: &[u8]) -> bool {
+/// (core#1314) A path in the engine scratch: `tmp` itself or under it. A case variant (`TMP`) is
+/// the scratch only where it resolves to the scratch directory, on a filesystem that folds case;
+/// on a case-sensitive one it is a directory of the change's own (review on #1764).
+fn in_engine_scratch(worktree: &Path, p: &[u8]) -> bool {
     let first = p.split(|b| *b == b'/').next().unwrap_or_default();
-    first.eq_ignore_ascii_case(ENGINE_SCRATCH_DIR.as_bytes())
+    if first == ENGINE_SCRATCH_DIR.as_bytes() {
+        return true;
+    }
+    if !first.eq_ignore_ascii_case(ENGINE_SCRATCH_DIR.as_bytes()) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(first) = std::str::from_utf8(first) else {
+            return false;
+        };
+        match (
+            std::fs::metadata(worktree.join(first)),
+            std::fs::metadata(worktree.join(ENGINE_SCRATCH_DIR)),
+        ) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    // NTFS folds case.
+    #[cfg(not(unix))]
+    {
+        let _ = worktree;
+        true
+    }
+}
+
+/// (core#1314) A worktree entry git reads as a directory: a directory, and on Windows any
+/// directory reparse point too (a junction, which Rust reports as a link and git traverses).
+fn dir_like(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        if m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return true;
+        }
+    }
+    m.is_dir()
 }
 
 /// (core#1314) The paths an index lists (`ls-files -z --cached`), as raw bytes.
@@ -555,7 +595,7 @@ fn snapshot_through_inner(
                 index_paths(worktree, &env)?.into_iter().collect();
             let mut forced: Vec<u8> = Vec::new();
             for p in index_paths(worktree, &pinned)? {
-                if scratch.contains(&p) || in_engine_scratch(&p) {
+                if scratch.contains(&p) || in_engine_scratch(worktree, &p) {
                     continue;
                 }
                 let p = String::from_utf8(p).map_err(|e| {
@@ -566,9 +606,9 @@ fn snapshot_through_inner(
                 })?;
                 match std::fs::symlink_metadata(worktree.join(&p)) {
                     // A file or a link: force-added as the worktree holds it. A staged entry the
-                    // worktree replaced with a directory is `add -A`'s to read: forcing it would
-                    // import the directory's ignored contents.
-                    Ok(m) if !m.is_dir() => {
+                    // worktree replaced with a directory (or, on Windows, a junction) is `add
+                    // -A`'s to read: forcing it would import the directory's ignored contents.
+                    Ok(m) if !dir_like(&m) => {
                         forced.extend_from_slice(p.as_bytes());
                         forced.push(0);
                     }
@@ -1454,6 +1494,58 @@ pub(crate) mod tests {
             "{}",
             names(&strict.tree)
         );
+        // (review on #1764) On a case-sensitive filesystem `TMP` is the change's own directory:
+        // a path force-added under it is in the tree. Where `TMP` folds to `tmp`, it is scratch.
+        std::fs::create_dir_all(repo.join("TMP")).unwrap();
+        if repo.join("TMP").exists()
+            && std::fs::read_dir(&repo)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name() == "TMP")
+        {
+            std::fs::write(repo.join(".gitignore"), "vendor/\nTMP/\n").unwrap();
+            std::fs::write(repo.join("TMP/own.txt"), "own\n").unwrap();
+            run_git(&repo, &["add", "-f", "TMP/own.txt"]);
+            let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+            assert!(
+                names(&strict.tree).lines().any(|n| n == "TMP/own.txt"),
+                "{}",
+                names(&strict.tree)
+            );
+            run_git(&repo, &["rm", "-q", "--cached", "TMP/own.txt"]);
+            std::fs::remove_dir_all(repo.join("TMP")).unwrap();
+            std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        } else {
+            eprintln!("SKIP: this filesystem folds `TMP` to `tmp`");
+        }
+        // (review on #1764) Windows: a staged file replaced by a JUNCTION to the scratch is a
+        // directory to git, never force-added.
+        #[cfg(windows)]
+        {
+            std::fs::write(repo.join("alias"), "staged\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), "vendor/\nalias\n").unwrap();
+            run_git(&repo, &["add", "-f", "alias"]);
+            std::fs::remove_file(repo.join("alias")).unwrap();
+            // spawn-audit: test-only — `cmd /C mklink /J` builds the junction fixture; reads no engine state.
+            let made = Command::new("cmd")
+                .args(["/C", "mklink", "/J", "alias", "tmp"])
+                .current_dir(&repo)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if made {
+                let strict = snapshot_through_strict(&repo, &git_dir).unwrap();
+                assert!(
+                    !names(&strict.tree).lines().any(|n| n.starts_with("alias/")),
+                    "{}",
+                    names(&strict.tree)
+                );
+                let _ = std::fs::remove_dir(repo.join("alias"));
+            } else {
+                eprintln!("SKIP: no junction could be made");
+            }
+            run_git(&repo, &["rm", "-q", "--cached", "alias"]);
+            std::fs::write(repo.join(".gitignore"), "vendor/\n").unwrap();
+        }
         run_git(&repo, &["rm", "-q", "--cached", "tmp"]);
         std::fs::remove_dir_all(repo.join("tmp")).unwrap();
         // Hundreds of long force-added paths: 300 x ~130 chars is past 32,767 in any 256-path
