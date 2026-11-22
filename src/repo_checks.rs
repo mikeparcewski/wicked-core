@@ -7537,6 +7537,10 @@ fn write_private_git_dir(
     Ok(())
 }
 
+/// (core#1131) The most paths [`cat_batch`] converts one git at a time (a path that starts with
+/// whitespace or ends in CR); more fail the export closed.
+const ODD_PATH_CAP: usize = 64;
+
 /// The path given to the end-of-body request (any; the object is missing).
 const SENTINEL_PATH: &str = "wicked-end";
 
@@ -7562,6 +7566,20 @@ fn cat_batch(
         line.split_once(' ')
             .is_some_and(|(_, p)| p.starts_with([' ', '\t']) || p.ends_with('\r'))
     };
+    // (coord r1 on #1765) Each odd path costs its own git: past the cap, the export fails closed
+    // (the base is then unknown, never compared) instead of spawning one git per file of a tree
+    // built to hold thousands of them.
+    let odd_count = if filtered {
+        inputs.iter().filter(|l| odd(l)).count()
+    } else {
+        0
+    };
+    if odd_count > ODD_PATH_CAP {
+        return Err(format!(
+            "the tree has {odd_count} paths that start with whitespace or end in CR; the export \
+             converts at most {ODD_PATH_CAP} of them one by one"
+        ));
+    }
     let mut at: Vec<usize> = Vec::with_capacity(inputs.len());
     let mut batch: Vec<String> = Vec::with_capacity(inputs.len());
     for (i, line) in inputs.into_iter().enumerate() {

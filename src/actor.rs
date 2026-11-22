@@ -569,6 +569,14 @@ fn run_code_graph_db(
 /// Shared rather than inlined because [`crate::Core`] derives the event-log root from it too, off the
 /// actor thread — two copies of this rule would mean a reader that looks in the wrong directory for a
 /// postgres-backed core, and the symptom would be an empty evidence trail rather than an error.
+pub(crate) fn sidecar_base(path: &str) -> String {
+    if path.contains("://") {
+        ".wicked-estate/graph.db".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// (core#1131) The event-log root for the store `path`: `None` when SQLite opens it in memory,
 /// classified on the ORIGINAL spec (a `file:///…?mode=memory` URI holds `://`, which
 /// [`sidecar_base`] would replace with the estate default), else `<sidecar base>.events`.
@@ -577,14 +585,6 @@ pub(crate) fn event_log_root(path: &str) -> Option<std::path::PathBuf> {
         None
     } else {
         crate::event_log::log_root_for(&sidecar_base(path))
-    }
-}
-
-pub(crate) fn sidecar_base(path: &str) -> String {
-    if path.contains("://") {
-        ".wicked-estate/graph.db".to_string()
-    } else {
-        path.to_string()
     }
 }
 
