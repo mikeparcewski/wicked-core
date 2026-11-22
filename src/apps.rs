@@ -190,12 +190,24 @@ pub(crate) fn admit(
     store: &dyn wicked_apps_core::GraphRead,
     f: &LaunchFacts<'_>,
 ) -> anyhow::Result<Option<AppsContract>> {
-    // (core#1343) A `run-cost` launch's facts step is crew's Tool, which runs only with its unit's
-    // capability token ([`crate::actor::crew_tool_channel`], keyed on the same preset name). That
-    // token needs input governance and a broker URL; without either the step refused late, after
-    // the run had started. Refused here instead, typed and with nothing persisted, as an Apps
-    // launch is.
-    if f.workflow == Some(crate::actor::RUN_COST_PRESET) && !(f.governed && f.crew_url) {
+    // (core#1343) A `run-cost` launch whose facts step is crew's Tool runs that step only with its
+    // unit's capability token ([`crate::actor::crew_tool_channel`]: the preset name AND the exact
+    // facts command). The token needs input governance and a broker URL; without either the step
+    // refused late, after the run had started. Refused here instead, typed and with nothing
+    // persisted, as an Apps launch is. Only when the preset that resolves for the launch carries
+    // that command: a saved `run-cost` without it needs no channel (codex review).
+    if f.workflow == Some(crate::actor::RUN_COST_PRESET)
+        && !f.plan
+        && !(f.governed && f.crew_url)
+        && crate::preset::resolve(store, f.project_id, crate::actor::RUN_COST_PRESET)?.is_some_and(
+            |p| {
+                p.steps.iter().any(|s| {
+                    matches!(&s.executor, Some(crate::workflow::PhaseExecutor::Tool { cmd })
+                    if cmd.iter().map(String::as_str).eq(crate::actor::RUN_COST_FACTS_CMD))
+                })
+            },
+        )
+    {
         let missing = match (f.governed, f.crew_url) {
             (false, false) => {
                 "input governance is not armed on this engine and the daemon has no \

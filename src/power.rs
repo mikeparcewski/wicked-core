@@ -1593,16 +1593,6 @@ pub(crate) fn unregister_actor(gen: uuid::Uuid) {
         .remove(&gen);
 }
 
-/// (core#1708) The process generations of every engine actor live right now.
-pub(crate) fn live_actor_gens() -> Vec<uuid::Uuid> {
-    actors()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .keys()
-        .copied()
-        .collect()
-}
-
 pub(crate) fn actor_tx(
     gen: Option<uuid::Uuid>,
 ) -> Option<std::sync::mpsc::Sender<crate::command::Command>> {

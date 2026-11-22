@@ -1801,6 +1801,35 @@ fn a_run_cost_launch_that_could_not_arm_the_crew_tool_channel_is_refused() {
         admit(&store, &base()).unwrap().is_none(),
         "an armed run-cost launch is admitted, and is not an Apps run"
     );
+    // A saved `run-cost` that runs no crew facts command needs no channel, so it is not refused.
+    let mut store = store;
+    let row = crate::preset::Preset {
+        name: crate::actor::RUN_COST_PRESET.into(),
+        scope: "project:p1".into(),
+        steps: vec![crate::plan::PlanStep {
+            catalog: "understand".into(),
+            id: "model".into(),
+            ..Default::default()
+        }],
+        created_by: "api".into(),
+        updated_at: 1,
+        deleted_at: None,
+        required_instruments: None,
+        title: None,
+        summary: None,
+        use_when: Vec::new(),
+    };
+    crate::domain::put_node(&mut store, row.to_node()).unwrap();
+    let saved = LaunchFacts {
+        project_id: Some("p1"),
+        governed: false,
+        crew_url: false,
+        ..base()
+    };
+    assert!(
+        admit(&store, &saved).unwrap().is_none(),
+        "no facts Tool, no channel to arm"
+    );
     // Any other launch is not judged by this rule.
     let other = LaunchFacts {
         governed: false,

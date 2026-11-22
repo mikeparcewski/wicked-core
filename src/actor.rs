@@ -16429,33 +16429,12 @@ fn run_conformance_harness(
 /// private temp directory is writable. Crew's install gate calls this; it never runs the
 /// harness unjailed.
 pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
-    run_editor_conformance_with(
-        request_json,
-        &crate::validator::serve_jail,
-        &install_conformance_stop(crate::power::live_actor_gens()),
-    )
-}
-
-/// (core#1708) The install-time harness's stop: `shutdown` once an engine actor that was live when
-/// the call began has taken `Shutdown` (crew's daemon stopping or restarting its `Core`). The call
-/// is static (`Core.runEditorConformance`), so no run or `Core` owns it; the engines live at its
-/// start stand for the daemon that asked. On `shutdown` the harness's poll loop
-/// ([`run_tool_cmd_jailed`]) kills the jailed process group at once, as the review-time step's
-/// does; it used to run on to its own deadline (up to 900 s). A call made with no engine live
-/// has nothing to stop it but that deadline, as before.
-fn install_conformance_stop(engines: Vec<uuid::Uuid>) -> impl Fn() -> Option<&'static str> {
-    move || {
-        engines
-            .iter()
-            .any(|g| crate::power::actor_tx(Some(*g)).is_none())
-            .then_some(STOP_SHUTDOWN)
-    }
+    run_editor_conformance_with(request_json, &crate::validator::serve_jail)
 }
 
 fn run_editor_conformance_with(
     request_json: &str,
     jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
-    stop: &dyn Fn() -> Option<&'static str>,
 ) -> Result<String, String> {
     use crate::editor_conformance as ec;
     #[derive(serde::Deserialize)]
@@ -16534,7 +16513,7 @@ fn run_editor_conformance_with(
         0,
         deadline,
         jail,
-        stop,
+        &|| None,
         &|_| {},
         &|_| {},
     );
@@ -16646,7 +16625,7 @@ mod editor_install_conformance_tests {
                 for timeout in [1, 900] {
                     let request =
                         serde_json::json!({ "packRoot": pack, "timeoutS": timeout }).to_string();
-                    let raw = run_editor_conformance_with(&request, &jail, &|| None).unwrap();
+                    let raw = run_editor_conformance_with(&request, &jail).unwrap();
                     let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                     assert!(called.get());
                     assert_eq!(response["record"]["outcome"], "refused");
@@ -16655,71 +16634,6 @@ mod editor_install_conformance_tests {
                     assert!(response["report"].is_null());
                 }
             }
-        });
-    }
-
-    /// core#1708: the install-time harness stops when the engine that was live at the call's start
-    /// shuts down. The jail's process (a stand-in that records its pid and sleeps) is killed and
-    /// reaped within seconds of the `Core` dropping, and the call returns. Red on main: the stop was
-    /// `|| None`, so the harness ran to its own deadline (here the stand-in's 60 s sleep).
-    #[cfg(unix)]
-    #[test]
-    fn an_install_harness_is_killed_when_its_engine_shuts_down() {
-        with_host_inputs(|root| {
-            let pack = root.join("pack");
-            std::fs::create_dir(&pack).unwrap();
-            let pidfile = root.join("harness.pid");
-            let before = crate::power::live_actor_gens();
-            let core = crate::Core::spawn(":memory:");
-            // The actor registers itself on its own thread: a reply proves it is up.
-            let _ = core.sessions();
-            let ours: Vec<uuid::Uuid> = crate::power::live_actor_gens()
-                .into_iter()
-                .filter(|g| !before.contains(g))
-                .collect();
-            assert!(!ours.is_empty(), "the engine registered its actor");
-            let stop = install_conformance_stop(ours);
-            assert_eq!(stop(), None, "a live engine does not stop the harness");
-            let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
-            let request = serde_json::json!({ "packRoot": pack, "timeoutS": 120 }).to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                let jail = |_: &[&Path], _: u16| crate::validator::SandboxLauncher {
-                    wrapper: vec!["sh".into(), "-c".into(), script.clone(), "sh".into()],
-                    level: crate::validator::SandboxLevel::Sandboxed,
-                };
-                let raw = run_editor_conformance_with(&request, &jail, &stop).unwrap();
-                tx.send(raw).unwrap();
-            });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let pid: i32 = loop {
-                if let Some(p) = std::fs::read_to_string(&pidfile)
-                    .ok()
-                    .and_then(|t| t.trim().parse().ok())
-                {
-                    break p;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the harness never started"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            };
-            // SAFETY: signal 0 only probes that the pid exists.
-            assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the harness runs");
-            drop(core);
-            let raw = rx
-                .recv_timeout(std::time::Duration::from_secs(20))
-                .expect("the call returned once its engine shut down, not at the deadline");
-            worker.join().unwrap();
-            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            assert_eq!(response["record"]["outcome"], "refused", "{response}");
-            // SAFETY: as above.
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                -1,
-                "the jailed process is gone (killed and reaped)"
-            );
         });
     }
 
@@ -16733,7 +16647,7 @@ mod editor_install_conformance_tests {
             };
             let check = |path: &Path| {
                 let request = serde_json::json!({ "packRoot": path }).to_string();
-                let raw = run_editor_conformance_with(&request, &jail, &|| None).unwrap();
+                let raw = run_editor_conformance_with(&request, &jail).unwrap();
                 let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 assert_eq!(response["record"]["outcome"], "refused");
                 assert_eq!(response["record"]["cause"], "engine_refused");
@@ -39484,6 +39398,12 @@ mod terminal_worktree_reap_tests {
         )
         .unwrap();
         wait_claimed(&gated, "the gate continue");
+        // Long after both boot claims ran (a gate round trip later), the other daemon's marker is
+        // still its own.
+        assert_eq!(
+            crate::repo::worktree_daemon(&theirs).as_deref(),
+            Some("daemon-other")
+        );
         drop(core);
         for root in roots {
             let _ = std::fs::remove_dir_all(root);
