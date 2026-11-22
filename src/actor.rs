@@ -19280,6 +19280,13 @@ mod answer_tx {
         fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
             self.inner.find_structural_symbols(query)
         }
+        fn find_symbols_by_name_prefix(
+            &self,
+            prefix: &str,
+            limit: Option<usize>,
+        ) -> Result<Vec<Node>> {
+            self.inner.find_symbols_by_name_prefix(prefix, limit)
+        }
         fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
             self.inner.neighbors(id, dir)
         }
@@ -19297,6 +19304,9 @@ mod answer_tx {
         }
         fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
             self.inner.unresolved_refs_for_name(name)
+        }
+        fn count_unresolved_refs_from(&self, from: &[SymbolId]) -> Result<Option<u64>> {
+            self.inner.count_unresolved_refs_from(from)
         }
         fn indexed_files(&self) -> Result<Vec<String>> {
             self.inner.indexed_files()
@@ -19327,6 +19337,12 @@ mod answer_tx {
         }
         fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
             self.inner.node_semantics(symbol)
+        }
+        fn semantics_in_files(
+            &self,
+            files: &[&str],
+        ) -> Result<Vec<(String, SymbolId, NodeSemantics)>> {
+            self.inner.semantics_in_files(files)
         }
         fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
             self.inner.find_by_requirement(requirement)
@@ -19417,6 +19433,25 @@ mod answer_tx {
             self.inner
                 .set_node_semantics(symbol, description, requirement, validation)
         }
+        fn can_restore_node_semantics(&self) -> bool {
+            self.inner.can_restore_node_semantics()
+        }
+        fn restore_node_semantics(
+            &mut self,
+            symbol: &SymbolId,
+            semantics: &NodeSemantics,
+        ) -> Result<()> {
+            self.inner.restore_node_semantics(symbol, semantics)
+        }
+        fn record_search_miss(
+            &mut self,
+            query: &str,
+            searched_at: i64,
+            session_id: Option<&str>,
+        ) -> Result<()> {
+            self.inner
+                .record_search_miss(query, searched_at, session_id)
+        }
         fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
             self.inner.annotate(symbol, annotation)
         }
@@ -19435,6 +19470,46 @@ mod answer_tx {
             facts: &[SupportFact],
         ) -> Result<SupportReplacement> {
             self.inner.replace_edge_supports(owner, generation, facts)
+        }
+    }
+
+    /// core#1668: the answer transaction keeps the backend's semantics restore (estate 0.35
+    /// defaulted methods), so a re-extract driven through it keeps a file's requirements.
+    #[cfg(test)]
+    mod tests {
+        use super::AnswerTx;
+        use wicked_estate_core::*;
+
+        #[test]
+        fn answer_tx_forwards_semantics_restore_1668() {
+            let mut store = wicked_apps_core::open_store_any(Some(":memory:")).unwrap();
+            let sym = wicked_apps_core::synthetic_symbol("answer_tx_test", "n1");
+            let node = Node::new(
+                sym.clone(),
+                NodeKind::Other("answer_tx_test".to_string()),
+                "n1",
+                Language::new(wicked_apps_core::SYMBOL_SCHEME),
+                Location::new("answer_tx_test/n1", Span::ZERO),
+            );
+            let mut tx = AnswerTx::open(&mut store).unwrap();
+            tx.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+            tx.set_node_semantics(&sym, None, Some("REQ-1668"), None)
+                .unwrap();
+            assert!(tx.can_restore_node_semantics());
+            let snapshot = tx.semantics_in_files(&["answer_tx_test/n1"]).unwrap();
+            assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+            tx.remove_file("answer_tx_test/n1").unwrap();
+            tx.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+            tx.restore_node_semantics(&sym, &snapshot[0].2).unwrap();
+            tx.finish().unwrap();
+            drop(tx);
+            assert_eq!(
+                store
+                    .node_semantics(&sym)
+                    .unwrap()
+                    .and_then(|s| s.requirement),
+                Some("REQ-1668".to_string())
+            );
         }
     }
 }
