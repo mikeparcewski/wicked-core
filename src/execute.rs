@@ -438,7 +438,10 @@ fn work_output_node(
 /// [`crate::worktree_guard::scrub_notes_paths`]. Run on both sides of the secret redaction: before
 /// it, so a cut can never split a path the scrub must match; after it, because the redaction joins
 /// a shell line continuation (`/tm\<newline>p/...`) into a path the scrub had not seen.
-fn scrub_notes_fields(map: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
+pub(crate) fn scrub_notes_fields(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) {
     fn scrub(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::String(s) => {
@@ -650,6 +653,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(node.metadata["output"].as_str().unwrap(), plain);
+    }
+
+    /// core#1380 (coord review F1): a failed unit's own row keeps its output's tail in the
+    /// denial and the review rounds; a notes link there persists in the scrubbed form.
+    #[test]
+    fn a_failed_units_row_names_no_host_temp_dir_for_a_notes_link_1380() {
+        let tmp = std::env::temp_dir();
+        let run_dir = crate::gate_hook::run_dir_name("run-1380-row");
+        let link = tmp
+            .join("wicked-core-notes")
+            .join(&run_dir)
+            .join("unit-9")
+            .join("command-record.md")
+            .display()
+            .to_string();
+        let tail = format!("wicked-core-notes/{run_dir}/unit-9/command-record.md");
+        let failed = format!("worker failed; last output:\n[Command record]({link})\n");
+        let mut unit = WorkUnit::pending("s:u9", "s", 9, "verify it");
+        unit.denial_reason = Some(failed.clone());
+        unit.denial = Some(UnitDenial::new("worker_failure", failed.as_str()));
+        unit.denials_behind = Some(vec![UnitDenial::new("worker_failure", failed.as_str())]);
+        unit.review_rounds = vec![crate::domain::ReviewRound {
+            attempt: 1,
+            findings: failed.clone(),
+            outcome: None,
+        }];
+        let node = unit.to_node();
+        let want = format!("worker failed; last output:\n[Command record]({tail})\n");
+        for got in [
+            &node.metadata["denial_reason"],
+            &node.metadata["denial"]["reason"],
+            &node.metadata["denials_behind"][0]["reason"],
+            &node.metadata["review_rounds"][0]["findings"],
+        ] {
+            assert_eq!(got.as_str(), Some(want.as_str()));
+        }
+        let host = tmp
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string();
+        assert!(!serde_json::to_string(&node.metadata)
+            .unwrap()
+            .contains(&host));
     }
 
     #[test]

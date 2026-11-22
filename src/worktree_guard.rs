@@ -347,7 +347,8 @@ impl NotesScrub {
     pub(crate) fn scrub<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         // A byte that continues a path name.
         let name_byte = |c: u8| c.is_ascii_alphanumeric() || b"._-~%+@".contains(&c) || c >= 0x80;
-        let opens = |c: u8| c.is_ascii_whitespace() || b"([<{\"'`=:,;|".contains(&c);
+        // `*` and `>`: markdown emphasis (`**/tmp/x**`) and a shell redirect (`cmd >/tmp/x`).
+        let opens = |c: u8| c.is_ascii_whitespace() || b"([<{\"'`=:,;|*>".contains(&c);
         let closes = |c: u8| c.is_ascii_whitespace() || b")]>}\"'`,;|".contains(&c);
         let b = text.as_bytes();
         // ASCII lowering keeps every byte offset, so a match in `hay` is a match in `text`.
@@ -2240,6 +2241,14 @@ pub(crate) mod tests {
             (
                 "P=/tmp/wicked-core-notes/a:/tmp/wicked-core-notes/b:/tmp/wicked-core-notes/c",
                 "P=wicked-core-notes/a:wicked-core-notes/b:wicked-core-notes/c",
+            ),
+            (
+                "saved **/tmp/wicked-core-notes/r/unit-9/a.md**",
+                "saved **wicked-core-notes/r/unit-9/a.md**",
+            ),
+            (
+                "cmd >/tmp/wicked-core-notes/r/unit-9/log.txt",
+                "cmd >wicked-core-notes/r/unit-9/log.txt",
             ),
         ] {
             check(&linux, input, want);
