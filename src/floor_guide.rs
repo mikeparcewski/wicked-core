@@ -972,6 +972,7 @@ impl GuideCheck {
             )
             .ok_or("the results hold no testsuite")?;
             let mut want = listed.to_vec();
+            // Both sorted: the mismatch is found by binary search (coord on #1766).
             ran.sort();
             want.sort();
             if ran == want {
@@ -979,7 +980,7 @@ impl GuideCheck {
             }
             let odd = ran
                 .iter()
-                .find(|t| !want.contains(*t))
+                .find(|t| want.binary_search(t).is_err())
                 .map(|t| {
                     format!(
                         "the run has `{}` (q `{}`), which the list does not",
@@ -987,12 +988,14 @@ impl GuideCheck {
                     )
                 })
                 .or_else(|| {
-                    want.iter().find(|t| !ran.contains(*t)).map(|t| {
-                        format!(
-                            "the list names `{}` (q `{}`), which the run does not",
-                            t.id, t.q
-                        )
-                    })
+                    want.iter()
+                        .find(|t| ran.binary_search(t).is_err())
+                        .map(|t| {
+                            format!(
+                                "the list names `{}` (q `{}`), which the run does not",
+                                t.id, t.q
+                            )
+                        })
                 })
                 .unwrap_or_default();
             return Err(format!(

@@ -294,10 +294,13 @@ struct Probe<'a> {
 /// (core#1101) The passing test `alone` and `deselect` probe: under `t`'s qualifier, not `t`, not
 /// `skip`, and with an id no other listed test has under ANY qualifier.
 fn unique_passing(ids: &[TestId], t: &TestId, skip: impl Fn(&TestId) -> bool) -> Option<TestId> {
+    // One pass to count each id across every qualifier, one to pick (coord on #1766: not O(n²)).
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for x in ids {
+        *seen.entry(x.id.as_str()).or_default() += 1;
+    }
     ids.iter()
-        .find(|x| {
-            x.q == t.q && *x != t && !skip(x) && ids.iter().filter(|y| y.id == x.id).count() == 1
-        })
+        .find(|x| x.q == t.q && *x != t && !skip(x) && seen.get(x.id.as_str()) == Some(&1))
         .cloned()
 }
 
