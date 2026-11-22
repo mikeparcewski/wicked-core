@@ -25,8 +25,9 @@
 //!
 //! Both Tools run under the validator's OS launcher with [`crate::validator::port_jail`]: writes only in
 //! their own directories and a private temp dir, network to `localhost:<the app's port>` outbound
-//! only. A host with no such jail (Linux: bwrap's `--unshare-net` hides the host's app; Windows) runs
-//! NO recorder: the engine writes the verdict file as `INCONCLUSIVE` itself and says why.
+//! only. Linux (core#1295) runs bwrap inside a `pasta` namespace that maps that one port to the host.
+//! A host with no such jail (Linux without bwrap or `pasta`; Windows) runs NO recorder: the engine
+//! writes the verdict file as `INCONCLUSIVE` itself and says why.
 //!
 //! ## The fold
 //!

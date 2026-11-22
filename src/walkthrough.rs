@@ -27,17 +27,21 @@
 //!   worktree's tree id, snapshotted at dispatch OUTSIDE the jail, since computing it writes git
 //!   objects), `WICKED_WALKTHROUGH_AUTHOR` (the author dir of the walkthrough_plan step it
 //!   records, when the plan has one) and the skills generation's launcher env
-//!   (`WICKED_GARDEN_ROOT` + the `PATH` prefix), and `WICKED_WALKTHROUGH_JAIL` = the armed
-//!   launcher's kind (core#798: garden's recorder records only when it is set). Nothing else: no key or token reaches the
-//!   recorder, the app or the probes.
+//!   (`WICKED_GARDEN_ROOT` + the `PATH` prefix), `WICKED_WALKTHROUGH_JAIL` = the armed
+//!   launcher's kind (core#798: garden's recorder records only when it is set), and
+//!   `WICKED_WALKTHROUGH_PORT` = the one loopback port its fixture serves on (core#1297). Nothing
+//!   else: no key or token reaches the recorder, the app or the probes.
 //!
 //! ## The jail
 //!
-//! The Tool runs under the validator's OS launcher with `NetworkPolicy::LoopbackOnly`: writes only
-//! in the proof root and the private temp dir, loopback connect/bind only. A host with no
-//! `Sandboxed` launcher (Windows; Linux without bwrap) runs NO walkthrough: the engine writes the
-//! proof root's `result.json` as `INCONCLUSIVE` / `unjailed_host` and the pinned result validator
-//! denies, saying why (O4).
+//! The Tool runs under the validator's OS launcher with the serve jail
+//! ([`crate::validator::serve_jail`]) on a loopback port the engine reserved for this take
+//! (core#1297): writes only in the proof root and the private temp dir; network only bind, inbound
+//! and outbound on `localhost:<that port>`, so the storyline the recorder imports reaches no other
+//! local service (a crew daemon on loopback included). A host with no `Sandboxed` launcher
+//! (Windows; Linux without bwrap) runs NO walkthrough: the engine writes the proof root's
+//! `result.json` as `INCONCLUSIVE` / `unjailed_host` and the pinned result validator denies,
+//! saying why (O4).
 
 use std::path::{Path, PathBuf};
 
@@ -58,6 +62,9 @@ pub(crate) const AUTHOR_DIR_ENV: &str = "WICKED_WALKTHROUGH_AUTHOR";
 /// (INCONCLUSIVE / `unjailed_host`) when it is absent, so a hand-run outside the engine's jail
 /// never records; the engine owns the jail decision and says so here.
 pub(crate) const JAIL_ENV: &str = "WICKED_WALKTHROUGH_JAIL";
+/// (core#1297) The one loopback port the record Tool's jail opens (bind, inbound, outbound), reserved
+/// by the engine at dispatch: garden's recorder starts the fixture there. Any other port is refused.
+pub(crate) const FIXTURE_PORT_ENV: &str = "WICKED_WALKTHROUGH_PORT";
 /// The subdirectory of the evidence root the walkthrough author writes under.
 pub(crate) const AUTHOR_SUBDIR: &str = "author";
 /// The record Tool's verdict file, read by the pinned result validator.

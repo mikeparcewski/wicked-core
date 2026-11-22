@@ -453,12 +453,12 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
         ),
         "demo" => (
             "Demo video",
-            "Plan, record and review a narrated demo video of an app.",
+            "Plan, record and review a captioned demo video of an app.",
             &["record a product demo", "show a feature working on video"],
         ),
         "demo-human-review" => (
             "Demo video (reviewed by you)",
-            "Plan and record a narrated demo video of an app whose data stays out of model context; you review the take.",
+            "Plan and record a captioned demo video of an app whose data stays out of model context; you review the take.",
             &[
                 "record a demo of an app with private data",
                 "a demo no model may watch",
@@ -2415,6 +2415,32 @@ chmod +x node_modules/.bin/vitest
         }
         assert_eq!(builtin_preset_descriptor("no-such-preset"), None);
         assert_eq!(builtin_preset_descriptor("campaign-x-y"), None);
+    }
+
+    /// (core#1388) A demo take has captions and chapters, no audio track: no built-in's copy may
+    /// promise narration, and both demo presets say what the take has.
+    #[test]
+    fn the_demo_copy_says_captioned_never_narrated() {
+        for (name, _) in builtin_presets() {
+            let d = builtin_preset_descriptor(name).expect("every built-in has a descriptor");
+            for text in std::iter::once(d.summary)
+                .chain(std::iter::once(d.title))
+                .chain(d.use_when.iter().copied())
+            {
+                assert!(
+                    !text.to_ascii_lowercase().contains("narrat"),
+                    "{name}: `{text}` promises narration; a take is captioned"
+                );
+            }
+        }
+        for name in ["demo", "demo-human-review"] {
+            let d = builtin_preset_descriptor(name).expect("demo presets are built-ins");
+            assert!(
+                d.summary.contains("captioned demo video"),
+                "{name}: `{}`",
+                d.summary
+            );
+        }
     }
 
     /// (DES-TEAMING-002 §8.8, operator decision 2026-10-18) The built-in presets hand their

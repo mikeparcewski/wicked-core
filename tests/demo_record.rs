@@ -310,10 +310,22 @@ fn run(name: &str, mode: &str, plant: bool) -> Run {
     run_with(name, mode, plant, true)
 }
 
-/// macOS is the one host with a port-scoped jail (sandbox-exec); elsewhere nothing records.
+/// Whether this host arms the one-port jail: macOS with sandbox-exec, or (core#1295) Linux with bwrap
+/// and `pasta` on `PATH`. The CI Linux leg sets `WICKED_REQUIRE_PASTA`, so it can never skip there.
 fn port_jailed() -> bool {
-    cfg!(target_os = "macos")
-        && wicked_core::sandbox_availability().0 == wicked_core::SandboxLevel::Sandboxed
+    let sandboxed = wicked_core::sandbox_availability().0 == wicked_core::SandboxLevel::Sandboxed;
+    if cfg!(target_os = "macos") {
+        return sandboxed;
+    }
+    let on_path = |name: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+    };
+    let armed = cfg!(target_os = "linux") && sandboxed && on_path("bwrap") && on_path("pasta");
+    if !armed && cfg!(target_os = "linux") && std::env::var_os("WICKED_REQUIRE_PASTA").is_some() {
+        panic!("WICKED_REQUIRE_PASTA is set but this host cannot arm the port jail");
+    }
+    armed
 }
 
 fn types(events: &[CoreEvent]) -> Vec<String> {
@@ -361,7 +373,13 @@ fn a_passing_take_completes_and_the_recorder_got_exactly_the_declared_env() {
         Some("http://127.0.0.1:7721")
     );
     assert_eq!(get("WICKED_DEMO_LAUNCH_PATH").as_deref(), Some("/apps/esc"));
-    assert_eq!(get("WICKED_DEMO_JAIL").as_deref(), Some("sandbox-exec"));
+    // The launcher kind past any prefix: bwrap inside `pasta` on Linux (core#1295).
+    let kind = if cfg!(target_os = "macos") {
+        "sandbox-exec"
+    } else {
+        "bwrap"
+    };
+    assert_eq!(get("WICKED_DEMO_JAIL").as_deref(), Some(kind));
     assert_eq!(get("WICKED_DEMO_LIVE_DATA_TO_MODELS").as_deref(), Some("1"));
     assert_eq!(
         get("WICKED_DEMO_STORYLINE").map(PathBuf::from),

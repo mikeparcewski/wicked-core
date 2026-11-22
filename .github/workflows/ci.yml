@@ -74,10 +74,15 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap passt
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent -- /bin/true
           echo "bwrap can arm a boundary on this runner"
+          # core#1295: the demo recorder's one-port jail is bwrap inside a `pasta` namespace. The
+          # port-jail tests fail here, rather than skip, when either is missing.
+          pasta --quiet -t none -u none -U none -- bwrap --ro-bind / / --dev /dev --proc /proc \
+            --unshare-user --cap-drop ALL --die-with-parent -- /bin/true
+          echo "WICKED_REQUIRE_PASTA=1" >> "$GITHUB_ENV"
 
       # DES-BUILD-GUIDE: the build-guide probe fixtures run against a REAL pytest and vitest here
       # (elsewhere they skip): a lane-local venv on PATH, and `WICKED_TEST_VITEST` naming vitest.

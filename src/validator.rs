@@ -535,25 +535,22 @@ pub(crate) struct SandboxLauncher {
 enum NetworkPolicy {
     Deny,
     Allow,
-    /// (WT-C2, DES-walkthrough-proof §4.4) Loopback only: connect to and bind on `localhost`, and
-    /// nothing else — the walkthrough recorder starts the app on a loopback port and drives it
-    /// there. macOS: the deny plus loopback allows; Linux bwrap: `--unshare-net` (the new network
-    /// namespace has only `lo`). No system-temp carve-out: the caller hands its private temp dir in
-    /// as a write root.
-    LoopbackOnly,
     /// (DES-DEMO-RECORD-001 §3.4, core#1249) ONE outbound TCP port on `localhost` and nothing else: no
     /// bind, no inbound, no other loopback port. The demo recorder drives the person's app on the host,
-    /// which may be the crew daemon itself, so `localhost:*` would hand it every local service. macOS
-    /// only: Linux bwrap's `--unshare-net` gives the jail its own loopback, where the host's app is not
-    /// reachable, so a Linux host gets no `Sandboxed` launcher for this policy (the caller reports
-    /// `no_port_scoped_jail`).
+    /// which may be the crew daemon itself, so `localhost:*` would hand it every local service. macOS:
+    /// one outbound rule. Linux (core#1295): bwrap inside a `pasta` (passt) network namespace whose
+    /// only route to the host is `-T <port>`, the namespace's `localhost:<port>` spliced to the host's
+    /// (no tap address, no route, no DNS; the jail runs in a nested user namespace with every
+    /// capability dropped, so it cannot bring the tap up), plus the AF_UNIX seccomp program. A Linux
+    /// host without `pasta` gets no `Sandboxed` launcher (the caller reports `no_port_scoped_jail`).
     LoopbackPort(u16),
     /// (DES-EDITOR-CONFORMANCE-HOST, e2e F18) ONE loopback port the jailed process SERVES and talks to,
     /// and nothing else: bind, inbound and outbound on `localhost:<port>` only. The editor conformance
     /// harness serves its own origin there (studio's host page from a dist, the candidate's entry) and
-    /// drives headless Chromium against it; no daemon, no other local service, no public address.
+    /// drives headless Chromium against it; no daemon, no other local service, no public address. The
+    /// walkthrough recorder (core#1297) serves its fixture on the port the engine reserved for it.
     /// macOS: the deny plus three rules for that port; Linux bwrap: `--unshare-net` (the namespace's own
-    /// `lo` holds only what the jail starts) plus the same AF_UNIX seccomp program as `LoopbackOnly`.
+    /// `lo` holds only what the jail starts) plus the AF_UNIX seccomp program.
     LoopbackServe(u16),
     /// (PLAN G12, `draft_render`) No network of any kind, and writes ONLY to the caller's roots. The
     /// draft renderer prints a seat-written page with a headless browser: no loopback (the crew daemon
@@ -784,14 +781,6 @@ fn macos_sandbox_profile_reading(
         p.push_str("(deny file-read-data)\n");
         p.push_str(&allow);
     }
-    if matches!(network, NetworkPolicy::LoopbackOnly) {
-        // After the deny, so these win for loopback only (A12, spiked on macOS 26: a loopback
-        // bind + connect succeeds, a connect to a public address is refused with EPERM, and no
-        // name resolves because the resolver's own traffic is refused).
-        p.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
-        p.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-        p.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
-    }
     if let NetworkPolicy::LoopbackPort(port) = network {
         // After the deny, so it wins for this one port only (spiked on macOS 26 with curl and
         // headless Chromium: the port connects, another loopback port and a public address are
@@ -1013,16 +1002,10 @@ fn socket_dir_masks(
     out
 }
 
-/// (WT-C2) The jail the `walkthrough_review` Tool runs in: writes only under `write_roots`, network
-/// to loopback only, the curated secret dirs unreadable. Only a `Sandboxed` launcher jails it — a
-/// network-only `firejail` contains no writes — so the caller treats any other level as "no jail".
-pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
-    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::LoopbackOnly, PtyPolicy::Deny)
-}
-
 /// (DES-DEMO-RECORD-001 §3.4) The jail the demo Tools (`demo_probe`, `demo_record`) run in: writes only
 /// under `write_roots`, network to `localhost:<port>` outbound only, the curated secret dirs unreadable.
-/// `Sandboxed` on macOS only; elsewhere the caller gets a non-`Sandboxed` level and records nothing.
+/// `Sandboxed` on macOS (sandbox-exec) and on Linux with bwrap and `pasta` (core#1295); elsewhere the
+/// caller gets a non-`Sandboxed` level and records nothing.
 pub(crate) fn port_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
     detect_sandbox_launcher_for_roots(
         write_roots,
@@ -1031,8 +1014,9 @@ pub(crate) fn port_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
     )
 }
 
-/// (DES-EDITOR-CONFORMANCE-HOST) The jail the `editor_conformance` Tool runs in: writes only under
-/// `write_roots`, network only on `localhost:<port>` (the harness's own origin: bind, inbound,
+/// (DES-EDITOR-CONFORMANCE-HOST) The jail the `editor_conformance` Tool runs in (and, core#1297, the
+/// `walkthrough_review` recorder, on the port the engine reserved for its fixture): writes only under
+/// `write_roots`, network only on `localhost:<port>` (the Tool's own origin: bind, inbound,
 /// outbound), the curated secret dirs unreadable. `Sandboxed` on macOS (sandbox-exec) and on Linux
 /// (bwrap's own network namespace); Windows has no jail, and the caller refuses to run.
 pub(crate) fn serve_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
@@ -1072,7 +1056,7 @@ pub(crate) fn render_jail(write_roots: &[&Path], read_roots: &[&Path]) -> Sandbo
 
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
-/// (core#703) The seccomp program the loopback-only jail loads: every way to reach a pathname
+/// (core#703) The seccomp program every loopback jail loads: every way to reach a pathname
 /// socket fails with `EACCES` — `socket(AF_UNIX, …)`, a datagram `socketpair(AF_UNIX, …)` and
 /// `io_uring_setup` — every other syscall is allowed, an x32-ABI syscall on x86_64 and any syscall
 /// of a foreign architecture are refused. Raw classic BPF, no library, for the arch this binary
@@ -1225,11 +1209,14 @@ fn launcher_for_roots_reading(
     // caller names — a validator's private `TMPDIR`, the coverage store's dir), unshare the network,
     // mask the curated secret dirs that exist with an empty tmpfs, and put the sandbox in its own PID
     // namespace tied to the launcher so the whole tree dies on timeout (C4).
-    if let Some(tool) = find_on_path("bwrap").filter(|_| {
-        // A port-scoped jail cannot be expressed with `--unshare-net` (the host's app is outside
-        // the new namespace): no bwrap launcher for it, so the caller sees "no jail" and says so.
-        !matches!(network, NetworkPolicy::LoopbackPort(_))
-    }) {
+    // (core#1295) A port-scoped jail cannot be expressed with `--unshare-net` (the host's app is
+    // outside the new namespace): bwrap runs inside `pasta`'s namespace instead, which splices that
+    // one port to the host. No `pasta`, no bwrap launcher for it: the caller sees "no jail" and says so.
+    let port_map = match network {
+        NetworkPolicy::LoopbackPort(port) => find_on_path("pasta").map(|pasta| Some((pasta, port))),
+        _ => Some(None),
+    };
+    if let (Some(tool), Some(port_map)) = (find_on_path("bwrap"), port_map) {
         if let Some(primary) = write_roots
             .first()
             .and_then(|root| root.canonicalize().ok())
@@ -1285,8 +1272,14 @@ fn launcher_for_roots_reading(
                 ]
                 .map(String::from),
             );
-            if network.restricts() {
-                // LoopbackOnly too: bwrap brings `lo` up in the new namespace, and nothing else.
+            if port_map.is_some() {
+                // (core#1295) The network namespace is `pasta`'s (wrapped around bwrap below): its
+                // `lo` reaches the host only on the mapped port. The jail gets its own user namespace
+                // with every capability dropped, so it can never configure that namespace (bring the
+                // tap up, give it an address or a route) and so reach anything else through `pasta`.
+                w.extend(["--unshare-user", "--cap-drop", "ALL"].map(String::from));
+            } else if network.restricts() {
+                // bwrap brings `lo` up in the new namespace, and nothing else.
                 w.push("--unshare-net".to_string());
             }
             // C8 (revised, core#460 CI leg): NO `--tmpfs` over the system temp dir. A validator's
@@ -1342,7 +1335,7 @@ fn launcher_for_roots_reading(
             w.push(c.clone());
             w.push(c);
             w.push("--".to_string());
-            // (core#703) The LOOPBACK-only jail (the walkthrough recorder) also refuses
+            // (core#703) The loopback jails (the walkthrough and demo recorders) also refuse
             // `socket(AF_UNIX, …)`: the masks above hide the usual socket dirs, but a pathname
             // socket anywhere else (a custom dir under the home) stays connectable under the
             // read-only `/`. The seccomp program rides `bwrap --seccomp 9`, opened by a `sh`
@@ -1350,7 +1343,7 @@ fn launcher_for_roots_reading(
             // for the next jail).
             if matches!(
                 network,
-                NetworkPolicy::LoopbackOnly
+                NetworkPolicy::LoopbackPort(_)
                     | NetworkPolicy::LoopbackServe(_)
                     | NetworkPolicy::Isolated
             ) {
@@ -1369,6 +1362,24 @@ fn launcher_for_roots_reading(
                     "9".to_string(),
                 ];
                 wrapped.extend(w.into_iter().skip(1));
+                w = wrapped;
+            }
+            if let Some((pasta, port)) = port_map {
+                // (core#1295) `pasta` OUTSIDE everything, the seccomp `sh` prefix inside it (`pasta`
+                // closes every inherited descriptor above stderr, so fd 9 is opened after it).
+                // Every port class is named, so none falls back to `auto` (which would map every
+                // port the host listens on): no inbound TCP or UDP from the host, no UDP to it, and
+                // TCP to the host on `port` alone. No `--config-net`: the tap stays down with no
+                // address and no route, so nothing but the mapped port leaves the namespace.
+                let port = port.to_string();
+                let mut wrapped: Vec<String> = vec![pasta.to_string_lossy().into_owned()];
+                wrapped.extend(
+                    [
+                        "--quiet", "-t", "none", "-u", "none", "-U", "none", "-T", &port, "--",
+                    ]
+                    .map(String::from),
+                );
+                wrapped.extend(w);
                 w = wrapped;
             }
             return SandboxLauncher {
@@ -4897,11 +4908,12 @@ mod tests {
         }
     }
 
-    /// core#703, end to end on a Linux host with bwrap: inside the loopback-only jail a process
-    /// cannot create an AF_UNIX socket (so no pathname socket is reachable), while AF_INET and a
-    /// socketpair still work. Skipped where the jail is not bwrap.
+    /// core#703, end to end on a Linux host with bwrap: inside a loopback jail (the serve jail the
+    /// walkthrough recorder runs in, and the demo recorder's port jail where `pasta` arms it) a
+    /// process cannot create an AF_UNIX socket (so no pathname socket is reachable), while AF_INET
+    /// and a socketpair still work. Skipped where the jail is not bwrap.
     #[test]
-    fn the_loopback_jail_refuses_af_unix_sockets_on_linux() {
+    fn the_loopback_jails_refuse_af_unix_sockets_on_linux() {
         if !cfg!(target_os = "linux") || find_on_path("bwrap").is_none() {
             return;
         }
@@ -4910,10 +4922,29 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("wicked-703-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let jail = loopback_jail(&[dir.as_path()]);
-        if jail.level != SandboxLevel::Sandboxed {
-            return;
+        let mut jails = vec![serve_jail(&[dir.as_path()], 18799)];
+        if linux_port_jail_expected() {
+            jails.push(port_jail(&[dir.as_path()], 18799));
         }
+        for jail in jails {
+            refuses_af_unix(&jail, &dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1295) Whether this Linux host must arm the demo recorder's port jail: bwrap and `pasta`
+    /// are both on `PATH`. Panics when `WICKED_REQUIRE_PASTA` is set (the CI Linux leg) and either is
+    /// missing, so the port-jail tests can never pass there by skipping.
+    fn linux_port_jail_expected() -> bool {
+        let found = find_on_path("bwrap").is_some() && find_on_path("pasta").is_some();
+        if !found && std::env::var_os("WICKED_REQUIRE_PASTA").is_some() {
+            panic!("WICKED_REQUIRE_PASTA is set but bwrap or pasta is not on PATH");
+        }
+        found
+    }
+
+    fn refuses_af_unix(jail: &SandboxLauncher, dir: &Path) {
+        assert_eq!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
         assert!(
             jail.wrapper.iter().any(|a| a == "--seccomp"),
             "the program rides the jail: {:?}",
@@ -4924,7 +4955,7 @@ mod tests {
             std::process::Command::new(&jail.wrapper[0])
                 .args(&jail.wrapper[1..])
                 .args(["python3", "-c", code])
-                .current_dir(&dir)
+                .current_dir(dir)
                 .status()
                 .expect("the jail runs")
                 .success()
@@ -4945,7 +4976,6 @@ mod tests {
             !run("import socket; socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)"),
             "a datagram AF_UNIX socketpair is refused (it could sendto any pathname socket)"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (DES-DEMO-RECORD-001 §3.4) The port jail's profile admits ONE outbound loopback port: no
@@ -5186,31 +5216,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// (DES-DEMO-RECORD-001 §3.4) bwrap cannot scope a jail to one HOST port (`--unshare-net` gives
-    /// it its own loopback), so on a host whose only jail is bwrap the port jail is never
-    /// `Sandboxed`: the demo recorder then records nothing and says why.
+    /// (DES-DEMO-RECORD-001 §3.4, core#1295) bwrap alone cannot scope a jail to one HOST port
+    /// (`--unshare-net` gives it its own loopback). On Linux the port jail is `pasta` around bwrap:
+    /// `pasta` first, every port class named (none left to `auto`), only `-T <port>` mapped, and bwrap
+    /// in a nested user namespace with every capability dropped, NOT in a namespace of its own (that
+    /// would cut the mapped port), with the AF_UNIX program. Without `pasta` it is never `Sandboxed`:
+    /// the demo recorder then records nothing and says why.
     #[test]
-    fn the_port_jail_is_never_a_bwrap_jail() {
+    fn the_linux_port_jail_is_pasta_around_bwrap_or_none() {
         if cfg!(target_os = "macos") {
             return;
         }
         let dir = std::env::temp_dir().join(format!("wicked-port-bwrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let jail = port_jail(&[dir.as_path()], 7721);
-        assert_ne!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
+        if !linux_port_jail_expected() {
+            assert_ne!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
+        let w = &jail.wrapper;
+        let name = |a: &String| {
+            Path::new(a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        };
+        assert_eq!(name(&w[0]).as_deref(), Some("pasta"), "{w:?}");
+        let sep = w.iter().position(|a| a == "--").expect("pasta's `--`");
+        assert_eq!(
+            w[1..sep],
+            ["--quiet", "-t", "none", "-u", "none", "-U", "none", "-T", "7721"].map(String::from),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|a| a == "--config-net"), "{w:?}");
+        let bwrap = w
+            .iter()
+            .position(|a| name(a).as_deref() == Some("bwrap"))
+            .expect("bwrap inside pasta");
+        assert!(bwrap > sep, "{w:?}");
+        assert!(!w.iter().any(|a| a == "--unshare-net"), "{w:?}");
+        assert!(
+            w.windows(3)
+                .any(|x| x == ["--unshare-user", "--cap-drop", "ALL"]),
+            "{w:?}"
+        );
+        assert!(w.iter().any(|a| a == "--seccomp"), "{w:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (DES-DEMO-RECORD-001 §3.4, the first build step) End to end on macOS: inside the port jail a
-    /// process connects to the allowed loopback port, and is refused another loopback port, a
-    /// public address and a bind; a write outside its root is refused too.
-    #[cfg(target_os = "macos")]
+    /// (DES-DEMO-RECORD-001 §3.4, core#1295) End to end on macOS and on Linux with bwrap and
+    /// `pasta`: inside the port jail a process connects to the allowed HOST loopback port, and is
+    /// refused another host loopback port and a public address; a write outside its root is
+    /// refused too. macOS also refuses a bind; on Linux a bind lands in the jail's own namespace,
+    /// which the host cannot reach, and the jail holds no capability to reconfigure it.
+    #[cfg(unix)]
     #[test]
-    fn the_port_jail_reaches_only_its_port_on_macos() {
+    fn the_port_jail_reaches_only_its_port() {
         if crate::test_sandbox::skip(
             crate::test_sandbox::Need::Loopback,
-            "the_port_jail_reaches_only_its_port_on_macos",
+            "the_port_jail_reaches_only_its_port",
         ) {
+            return;
+        }
+        if !cfg!(target_os = "macos") && !linux_port_jail_expected() {
             return;
         }
         if find_on_path("python3").is_none() {
@@ -5226,9 +5295,10 @@ mod tests {
             other.local_addr().unwrap().port(),
         );
         let jail = port_jail(&[dir.as_path()], ap);
-        if jail.level != SandboxLevel::Sandboxed {
+        if jail.level != SandboxLevel::Sandboxed && cfg!(target_os = "macos") {
             return;
         }
+        assert_eq!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
         let run = |code: &str| {
             // spawn-audit: test-only — runs python inside the test's own jail.
             std::process::Command::new(&jail.wrapper[0])
@@ -5250,10 +5320,18 @@ mod tests {
             !run("import socket; socket.create_connection(('1.1.1.1', 80), timeout=3)"),
             "a public address is refused"
         );
-        assert!(
-            !run("import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()"),
-            "a bind is refused"
-        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                !run("import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()"),
+                "a bind is refused"
+            );
+        } else {
+            assert!(
+                run("import re; s=open('/proc/self/status').read(); \
+                     assert re.search(r'CapEff:\\s*0+\\n', s), s"),
+                "the jail holds no capability"
+            );
+        }
         let outside = std::env::temp_dir().join(format!("wicked-port-out-{}", std::process::id()));
         assert!(
             !run(&format!(
@@ -7705,7 +7783,8 @@ mod worker_sandbox_tests {
         for network in [
             NetworkPolicy::Allow,
             NetworkPolicy::Deny,
-            NetworkPolicy::LoopbackOnly,
+            NetworkPolicy::LoopbackPort(7721),
+            NetworkPolicy::LoopbackServe(7721),
             NetworkPolicy::Isolated,
         ] {
             for pty in [PtyPolicy::Deny, PtyPolicy::Own] {
