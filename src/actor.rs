@@ -15645,8 +15645,11 @@ mod draft_render_live {
     }
 
     /// (core#1335 #1336 #1337) The render step with a REAL browser in the read-allowlisted jail, on
-    /// any host that has one (CI's Linux images ship Chrome; a macOS host names its headless shell in
-    /// `WICKED_TEST_HEADLESS_SHELL`), else a stated SKIP. The garden root has NO `.venv` (the counter
+    /// a host that names a headless shell in `WICKED_TEST_HEADLESS_SHELL` (the renderer crew
+    /// provisions: Playwright's `chrome-headless-shell`), else a stated SKIP. Not a full Chrome such
+    /// as CI's `CHROME_BIN`: on Linux its process singleton needs `socket(AF_UNIX)`, which the
+    /// Isolated jail's seccomp program refuses (on main's `--ro-bind / /` jail as well), so it
+    /// aborts before printing. The garden root has NO `.venv` (the counter
     /// runs with the PATH's python3) and its launcher fails if anything runs it; the counter is a stub
     /// that prints with the browser as garden's `render_pdf` does, and gives up (no report) if it can
     /// read a file beside the draft. A two-page draft is measured as 2 pages, with the counter's
@@ -15660,31 +15663,15 @@ mod draft_render_live {
         {
             return;
         }
-        let candidates: Vec<std::path::PathBuf> = if cfg!(target_os = "macos") {
-            std::env::var_os("WICKED_TEST_HEADLESS_SHELL")
-                .map(std::path::PathBuf::from)
-                .into_iter()
-                .collect()
-        } else {
-            std::env::var_os("CHROME_BIN")
-                .map(std::path::PathBuf::from)
-                .into_iter()
-                .chain(
-                    [
-                        "/usr/bin/google-chrome",
-                        "/usr/bin/google-chrome-stable",
-                        "/usr/bin/chromium",
-                        "/usr/bin/chromium-browser",
-                    ]
-                    .map(std::path::PathBuf::from),
-                )
-                .collect()
-        };
+        let candidates: Vec<std::path::PathBuf> = std::env::var_os("WICKED_TEST_HEADLESS_SHELL")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect();
         let Some(chrome) = candidates
             .into_iter()
             .find(|p| p.is_absolute() && p.is_file())
         else {
-            eprintln!("SKIP {test}: no browser on this host");
+            eprintln!("SKIP {test}: WICKED_TEST_HEADLESS_SHELL names no headless shell");
             return;
         };
         if crate::validator::find_on_path("python3").is_none() {
