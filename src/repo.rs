@@ -1481,11 +1481,13 @@ where
     })
 }
 
+/// Test seam: runs between a fresh mint's `git worktree add` and its daemon claim.
+#[cfg(test)]
+type MintHook = Option<Box<dyn Fn(&Path)>>;
+
 #[cfg(test)]
 thread_local! {
-    /// Test seam: runs between a fresh mint's `git worktree add` and its daemon claim.
-    static AFTER_MINT_ADD: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
-        const { std::cell::RefCell::new(None) };
+    static AFTER_MINT_ADD: std::cell::RefCell<MintHook> = const { std::cell::RefCell::new(None) };
 }
 
 /// (core#1436) A freshly minted tree takes this daemon's marker, or the mint refuses: a claim lost
