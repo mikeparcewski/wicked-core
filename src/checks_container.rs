@@ -533,9 +533,10 @@ pub(crate) fn retire_target_claims(leaf: &Path) -> Result<(), String> {
 /// pass is over and its results are in the run's log store, while the head claim stays warm for
 /// the next floor's incremental build. Called under the leaf's EXCLUSIVE lock, so no floor of the
 /// run mounts the claim meanwhile. (core#1714) The deletion is only MARKED (`--wait=false`): the
-/// run's next floor never waits at its shared lease on a slow API server, and a floor that claims
-/// the same name waits for the terminating claim to be gone before it applies it
-/// ([`crate::k8s::floor::Place::claim`]). A leaf with no base claim registered (a
+/// run's next floor waits at its shared lease for the ownership GET and the DELETE call, never for
+/// the claim to finish terminating, and a floor that claims the same name waits for the
+/// terminating claim to be gone before it applies it ([`crate::k8s::floor::Place::claim`]). A
+/// leaf with no base claim registered (a
 /// host floor) has nothing to do. A failure keeps the claim registered: it goes with the leaf or
 /// the run's namespace, as before.
 pub(crate) fn retire_base_target_claim(leaf: &Path) -> Result<(), String> {

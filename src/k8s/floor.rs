@@ -291,10 +291,15 @@ impl Place {
     /// [`CLAIM_GONE_BOUND`]: applied now, it would be a no-op its deletion then undoes, and the
     /// floor's pod would wait for a claim that is gone.
     pub(crate) fn claim(&self, name: &str, size: &str) -> Result<(), String> {
+        self.claim_within(name, size, CLAIM_GONE_BOUND)
+    }
+
+    /// [`Self::claim`], waiting at most `gone` for a terminating claim of that name.
+    fn claim_within(&self, name: &str, size: &str, gone: Duration) -> Result<(), String> {
         let _admission =
             crate::checks_container::admit_dependency_claim(&self.kube, &self.ns, name)?;
         self.kube
-            .wait_not_terminating(Some(&self.ns), "pvc", name, CLAIM_GONE_BOUND)?;
+            .wait_not_terminating(Some(&self.ns), "pvc", name, gone)?;
         self.kube
             .apply(&[render::pvc(&self.ns, &self.kube.owner, name, size)])
             .map_err(|e| {
@@ -514,27 +519,36 @@ mod pr_c2_claim_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// (core#1714) A claim that stays terminating past the bound is an error, never an apply.
+    /// (core#1714) A claim that stays terminating past the bound, or whose GET fails, is an error
+    /// from the claim itself, never an apply.
     #[test]
-    fn a_claim_terminating_past_the_bound_is_not_applied() {
+    fn a_claim_terminating_past_the_bound_or_unreadable_is_not_applied() {
         let dir = std::env::temp_dir().join(format!("claim-stuck-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let place = place_with(
             &dir,
             &format!(
                 "#!/bin/sh\ncd '{0}' || exit 1\ncase \" $* \" in\n\
-                 *' get pvc '*) echo '{{\"metadata\":{{\"deletionTimestamp\":\"2026-11-22T00:00:00Z\"}}}}';;\n\
+                 *' get pvc '*) if [ -f unreadable ]; then echo 'the server is gone' >&2; exit 1; fi; \
+                 echo '{{\"metadata\":{{\"deletionTimestamp\":\"2026-11-22T00:00:00Z\"}}}}';;\n\
                  *' apply '*) cat >/dev/null; echo apply >>calls;;\n\
                  *) exit 9;;\nesac\n",
                 dir.display()
             ),
         );
         let err = place
-            .kube
-            .wait_not_terminating(Some("live-run"), "pvc", "target", Duration::ZERO)
+            .claim_within("target", "64Gi", Duration::from_millis(300))
             .unwrap_err();
-        assert!(err.contains("still terminating"), "{err}");
-        assert!(!dir.join("calls").exists());
+        assert!(
+            err.contains("not confirmed gone or live within 300 ms"),
+            "{err}"
+        );
+        std::fs::write(dir.join("unreadable"), "").unwrap();
+        let err = place
+            .claim_within("target", "64Gi", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(err.contains("the server is gone"), "{err}");
+        assert!(!dir.join("calls").exists(), "never applied");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

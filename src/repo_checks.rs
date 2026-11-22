@@ -3788,7 +3788,8 @@ impl Drop for CheckScratch {
 /// (core#1542, core#1714) A container floor's base target claim is marked for deletion under that
 /// lock without waiting for it to go: the run's next floor that claims the same name waits for the
 /// terminating claim to be gone before it applies it, so it never starts a pod on a claim that then
-/// disappears, and no floor waits at its shared lease on a slow API server.
+/// disappears. A floor at its shared lease meanwhile waits only for the marking calls (the
+/// ownership GET and the DELETE, each bounded), never for the claim's termination.
 /// Returns whether the base output is gone.
 fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
     let aside = format!(".base-drop-{}", random_tmp_name());

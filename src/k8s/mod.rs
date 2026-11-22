@@ -742,9 +742,11 @@ impl Kube {
         }
     }
 
-    /// (core#1714) Wait, at most `bound`, until `kind/name` is not TERMINATING (it carries a
-    /// `metadata.deletionTimestamp`): absent or live returns at once. An `apply` of a terminating
-    /// object is a no-op its deletion then undoes, so a caller about to apply waits here first.
+    /// (core#1714) Wait, at most `bound` in all (every GET is cut to what is left of it), until
+    /// `kind/name` is not TERMINATING (it carries a `metadata.deletionTimestamp`): absent or live
+    /// returns at once. An `apply` of a terminating object is a no-op its deletion then undoes, so a
+    /// caller about to apply waits here first. Past the bound, or on a GET that fails, it is an
+    /// error.
     pub(crate) fn wait_not_terminating(
         &self,
         ns: Option<&str>,
@@ -757,22 +759,42 @@ impl Kube {
         } else {
             Duration::from_millis(500)
         };
-        let start = Instant::now();
+        let deadline = Instant::now() + bound;
+        let past = || {
+            format!(
+                "{kind}/{name} is not confirmed gone or live within {} ms (still terminating, or \
+                 the API server did not answer)",
+                bound.as_millis()
+            )
+        };
         loop {
-            let terminating = self.get_json(ns, kind, name)?.is_some_and(|o| {
-                o.pointer("/metadata/deletionTimestamp")
-                    .is_some_and(|t| !t.is_null())
-            });
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(past());
+            }
+            let r = self.call(
+                ns,
+                &["get", kind, name, "--ignore-not-found", "-o", "json"],
+                None,
+                left.min(CALL_TIMEOUT),
+            );
+            if !r.ok() {
+                // A GET the bound cut short is the bound's, not the server's answer.
+                return Err(if Instant::now() >= deadline {
+                    past()
+                } else {
+                    r.err_text()
+                });
+            }
+            let terminating = !r.stdout.iter().all(u8::is_ascii_whitespace)
+                && serde_json::from_slice::<Value>(&r.stdout)
+                    .map_err(|e| e.to_string())?
+                    .pointer("/metadata/deletionTimestamp")
+                    .is_some_and(|t| !t.is_null());
             if !terminating {
                 return Ok(());
             }
-            if start.elapsed() >= bound {
-                return Err(format!(
-                    "{kind}/{name} is still terminating after {} s",
-                    bound.as_secs()
-                ));
-            }
-            std::thread::sleep(poll);
+            std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
         }
     }
 
