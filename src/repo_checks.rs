@@ -8789,69 +8789,72 @@ impl BaseTree {
         )
     }
 
-    /// (core#1110) The checks of the export's package at `rel`, detected THROUGH that directory
-    /// held first ([`HeldDir::at`], [`held_reads`]): a directory swapped in at the path while
-    /// detection reads is never what it reads. After it, the held directory must still be the one
-    /// at the path ([`HeldDir::still_at`]) — a swap made before the hold and undone after fails
-    /// here — and the walk from the export root must still reach it ([`HeldDir::still_at_rel`]).
-    /// Without directory fds (Windows) detection reads by path, checked the same way after.
+    /// (core#1110) The checks of the export's package at `rel`, detected through that directory
+    /// held first ([`Self::read_held`]).
     fn detect_held(&self, rel: &str, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+        self.read_held(rel, |path| detect_with(path, ctx))
+    }
+
+    /// (core#1110) `read` over the export's directory at `rel`, every [`probe`] of it THROUGH
+    /// that directory held first ([`HeldDir::at`], [`held_reads`]): a directory swapped in at the
+    /// path while `read` reads is never what it reads. After it, the held directory must still be
+    /// the one at the path ([`HeldDir::still_at`]: a swap made before the hold and undone after
+    /// fails here) and the walk from the export root must still reach it
+    /// ([`HeldDir::still_at_rel`]). Without directory fds (Windows) `read` goes by path, checked
+    /// the same way after.
+    fn read_held<T>(
+        &self,
+        rel: &str,
+        read: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Result<T, String> {
         let path = self.dir.join(rel);
         #[cfg(unix)]
-        let detected = {
-            let pkg = self.held.at(rel)?;
+        let got = {
+            let held = self.held.at(rel)?;
             #[cfg(test)]
             if let Some(f) = test_seam::take_base_detect(true) {
                 f(path.as_path());
             }
-            let detected = held_reads(&path, &pkg, || detect_with(&path, ctx))?;
+            let got = held_reads(&path, &held, || read(path.as_path()))?;
             #[cfg(test)]
             if let Some(f) = test_seam::take_base_detect(false) {
                 f(path.as_path());
             }
-            pkg.still_at(&path)?;
-            detected
+            held.still_at(&path)?;
+            got
         };
         #[cfg(not(unix))]
-        let detected = detect_with(&path, ctx);
+        let got = read(path.as_path());
         self.held.still_at_rel(&self.dir, rel)?;
-        detected
+        got
     }
 
-    /// (core#1408) The provisioning steps the base's ANCESTOR packages of `dir` declare for their
-    /// members: for each proper ancestor (the root first) whose checks include a native build,
-    /// its `install` (when detected) and then its native build, each with that ancestor as its
-    /// directory. An ancestor whose checks cannot be determined is skipped with a note (as before
-    /// this: the base then runs without the binding, reads red, and the floor escalates).
-    fn ancestor_native(&self, dir: &str, ctx: &FloorContext) -> Vec<RepoCheck> {
-        let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
-        let mut out = Vec::new();
-        for n in 0..parts.len() {
-            let anc = parts[..n].join("/");
-            let detected = match self.detect_held(&anc, ctx) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!(
-                        "wicked-core: repo checks floor — the base's ancestor package `{}` could \
-                         not be read ({e}); its native build is not provisioned for `{dir}`",
-                        if anc.is_empty() { "." } else { anc.as_str() }
-                    );
-                    continue;
-                }
-            };
-            if !detected.iter().any(|c| c.name == NATIVE_BUILD_CHECK) {
-                continue;
-            }
-            for name in [PROVISIONING_CHECK, NATIVE_BUILD_CHECK] {
-                if let Some(c) = detected.iter().find(|c| c.name == name) {
-                    out.push(RepoCheck {
-                        dir: anc.clone(),
-                        ..c.clone()
-                    });
-                }
-            }
+    /// (core#1408) The root package's provisioning for a check in the subdirectory `dir`: a root
+    /// whose config declares `native_rebuild` is always detected on the head (a config makes the
+    /// root's checks run, [`detect_manifests`]), and its install and native build run there before
+    /// any member's checks — so the base runs them too, in the root, in that order. An
+    /// intermediate directory is not provisioned on the head, so not here either. Nothing for a
+    /// root check, or a root that declares no native build; `Err` (the base is unknown) when the
+    /// root's config or checks cannot be read, as the head's root detection would fail too.
+    fn root_native(&self, dir: &str, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+        if dir.is_empty() {
+            return Ok(Vec::new());
         }
-        out
+        let declares = self.read_held("", |root| {
+            Ok(read_config(root)?.is_some_and(|c| !c.native_rebuild.is_empty()))
+        })?;
+        if !declares {
+            return Ok(Vec::new());
+        }
+        let detected = self.detect_held("", ctx)?;
+        Ok([PROVISIONING_CHECK, NATIVE_BUILD_CHECK]
+            .into_iter()
+            .filter_map(|name| detected.iter().find(|c| c.name == name))
+            .map(|c| RepoCheck {
+                dir: String::new(),
+                ..c.clone()
+            })
+            .collect())
     }
 
     /// [`Self::run_check`]; `scoped` (core#1198) runs `check` as a failing-set run: recorded with
@@ -8930,9 +8933,17 @@ impl BaseTree {
                 check.name
             ));
         }
-        // (core#1408) An ancestor workspace package's declared native build provisions its
-        // members on the head; the base gets it too, each step in its own directory, root first.
-        for step in self.ancestor_native(&check.dir, &base_ctx) {
+        // (core#1408) The root's declared native build provisions its members on the head; the
+        // base gets it too, before the member's own provisioning, as on the head.
+        let root_steps = match self.root_native(&check.dir, &base_ctx) {
+            Ok(steps) => steps,
+            Err(e) => {
+                return fail(format!(
+                    "the base's root package could not be determined: {e}"
+                ))
+            }
+        };
+        for step in root_steps {
             let r = run_held(
                 &self.dir,
                 Some(&self.held),
@@ -8948,12 +8959,7 @@ impl BaseTree {
                     "dependency install"
                 };
                 return fail(format!(
-                    "the base's ancestor `{}` {what} did not pass ({})",
-                    if step.dir.is_empty() {
-                        "."
-                    } else {
-                        step.dir.as_str()
-                    },
+                    "the base's root {what} did not pass ({})",
                     r.summary()
                 ));
             }
@@ -9253,9 +9259,11 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// the change's own, so a recorded `base_red_unseparated` for one is not reused; v15, core#1422:
 /// the pod floor's copies are converted like a checkout, so a base result recorded from a raw
 /// copy is not reused; v16, wicked-core#1701: a prose-only change sharing a completed base failure
-/// passes, so earlier floor decisions must be reconsidered): a record of any other version, or a
-/// bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 16;
+/// passes, so earlier floor decisions must be reconsidered; v17, core#1110/#1408: the base reads
+/// its package through the held directory and builds the root's declared native addons for a
+/// member, so a base result recorded without them is not reused): a record of any other version,
+/// or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 17;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -17016,10 +17024,19 @@ exit 1
             let err = f24_base_error(c);
             assert!(!err.starts_with(DECLARES_NO_PREFIX), "{err}");
             if restore {
+                // The base ran its OWN red `test` — not an error, not a failed install.
+                let run = c
+                    .base
+                    .as_ref()
+                    .filter(|b| b.error.is_none())
+                    .and_then(|b| b.run.as_ref())
+                    .unwrap_or_else(|| panic!("the base ran: {c:#?}"));
+                assert_eq!(run.exit_code, Some(101), "{run:#?}");
+                assert!(run.stdout_tail.contains("pkg::shared"), "{run:#?}");
                 assert_eq!(
                     c.classification.as_deref(),
                     Some(BASE_RED_UNSEPARATED),
-                    "the base ran its own red `test`: {c:#?}"
+                    "{c:#?}"
                 );
             } else {
                 assert!(
@@ -17085,27 +17102,27 @@ exit 1
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// (core#1408) A workspace root that declares `native_rebuild` provisions its members on the
-    /// head; the base comparison of a member's check runs the root's install and native build
-    /// too, in the root, before the member's own. An ancestor that declares none adds nothing.
+    /// (core#1408) A root that declares `native_rebuild` is provisioned on the head before any
+    /// member's checks; the base comparison of a member's check runs the root's install and
+    /// native build too, in the root. A root that declares none adds nothing; a root config that
+    /// does not parse leaves the base unknown (`Err`), as the head's root detection fails too.
     #[cfg(unix)]
     #[test]
-    fn the_base_provisions_an_ancestors_native_build_1408() {
-        for declares in [true, false] {
-            let repo = scratch(&format!("ancestor-native-{declares}"));
+    fn the_base_provisions_the_roots_native_build_for_a_member_1408() {
+        for (tag, cfg) in [
+            ("declares", r#"{"native_rebuild":["better-sqlite3"]}"#),
+            ("none", "{}"),
+            ("broken", "{"),
+        ] {
+            let repo = scratch(&format!("root-native-{tag}"));
             std::fs::write(repo.join(".gitignore"), "tmp/\nnode_modules/\n").unwrap();
             std::fs::write(
                 repo.join("package.json"),
-                r#"{"name":"root","workspaces":["packages/*"],"dependencies":{"better-sqlite3":"12.0.0"}}"#,
+                r#"{"name":"root","dependencies":{"better-sqlite3":"12.0.0"}}"#,
             )
             .unwrap();
             std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
             std::fs::create_dir_all(repo.join(".wicked")).unwrap();
-            let cfg = if declares {
-                r#"{"native_rebuild":["better-sqlite3"]}"#
-            } else {
-                "{}"
-            };
             std::fs::write(repo.join(CONFIG_PATH), cfg).unwrap();
             std::fs::create_dir_all(repo.join("packages/a")).unwrap();
             std::fs::write(
@@ -17118,23 +17135,26 @@ exit 1
             let root = HeldDir::open(&repo).unwrap();
             let base = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
             let ctx = FloorContext::default();
-            let steps = base.ancestor_native("packages/a", &ctx);
-            let got: Vec<(&str, &str)> = steps
-                .iter()
-                .map(|c| (c.name.as_str(), c.dir.as_str()))
-                .collect();
-            if declares {
-                assert_eq!(
-                    got,
-                    vec![("install", ""), (NATIVE_BUILD_CHECK, "")],
-                    "{steps:?}"
-                );
-                assert_eq!(steps[1].argv, native_build_argv(&["better-sqlite3"]));
-            } else {
-                assert!(got.is_empty(), "{steps:?}");
+            let steps = base.root_native("packages/a", &ctx);
+            match tag {
+                "declares" => {
+                    let steps = steps.unwrap();
+                    let got: Vec<(&str, &str)> = steps
+                        .iter()
+                        .map(|c| (c.name.as_str(), c.dir.as_str()))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        vec![("install", ""), (NATIVE_BUILD_CHECK, "")],
+                        "{steps:?}"
+                    );
+                    assert_eq!(steps[1].argv, native_build_argv(&["better-sqlite3"]));
+                }
+                "none" => assert!(steps.unwrap().is_empty()),
+                _ => assert!(steps.is_err(), "{steps:?}"),
             }
-            // The root has no ancestor.
-            assert!(base.ancestor_native("", &ctx).is_empty());
+            // A root check is the root's own: nothing extra.
+            assert!(base.root_native("", &ctx).unwrap().is_empty());
             drop(base);
             let _ = remove_base_export(&root);
             let _ = std::fs::remove_dir_all(&repo);
