@@ -41,9 +41,9 @@
 //!    credential helpers, with git's ssh replaced by a program that does not exist
 //!    (`GIT_SSH_COMMAND` and `core.sshCommand`), with the ssh/git/ext transports refused
 //!    (`protocol.<name>.allow = never` — so `user@host:` and bare `host:` remotes die too, R2-2)
-//!    and with a push kill on every URL-form transport (`url.wicked-nopush://.pushInsteadOf =
-//!    https:// | ssh:// | git@ | file:// | …`). Fetch over https, `file://` and local paths keeps
-//!    working; fetch over ssh does not. The deliver tool phase applies no seat config and keeps
+//!    and with every push handed to the `wicked-nopush` helper (`url.wicked-nopush::.pushInsteadOf`
+//!    = the empty prefix, which every URL starts with — core#1785). Fetch over https, `file://`
+//!    and local paths keeps working; fetch over ssh does not. The deliver tool phase applies no seat config and keeps
 //!    the daemon's login.
 //!
 //! ## Which programs (wicked-crew#663, core#569)
@@ -65,12 +65,21 @@
 //! Stated limit, as everywhere in this codebase: the shell is Turing-complete, so a determined
 //! escape (`base64 | sh`, a script file, a variable holding the verb, a renamed binary) can evade
 //! a scan of the literal command. Layer 3 is what holds then, and what it holds is exactly this:
-//! a `git` that runs with the seat's environment intact cannot push anywhere — https, `ssh://`,
-//! `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path (in a seat image, but for a
-//! bare repository strictly inside the seat's own `/tmp`, core#1210) — whether the remote is
-//! spelled on its command line, in the repository's config or through an operator
-//! `pushInsteadOf`, and cannot read a credential helper. Not covered by layer 3: a `git`
-//! carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c
+//! a `git` that runs with the seat's environment intact cannot read a credential helper or use
+//! ssh, `git://` or `ext::`, and every push URL it computes — https, ssh in any spelling, `file://`,
+//! an absolute or a relative path (in a seat image, but for a bare repository strictly inside the
+//! seat's own `/tmp`, core#1210) — is refused, whether the remote is spelled on its command line,
+//! as a remote's `url`, through the repository's `insteadOf` or through an operator
+//! `pushInsteadOf`. Not covered by layer 3 (core#1785): a repository config that re-aims the push
+//! ITSELF — its own `url.<x>.pushInsteadOf` (git takes the longest match from any source) or an
+//! explicit `remote.<name>.pushurl` (git applies no `pushInsteadOf` to it). No environment key
+//! unsets a rewrite, an empty `pushurl` clears only a remote named in advance, and git has no
+//! push-only protocol policy, so such a push reaches its target — with no ssh and no credential
+//! from the seat's environment: an https/http endpoint that accepts an anonymous push or takes a
+//! secret the seat already holds (in its own `http.extraHeader`, which it could send without git
+//! as well), or a local path the container floor bounds. This module refuses the `git push`
+//! literal, the `git config url.*` / `remote.*` write and `git remote set-url --push`. Not covered
+//! either: a `git` carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c
 //! core.sshCommand=ssh` — command-line `-c` outranks the environment entries) or its own
 //! `GIT_SSH_COMMAND`, and a seat that scrubs its environment (`env -i`) first. This module
 //! refuses every one of those as a literal; hidden in a script file they are the stated limit —
@@ -1074,6 +1083,17 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     if sub == "config" {
         return judge_git_config(rest);
     }
+    if sub == "remote"
+        && rest.iter().any(|r| r == "set-url")
+        && rest
+            .iter()
+            .any(|r| r.len() > 2 && "--push".starts_with(r.as_str()))
+    {
+        // (core#1785) The same write as `git config remote.<n>.pushurl`: git applies no
+        // `pushInsteadOf` to an explicit push URL, so it re-aims a push past layer 3. git's option
+        // parser takes any unambiguous prefix of a long option (`--pu`, `--p`).
+        return Some("remote set-url --push (re-aims a push)".to_string());
+    }
     if sub.starts_with("remote-") {
         // `git remote-https origin <url>` speaks the transport protocol directly.
         return Some(format!("{sub} (transport helper)"));
@@ -1271,6 +1291,11 @@ pub(crate) const REVIEW_BYPASS_STRINGS: &[&str] = &[
     "git send-email --to x@example.invalid HEAD~1",
     "git svn dcommit",
     "git lfs push origin main",
+    // (core#1785) An explicit push URL, which layer 3's `pushInsteadOf` never rewrites.
+    "git remote set-url --push origin https://example.invalid/o/r.git",
+    "git remote set-url --add --push origin ../outside.git",
+    "git remote set-url --pu origin https://example.invalid/o/r.git",
+    "git remote set-url --p origin https://example.invalid/o/r.git",
     // (r2) R2-3 credential reads, R2-4 parser gaps, `env -i`.
     "bash -euo pipefail -c 'git push'",
     "bash -c -e 'git push'",
@@ -1568,6 +1593,7 @@ mod tests {
             "git diff HEAD~1",
             "git remote -v",
             "git remote add upstream https://example.invalid/o/r.git",
+            "git remote set-url origin https://example.invalid/o/r.git",
             "git branch -a",
             "git checkout -b feat/x",
             "git worktree list",

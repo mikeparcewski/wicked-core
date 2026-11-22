@@ -2346,7 +2346,7 @@ mod tests {
         cmd.args(args).current_dir(cwd);
         // (rig run acf30461) A fixture's push to the bare remote it made is hermetic: a fenced
         // seat (QE, the creator) carries the engine's push kill in `GIT_CONFIG_*` and in its
-        // global gitconfig (`url.wicked-nopush://.pushInsteadOf`), which refused every fixture
+        // global gitconfig (`url.wicked-nopush::.pushInsteadOf`), which refused every fixture
         // push, so no seat could run these tests. The fence's own stated limit (a git with its
         // environment scrubbed) is what this uses; it reaches only the fixture's local repo.
         if args.first() == Some(&"push") {

@@ -5264,7 +5264,8 @@ esac
     }
 
     /// core#1210: under the seat's push fence, a fixture's push to a bare repository it made in
-    /// its own scratch dir lands (as a path and as `file://`); a `..` escape, a symlink inside the
+    /// its own scratch dir lands (as a path, a relative path and as `file://`); a `..` escape,
+    /// a relative path out of the scratch and a repository `insteadOf` name (core#1785), a symlink inside the
     /// scratch to a bare repository outside it, a scratch root that is itself a planted symlink,
     /// a non-bare repository and every network remote are refused by the helper.
     #[cfg(unix)]
@@ -5405,6 +5406,57 @@ esac
             format!("file://example.invalid{}", fixture.display()),
         ];
         for url in &refused {
+            let (ok, out) = git(&work, &["push", url, "HEAD:refs/heads/refused"], &path);
+            assert!(
+                !ok && out.contains("wicked-nopush"),
+                "{url} must be refused: {out}"
+            );
+        }
+        // core#1785: the fence hands the helper EVERY push URL as spelled. A relative path is
+        // resolved in git's own working directory: to a scratch fixture it lands, out of the
+        // scratch it is refused (the old prefix list never rewrote it, so it pushed for real),
+        // and so are the work tree itself, an scp-like remote and a name the repository's own
+        // `insteadOf` expands to the outside repository.
+        let (ok, out) = git(
+            &work,
+            &["push", "../scratch/fixture.git", "HEAD:refs/heads/rel"],
+            &path,
+        );
+        let rel_landed = git(
+            &base,
+            &[
+                "--git-dir",
+                &fixture.to_string_lossy(),
+                "rev-parse",
+                "-q",
+                "--verify",
+                "refs/heads/rel",
+            ],
+            &path,
+        )
+        .0;
+        assert!(
+            ok && rel_landed,
+            "a relative scratch fixture push lands: {out}"
+        );
+        assert!(
+            git(
+                &work,
+                &[
+                    "config",
+                    &format!("url.{}/.insteadOf", outside.display()),
+                    "zz:"
+                ],
+                &path
+            )
+            .0
+        );
+        for url in [
+            "../outside/op.git",
+            ".",
+            "example.invalid:o/r.git",
+            "zz:op.git",
+        ] {
             let (ok, out) = git(&work, &["push", url, "HEAD:refs/heads/refused"], &path);
             assert!(
                 !ok && out.contains("wicked-nopush"),
