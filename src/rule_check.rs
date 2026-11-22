@@ -1452,68 +1452,104 @@ fn part_note(k: usize, n: usize) -> String {
 const SCOPE_NOTE: &str =
     "THE FILES FOR THIS RULE, TOGETHER: the change is too big for one call, so \
      it was judged in parts, each in its own call. Every part was read, none found this rule \
-     broken, and the parts could not decide it alone. The EVIDENCE below is the whole diff of each \
-     changed file the judges of those parts named for it (listed in the CHANGED FILES). Judge the \
-     rule on these files together: BROKEN or KEPT on what they show, UNKNOWN when they cannot \
-     decide it.\n\n";
+     broken, and the parts found it touched but could not decide it alone. The EVIDENCE below is \
+     the whole diff of each changed file the judges of those parts named for it (listed in the \
+     CHANGED FILES). Judge the rule on these files together: BROKEN or KEPT on what they show. N/A \
+     does not count here. Answer KEPT only when these files are all the rule needs; when it needs \
+     a changed file not shown, answer UNKNOWN and name it.\n\n";
+
+/// (core#1278 item 4) Whether a diff header line names `path`, either side of a rename: a
+/// `diff --git a/<path> b/…` or `… b/<path>` line, or a part's repeated `[continued: …]` header
+/// ([`diff_parts`]) whose kept tail ends the path's own header (or is the end of the path).
+fn header_names(line: &str, path: &str) -> bool {
+    let h = line.trim_end_matches(['\n', '\r']);
+    if h.starts_with("diff --git ") {
+        return h.starts_with(&format!("diff --git a/{path} b/"))
+            || h.ends_with(&format!(" b/{path}"));
+    }
+    match h
+        .strip_prefix("[continued: ")
+        .and_then(|t| t.strip_suffix(']'))
+    {
+        Some(t) => {
+            let t = t.strip_prefix('…').unwrap_or(t);
+            !t.is_empty() && (t.ends_with(&format!("b/{path}")) || path.ends_with(t))
+        }
+        None => false,
+    }
+}
 
 /// (core#1278 item 4) The changed files a rule the parts could not decide alone is asked again on:
 /// the paths (from git's own list, `paths`) named whole in its UNKNOWN words and KEPT cites across
-/// the parts. `None`, and the rule is asked again as before, unless every part answered it with no
-/// BROKEN or holding miss, at least one part was UNKNOWN, and every UNKNOWN named a changed file.
-/// The caller asks only when every part was read (nothing cut).
-fn part_scope(parts: &[Parsed], id: &str, paths: &[&str]) -> Option<Vec<String>> {
-    let mut words: Vec<&str> = Vec::new();
+/// the parts (`answers[k]` read `parts[k]`). `None`, and the rule is asked again as before, unless
+/// every part answered it with no BROKEN or holding miss, at least one part was UNKNOWN, and every
+/// UNKNOWN names a changed file outside its own part: the parts could not decide it because what
+/// it needs is elsewhere, and they said where. An UNKNOWN about its own part alone is doubt a
+/// narrower view cannot settle. The caller asks only when every part was read (nothing cut).
+fn part_scope(
+    answers: &[Parsed],
+    parts: &[String],
+    id: &str,
+    paths: &[&str],
+) -> Option<Vec<String>> {
+    if answers.len() != parts.len() {
+        return None;
+    }
+    let named_in = |w: &str| -> Vec<&str> {
+        paths
+            .iter()
+            .copied()
+            .filter(|p| p.len() >= 3 && names_whole_path(w, p))
+            .collect()
+    };
+    let mut named: BTreeSet<&str> = BTreeSet::new();
     let mut unsure = false;
-    for p in parts {
+    for (p, text) in answers.iter().zip(parts) {
         match (p.answers.get(id), p.misses.get(id)) {
             (Some(a), None) if a.status == RuleStatus::Broken => return None,
             (Some(a), None) => {
                 if a.status == RuleStatus::Kept {
-                    words.push(&a.cite);
+                    named.extend(named_in(&a.cite));
                 }
             }
-            // Each undecided part says what it needs: an UNKNOWN naming no changed file
-            // leaves that part's doubt unknown, so nothing is scoped.
-            (None, Some(Miss::Unsure(w)))
-                if paths.iter().any(|p| p.len() >= 3 && names_whole_path(w, p)) =>
-            {
+            (None, Some(Miss::Unsure(w))) => {
+                let own = |f: &str| text.lines().any(|l| header_names(l, f));
+                let these = named_in(w);
+                if !these.iter().any(|f| !own(f)) {
+                    return None;
+                }
                 unsure = true;
-                words.push(w);
+                named.extend(these);
             }
             _ => return None,
         }
     }
-    let named: Vec<String> = paths
-        .iter()
-        .filter(|p| p.len() >= 3 && words.iter().any(|w| names_whole_path(w, p)))
-        .map(|p| p.to_string())
-        .collect();
-    (unsure && !named.is_empty()).then_some(named)
+    (unsure && !named.is_empty()).then(|| named.into_iter().map(str::to_string).collect())
 }
 
 /// (core#1278 item 4) The whole sections of `diff` (from each `diff --git` line to the next) whose
-/// header names a path in `scope`, either side of a rename, in the diff's order. A header the engine
-/// cannot match (git quoted it) is left out: the judge then cannot cite it, so a KEPT on it fails
-/// closed.
-fn scoped_sections(diff: &str, scope: &[&str]) -> String {
-    let names = |header: &str| {
-        let h = header.trim_end_matches(['\n', '\r']);
-        scope.iter().any(|p| {
-            h.starts_with(&format!("diff --git a/{p} b/")) || h.ends_with(&format!(" b/{p}"))
-        })
-    };
+/// header names a path in `scope` ([`header_names`]), in the diff's order. `None` when a path in
+/// `scope` names no section (git quoted its header): the judge would be asked to cite a file it was
+/// not shown, so the rule is not asked on the files alone.
+fn scoped_sections(diff: &str, scope: &[&str]) -> Option<String> {
     let mut out = String::new();
+    let mut found: BTreeSet<&str> = BTreeSet::new();
     let mut keep = false;
     for line in diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
-            keep = names(line);
+            let these: Vec<&str> = scope
+                .iter()
+                .copied()
+                .filter(|p| header_names(line, p))
+                .collect();
+            keep = !these.is_empty();
+            found.extend(these);
         }
         if keep {
             out.push_str(line);
         }
     }
-    out
+    (found.len() == scope.iter().collect::<BTreeSet<_>>().len()).then_some(out)
 }
 
 /// (core#1474) The answers of one batch's parts, combined per rule: BROKEN if any part broke it
@@ -4320,9 +4356,12 @@ fn run_pool(
                         CheckStage::Review,
                     ) => {
                         let shown: Vec<&str> = scope.iter().map(String::as_str).collect();
-                        let slice = scoped_sections(&input.change.diff, &shown);
-                        (!slice.is_empty() && slice.len() <= cap_beside(&shown, SCOPE_NOTE.len()))
-                            .then_some((slice, shown))
+                        scoped_sections(&input.change.diff, &shown)
+                            .filter(|slice| {
+                                !slice.is_empty()
+                                    && slice.len() <= cap_beside(&shown, SCOPE_NOTE.len())
+                            })
+                            .map(|slice| (slice, shown))
                     }
                     _ => None,
                 };
@@ -4612,6 +4651,17 @@ fn run_pool(
                                 Some(ans) if cut && ans.status != RuleStatus::Broken => {
                                     Miss::CutNotBroken(input.change.diff.len())
                                 }
+                                // (core#1278 item 4) The parts found the rule touched: the
+                                // files they named can keep or break it, never rule it out.
+                                Some(ans)
+                                    if scoped.is_some()
+                                        && ans.status == RuleStatus::NotApplicable =>
+                                {
+                                    Miss::Barred(
+                                        "the parts found the rule touched, so on the files they \
+                                         named only KEPT or BROKEN counts",
+                                    )
+                                }
                                 Some(ans)
                                     if subject == EvidenceSubject::Process
                                         && ans.status == RuleStatus::Kept
@@ -4692,7 +4742,7 @@ fn run_pool(
                             // (core#1278 item 4) Every part read, none of them able to decide
                             // it alone: the retry shows the files they named for it together.
                             let scope = (!cut && total_parts > 1 && retry.is_none())
-                                .then(|| part_scope(&each, id, &paths))
+                                .then(|| part_scope(&each, &parts, id, &paths))
                                 .flatten();
                             l.insert(
                                 batch[j],

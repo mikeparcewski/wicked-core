@@ -5351,11 +5351,14 @@ fn a_quote_across_a_nul_counts_as_the_seat_read_it() {
 
 /// A judge that decides each rule only when it sees the server and its test together: KEPT then,
 /// UNKNOWN (naming both files, and `extra`'s words) when it sees one of them, N/A on a part with
-/// neither. `NAMES-NOTHING`'s UNKNOWN on the server's part names no file; `QUIET` gets no line on a
-/// part that shows the test alone. Every prompt is recorded with its seat.
+/// neither. Rule by rule: `NAMES-NOTHING`'s UNKNOWN on the server's part names no file; `QUIET`
+/// gets no line on a part that shows the test alone; `OWN-ONLY`'s UNKNOWN names only the file its
+/// part shows; `SCOPED-NA` is N/A when asked on the named files. Every prompt is recorded with its
+/// seat.
 struct SpanJudge {
     seen: Mutex<Vec<(String, String)>>,
     extra: &'static str,
+    server: &'static str,
 }
 
 impl SpanJudge {
@@ -5363,6 +5366,7 @@ impl SpanJudge {
         SpanJudge {
             seen: Mutex::new(Vec::new()),
             extra,
+            server: "src/server.ts",
         }
     }
 }
@@ -5378,19 +5382,26 @@ impl RuleJudge for SpanJudge {
             .push((seat.to_string(), prompt.to_string()));
         let nonce = nonce_of(prompt);
         let (server, test) = (prompt.contains(SERVER_MARK), prompt.contains(TEST_MARK));
+        let scoped = prompt.starts_with(SCOPE_NOTE);
+        let s = self.server;
         let mut out = format!("BEGIN VERDICTS {nonce}\n");
         for id in asked_ids(prompt) {
             let line = match (id.as_str(), server, test) {
+                ("SCOPED-NA", _, _) if scoped => "N/A — these files are not about it".to_string(),
                 (_, true, true) => {
-                    "KEPT — test/server.test.ts covers the handler src/server.ts adds".to_string()
+                    format!("KEPT — test/server.test.ts covers the handler {s} adds")
                 }
                 ("QUIET", false, true) => continue,
                 ("NAMES-NOTHING", true, false) => {
                     "UNKNOWN — the rest is somewhere else".to_string()
                 }
+                ("OWN-ONLY", true, false) => {
+                    format!("UNKNOWN — {s} does not show how the handler checks its caller")
+                }
+                ("OWN-ONLY", false, true) => "N/A — this part does not touch it".to_string(),
                 (_, true, false) | (_, false, true) => format!(
-                    "UNKNOWN — this part shows only one of src/server.ts and test/server.test.ts; \
-                     the rule needs both{}",
+                    "UNKNOWN — this part shows only one of {s} and test/server.test.ts; the rule \
+                     needs both{}",
                     self.extra
                 ),
                 _ => "N/A — this part does not touch it".to_string(),
@@ -5401,12 +5412,12 @@ impl RuleJudge for SpanJudge {
     }
 }
 
-/// The server, `filler` lines of data between it and its test, then the test: the two land in
-/// different parts.
-fn span_change(filler: usize) -> Change {
+/// The server (its header as git writes it), `filler` lines of data between it and its test, then
+/// the test: the two land in different parts.
+fn span_change_at(filler: usize, server_path: &str, server_header: &str) -> Change {
     let server = format!(
-        "diff --git a/src/server.ts b/src/server.ts\nnew file mode 100644\n--- /dev/null\n+++ \
-         b/src/server.ts\n@@ -0,0 +1 @@\n+export const handler = () => '{SERVER_MARK}';\n"
+        "{server_header}\nnew file mode 100644\n--- /dev/null\n+++ b/{server_path}\n@@ -0,0 +1 @@\n\
+         +export const handler = () => '{SERVER_MARK}';\n"
     );
     let test = format!(
         "diff --git a/test/server.test.ts b/test/server.test.ts\nnew file mode 100644\n--- \
@@ -5419,7 +5430,15 @@ fn span_change(filler: usize) -> Change {
     );
     change_of(
         &diff,
-        &["src/server.ts", "fixtures/data.json", "test/server.test.ts"],
+        &[server_path, "fixtures/data.json", "test/server.test.ts"],
+    )
+}
+
+fn span_change(filler: usize) -> Change {
+    span_change_at(
+        filler,
+        "src/server.ts",
+        "diff --git a/src/server.ts b/src/server.ts",
     )
 }
 
@@ -5456,10 +5475,10 @@ fn span_check(rules: &[ConformanceRule], c: &Change, judge: &SpanJudge) -> RuleC
 }
 
 /// (core#1278 item 4, the MCP-server run 6679b515) A change too big for one call, read in parts: the
-/// rule's server is in the first part and its test in the last, so each part is UNKNOWN on it. Every
-/// part was read and none broke it, so it is asked again alone on the two files the parts named, in
-/// ONE call, and that call keeps it. On main the alone retry re-read the same parts, was UNKNOWN
-/// again, and the rule held for a person on every check.
+/// rule's server is in the first part and its test in the last, so each part is UNKNOWN on it,
+/// naming the file it lacks. Every part was read and none broke it, so it is asked again alone on
+/// the two files the parts named, in ONE call, and that call keeps it. On main the alone retry
+/// re-read the same parts, was UNKNOWN again, and the rule held for a person on every check.
 #[test]
 fn core_1278_a_rule_the_parts_cannot_decide_alone_is_kept_on_the_files_they_named() {
     let c = span_change(4000);
@@ -5495,8 +5514,9 @@ fn core_1278_a_rule_the_parts_cannot_decide_alone_is_kept_on_the_files_they_name
 }
 
 /// (core#1278 item 4) Fail closed: a rule whose pages were not all shown, or not all answered, or
-/// whose named files do not fit one call, or whose UNKNOWN named no file, is never asked on the
-/// named files, so it still holds (the same judge keeps it whenever it sees both files together).
+/// whose parts did not say what they need elsewhere, or whose named files cannot all be shown in one
+/// call, is never asked on the named files, so it still holds (the same judge keeps it whenever it
+/// sees both files together); and on the named files, N/A does not count.
 #[test]
 fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
     let holds = |r: &RuleCheckReport, id: &str, judge: &SpanJudge| {
@@ -5534,6 +5554,7 @@ fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
         &[
             rule("QUIET", "every handler has a test"),
             rule("NAMES-NOTHING", "the handler is documented"),
+            rule("OWN-ONLY", "every handler checks its caller"),
         ],
         &c,
         &judge,
@@ -5542,26 +5563,74 @@ fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
     // 3. A part whose UNKNOWN names no changed file (the other part's names both): what that
     // part needed is not known.
     holds(&r, "NAMES-NOTHING", &judge);
-    // 4. The named files are too big for one call together (the data file is named too): asked
+    // 4. (codex r1) An UNKNOWN naming only the file its own part shows: its doubt is not about
+    // evidence elsewhere, and that file alone cannot settle it.
+    holds(&r, "OWN-ONLY", &judge);
+    // 5. The named files are too big for one call together (the data file is named too): asked
     // again on the parts, as before.
     let judge = SpanJudge::new(", and fixtures/data.json");
     let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
     holds(&r, "SPAN", &judge);
+    // 6. (codex r1) A named file git quoted the header of has no section the engine can show: the
+    // rule is not asked on the others alone.
+    let c = span_change_at(
+        4000,
+        "src/a\"b.ts",
+        "diff --git \"a/src/a\\\"b.ts\" \"b/src/a\\\"b.ts\"",
+    );
+    let judge = SpanJudge {
+        server: "src/a\"b.ts",
+        ..SpanJudge::new("")
+    };
+    let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
+    holds(&r, "SPAN", &judge);
+    // 7. (codex r1) On the named files, N/A does not count: the parts found the rule touched.
+    let c = span_change(4000);
+    let judge = SpanJudge::new("");
+    let r = span_check(&[rule("SCOPED-NA", "every handler has a test")], &c, &judge);
+    let row = row(&r, "SCOPED-NA");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("only KEPT or BROKEN counts"),
+        "{}",
+        row.reason
+    );
 }
 
 /// (core#1278 item 4) The named files' sections, whole, in the diff's order; either side of a
-/// rename names its section; a path inside a longer one does not.
+/// rename names its section; a path inside a longer one does not; a named path with no section
+/// (a quoted header) gives none. A part's repeated header names its file.
 #[test]
 fn core_1278_scoped_sections_take_each_named_files_whole_section() {
     let diff = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+A\n\
                 diff --git a/old.ts b/new.ts\nsimilarity index 90%\nrename from old.ts\nrename to new.ts\n\
                 diff --git a/src/a.ts.bak b/src/a.ts.bak\n--- a/src/a.ts.bak\n+++ b/src/a.ts.bak\n@@ -1 +1 @@\n-x\n+y\n";
-    let a = scoped_sections(diff, &["src/a.ts"]);
     assert_eq!(
-        a,
-        "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+A\n"
+        scoped_sections(diff, &["src/a.ts"]).as_deref(),
+        Some("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+A\n")
     );
-    assert!(scoped_sections(diff, &["old.ts"]).contains("rename to new.ts"));
-    assert!(scoped_sections(diff, &["new.ts"]).contains("rename from old.ts"));
-    assert_eq!(scoped_sections(diff, &["src/b.ts"]), "");
+    assert!(scoped_sections(diff, &["old.ts"])
+        .unwrap()
+        .contains("rename to new.ts"));
+    assert!(scoped_sections(diff, &["new.ts"])
+        .unwrap()
+        .contains("rename from old.ts"));
+    assert_eq!(scoped_sections(diff, &["src/b.ts"]), None);
+    assert_eq!(scoped_sections(diff, &["src/a.ts", "src/b.ts"]), None);
+    assert!(header_names(
+        "[continued: …ery/long/dir/src/a.ts b/very/long/dir/src/a.ts]\n",
+        "very/long/dir/src/a.ts"
+    ));
+    assert!(header_names(
+        "[continued: …g/dir/src/a.ts]\n",
+        "very/long/dir/src/a.ts"
+    ));
+    assert!(!header_names(
+        "[continued: …g/dir/src/b.ts]\n",
+        "very/long/dir/src/a.ts"
+    ));
+    assert!(!header_names(
+        "+diff --git a/src/a.ts b/src/a.ts\n",
+        "src/a.ts"
+    ));
 }
