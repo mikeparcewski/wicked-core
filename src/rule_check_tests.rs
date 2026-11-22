@@ -5346,3 +5346,449 @@ fn a_quote_across_a_nul_counts_as_the_seat_read_it() {
         record
     ));
 }
+
+// ── core#1278 item 4: a rule whose evidence spans the parts is read on the files they named ──
+
+/// A judge that decides each rule only when it sees the server and its test together: KEPT then,
+/// UNKNOWN (naming both files, and `extra`'s words) when it sees one of them, N/A on a part with
+/// neither. Rule by rule: `NAMES-NOTHING`'s UNKNOWN on the server's part names no file; `QUIET`
+/// gets no line on a part that shows the test alone; `OWN-ONLY`'s UNKNOWN names only the file its
+/// part shows; `ELSEWHERE-ONLY`'s names only the file outside it, and a view of the test alone
+/// keeps it; `SCOPED-NA` is N/A when asked on the named files. Every prompt is recorded with its
+/// seat.
+struct SpanJudge {
+    seen: Mutex<Vec<(String, String)>>,
+    extra: &'static str,
+    server: &'static str,
+}
+
+impl SpanJudge {
+    fn new(extra: &'static str) -> Self {
+        SpanJudge {
+            seen: Mutex::new(Vec::new()),
+            extra,
+            server: "src/server.ts",
+        }
+    }
+}
+
+const SERVER_MARK: &str = "ZZSERVERZZ";
+const TEST_MARK: &str = "QQTESTQQ";
+
+impl RuleJudge for SpanJudge {
+    fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((seat.to_string(), prompt.to_string()));
+        let nonce = nonce_of(prompt);
+        let (server, test) = (prompt.contains(SERVER_MARK), prompt.contains(TEST_MARK));
+        let scoped = prompt.starts_with(SCOPE_NOTE);
+        let s = self.server;
+        let mut out = format!("BEGIN VERDICTS {nonce}\n");
+        for id in asked_ids(prompt) {
+            let line = match (id.as_str(), server, test) {
+                ("SCOPED-NA", _, _) if scoped => "N/A — these files are not about it".to_string(),
+                (_, true, true) => {
+                    format!("KEPT — test/server.test.ts covers the handler {s} adds")
+                }
+                ("QUIET", false, true) => continue,
+                ("NAMES-NOTHING", true, false) => {
+                    "UNKNOWN — the rest is somewhere else".to_string()
+                }
+                ("OWN-ONLY", true, false) => {
+                    format!("UNKNOWN — {s} does not show how the handler checks its caller")
+                }
+                ("OWN-ONLY", false, true) => "N/A — this part does not touch it".to_string(),
+                ("ELSEWHERE-ONLY", true, false) => {
+                    "UNKNOWN — it needs test/server.test.ts".to_string()
+                }
+                ("ELSEWHERE-ONLY", false, true) => {
+                    "KEPT — test/server.test.ts has a test".to_string()
+                }
+                (_, true, false) | (_, false, true) => format!(
+                    "UNKNOWN — this part shows only one of {s} and test/server.test.ts; the rule \
+                     needs both{}",
+                    self.extra
+                ),
+                _ => "N/A — this part does not touch it".to_string(),
+            };
+            out.push_str(&format!("RULE {id}: {line}\n"));
+        }
+        JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+    }
+}
+
+/// The server (its header as git writes it), `filler` lines of data between it and its test, then
+/// the test: the two land in different parts.
+fn span_change_at(filler: usize, server_path: &str, server_header: &str) -> Change {
+    let server = format!(
+        "{server_header}\nnew file mode 100644\n--- /dev/null\n+++ b/{server_path}\n@@ -0,0 +1 @@\n\
+         +export const handler = () => '{SERVER_MARK}';\n"
+    );
+    let test = format!(
+        "diff --git a/test/server.test.ts b/test/server.test.ts\nnew file mode 100644\n--- \
+         /dev/null\n+++ b/test/server.test.ts\n@@ -0,0 +1 @@\n+test('handler', () => \
+         expect(handler()).toBe('{TEST_MARK}'));\n"
+    );
+    let diff = format!(
+        "{server}{}{test}",
+        big_file("fixtures/data.json", filler, 30)
+    );
+    change_of(
+        &diff,
+        &[server_path, "fixtures/data.json", "test/server.test.ts"],
+    )
+}
+
+fn span_change(filler: usize) -> Change {
+    span_change_at(
+        filler,
+        "src/server.ts",
+        "diff --git a/src/server.ts b/src/server.ts",
+    )
+}
+
+fn span_check(rules: &[ConformanceRule], c: &Change, judge: &SpanJudge) -> RuleCheckReport {
+    let f = job_facts(&bug_steps(), None, None, c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules,
+            facts: &f,
+            change: c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+/// (core#1278 item 4, the MCP-server run 6679b515) A change too big for one call, read in parts: the
+/// rule's server is in the first part and its test in the last, so each part is UNKNOWN on it,
+/// naming the file it lacks. Every part was read and none broke it, so it is asked again alone on
+/// the two files the parts named, in ONE call, and that call keeps it. On main the alone retry
+/// re-read the same parts, was UNKNOWN again, and the rule held for a person on every check.
+#[test]
+fn core_1278_a_rule_the_parts_cannot_decide_alone_is_kept_on_the_files_they_named() {
+    let c = span_change(4000);
+    assert!(c.diff.len() > EVIDENCE_CAP, "{}", c.diff.len());
+    let judge = SpanJudge::new("");
+    let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
+    let row = row(&r, "SPAN");
+    assert_eq!(row.status, RuleStatus::Kept, "{row:?}");
+    assert_eq!(row.evidence_complete, Some(true), "{row:?}");
+    assert!(
+        row.reason
+            .starts_with("on the files the parts named, read together: test/server.test.ts"),
+        "{}",
+        row.reason
+    );
+    let seen = judge.seen.lock().unwrap();
+    let parts = seen.iter().filter(|(_, p)| p.starts_with("PART ")).count();
+    assert!((2..=MAX_PARTS).contains(&parts), "{parts}");
+    let scoped: Vec<&(String, String)> = seen
+        .iter()
+        .filter(|(_, p)| p.starts_with(SCOPE_NOTE))
+        .collect();
+    assert_eq!(scoped.len(), 1, "one call on the named files");
+    let (seat, p) = scoped[0];
+    assert_eq!(seat, "pi", "asked again on another seat");
+    assert!(p.contains(SERVER_MARK) && p.contains(TEST_MARK), "{p:.200}");
+    // (coord F1) The data file the undecided parts held is listed as not shown, never shown.
+    assert!(
+        !p.contains("diff --git a/fixtures/data.json"),
+        "a file no part named is not shown"
+    );
+    let list = p.split("NOTSHOWN-").nth(1).expect("the not-shown list");
+    assert!(list.contains("fixtures/data.json\n"), "{list}");
+    assert!(!p.contains(DIFF_CUT_MARK), "shown whole");
+    assert_eq!(r.calls, seen.len() as u32);
+}
+
+/// (core#1278 item 4) Fail closed: a rule whose pages were not all shown, or not all answered, or
+/// whose parts did not say what they need elsewhere, or whose named files cannot all be shown in one
+/// call, is never asked on the named files, so it still holds (the same judge keeps it whenever it
+/// sees both files together); and on the named files, N/A does not count.
+#[test]
+fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
+    let holds = |r: &RuleCheckReport, id: &str, judge: &SpanJudge| {
+        let row = row(r, id);
+        assert_eq!(row.status, RuleStatus::Unchecked, "{id}: {row:?}");
+        assert!(
+            !judge
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, p)| p.starts_with(SCOPE_NOTE) && asked_ids(p).contains(&id.to_string())),
+            "{id} was never asked on the named files"
+        );
+    };
+    // 1. More parts than MAX_PARTS: the pages past them, the test's among them, are never shown.
+    let c = span_change(24_000);
+    let judge = SpanJudge::new("");
+    let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
+    assert!(r.parts as usize > MAX_PARTS, "{}", r.parts);
+    holds(&r, "SPAN", &judge);
+    assert!(
+        !judge
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, p)| p.contains(TEST_MARK)),
+        "the test's page was never shown"
+    );
+    // 2. A part that gave no line for the rule: that page was not judged for it.
+    let c = span_change(4000);
+    let judge = SpanJudge::new("");
+    let r = span_check(
+        &[
+            rule("QUIET", "every handler has a test"),
+            rule("NAMES-NOTHING", "the handler is documented"),
+            rule("OWN-ONLY", "every handler checks its caller"),
+            rule("ELSEWHERE-ONLY", "every handler has a test"),
+        ],
+        &c,
+        &judge,
+    );
+    holds(&r, "QUIET", &judge);
+    // 3. A part whose UNKNOWN names no changed file (the other part's names both): what that
+    // part needed is not known.
+    holds(&r, "NAMES-NOTHING", &judge);
+    // 4. (codex r1) An UNKNOWN naming only the file its own part shows: its doubt is not about
+    // evidence elsewhere, and that file alone cannot settle it.
+    holds(&r, "OWN-ONLY", &judge);
+    // 4b. (codex r2) An UNKNOWN naming only a file elsewhere: shown that file alone, the judge
+    // keeps the rule without the handler it was unsure about.
+    holds(&r, "ELSEWHERE-ONLY", &judge);
+    // 5. The named files are too big for one call together (the data file is named too): asked
+    // again on the parts, as before.
+    let judge = SpanJudge::new(", and fixtures/data.json");
+    let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
+    holds(&r, "SPAN", &judge);
+    // 6. (codex r1) A named file git quoted the header of has no header the engine can match, so
+    // it is neither the part's own file nor a section it could show (scoped_sections gives none
+    // for it: see the unit test below).
+    let c = span_change_at(
+        4000,
+        "src/a\"b.ts",
+        "diff --git \"a/src/a\\\"b.ts\" \"b/src/a\\\"b.ts\"",
+    );
+    let judge = SpanJudge {
+        server: "src/a\"b.ts",
+        ..SpanJudge::new("")
+    };
+    let r = span_check(&[rule("SPAN", "every handler has a test")], &c, &judge);
+    holds(&r, "SPAN", &judge);
+    // 7. (codex r1) On the named files, N/A does not count: the parts found the rule touched.
+    let c = span_change(4000);
+    let judge = SpanJudge::new("");
+    let r = span_check(&[rule("SCOPED-NA", "every handler has a test")], &c, &judge);
+    let row = row(&r, "SCOPED-NA");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("only KEPT or BROKEN counts"),
+        "{}",
+        row.reason
+    );
+}
+
+/// (core#1278 item 4) The named files' sections, whole, in the diff's order; either side of a
+/// rename names its section; a path inside a longer one does not; a named path with no section
+/// (a quoted header) gives none.
+#[test]
+fn core_1278_scoped_sections_take_each_named_files_whole_section() {
+    let diff = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+A\n\
+                diff --git a/old.ts b/new.ts\nsimilarity index 90%\nrename from old.ts\nrename to new.ts\n\
+                diff --git a/src/a.ts.bak b/src/a.ts.bak\n--- a/src/a.ts.bak\n+++ b/src/a.ts.bak\n@@ -1 +1 @@\n-x\n+y\n";
+    assert_eq!(
+        scoped_sections(diff, &["src/a.ts"]).as_deref(),
+        Some("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+A\n")
+    );
+    assert!(scoped_sections(diff, &["old.ts"])
+        .unwrap()
+        .contains("rename to new.ts"));
+    assert!(scoped_sections(diff, &["new.ts"])
+        .unwrap()
+        .contains("rename from old.ts"));
+    assert_eq!(scoped_sections(diff, &["src/b.ts"]), None);
+    assert_eq!(scoped_sections(diff, &["src/a.ts", "src/b.ts"]), None);
+    // (coord F3) Only a `diff --git` line names a file, never a part's repeated header text.
+    assert!(!header_names(
+        "[continued: …g/dir/src/a.ts]\n",
+        "very/long/dir/src/a.ts"
+    ));
+    assert!(!header_names(
+        "+diff --git a/src/a.ts b/src/a.ts\n",
+        "src/a.ts"
+    ));
+}
+
+/// (core#1278 item 4, coord F1) A part shows two handlers and its UNKNOWN names one of them and the
+/// test it needs. The other handler is not shown on the scoped call, but it is listed there as
+/// changed and not shown, so the judge asks for it and the rule holds; without the list the scoped
+/// judge would keep the rule on the named handler and its test.
+#[test]
+fn core_1278_a_file_an_undecided_part_showed_but_did_not_name_is_listed_as_not_shown() {
+    struct TwoHandlers(Mutex<Vec<(String, String)>>);
+    impl RuleJudge for TwoHandlers {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            self.0
+                .lock()
+                .unwrap()
+                .push((seat.to_string(), prompt.to_string()));
+            let nonce = nonce_of(prompt);
+            let (a, test) = (prompt.contains("AAHANDLERAA"), prompt.contains(TEST_MARK));
+            let line = if prompt.starts_with(SCOPE_NOTE) {
+                // The judge on the named files reads the not-shown list.
+                match prompt.split("NOTSHOWN-").nth(1) {
+                    Some(list) if list.contains("src/b.ts") => {
+                        "UNKNOWN — src/b.ts is changed and not shown; it needs its own test"
+                    }
+                    _ => "KEPT — test/a.test.ts covers src/a.ts",
+                }
+            } else if a {
+                "UNKNOWN — src/a.ts needs its test test/a.test.ts"
+            } else if test {
+                "UNKNOWN — test/a.test.ts needs the handler src/a.ts"
+            } else {
+                "N/A — this part does not touch it"
+            };
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: {line}\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let file = |path: &str, body: &str| {
+        format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n\
+             @@ -0,0 +1 @@\n+{body}\n"
+        )
+    };
+    let diff = format!(
+        "{}{}{}{}",
+        file("src/a.ts", "export const a = () => 'AAHANDLERAA';"),
+        file("src/b.ts", "export const b = () => 'no test for me';"),
+        big_file("fixtures/data.json", 4000, 30),
+        file(
+            "test/a.test.ts",
+            &format!("test('a', () => '{TEST_MARK}');")
+        ),
+    );
+    let c = change_of(
+        &diff,
+        &[
+            "src/a.ts",
+            "src/b.ts",
+            "fixtures/data.json",
+            "test/a.test.ts",
+        ],
+    );
+    let judge = TwoHandlers(Mutex::new(Vec::new()));
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("EVERY", "every handler has a test")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    let row = row(&r, "EVERY");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("src/b.ts is changed and not shown"),
+        "{}",
+        row.reason
+    );
+    let seen = judge.0.lock().unwrap();
+    let scoped: Vec<&String> = seen
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p.starts_with(SCOPE_NOTE))
+        .collect();
+    assert_eq!(scoped.len(), 1, "asked once on the named files");
+    let p = scoped[0];
+    assert!(
+        p.contains("AAHANDLERAA") && p.contains(TEST_MARK),
+        "{p:.300}"
+    );
+    assert!(!p.contains("no test for me"), "src/b.ts is not shown");
+    let list = p.split("NOTSHOWN-").nth(1).unwrap();
+    let list = list.split("NOTSHOWN-").next().unwrap();
+    // Every file an undecided part held and no judge named, and no file shown.
+    assert!(
+        list.contains("src/b.ts\n") && list.contains("fixtures/data.json\n"),
+        "{list}"
+    );
+    assert!(
+        !list.contains("src/a.ts") && !list.contains("test/a.test.ts"),
+        "{list}"
+    );
+}
+
+/// (core#1278 item 4, coord F3) A part's files come from the diff's own headers: a piece of an
+/// over-long changed line that starts a part with `diff --git a/<elsewhere> …` does not make that
+/// file the part's own.
+#[test]
+fn core_1278_a_part_holds_only_the_files_the_diff_headers_place_in_it() {
+    let cap = 4 * 1024;
+    let head = "diff --git a/x.json b/x.json\n--- a/x.json\n+++ b/x.json\n";
+    let room = cap - head.len();
+    let planted = "diff --git a/test/server.test.ts b/test/server.test.ts";
+    let long = format!("+{}{planted}{}\n", "a".repeat(room - 1), "b".repeat(room));
+    let diff = format!("{head}@@ -0,0 +1 @@\n{long}");
+    let parts = diff_parts_with_files(&diff, cap);
+    assert!(
+        parts
+            .iter()
+            .any(|(t, _)| t.lines().any(|l| l.starts_with(planted))),
+        "the plant starts a line in some part"
+    );
+    for (_, files) in &parts {
+        assert_eq!(files, &vec!["diff --git a/x.json b/x.json\n".to_string()]);
+    }
+    let texts: Vec<String> = parts.into_iter().map(|(t, _)| t).collect();
+    assert_eq!(texts, diff_parts(&diff, cap), "the same parts");
+}
