@@ -246,10 +246,12 @@ const NOTES_DIR: &str = "wicked-core-notes";
 /// dir. Applied where a unit's output is persisted (`execute.rs`). Text naming no notes path comes
 /// back borrowed.
 ///
-/// A match is a whole path: the temp dir in any spelling the host has for it ([`NotesScrub`]),
-/// starting at a path boundary (or after `file://`), then one or more separators and the
-/// `wicked-core-notes` component itself. `/var/tmp/wicked-core-notes/...`, `<tree>/tmp/
-/// wicked-core-notes/...` and `<temp>/wicked-core-notes.md` are other paths and stay as written.
+/// A match is a whole path: it starts at the start of the text, after a space or an opening
+/// delimiter (`(`, `[`, `<`, a quote, `=`, `:` ...), or after `file://` / `file:///`; then the
+/// temp dir in a spelling the host has for it ([`NotesScrub`]), one or more separators, and the
+/// `wicked-core-notes` component itself, ending at a separator, a space, a closing delimiter or
+/// the end. `/var/tmp/wicked-core-notes/...`, `<tree>/tmp/wicked-core-notes/...` and
+/// `<temp>/wicked-core-notes.md` are other paths and stay as written.
 pub(crate) fn scrub_notes_paths(text: &str) -> std::borrow::Cow<'_, str> {
     static HOST: std::sync::OnceLock<NotesScrub> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
@@ -259,20 +261,16 @@ pub(crate) fn scrub_notes_paths(text: &str) -> std::borrow::Cow<'_, str> {
             temps.push(resolved.to_string_lossy().into_owned());
             temps.push(plain_path(resolved).to_string_lossy().into_owned());
         }
-        NotesScrub::new(
-            &temps,
-            cfg!(windows),
-            cfg!(any(windows, target_os = "macos")),
-        )
+        NotesScrub::new(&temps, cfg!(windows), cfg!(target_os = "macos"))
     })
     .scrub(text)
 }
 
 /// (core#1380) The spellings of the host temp dir a notes path may start with, and how to match
 /// them. Built from the temp dir as named and as resolved, plus the spellings the same directory
-/// has on this kind of host: macOS's `/var` and `/tmp` with and without `/private`; on Windows,
-/// `/` separators and the verbatim `\\?\` and `\\?\UNC\` forms. Matched ASCII-case-insensitively
-/// where the filesystem is (macOS, Windows).
+/// has on this kind of host: on macOS, `/var` and `/tmp` with and without `/private`; on Windows,
+/// the plain, verbatim (`\\?\`) and verbatim UNC (`\\?\UNC\`) forms, with `/` and `\` matched as
+/// one separator. Matched ASCII-case-insensitively where the filesystem is (macOS, Windows).
 pub(crate) struct NotesScrub {
     /// Longest first, so a spelling that contains another (`/private/var/...` holds `/var/...`)
     /// is tried before it.
@@ -282,41 +280,43 @@ pub(crate) struct NotesScrub {
 }
 
 impl NotesScrub {
-    pub(crate) fn new(temps: &[String], windows: bool, fold_case: bool) -> Self {
+    pub(crate) fn new(temps: &[String], windows: bool, macos: bool) -> Self {
         let mut all: Vec<String> = Vec::new();
         for t in temps {
-            let t = t.trim_end_matches(['/', '\\']);
+            let t = if windows {
+                t.trim_end_matches(['/', '\\'])
+            } else {
+                t.trim_end_matches('/')
+            };
             if t.is_empty() {
                 continue;
             }
             let mut spellings = vec![t.to_string()];
-            for (with, without) in [("/private/var", "/var"), ("/private/tmp", "/tmp")] {
-                let under = |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
-                if under(t, with) {
-                    spellings.push(t.replacen(with, without, 1));
-                } else if under(t, without) {
-                    spellings.push(t.replacen(without, with, 1));
+            if macos {
+                for (with, without) in [("/private/var", "/var"), ("/private/tmp", "/tmp")] {
+                    let under =
+                        |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
+                    if under(t, with) {
+                        spellings.push(t.replacen(with, without, 1));
+                    } else if under(t, without) {
+                        spellings.push(t.replacen(without, with, 1));
+                    }
                 }
             }
             if windows {
-                for sp in spellings.clone() {
-                    let plain = if let Some(rest) = sp.strip_prefix(r"\\?\UNC\") {
-                        format!(r"\\{rest}")
-                    } else if let Some(rest) = sp.strip_prefix(r"\\?\") {
-                        rest.to_string()
-                    } else {
-                        sp
-                    };
-                    let verbatim = match plain.strip_prefix(r"\\") {
-                        Some(rest) => format!(r"\\?\UNC\{rest}"),
-                        None => format!(r"\\?\{plain}"),
-                    };
-                    for v in [plain, verbatim] {
-                        spellings.push(v.replace('/', "\\"));
-                        spellings.push(v.replace('\\', "/"));
-                        spellings.push(v);
-                    }
-                }
+                let plain = if let Some(rest) = t.strip_prefix(r"\\?\UNC\") {
+                    format!(r"\\{rest}")
+                } else if let Some(rest) = t.strip_prefix(r"\\?\") {
+                    rest.to_string()
+                } else {
+                    t.to_string()
+                };
+                let verbatim = match plain.strip_prefix(r"\\") {
+                    Some(rest) => format!(r"\\?\UNC\{rest}"),
+                    None => format!(r"\\?\{plain}"),
+                };
+                spellings.push(plain);
+                spellings.push(verbatim);
             }
             all.extend(spellings);
         }
@@ -325,29 +325,51 @@ impl NotesScrub {
         NotesScrub {
             temps: all,
             windows,
-            fold_case,
+            fold_case: windows || macos,
         }
     }
 
+    fn sep(&self, c: u8) -> bool {
+        c == b'/' || (self.windows && c == b'\\')
+    }
+
+    /// Whether `seen` spells `want`: byte for byte, but for ASCII case where the filesystem folds
+    /// it and for `/` against `\` on Windows.
+    fn same(&self, seen: &[u8], want: &[u8]) -> bool {
+        seen.len() == want.len()
+            && seen.iter().zip(want).all(|(&a, &b)| {
+                a == b
+                    || (self.fold_case && a.eq_ignore_ascii_case(&b))
+                    || (self.sep(a) && self.sep(b))
+            })
+    }
+
     pub(crate) fn scrub<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
-        // A byte that continues a path name: a match must not start or end inside one.
+        // A byte that continues a path name.
         let name_byte = |c: u8| c.is_ascii_alphanumeric() || b"._-~%+@".contains(&c) || c >= 0x80;
-        let sep = |c: u8| c == b'/' || c == b'\\';
-        // The tail of a matched path runs to the next space or closing delimiter.
-        let tail_byte = |c: u8| !c.is_ascii_whitespace() && !b")]>\"'`,;|".contains(&c);
+        let opens = |c: u8| c.is_ascii_whitespace() || b"([<{\"'`=:,;|".contains(&c);
+        let closes = |c: u8| c.is_ascii_whitespace() || b")]>}\"'`,;|".contains(&c);
         let b = text.as_bytes();
+        // ASCII lowering keeps every byte offset, so a match in `hay` is a match in `text`.
+        let lowered;
+        let hay: &str = if self.fold_case {
+            lowered = text.to_ascii_lowercase();
+            &lowered
+        } else {
+            text
+        };
         let mut out = String::new();
         let mut last = 0;
         let mut from = 0;
-        while let Some(off) = text[from..].find(NOTES_DIR) {
+        while let Some(off) = hay[from..].find(NOTES_DIR) {
             let at = from + off;
             let end = at + NOTES_DIR.len();
             from = end;
-            if b.get(end).is_some_and(|&c| name_byte(c)) {
+            if b.get(end).is_some_and(|&c| !self.sep(c) && !closes(c)) {
                 continue;
             }
             let mut k = at;
-            while k > last && sep(b[k - 1]) {
+            while k > last && self.sep(b[k - 1]) {
                 k -= 1;
             }
             if k == at {
@@ -355,37 +377,38 @@ impl NotesScrub {
             }
             let found = self.temps.iter().find_map(|t| {
                 let s = k.checked_sub(t.len()).filter(|&s| s >= last)?;
-                let seen = &b[s..k];
-                let same = if self.fold_case {
-                    seen.eq_ignore_ascii_case(t.as_bytes())
-                } else {
-                    seen == t.as_bytes()
-                };
-                same.then_some(s)
+                self.same(&b[s..k], t.as_bytes()).then_some(s)
             });
             let Some(mut s) = found else {
                 continue;
             };
-            const FILE_URL: &[u8] = b"file://";
-            if s >= last + FILE_URL.len() && b[s - FILE_URL.len()..s].eq_ignore_ascii_case(FILE_URL)
-            {
-                s -= FILE_URL.len();
+            // A file URL: `file:///tmp/...` (the path brings its own `/`), `file:///C:/...`.
+            let url: &[u8] = if self.sep(b[s]) {
+                b"file://"
+            } else {
+                b"file:///"
+            };
+            if s >= last + url.len() && b[s - url.len()..s].eq_ignore_ascii_case(url) {
+                s -= url.len();
             }
-            if s > 0 && (name_byte(b[s - 1]) || sep(b[s - 1])) {
+            if s > 0 && !opens(b[s - 1]) {
                 continue;
             }
+            // On Windows the rest of the path is part of the match, its `\` turned into `/`: name
+            // bytes, and a separator only when a name follows (never a `\` that escapes a quote
+            // or ends a line). Elsewhere the rest is left as written, and searched on.
             let mut t = end;
-            while t < b.len() && tail_byte(b[t]) {
-                t += 1;
+            if self.windows {
+                while t < b.len()
+                    && (name_byte(b[t])
+                        || (self.sep(b[t]) && b.get(t + 1).is_some_and(|&c| name_byte(c))))
+                {
+                    t += 1;
+                }
             }
             out.push_str(&text[last..s]);
             out.push_str(NOTES_DIR);
-            let tail = &text[end..t];
-            if self.windows {
-                out.push_str(&tail.replace('\\', "/"));
-            } else {
-                out.push_str(tail);
-            }
+            out.push_str(&text[end..t].replace('\\', "/"));
             last = t;
             from = t;
         }
@@ -2214,14 +2237,21 @@ pub(crate) mod tests {
                 "notes go in /tmp/wicked-core-notes now",
                 "notes go in wicked-core-notes now",
             ),
+            (
+                "P=/tmp/wicked-core-notes/a:/tmp/wicked-core-notes/b:/tmp/wicked-core-notes/c",
+                "P=wicked-core-notes/a:wicked-core-notes/b:wicked-core-notes/c",
+            ),
         ] {
             check(&linux, input, want);
         }
         for kept in [
             "/var/tmp/wicked-core-notes/r/a.md",
             "/srv/tmp/wicked-core-notes/r/a.md",
+            "/srv!/tmp/wicked-core-notes/r/a.md",
             "repo/tmp/wicked-core-notes/r/a.md",
             "/tmp/wicked-core-notes.md and /tmp/wicked-core-notes-backup/a.md",
+            "/tmp/wicked-core-notes=backup/a.md",
+            "/tmp\\wicked-core-notes/r/a.md",
             "wicked-core-notes/r/unit-9/a.md",
             "/TMP/wicked-core-notes/r/a.md",
             "Ran /tmp/build.sh.",
@@ -2229,13 +2259,18 @@ pub(crate) mod tests {
             check(&linux, kept, kept);
         }
 
+        // Off macOS, /private/var is its own directory, never an alias of /var.
+        let linux_var = NotesScrub::new(&["/var/x/T".into()], false, false);
+        let kept = "/private/var/x/T/wicked-core-notes/r/a.md";
+        check(&linux_var, kept, kept);
+
         // macOS: named with a trailing slash, its /private spelling in the same text (and a
         // doubled separator), and the other direction: the /tmp spelling of a /private/tmp temp.
         let mac = NotesScrub::new(&["/var/folders/k3/x_y/T/".into()], false, true);
         check(
             &mac,
             "a /private/var/folders/k3/x_y/T/wicked-core-notes/r/u/a.md b \
-             /var/folders/k3/x_y/T//wicked-core-notes/r/u/b.md c",
+             /var/folders/k3/x_y/T//Wicked-Core-Notes/r/u/b.md c",
             "a wicked-core-notes/r/u/a.md b wicked-core-notes/r/u/b.md c",
         );
         let mac_tmp = NotesScrub::new(&["/private/tmp".into()], false, true);
@@ -2245,26 +2280,35 @@ pub(crate) mod tests {
             "(wicked-core-notes/r/u/a.md)",
         );
 
-        // Windows: either separator, any ASCII case, the verbatim form, a space in the user name,
-        // and a UNC temp dir; the kept tail uses `/`.
-        let win = NotesScrub::new(&[r"C:\Temp Dir\Jo Smith\T\".into()], true, true);
+        // Windows: either separator (mixed too), any ASCII case, the verbatim form, a file URL, a
+        // space in the user name, and a UNC temp dir; the kept tail uses `/`.
+        let win = NotesScrub::new(&[r"C:\Temp Dir\Jo Smith\T\".into()], true, false);
         for input in [
             r"[r](C:\Temp Dir\Jo Smith\T\wicked-core-notes\run-1\unit-9\a.md)",
             "[r](C:/Temp Dir/Jo Smith/T/wicked-core-notes/run-1/unit-9/a.md)",
-            r"[r](c:\temp dir\jo smith\t\wicked-core-notes\run-1\unit-9\a.md)",
+            r"[r](C:\Temp Dir/Jo Smith\T/wicked-core-notes\run-1\unit-9\a.md)",
+            r"[r](c:\temp dir\jo smith\t\WICKED-CORE-NOTES\run-1\unit-9\a.md)",
             r"[r](\\?\C:\Temp Dir\Jo Smith\T\wicked-core-notes\run-1\unit-9\a.md)",
+            "[r](file:///C:/Temp Dir/Jo Smith/T/wicked-core-notes/run-1/unit-9/a.md)",
         ] {
             check(&win, input, "[r](wicked-core-notes/run-1/unit-9/a.md)");
         }
+        // An escaped quote and a line continuation after the path keep their backslash.
+        check(
+            &win,
+            r#"say \"C:\Temp Dir\Jo Smith\T\wicked-core-notes\r\a.md\" and C:\Temp Dir\Jo Smith\T\wicked-core-notes\r\x\"#,
+            r#"say \"wicked-core-notes/r/a.md\" and wicked-core-notes/r/x\"#,
+        );
         check(
             &win,
             r"D:\Temp Dir\Jo Smith\T\wicked-core-notes\a.md",
             r"D:\Temp Dir\Jo Smith\T\wicked-core-notes\a.md",
         );
-        let unc = NotesScrub::new(&[r"\\?\UNC\srv\share\Temp".into()], true, true);
+        let unc = NotesScrub::new(&[r"\\?\UNC\srv\share\Temp".into()], true, false);
         for input in [
             r"\\srv\share\Temp\wicked-core-notes\r\a.md",
             r"\\?\UNC\srv\share\Temp\wicked-core-notes\r\a.md",
+            "//srv/share/Temp/wicked-core-notes/r/a.md",
         ] {
             check(&unc, input, "wicked-core-notes/r/a.md");
         }

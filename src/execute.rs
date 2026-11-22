@@ -596,7 +596,11 @@ mod tests {
                 format!("Checks pass with ***.\n\n[Command record]({tail})\n"),
             ));
             // The shell continuation the redaction joins, inside the temp dir's spelling.
-            let cut = link.char_indices().nth(3).map(|(i, _)| i).unwrap();
+            // Inside a name of the temp dir's spelling (`/tm` + `p`, `Use` + `rs`).
+            let lb = link.as_bytes();
+            let cut = (1..lb.len())
+                .find(|&i| lb[i - 1].is_ascii_alphanumeric() && lb[i].is_ascii_alphanumeric())
+                .unwrap();
             cases.push((
                 format!("cat {}\\\n{}", &link[..cut], &link[cut..]),
                 format!("cat {tail}"),
