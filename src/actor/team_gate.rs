@@ -2595,6 +2595,10 @@ fn accept_member_step(
             last.member_reason.get_or_insert(why);
         }
     }
+    // (core#1748, codex xreview) A review turn the engine lost and the operator re-ran left its
+    // failure on the unit; a counted step carries no standing denial.
+    unit.denial = None;
+    unit.denial_reason = None;
     unit.status = crate::domain::UnitStatus::Done;
     put_node(act.store, unit.to_node())?;
     emit_counted(act, run_id, ord);
