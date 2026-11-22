@@ -1152,6 +1152,16 @@ pub(crate) fn run(
             eprintln!("{notice}");
         }
     }
+    // (core#1662) A checkout that moved since its run worktrees were minted: this daemon's trees get
+    // their git links repaired to the checkout's resolved paths before anything else reads them
+    // (a container seat mounts resolved paths), so before the resumed cleanups below and the
+    // reaper. Nothing is removed. Synchronous, before any thread that touches a tree starts.
+    if let Ok(repos) = &boot_repos {
+        let owner = crate::repo::bound_daemon_owner();
+        for r in repos {
+            crate::repo::repair_moved_worktrees(&r.id, &r.root_path, owner.as_deref());
+        }
+    }
     // (core#1434) A cancel's cleanup the last life of this daemon never heard the end of is reaped
     // again, off the actor, and its outcome said through the same continuation. The boot reaper
     // below keeps its hands off those trees (counted live): it would reap them on the actor, and a
@@ -1163,15 +1173,6 @@ pub(crate) fn run(
             "wicked-core: skipping the startup worktree reap — the pending worktree cleanups \
              cannot be read"
         );
-    }
-    // (core#1662) A checkout that moved since its run worktrees were minted: this daemon's trees get
-    // their git links repaired to the checkout's resolved paths before anything else reads them
-    // (a container seat mounts resolved paths). Nothing is removed.
-    if let Ok(repos) = &boot_repos {
-        let owner = crate::repo::bound_daemon_owner();
-        for r in repos {
-            crate::repo::repair_moved_worktrees(&r.id, &r.root_path, owner.as_deref());
-        }
     }
     // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
     // clean (the same rule the terminal-status reap applies — so a crash between a run finishing

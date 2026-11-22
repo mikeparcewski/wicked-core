@@ -2071,12 +2071,16 @@ pub(crate) fn reap_worktree_with(ticket: TreeTicket, repo_root: &str, run_id: &s
 /// remounted), git's link files still name the old resolved path: the tree's `.git` file names its
 /// admin dir (`<old>/.git/worktrees/<name>`) and the admin dir's `gitdir` names the tree
 /// (`<old>/wicked-worktrees/<name>/.git`). A container seat mounts resolved paths, so it cannot
-/// use such a tree until `git worktree repair` rewrites both. On boot, for the checkout as it now
-/// resolves, every admin dir carrying THIS daemon's marker (`daemon`) whose tree is at
-/// `<resolved>/wicked-worktrees/<name>` and whose two links do not both name the resolved paths is
-/// repaired from the checkout. Another daemon's tree, an unmarked tree and a tree that is not
-/// where the layout puts it are left as they are; nothing is removed. One line per repository
-/// with repairs. Returns how many trees were repaired.
+/// use such a tree until both are rewritten. On boot, for the checkout as it now resolves, every
+/// admin dir `<resolved>/.git/worktrees/<name>` that carries THIS daemon's marker and pairs with
+/// the tree `<resolved>/wicked-worktrees/<name>` (the same name on both sides, the back-pointer
+/// naming `<...>/<name>/.git` and the tree's pointer `<...>/worktrees/<name>`) gets both links
+/// rewritten to the absolute resolved paths, as `git worktree add` writes them. The engine writes
+/// the two files itself rather than run `git worktree repair`, which also sweeps every other
+/// registered tree and follows whatever the tree's `.git` names: only the verified pair is
+/// written, each through a fresh file renamed into place (never through a link a seat planted).
+/// Another daemon's tree, an unmarked tree and an unpaired one are left as they are; nothing is
+/// removed. One line per repository with repairs. Returns how many trees were repaired.
 pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&str>) -> usize {
     let Some(daemon) = daemon else {
         return 0;
@@ -2084,67 +2088,51 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
     let Ok(root) = std::fs::canonicalize(repo_root) else {
         return 0;
     };
-    let Some(root_str) = root.to_str().map(str::to_string) else {
+    let admin_root = root.join(".git").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&admin_root) else {
         return 0;
     };
-    let Ok(entries) = std::fs::read_dir(root.join(".git").join("worktrees")) else {
-        return 0;
-    };
-    let trees = worktrees_root(&root_str);
-    // Whether link text `named` (absolute, or relative to `base`) names `want`: an absolute link
-    // must be the resolved spelling itself (what `git worktree repair` writes), a relative one
-    // must resolve to it.
-    let names = |named: &str, base: &Path, want: &Path| {
-        let p = Path::new(named.trim());
-        if p.is_absolute() {
-            p == want
-        } else {
-            std::fs::canonicalize(base.join(p)).ok().as_deref()
-                == std::fs::canonicalize(want).ok().as_deref()
-        }
-    };
+    let trees = worktrees_root(&root.to_string_lossy());
     let mut repaired = 0;
     for entry in entries.flatten() {
-        let admin = entry.path();
+        let name = entry.file_name();
+        let admin = admin_root.join(&name);
+        let tree = trees.join(&name);
+        let dot_git = tree.join(".git");
+        if !std::fs::symlink_metadata(&admin).is_ok_and(|m| m.is_dir())
+            || !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file())
+        {
+            continue;
+        }
         let owner = std::fs::read_to_string(admin.join(DAEMON_MARKER)).unwrap_or_default();
         if owner.trim() != daemon {
             continue;
         }
-        let Ok(back) = std::fs::read_to_string(admin.join("gitdir")) else {
-            continue;
-        };
-        let Some(name) = Path::new(back.trim()).parent().and_then(Path::file_name) else {
-            continue;
-        };
-        let tree = trees.join(name);
-        let dot_git = tree.join(".git");
-        if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file()) {
-            continue;
-        }
+        let back = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let back = Path::new(back.trim()).to_path_buf();
         let pointer = std::fs::read_to_string(&dot_git)
             .ok()
             .and_then(|t| {
                 t.lines()
                     .find_map(|l| l.strip_prefix("gitdir:"))
-                    .map(str::to_string)
+                    .map(|p| PathBuf::from(p.trim()))
             })
             .unwrap_or_default();
-        if names(&back, &admin, &dot_git) && names(&pointer, &tree, &admin) {
+        let back_pairs = back.file_name().is_some_and(|n| n == ".git")
+            && back.parent().and_then(Path::file_name) == Some(name.as_os_str());
+        let pointer_pairs = pointer.file_name() == Some(name.as_os_str())
+            && pointer.parent().and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new("worktrees"));
+        if !back_pairs || !pointer_pairs || (back == dot_git && pointer == admin) {
             continue;
         }
-        let Some(tree_str) = tree.to_str() else {
-            continue;
-        };
-        match git(&root_str, &["worktree", "repair", tree_str]) {
-            Ok((true, _, _)) => repaired += 1,
-            Ok((false, _, err)) => eprintln!(
-                "wicked-core: repo `{repo_id}`: could not repair the links of worktree {} after \
-                 the checkout moved: {err} (core#1662)",
-                tree.display()
-            ),
+        let wrote = replace_file(&admin.join("gitdir"), &format!("{}\n", dot_git.display()))
+            .and_then(|()| replace_file(&dot_git, &format!("gitdir: {}\n", admin.display())));
+        match wrote {
+            Ok(()) => repaired += 1,
             Err(e) => eprintln!(
-                "wicked-core: repo `{repo_id}`: could not repair the links of worktree {}: {e} \
-                 (core#1662)",
+                "wicked-core: repo `{repo_id}`: could not repair the links of worktree {} after \
+                 the checkout moved: {e} (core#1662)",
                 tree.display()
             ),
         }
@@ -2157,6 +2145,30 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
         );
     }
     repaired
+}
+
+/// Replace `path` with a regular file holding `text`: written whole to a new file beside it, then
+/// renamed over it, so a link at `path` is replaced, never followed.
+fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+    let tmp = dir.join(format!(
+        ".wicked-repair.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let renamed = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
 }
 
 /// Prune worktrees whose run is not live, on actor startup. For each
@@ -4724,6 +4736,15 @@ mod tests {
             let link_text = |wt: &Path| std::fs::read_to_string(wt.join(".git")).unwrap();
             let before_theirs = link_text(&theirs);
             let before_unmarked = link_text(&unmarked);
+            let before_theirs_back = std::fs::read_to_string(
+                old.join(".git")
+                    .join("worktrees")
+                    .join("run-theirs")
+                    .join("gitdir"),
+            )
+            .unwrap()
+            .trim()
+            .to_string();
             let moved = old.with_file_name(format!(
                 "{}-moved",
                 old.file_name().unwrap().to_string_lossy()
@@ -4773,6 +4794,19 @@ mod tests {
                 "{tag}: not this daemon's"
             );
             assert_eq!(
+                std::fs::read_to_string(
+                    resolved
+                        .join(".git")
+                        .join("worktrees")
+                        .join("run-theirs")
+                        .join("gitdir")
+                )
+                .unwrap()
+                .trim(),
+                before_theirs_back,
+                "{tag}: another daemon's back-pointer is untouched"
+            );
+            assert_eq!(
                 link_text(&tree(&unmarked)),
                 before_unmarked,
                 "{tag}: unmarked"
@@ -4794,18 +4828,67 @@ mod tests {
         }
     }
 
+    /// core#1662 (review): the repair writes only a verified pair. A tree whose seat pointed its
+    /// `.git` at a sibling's admin dir is not "repaired" into the sibling (the sibling's links stay
+    /// as they are), and a `.git` that is a link a seat planted is never followed: it is not a
+    /// regular file, so the tree is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn the_moved_checkout_repair_writes_only_a_verified_pair() {
+        let old = git_repo("move-pair");
+        let p = old.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let a = create_worktree(p, "run-a").unwrap();
+        let b = create_worktree(p, "run-b").unwrap();
+        let c = create_worktree(p, "run-c").unwrap();
+        let canon = std::fs::canonicalize(&old).unwrap();
+        let admin = |n: &str| canon.join(".git").join("worktrees").join(n);
+        std::fs::write(
+            a.join(".git"),
+            format!("gitdir: {}\n", admin("run-b").display()),
+        )
+        .unwrap();
+        let outside = old.with_file_name(format!(
+            "{}-outside",
+            old.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, "do not touch\n").unwrap();
+        std::fs::remove_file(c.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&outside, c.join(".git")).unwrap();
+        let b_admin_before = std::fs::read_to_string(admin("run-b").join("gitdir")).unwrap();
+        let b_link_before = std::fs::read_to_string(b.join(".git")).unwrap();
+        assert_eq!(repair_moved_worktrees("r", p, Some("daemon-me")), 0);
+        assert_eq!(
+            std::fs::read_to_string(admin("run-b").join("gitdir")).unwrap(),
+            b_admin_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.join(".git")).unwrap(),
+            b_link_before
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do not touch\n");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&old);
+    }
+
     /// core#1662: the boot pass runs the repair for every registered repository, before the
-    /// orphan reaper looks at the trees.
+    /// resumed cleanups and the orphan reaper look at the trees.
     #[test]
     fn boot_repairs_moved_worktrees_before_the_reaper() {
         let actor = include_str!("actor.rs");
         let repair = actor
             .find("crate::repo::repair_moved_worktrees(")
             .expect("the boot pass repairs moved worktrees");
+        let resume = actor
+            .find("worktree_cleanup::resume_pending(&mut store")
+            .expect("the boot pass resumes pending cleanups");
         let reap = actor
             .find("crate::repo::reap_orphan_worktrees(")
             .expect("the boot pass reaps");
-        assert!(repair < reap, "the repair runs before the reaper");
+        assert!(
+            repair < resume && repair < reap,
+            "the repair runs before the resumed cleanups and the reaper"
+        );
     }
 
     /// core#1373: two daemons, each with its own store, register ONE checkout. Daemon A restarts
