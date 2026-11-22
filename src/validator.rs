@@ -2504,12 +2504,11 @@ pub(crate) fn judge_seat_refusal(output: &str) -> Option<String> {
 pub const DETERMINISTIC_VALIDATOR_SEAT: &str = "claude";
 
 /// Normalize an identity token (a registry key or an invocation argv[0]) to a comparable identity: its
-/// basename (last path component), case-folded. So `/usr/local/bin/Claude` and `claude` compare EQUAL.
+/// basename (last path component), case-folded, without a Windows executable suffix. So
+/// `/usr/local/bin/Claude`, `C:\Tools\claude.exe` and `claude` compare EQUAL (core#1775: a kept
+/// `.exe` read as a distinct identity no shipped CLI matches, so the seat could not be verified).
 pub(crate) fn normalize_identity(tok: &str) -> String {
-    tok.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(tok)
-        .to_ascii_lowercase()
+    crate::execute_wrapped::cli_stem(tok)
 }
 
 /// The NORMALIZED invocation identity of a seat (C2): the argv[0] of its headless invocation — the

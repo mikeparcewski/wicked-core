@@ -470,10 +470,13 @@ pub(crate) enum Command {
     /// Register (or replace) a workflow def in the actor's registry. Validates before inserting.
     /// `json` is a serialized `WorkflowDef`. Replies `Err` if validation fails.
     /// (core#590 S5) Convene a council on one disputed decision (`Core::convene_decision`). The
-    /// actor hands the ballots to a worker thread and replies from there.
+    /// actor hands the ballots to a worker thread and replies from there. (core#1289) `lock` is the
+    /// host's council slot, taken by the sender before this was sent (never on the actor): the
+    /// council thread drops it after its last ballot, as a rule council's.
     ConveneDecision {
         req: crate::decision::DecisionRequest,
         clis: Vec<wicked_council::AgenticCli>,
+        lock: crate::cli_runner::HostCouncilLock,
         reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
     },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before
@@ -487,8 +490,8 @@ pub(crate) enum Command {
     /// `size` seats (three, or one arbiter) or none, the dispute ballot frame, one absolute
     /// `deadline`. `lock` is the host's rule-council slot, taken by the unit's worker thread
     /// before this was sent: the council thread drops it after its last ballot, never earlier (a
-    /// caller that stops waiting does not release it). The team councils' `ConveneDecision` is
-    /// untouched.
+    /// caller that stops waiting does not release it). (core#1289) A team council's
+    /// `ConveneDecision` carries the same slot.
     ConveneRuleCouncil {
         req: crate::decision::DecisionRequest,
         clis: Vec<wicked_council::AgenticCli>,

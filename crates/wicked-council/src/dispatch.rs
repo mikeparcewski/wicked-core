@@ -1505,6 +1505,11 @@ pub const ENV_MAX_CONCURRENT_SEATS: &str = "WICKED_COUNCIL_MAX_CONCURRENT_SEATS"
 /// process-wide ceiling; what changed is that one council's ballot no longer queues on itself.
 const DEFAULT_MAX_CONCURRENT_SEATS: usize = 6;
 
+/// (core#1289) The most concurrent seat subprocesses [`ENV_MAX_CONCURRENT_SEATS`] may allow: twice
+/// the default. A larger override is clamped to it, so the host's council fan-out stays bounded
+/// (with the host council slot, one council at a time).
+const MAX_CONCURRENT_SEATS_CEILING: usize = 2 * DEFAULT_MAX_CONCURRENT_SEATS;
+
 /// A counting semaphore over concurrent seat subprocesses, shared by every council in the process.
 struct SeatPermits {
     /// Permits still available.
@@ -1572,10 +1577,11 @@ fn seat_permits() -> &'static SeatPermits {
 ///
 /// Anything unusable falls back to the default. Zero is rejected for a specific reason: a ceiling
 /// of zero is not "no limit", it is a deadlock — every seat would block forever waiting for a
-/// permit that no one holds.
+/// permit that no one holds. A value over [`MAX_CONCURRENT_SEATS_CEILING`] is clamped to it.
 fn max_concurrent_seats(raw: Option<String>) -> usize {
     raw.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_CONCURRENT_SEATS_CEILING))
         .unwrap_or(DEFAULT_MAX_CONCURRENT_SEATS)
 }
 
@@ -2677,6 +2683,21 @@ mod failure_diagnostics_tests {
             DEFAULT_MAX_CONCURRENT_SEATS,
             "a ceiling of zero is not 'no limit', it is every seat blocking forever"
         );
+    }
+
+    /// (core#1289) The override has a ceiling: a huge value cannot unbound the host's fan-out.
+    #[test]
+    fn the_seat_ceiling_override_is_clamped() {
+        assert_eq!(max_concurrent_seats(Some("12".into())), 12);
+        assert_eq!(
+            max_concurrent_seats(Some("1000".into())),
+            MAX_CONCURRENT_SEATS_CEILING
+        );
+        assert_eq!(
+            max_concurrent_seats(Some(usize::MAX.to_string())),
+            MAX_CONCURRENT_SEATS_CEILING
+        );
+        assert_eq!(MAX_CONCURRENT_SEATS_CEILING, 12);
     }
 
     #[test]

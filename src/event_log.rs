@@ -130,10 +130,72 @@ pub fn log_root(store_path: &str) -> PathBuf {
     PathBuf::from(format!("{store_path}.events"))
 }
 
-/// [`log_root`], or `None` for an in-memory store (`:memory:`), which has no sidecar anchor and must
-/// create no directory: `:memory:.events/` would land in the process's working directory.
+/// [`log_root`], or `None` for an in-memory store, which has no sidecar anchor and must create no
+/// directory: `:memory:.events/` would land in the process's working directory.
 pub fn log_root_for(store_path: &str) -> Option<PathBuf> {
-    (store_path != ":memory:").then(|| log_root(store_path))
+    (!in_memory_spec(store_path)).then(|| log_root(store_path))
+}
+
+/// (core#1131) Does SQLite open `spec` as an in-memory (or private temporary) database?
+/// `:memory:`; `""` (a private temporary database, deleted on close); and the URI forms the store
+/// accepts (rusqlite opens with `SQLITE_OPEN_URI`), parsed as SQLite parses them: the fragment
+/// (`#…`) dropped first, an optional `//` authority, the filename and every query key and value
+/// percent-decoded, and the LAST `mode` / `vfs` option winning. A decoded filename `:memory:` or
+/// empty, `mode=memory` or `vfs=memdb` is in memory.
+pub(crate) fn in_memory_spec(spec: &str) -> bool {
+    if spec == ":memory:" || spec.is_empty() {
+        return true;
+    }
+    let Some(uri) = spec.strip_prefix("file:") else {
+        return false;
+    };
+    let uri = uri.split_once('#').map_or(uri, |(u, _)| u);
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let path = match path.strip_prefix("//") {
+        // `file://<authority>/<path>`: SQLite takes the path after the authority.
+        Some(rest) => rest.find('/').map_or("", |i| &rest[i..]),
+        None => path,
+    };
+    let file = percent_decoded(path);
+    if file.is_empty() || file == b":memory:" {
+        return true;
+    }
+    let (mut mode, mut vfs) = (None, None);
+    for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match percent_decoded(k).as_slice() {
+            b"mode" => mode = Some(percent_decoded(v)),
+            b"vfs" => vfs = Some(percent_decoded(v)),
+            _ => {}
+        }
+    }
+    mode.as_deref() == Some(b"memory".as_slice()) || vfs.as_deref() == Some(b"memdb".as_slice())
+}
+
+/// `%HH` decoded as SQLite's URI parser does: a `%00` ends the component (the rest is dropped);
+/// any other byte (a `%` without two hex digits too) kept as is.
+fn percent_decoded(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                // (review on #1765) SQLite drops the rest of the component at a `%00`.
+                let byte = (h << 4) | l;
+                if byte == 0 {
+                    break;
+                }
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// `<root>/<encoded-run-id>.ndjson`.
@@ -543,6 +605,11 @@ pub struct EventSink {
     /// Where this sink records. `None` ⇒ fan out only, for embedders and tests that want no
     /// filesystem writes.
     root: Option<PathBuf>,
+    /// (core#1131) With no `root`: when each run's CURRENT life launched (the epoch millis of its
+    /// last `sessionStarted`, as [`run_started_ms`] reads it from a log), kept in memory so an
+    /// in-memory core's deliverable floor can still date its output. A relaunch replaces the stamp;
+    /// a resume emits no marker and keeps it.
+    launches: std::collections::HashMap<String, i64>,
 }
 
 impl EventSink {
@@ -552,6 +619,7 @@ impl EventSink {
             subscribers: Vec::new(),
             root: Some(root),
             asks: Default::default(),
+            launches: Default::default(),
         }
     }
 
@@ -560,6 +628,13 @@ impl EventSink {
     /// filesystem writes), and a caller that needs the durable trail has to handle that.
     pub(crate) fn log_root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// (core#1131) A sink with no root: when `run_id`'s current life launched, as this sink saw
+    /// its `sessionStarted`. `None` for a run it never saw launch (an embedder that drives the
+    /// fold directly) — and always for a recording sink, whose log is the record.
+    pub(crate) fn launched_ms(&self, run_id: &str) -> Option<i64> {
+        self.launches.get(run_id).copied()
     }
 
     /// Resolve displayed asks and discard queued asks before the actor exits.
@@ -582,6 +657,9 @@ impl EventSink {
     pub fn emit(&mut self, ev: CoreEvent) {
         if let Some(root) = &self.root {
             append(root, &ev);
+        } else if let CoreEvent::SessionStarted { session, .. } = &ev {
+            self.launches
+                .insert(session.clone(), crate::interaction::now_millis());
         }
         self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
         if let CoreEvent::RunCancelled { session, .. }
@@ -887,6 +965,47 @@ mod tests {
         );
     }
 
+    /// (core#1131) A sink with no root (an in-memory core) remembers when each run's current life
+    /// launched, so its deliverable floor can date output; a relaunch replaces the stamp, another
+    /// run keeps its own, and a recording sink keeps none (its log is the record).
+    #[test]
+    fn a_rootless_sink_remembers_each_runs_launch() {
+        let started = |run: &str| CoreEvent::SessionStarted {
+            session: run.to_string(),
+            problem: "p".to_string(),
+            workflow_id: None,
+            cli_count: 1,
+            governed: false,
+            entity_mode: "shared".to_string(),
+            assurance: Default::default(),
+        };
+        let mut sink = EventSink::default();
+        assert_eq!(sink.launched_ms("r1"), None);
+        let before = crate::interaction::now_millis();
+        sink.emit(started("r1"));
+        let first = sink.launched_ms("r1").expect("the launch is remembered");
+        assert!(first >= before, "{first} >= {before}");
+        assert_eq!(sink.launched_ms("r2"), None, "another run keeps its own");
+        // (review on #1765) Launching another run keeps the first's; relaunching the first keeps
+        // the other's.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        sink.emit(started("r2"));
+        let second = sink.launched_ms("r2").expect("r2's launch");
+        assert_eq!(sink.launched_ms("r1"), Some(first));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        sink.emit(started("r1"));
+        assert!(
+            sink.launched_ms("r1").unwrap() > first,
+            "a relaunch replaces it"
+        );
+        assert_eq!(sink.launched_ms("r2"), Some(second));
+        let root = tmp("rootless-launch");
+        let mut recording = EventSink::persistent(root.clone());
+        recording.emit(started("r3"));
+        assert_eq!(recording.launched_ms("r3"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The whole point of the finding: a run with NO live subscriber must still leave a complete,
     /// ordered, timestamped trail. Under the old fanout-only `emit` this recorded nothing at all.
     ///
@@ -1169,9 +1288,66 @@ mod tests {
     #[test]
     fn an_in_memory_store_has_no_log_root() {
         assert_eq!(log_root_for(":memory:"), None);
+        // (core#1131) Every spelling SQLite opens in memory, and the private temporary database.
+        for spec in [
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:x?mode=memory",
+            "file:x?cache=shared&mode=memory",
+            "file:/x/core.db?vfs=memdb",
+            // (review on #1765) Percent-encoded, the last option winning, an empty filename
+            // (a private temporary database), and an authority.
+            "file:%3Amemory%3A",
+            "file:x?mode=mem%6fry",
+            "file:x?m%6fde=memory",
+            "file:x?mode=rwc&mode=memory",
+            "file:/x/core.db?vfs=unix&vfs=memdb",
+            "file:",
+            "file:?cache=private",
+            "file:///x/core.db?mode=memory",
+            "file://localhost/x/core.db?mode=memory",
+            // (review on #1765) `%00` ends a component, as in SQLite.
+            "file:x?mode=memory%00ignored",
+            "file:%3Amemory%3A%00junk",
+        ] {
+            assert_eq!(log_root_for(spec), None, "{spec:?}");
+        }
+        for spec in [
+            "file:/x/core.db",
+            "file:/x/core.db?mode=rwc",
+            "memory.db",
+            // (review on #1765) A fragment is not the query; a later option overrides.
+            "file:core.db#ignored?mode=memory",
+            "file:/x/core.db?vfs=memdb&vfs=unix",
+            "file:x?mode=memory&mode=rwc",
+            "file:%3Amemory%3Ax",
+            "file:core.db?mode=memory&mode%00ignored=rwc",
+        ] {
+            assert!(log_root_for(spec).is_some(), "{spec:?}");
+        }
         assert_eq!(
             log_root_for("/var/lib/wicked/core.db"),
             Some(log_root("/var/lib/wicked/core.db"))
+        );
+        // (review on #1765) The production root (actor and `Core`) classifies the ORIGINAL spec:
+        // a `file:///…` memory URI holds `://`, which the sidecar fallback would otherwise anchor
+        // at the estate default.
+        assert_eq!(
+            crate::actor::event_log_root("file:///x/core.db?mode=memory"),
+            None
+        );
+        assert_eq!(
+            crate::actor::event_log_root("file:core.db?mode=memory&mode%00ignored=rwc"),
+            Some(log_root("file:core.db?mode=memory&mode%00ignored=rwc"))
+        );
+        assert_eq!(
+            crate::actor::event_log_root("postgres://h/db"),
+            Some(log_root(".wicked-estate/graph.db"))
+        );
+        assert_eq!(
+            crate::actor::event_log_root("/x/core.db"),
+            Some(log_root("/x/core.db"))
         );
     }
 

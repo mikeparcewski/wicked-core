@@ -577,6 +577,17 @@ pub(crate) fn sidecar_base(path: &str) -> String {
     }
 }
 
+/// (core#1131) The event-log root for the store `path`: `None` when SQLite opens it in memory,
+/// classified on the ORIGINAL spec (a `file:///…?mode=memory` URI holds `://`, which
+/// [`sidecar_base`] would replace with the estate default), else `<sidecar base>.events`.
+pub(crate) fn event_log_root(path: &str) -> Option<std::path::PathBuf> {
+    if crate::event_log::in_memory_spec(path) {
+        None
+    } else {
+        crate::event_log::log_root_for(&sidecar_base(path))
+    }
+}
+
 /// (core#1390) The most commands moved off the channel per turn of the actor loop.
 const BACKLOG_DRAIN: usize = 256;
 
@@ -938,7 +949,7 @@ pub(crate) fn run(
     // `<store>.events` — the same sidecar anchor as memory/knowledge above, so a core opened against a
     // scratch db keeps its logs there instead of in a shared global tree.
     // An in-memory store has no sidecar anchor: it fans out live and records nothing.
-    let mut subscribers = match crate::event_log::log_root_for(&sidecar_base) {
+    let mut subscribers = match event_log_root(&path) {
         Some(root) => crate::event_log::EventSink::persistent(root),
         None => crate::event_log::EventSink::default(),
     };
@@ -1044,6 +1055,17 @@ pub(crate) fn run(
     let process_gen: uuid::Uuid = uuid::Uuid::new_v4();
     // (program DES-POWER-MODE) A power build's worker reaches this actor by its generation.
     crate::power::register_actor(process_gen, self_tx.clone());
+    // (core#1662) A checkout that moved since its run worktrees were minted: this daemon's trees get
+    // their git links repaired to the checkout's resolved paths before anything else reads them
+    // (a container seat mounts resolved paths), so before the boot cancels below (a cancel starts
+    // its tree's cleanup), the resumed cleanups and the reaper. Nothing is removed. Synchronous,
+    // before any thread that touches a tree starts.
+    if let Ok(repos) = crate::repo::list_repos(&store) {
+        let owner = crate::repo::bound_daemon_owner();
+        for r in &repos {
+            crate::repo::repair_moved_worktrees(&r.id, &r.root_path, owner.as_deref());
+        }
+    }
     // (DES-TEAMING-002 P1) A `team_transport` reject recorded before the restart is finished here,
     // now that the actor's seams exist: the run tombstone is already written (boot reconcile), so
     // the cancel publishes only `path.ended`.
@@ -3533,7 +3555,12 @@ pub(crate) fn run(
                     emit_run_error(&mut subscribers, &run_id, e);
                 }
             }
-            Command::ConveneDecision { req, clis, reply } => {
+            Command::ConveneDecision {
+                req,
+                clis,
+                lock,
+                reply,
+            } => {
                 // (operator ruling 2026-10-11) Eligible = the run's unbenched roster intersected
                 // with what the caller handed (which already excludes the dispute's parties, so
                 // evaluator≠creator holds) — `council_roster`.
@@ -3577,9 +3604,10 @@ pub(crate) fn run(
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
                     // (core#1290) The verdict goes first; then every carried ballot is reaped, on
-                    // this council thread (a host council slot is released only after it).
+                    // this council thread. (core#1289) The host slot is freed only after the reap.
                     let _ = reply.send(result);
                     reap_carried_ballots(reaper.as_ref(), &req.session_id, req.ord);
+                    drop(lock);
                 });
             }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
@@ -5042,6 +5070,8 @@ pub(crate) fn run(
                     runner.on_run_complete(&run_id);
                 }
                 runner.on_shutdown();
+                // (core#1322) This engine's published context blocks go with it.
+                crate::run_context::forget_published_here();
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
                 let ids: Vec<String> = terminals.keys().cloned().collect();
@@ -5300,9 +5330,25 @@ fn council_context_primed(
     session: Option<&AgentSession>,
     self_tx: &Sender<Command>,
 ) -> Option<(Sender<Command>, u64)> {
-    let s = session?;
+    // (core#1322, codex r1 on #1777) A council on a run that has ended republishes nothing: the
+    // run's blocks were dropped when it ended, and a publish here would outlive it.
+    let s = session.filter(|s| {
+        !matches!(
+            s.status,
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+        )
+    })?;
     crate::run_context::publish(&s.id, s.run_context.as_ref());
     crate::run_context::current(&s.id).map(|c| (self_tx.clone(), c.version))
+}
+
+/// A run reached a terminal status (called right AFTER it is persisted, on the actor): the team
+/// side is told (`team_gate::run_ended`), and (core#1322) the run's published context blocks are
+/// dropped, so the process-wide map does not grow for the daemon's life. Every terminal
+/// transition goes through here.
+fn run_terminal(store: &dyn GraphStore, run_id: &str, status: crate::team::events::PathStatus) {
+    crate::run_context::forget(run_id);
+    team_gate::run_ended(store, run_id, status);
 }
 
 /// (program context-block-core) One `runContextDelivered` per seat the council seated: each was
@@ -6310,7 +6356,7 @@ pub(crate) fn resume_run_inner(
         session.status = SessionStatus::Failed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Failed);
+        run_terminal(&*store, run_id, crate::team::events::PathStatus::Failed);
         reap_terminal_worktree(&*store, &session);
         emit(
             subscribers,
@@ -7424,7 +7470,7 @@ fn apply_step_result(
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
+        run_terminal(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
         drop_run_floor_cache(&session);
         emit(
             subscribers,
@@ -9031,7 +9077,11 @@ fn apply_step_result(
         // durable trail and cannot be dated from it is refused rather than waved through on
         // whatever was lying in the write root.
         let launch = match subscribers.log_root() {
-            None => crate::path_policy::LaunchClock::Unrecorded,
+            // (core#1131) An in-memory core keeps no log, but its sink saw the launch.
+            None => match subscribers.launched_ms(&run_id) {
+                Some(ms) => crate::path_policy::LaunchClock::At(ms),
+                None => crate::path_policy::LaunchClock::Unrecorded,
+            },
             Some(root) => match crate::event_log::run_started_ms(root, &run_id) {
                 Some(ms) => crate::path_policy::LaunchClock::At(ms),
                 None => crate::path_policy::LaunchClock::Undatable,
@@ -11032,7 +11082,7 @@ fn fail_run(
     session.finished_at = Some(crate::interaction::now_millis());
     power_gate::set_outcome(&*store, session, "failed");
     let _ = put_node(store, session.to_node());
-    team_gate::run_ended(
+    run_terminal(
         &*store,
         &session.id,
         crate::team::events::PathStatus::Failed,
@@ -13208,6 +13258,18 @@ fn dispatch_unit_with(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
+    // (core#1436) Every dispatch into the run's persisted worktree (a boot redrive, a gate
+    // continue, the run's next unit) marks it as this daemon's when no daemon has: a tree minted
+    // before core#1373 stops being unmarked once its run moves again. Another daemon's marker is
+    // never replaced. Once per dispatch (the first pass, before any probe), and off the actor: the
+    // claim runs git and resolves paths the seat wrote, and nothing waits on it.
+    if probe.is_none() {
+        if let Some(wd) = session.workdir.clone() {
+            let _claim = crate::repo::spawn_bound(move || {
+                crate::repo::claim_reentered_worktree(std::path::Path::new(&wd));
+            });
+        }
+    }
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
@@ -15740,6 +15802,13 @@ fn run_draft_render_tool(
 mod draft_render_live {
     use super::*;
 
+    /// (core#1762) CI sets `WICKED_REQUIRE_HEADLESS_SHELL` where it provisions a headless shell: a
+    /// real-browser test that would skip there fails instead.
+    #[cfg(unix)]
+    fn required_headless_shell() -> bool {
+        std::env::var_os("WICKED_REQUIRE_HEADLESS_SHELL").is_some_and(|v| !v.is_empty())
+    }
+
     #[test]
     #[ignore = "needs WICKED_TEST_HEADLESS_SHELL and WICKED_TEST_GARDEN_ROOT"]
     fn a_two_page_draft_is_measured_in_the_jail_and_reaches_no_listener() {
@@ -15812,13 +15881,25 @@ mod draft_render_live {
     /// that prints with the browser as garden's `render_pdf` does, and gives up (no report) if it can
     /// read a file beside the draft. A two-page draft is measured as 2 pages, with the counter's
     /// sha256 and the browser's version line on the record.
+    ///
+    /// (core#1762) CI's ubuntu and macOS legs provision the shell and set
+    /// `WICKED_REQUIRE_HEADLESS_SHELL`: there every SKIP below fails instead, so CI cannot report
+    /// this test as passed while it skipped.
     #[cfg(unix)]
     #[test]
     fn a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv() {
         let test = "a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv";
+        let skip = |why: &str| {
+            assert!(
+                !required_headless_shell(),
+                "{test} would SKIP ({why}), but WICKED_REQUIRE_HEADLESS_SHELL requires it to run"
+            );
+            eprintln!("SKIP {test}: {why}");
+        };
         if crate::validator::skip_when_nested(test)
             || crate::validator::skip_in_container_floor(test)
         {
+            skip("no OS jail can arm here");
             return;
         }
         let candidates: Vec<std::path::PathBuf> = std::env::var_os("WICKED_TEST_HEADLESS_SHELL")
@@ -15829,11 +15910,11 @@ mod draft_render_live {
             .into_iter()
             .find(|p| p.is_absolute() && p.is_file())
         else {
-            eprintln!("SKIP {test}: WICKED_TEST_HEADLESS_SHELL names no headless shell");
+            skip("WICKED_TEST_HEADLESS_SHELL names no headless shell");
             return;
         };
         if crate::validator::find_on_path("python3").is_none() {
-            eprintln!("SKIP {test}: no python3 on PATH");
+            skip("no python3 on PATH");
             return;
         }
         let base = std::env::temp_dir().join(format!("wc-dr-browser-{}", std::process::id()));
@@ -15915,8 +15996,8 @@ print(json.dumps({{"check": "pages", "pages": n, "source": "chrome-render", "ver
         );
         eprintln!("{test}: {out}\n{rec:#?}");
         if rec.cause.as_deref() == Some("unjailed_host") {
-            eprintln!("SKIP {test}: no render jail on this host");
             let _ = std::fs::remove_dir_all(&base);
+            skip("no render jail on this host");
             return;
         }
         assert_eq!(st, crate::workflow::StepStatus::Ok);
@@ -17594,7 +17675,7 @@ fn finalize_run(
         power_gate::set_outcome(&*store, &mut session, "completed");
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
+        run_terminal(&*store, run_id, crate::team::events::PathStatus::Completed);
         // (F-7R2-013) A completed run's worktree is RETAINED — the files view, the delivered
         // PR's review cycle and any uncommitted leftover need it — until the run is archived or
         // the retention window elapses (`completed_worktree_retention`); `0` days restores the
@@ -22791,7 +22872,7 @@ pub(crate) fn cancel_run(
     // (core#1390) Only once the cancel is on the store: a dispatch probe still out for this run is
     // no longer its dispatch (a cancel that failed before this leaves the probe to land).
     dispatch_probe::forget(run_id);
-    team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
+    run_terminal(&*store, run_id, crate::team::events::PathStatus::Cancelled);
     // (core#1122) The floor build cache goes whether or not the repository still resolves (the
     // worktree reap below needs it).
     drop_run_floor_cache(&session);
@@ -36429,6 +36510,60 @@ mod deliverable_floor_tests {
         let _ = std::fs::remove_dir_all(&logs);
         let _ = std::fs::remove_dir_all(&fresh_logs);
         let _ = std::fs::remove_dir_all(blank_logs.parent().unwrap());
+    }
+
+    /// core#1131: an in-memory core keeps no event log, but its sink saw the launch: the
+    /// deliverable floor dates output against it, so a prior run's leftover in a shared write
+    /// root is refused rather than passed on presence alone. A run the sink never saw launch (an
+    /// embedder driving the fold directly) keeps the presence-only judgement.
+    #[test]
+    fn an_in_memory_cores_deliverable_floor_dates_against_the_launch_its_sink_saw() {
+        let inbox = tmp("mem-stale-inbox");
+        let draft = inbox.join("draft.html");
+        std::fs::write(&draft, "<p>a prior run's draft</p>").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&draft)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3_600))
+            .unwrap();
+        let roots = vec![inbox.to_string_lossy().into_owned()];
+        let run_id = format!("deliv-mem-stale-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            roots.clone(),
+            vec!["draft.html".into()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        subs.emit(CoreEvent::SessionStarted {
+            session: run_id.clone(),
+            problem: "p".into(),
+            workflow_id: None,
+            cli_count: 1,
+            governed: false,
+            entity_mode: "shared".into(),
+            assurance: Default::default(),
+        });
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "{:?}",
+            unit.denial_reason
+        );
+        let why = unit.denial_reason.unwrap_or_default();
+        assert!(why.contains("draft.html") && why.contains("stale"), "{why}");
+
+        let unseen = format!("deliv-mem-unseen-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &unseen, None, roots, vec!["draft.html".into()]);
+        let mut subs = crate::event_log::EventSink::default();
+        let (_session, unit) = fold(&mut store, &mut subs, &unseen);
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        let _ = std::fs::remove_dir_all(&inbox);
     }
 }
 
