@@ -682,7 +682,7 @@ pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
 pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
-    build_seat_image_on(rt, cli, package, &SeatBase::from_env())
+    build_seat_image_on(rt, cli, package, &SeatBase::from_env()).map_err(|(_, e)| e)
 }
 
 /// The base the seat images build on: the operator's own ([`BASE_IMAGE_ENV`], with its recipe
@@ -736,20 +736,45 @@ fn default_seat_dockerfile() -> String {
     format!("{floor}\n{seat}\n")
 }
 
-/// [`build_seat_image`] on `base`: an operator base that is missing is rebuilt from its recipe
-/// first; a missing operator base with no recipe fails naming the base and the
-/// fix. The default base is the checks floor image: it is ensured (built from the engine's
-/// embedded Dockerfile, again if a GC removed it) before the self-contained seat build.
+/// [`build_seat_image`] on `base`: an operator base the runtime lacks is rebuilt from its recipe
+/// first; one the runtime confirms is still missing then (no recipe, or a recipe whose build did
+/// not leave it on the runtime) is refused BEFORE any seat build, as
+/// [`FloorUnarmed::SeatBaseMissing`] naming the base and the fix (core#1053): a build `FROM` an
+/// image the runtime lacks pulls it from a registry, and an operator base is a local image. An
+/// inspection that does not answer ([`image_presence`] `None`) proves nothing, and keeps the build
+/// path it always had. The default base is the checks floor image: it is ensured (built from the
+/// engine's embedded Dockerfile, again if a GC removed it) before the self-contained seat build.
+/// Every other failure is [`FloorUnarmed::NoSeatImage`].
 fn build_seat_image_on(
     rt: &Runtime,
     cli: &str,
     package: SeatPackage,
     base: &SeatBase,
-) -> Result<String, String> {
+) -> Result<String, (FloorUnarmed, String)> {
+    let no_image = |e: String| (FloorUnarmed::NoSeatImage, e);
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
-    if base.operator && !image_present(rt, &base.image) {
-        if let Some(recipe) = &base.recipe {
-            rebuild_base(rt, &base.image, recipe)?;
+    // The recipe this call rebuilt the base from, for the diagnosis of a base still missing.
+    let mut rebuilt: Option<&Path> = None;
+    if base.operator {
+        let mut present = image_presence(rt, &base.image);
+        if present != Some(true) {
+            if let Some(recipe) = &base.recipe {
+                // A failed recipe is the base's absence only when the runtime confirmed it.
+                let why = if present == Some(false) {
+                    FloorUnarmed::SeatBaseMissing
+                } else {
+                    FloorUnarmed::NoSeatImage
+                };
+                rebuild_base(rt, &base.image, recipe).map_err(|e| (why, e))?;
+                rebuilt = Some(recipe.as_path());
+                present = image_presence(rt, &base.image);
+            }
+        }
+        if present == Some(false) {
+            return Err((
+                FloorUnarmed::SeatBaseMissing,
+                missing_base_error(&base.image, rebuilt),
+            ));
         }
     }
     if !base.operator && base.image == default_base() && !image_present(rt, &base.image) {
@@ -757,7 +782,7 @@ fn build_seat_image_on(
             "wicked-core: building the checks floor image {} (the seat base)",
             base.image
         );
-        build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[])?;
+        build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[]).map_err(no_image)?;
     }
     let mut args = vec![format!("CLI={cli}")];
     let dockerfile = if base.operator {
@@ -768,12 +793,28 @@ fn build_seat_image_on(
     };
     args.extend(package.build_args());
     build_image(rt, &dockerfile, &tag, &args).map_err(|e| {
-        if base.operator && !image_present(rt, &base.image) {
-            missing_base_error(&base.image, &e)
+        if base.operator && image_presence(rt, &base.image) == Some(false) {
+            (
+                FloorUnarmed::SeatBaseMissing,
+                format!("{}: {e}", missing_base_error(&base.image, rebuilt)),
+            )
         } else {
-            e
+            no_image(e)
         }
     })
+}
+
+/// Whether `tag` is on the runtime: `Some(false)` only when its inspection failed AND the runtime
+/// answers (it lists its images), so a daemon it cannot reach is not an absence (codex r2);
+/// `None` when the inspection could not be run, ran out of time, or the runtime did not answer.
+fn image_presence(rt: &Runtime, tag: &str) -> Option<bool> {
+    let mut c = rt.cmd();
+    c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
+    let inspected = output_within(c, rt.bound(PROBE_TIMEOUT))?;
+    if inspected.status.success() {
+        return Some(true);
+    }
+    list_images(rt).ok().map(|_| false)
 }
 
 /// [`BASE_DOCKERFILE_ENV`], when set (trimmed).
@@ -802,13 +843,25 @@ pub(crate) fn rebuild_base(rt: &Runtime, base: &str, recipe: &Path) -> Result<()
     Ok(())
 }
 
-/// The error of a seat build whose base is not on the runtime and could not be pulled.
-pub(crate) fn missing_base_error(base: &str, build_error: &str) -> String {
-    format!(
-        "the seat base image {base} is not on the container runtime and could not be pulled \
-         (a runtime's image cleanup may have deleted it); rebuild it, or set \
-         {BASE_DOCKERFILE_ENV} to its Dockerfile so the engine rebuilds it: {build_error}"
-    )
+/// Why an operator seat base that is not on the runtime is refused ([`build_seat_image_on`]),
+/// naming the base and the fix; `rebuilt` is the Dockerfile this call built that did not produce it.
+pub(crate) fn missing_base_error(base: &str, rebuilt: Option<&Path>) -> String {
+    match rebuilt {
+        None => format!(
+            "the seat base image {base} ({BASE_IMAGE_ENV}) is not on the container runtime (a \
+             runtime's image cleanup may have deleted it), and the engine does not build a seat \
+             image on a base the runtime says it lacks, which would pull it from a registry; \
+             build or load it again, or set {BASE_DOCKERFILE_ENV} to its Dockerfile so the engine \
+             rebuilds it"
+        ),
+        Some(recipe) => format!(
+            "the seat base image {base} ({BASE_IMAGE_ENV}) is not on the container runtime: its \
+             Dockerfile {} ({BASE_DOCKERFILE_ENV}) built, but the runtime does not list the \
+             image it was tagged as (check where the runtime's builder stores what it builds); \
+             the engine does not build a seat image on a base the runtime says it lacks",
+            recipe.display()
+        ),
+    }
 }
 
 /// The floor image ([`FLOOR_DOCKERFILE`]), built on first use (one build at a time).
@@ -1236,16 +1289,18 @@ pub(crate) fn build_image(
 // The seat sign-in path (unix) and the tests use it; native Windows runs no container floor.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
-    ensure_seat_image_noting(rt, cli).map(|(tag, _)| tag)
+    ensure_seat_image_noting(rt, cli)
+        .map(|(tag, _)| tag)
+        .map_err(|(_, e)| e)
 }
 
 /// [`ensure_seat_image`], also saying how long the unit waited when the image was missing (a
 /// first use, or a runtime's image cleanup deleted it) and had to be built, by this call or by
-/// another unit it waited for, for the unit's note.
+/// another unit it waited for, for the unit's note. `Err` carries the arm's typed reason.
 pub(crate) fn ensure_seat_image_noting(
     rt: &Runtime,
     cli: &str,
-) -> Result<(String, Option<Duration>), String> {
+) -> Result<(String, Option<Duration>), (FloorUnarmed, String)> {
     ensure_seat_image_with(rt, cli, image_override(cli), &SeatBase::from_env())
 }
 
@@ -1258,12 +1313,16 @@ fn ensure_seat_image_with(
     cli: &str,
     over: Option<String>,
     base: &SeatBase,
-) -> Result<(String, Option<Duration>), String> {
+) -> Result<(String, Option<Duration>), (FloorUnarmed, String)> {
     if let Some(img) = over {
         return Ok((img, None));
     }
-    let package =
-        seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
+    let package = seat_package(cli).ok_or_else(|| {
+        (
+            FloorUnarmed::NoSeatImage,
+            format!("no seat image is defined for `{cli}`"),
+        )
+    })?;
     static BUILD: Mutex<()> = Mutex::new(());
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
     if image_present(rt, &tag) {
@@ -2603,8 +2662,7 @@ pub(crate) fn arm_noting(
     before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    let (image, built_in) =
-        ensure_seat_image_noting(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let (image, built_in) = ensure_seat_image_noting(&rt, cli)?;
     if let Some(waited) = built_in {
         on_built(&image, waited);
     }
@@ -4661,15 +4719,24 @@ esac
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// core#1053: an operator base the runtime lacks is refused BEFORE any build, with a typed
+    /// reason naming the base and the fix: a build `FROM` a missing image pulls it from a registry
+    /// (`pull access denied` on a local-only base, seen 2026-10-20). With a recipe whose build does
+    /// not produce it, the seat build is refused too. The default base is the engine's own recipe.
     #[test]
-    fn a_missing_base_with_no_recipe_names_the_base_and_the_fix() {
+    fn a_missing_operator_base_is_refused_before_any_build_and_never_pulled() {
         let dir = c4_temp();
+        let log = dir.join("calls.log");
         let rt = dir.join("runtime");
-        // Every build fails as a pull of a local-only base does.
+        // Nothing is on the runtime; every build "succeeds" without producing its image, and
+        // every call is logged, so a pull-capable build of the seat image is visible.
         crate::test_env::install_stub(
             &rt,
-            "#!/bin/sh\ncase \"$1\" in image) exit 1 ;; build) cat >/dev/null; \
-             echo 'FAKE pull access denied for seat-base' >&2; exit 1 ;; esac\nexit 0\n",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in image) exit 1 ;; build) cat >/dev/null; exit 0 ;; esac\nexit 0\n",
+                log.display()
+            ),
         );
         let rt = Runtime::answering(rt);
         let pkg = seat_package("claude").unwrap();
@@ -4678,16 +4745,97 @@ esac
             operator: true,
             recipe: None,
         };
-        let e = build_seat_image_on(&rt, "claude", pkg, &base).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &base).unwrap_err();
+        assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
+        assert_eq!(why.as_str(), "seat_base_missing");
         assert!(e.contains("seat base image seat-base:rust"), "{e}");
-        assert!(e.contains(BASE_DOCKERFILE_ENV), "{e}");
-        // The default registry base is not the operator's: a failed pull is said as it is.
+        assert!(
+            e.contains(BASE_DOCKERFILE_ENV) && e.contains("says it lacks"),
+            "{e}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!calls.contains("build"), "no build ran: {calls}");
+        // A recipe that builds without producing the base: only the recipe's own build ran.
+        let recipe = dir.join("base.Dockerfile");
+        std::fs::write(&recipe, "FROM scratch\n").unwrap();
+        let with_recipe = SeatBase {
+            recipe: Some(recipe.clone()),
+            ..base
+        };
+        std::fs::remove_file(&log).ok();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe).unwrap_err();
+        assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
+        assert!(e.contains(&recipe.display().to_string()), "{e}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.matches("build").count(), 1, "{calls}");
+        assert!(calls.contains("-t seat-base:rust -"), "{calls}");
+        // The ensure path carries the same typed reason to the arm.
+        let (why, _) = ensure_seat_image_with(&rt, "claude", None, &with_recipe).unwrap_err();
+        assert_eq!(why, FloorUnarmed::SeatBaseMissing);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// core#1053 (codex r2): an inspection the runtime did not answer (its listing fails too)
+    /// proves nothing: the seat build runs as it always did, and a recipe that fails then is
+    /// `no_seat_image`, never a claim that the base is missing.
+    #[test]
+    fn an_operator_base_the_runtime_cannot_answer_for_keeps_the_build_path() {
+        let dir = c4_temp();
+        let log = dir.join("calls.log");
+        let fail = dir.join("fail-builds");
+        let rt = dir.join("runtime");
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in image|images) exit 1 ;; build) cat >/dev/null; \
+                 [ -e '{}' ] && exit 1; exit 0 ;; esac\nexit 0\n",
+                log.display(),
+                fail.display()
+            ),
+        );
+        let rt = Runtime::answering(rt);
+        let pkg = seat_package("claude").unwrap();
+        let base = SeatBase {
+            image: "seat-base:rust".into(),
+            operator: true,
+            recipe: None,
+        };
+        let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains(&format!("-t {tag} -")), "{calls}");
+        std::fs::write(&fail, "").unwrap();
+        let recipe = dir.join("base.Dockerfile");
+        std::fs::write(&recipe, "FROM scratch\n").unwrap();
+        let with_recipe = SeatBase {
+            recipe: Some(recipe),
+            ..base
+        };
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe).unwrap_err();
+        assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The default base is the engine's own recipe, not the operator's: a failed build of it is
+    /// said as it is, under `no_seat_image`.
+    #[test]
+    fn a_failed_default_base_build_is_no_seat_image_said_as_it_is() {
+        let dir = c4_temp();
+        let rt = dir.join("runtime");
+        crate::test_env::install_stub(
+            &rt,
+            "#!/bin/sh\ncase \"$1\" in image) exit 1 ;; build) cat >/dev/null; \
+             echo 'FAKE pull access denied for node' >&2; exit 1 ;; esac\nexit 0\n",
+        );
+        let rt = Runtime::answering(rt);
+        let pkg = seat_package("claude").unwrap();
         let default = SeatBase {
             image: default_base(),
             operator: false,
             recipe: Some(PathBuf::from("/nonexistent")),
         };
-        let e = build_seat_image_on(&rt, "claude", pkg, &default).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &default).unwrap_err();
+        assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
         assert!(!e.contains(BASE_DOCKERFILE_ENV), "{e}");
         assert!(e.contains("FAKE pull access denied"), "{e}");
         std::fs::remove_dir_all(dir).unwrap();
@@ -5088,6 +5236,212 @@ esac
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.canonicalize().unwrap()
+    }
+
+    /// The shipped `git-remote-wicked-nopush` (core#1210): the script exactly as the seat image
+    /// writes it, with its scratch root pointed at a test dir.
+    #[cfg(unix)]
+    fn nopush_helper_script(scratch_root: &Path) -> String {
+        let start = "RUN cat > /usr/local/bin/git-remote-wicked-nopush <<'EOF'\n";
+        let at = SEAT_DOCKERFILE
+            .find(start)
+            .expect("the seat image writes the nopush helper")
+            + start.len();
+        let body = &SEAT_DOCKERFILE[at..];
+        let body = &body[..body.find("\nEOF\n").expect("the helper's heredoc ends")];
+        assert!(
+            SEAT_DOCKERFILE.contains("RUN chmod 0755 /usr/local/bin/git-remote-wicked-nopush\n"),
+            "the helper is executable in the image"
+        );
+        assert_eq!(body.matches("\nscratch_root=/tmp\n").count(), 1, "{body}");
+        format!(
+            "{}\n",
+            body.replace(
+                "\nscratch_root=/tmp\n",
+                &format!("\nscratch_root='{}'\n", scratch_root.display())
+            )
+        )
+    }
+
+    /// core#1210: under the seat's push fence, a fixture's push to a bare repository it made in
+    /// its own scratch dir lands (as a path and as `file://`); a `..` escape, a symlink inside the
+    /// scratch to a bare repository outside it, a scratch root that is itself a planted symlink,
+    /// a non-bare repository and every network remote are refused by the helper.
+    #[cfg(unix)]
+    #[test]
+    fn the_seat_push_helper_admits_only_a_bare_repo_inside_its_scratch() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = tmp("nopush-helper");
+        let scratch = base.join("scratch");
+        let outside = base.join("outside");
+        let bin = base.join("bin");
+        let work = base.join("work");
+        for d in [&scratch, &outside, &bin, &work] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let install = |dir: &Path, root: &Path| {
+            let helper = dir.join("git-remote-wicked-nopush");
+            std::fs::write(&helper, nopush_helper_script(root)).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        install(&bin, &scratch);
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let git = |cwd: &Path, args: &[&str], path: &str| -> (bool, String) {
+            let mut c = Command::new("git");
+            c.hardened()
+                .current_dir(cwd)
+                .args(args)
+                .env("PATH", path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "Seat")
+                .env("GIT_AUTHOR_EMAIL", "seat@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Seat")
+                .env("GIT_COMMITTER_EMAIL", "seat@example.invalid")
+                .env_remove("GIT_PROTOCOL_FROM_USER")
+                .env_remove("GIT_ALLOW_PROTOCOL")
+                .env_remove("GIT_DIR");
+            c.envs(wicked_apps_core::spawn::nopush_git_config_env());
+            let out = c.output().unwrap();
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        assert!(git(&work, &["init", "-q", "-b", "main"], &path).0);
+        assert!(
+            git(
+                &work,
+                &["commit", "-q", "--allow-empty", "-m", "fixture"],
+                &path
+            )
+            .0
+        );
+        let bare = |at: &Path| {
+            let (ok, out) = git(
+                &base,
+                &["init", "-q", "--bare", &at.to_string_lossy()],
+                &path,
+            );
+            assert!(ok, "{out}");
+        };
+        let landed = |at: &Path| {
+            git(
+                &base,
+                &[
+                    "--git-dir",
+                    &at.to_string_lossy(),
+                    "rev-parse",
+                    "-q",
+                    "--verify",
+                    "refs/heads/main",
+                ],
+                &path,
+            )
+            .0
+        };
+        // Admitted: a bare remote inside the scratch, as a path and as file://.
+        let fixture = scratch.join("fixture.git");
+        bare(&fixture);
+        let (ok, out) = git(
+            &work,
+            &["push", &fixture.to_string_lossy(), "HEAD:refs/heads/main"],
+            &path,
+        );
+        assert!(
+            ok && landed(&fixture),
+            "a scratch fixture push lands: {out}"
+        );
+        let by_url = scratch.join("nested").join("by-url.git");
+        bare(&by_url);
+        let (ok, out) = git(
+            &work,
+            &[
+                "push",
+                &format!("file://{}", by_url.display()),
+                "HEAD:refs/heads/main",
+            ],
+            &path,
+        );
+        assert!(
+            ok && landed(&by_url),
+            "a file:// scratch fixture push lands: {out}"
+        );
+        // Refused: everything that does not resolve to a bare repo strictly inside the scratch.
+        let target = outside.join("op.git");
+        bare(&target);
+        symlink(&target, scratch.join("link.git")).unwrap();
+        let non_bare = scratch.join("non-bare");
+        assert!(git(&base, &["init", "-q", &non_bare.to_string_lossy()], &path).0);
+        // receive-pack enters `<dir>/.git` before `<dir>`: a scratch bare repo redirecting there.
+        let redirect = scratch.join("redirect.git");
+        bare(&redirect);
+        symlink(&target, redirect.join(".git")).unwrap();
+        // A name ending in a newline next to a link outside: the resolution keeps every byte.
+        let newline = scratch.join("nl.git\n");
+        std::fs::create_dir_all(&newline).unwrap();
+        symlink(&target, scratch.join("nl.git")).unwrap();
+        symlink(&newline, scratch.join("via-nl")).unwrap();
+        let refused = [
+            redirect.to_string_lossy().into_owned(),
+            scratch.join("via-nl").to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+            format!("{}/../outside/op.git", scratch.display()),
+            scratch.join("link.git").to_string_lossy().into_owned(),
+            non_bare.to_string_lossy().into_owned(),
+            scratch.to_string_lossy().into_owned(),
+            scratch.join("absent.git").to_string_lossy().into_owned(),
+            "https://example.invalid/o/r.git".to_string(),
+            "http://example.invalid/o/r.git".to_string(),
+            format!("file://example.invalid{}", fixture.display()),
+        ];
+        for url in &refused {
+            let (ok, out) = git(&work, &["push", url, "HEAD:refs/heads/refused"], &path);
+            assert!(
+                !ok && out.contains("wicked-nopush"),
+                "{url} must be refused: {out}"
+            );
+        }
+        let (ok, refs) = git(
+            &base,
+            &["--git-dir", &target.to_string_lossy(), "for-each-ref"],
+            &path,
+        );
+        assert!(
+            ok && refs.trim().is_empty(),
+            "nothing reached the outside repository: {refs}"
+        );
+        // A planted scratch root (a symlink to the real one) admits nothing.
+        let planted_bin = base.join("planted-bin");
+        std::fs::create_dir_all(&planted_bin).unwrap();
+        let planted = base.join("planted");
+        symlink(&scratch, &planted).unwrap();
+        install(&planted_bin, &planted);
+        let planted_path = format!(
+            "{}:{}",
+            planted_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let (ok, out) = git(
+            &work,
+            &[
+                "push",
+                &planted.join("fixture.git").to_string_lossy(),
+                "HEAD:refs/heads/planted",
+            ],
+            &planted_path,
+        );
+        assert!(!ok && out.contains("not a real directory"), "{out}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// The seat layout of the two parked runs (core#840 run 290a7fee, core#997 run 3d3c96a8): a

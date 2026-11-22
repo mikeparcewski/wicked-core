@@ -1527,6 +1527,60 @@ pub(crate) fn launcher_failure(wrapper: &[String], stderr_first_line: &str) -> O
     }
 }
 
+/// Whether `path` is definitely gone: an inspection that fails any other way (a permission, a
+/// loop, an I/O error) keeps its mask (codex r1).
+fn definitely_gone(path: &str) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// The `--tmpfs` masks of a bwrap `wrapper` (its options, before the `--` that ends them).
+fn tmpfs_masks(wrapper: &[String]) -> impl Iterator<Item = &str> {
+    let options = wrapper
+        .iter()
+        .position(|a| a == "--")
+        .map_or(wrapper, |end| &wrapper[..end]);
+    options
+        .windows(2)
+        .filter(|pair| pair[0] == "--tmpfs")
+        .map(|pair| pair[1].as_str())
+}
+
+/// (core#840) The mask directory a jail died on BEFORE exec: `stderr_first_line` is bwrap's own
+/// `Can't mkdir <dir>: …` for one of `wrapper`'s `--tmpfs` masks, and that directory is gone now.
+/// bwrap has no "mask if present" form: a mask enumerated while the directory existed (an ssh
+/// agent's or tmux's socket dir) fails the whole jail when the directory is removed before
+/// bwrap's mount, because creating it on the read-only root fails. The command never ran, so a
+/// caller may run it again on a launcher built afresh, or [`without_vanished_masks`]. A command
+/// that ran cannot remove the directory (it is under the jail's read-only root, masked).
+pub(crate) fn vanished_mask<'a>(wrapper: &'a [String], stderr_first_line: &str) -> Option<&'a str> {
+    let rest = stderr_first_line
+        .trim_end()
+        .strip_prefix("bwrap: Can't mkdir ")?;
+    tmpfs_masks(wrapper).find(|mask| {
+        rest.strip_prefix(mask).is_some_and(|r| r.starts_with(": ")) && definitely_gone(mask)
+    })
+}
+
+/// (core#840) `wrapper` without the `--tmpfs` masks whose directory is gone: a directory that no
+/// longer exists has nothing to hide. Every other argument, and every mask still present, stays.
+pub(crate) fn without_vanished_masks(wrapper: &[String]) -> Vec<String> {
+    let end = wrapper
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(wrapper.len());
+    let mut out = Vec::with_capacity(wrapper.len());
+    let mut i = 0;
+    while i < wrapper.len() {
+        if i < end && wrapper[i] == "--tmpfs" && i + 1 < end && definitely_gone(&wrapper[i + 1]) {
+            i += 2;
+            continue;
+        }
+        out.push(wrapper[i].clone());
+        i += 1;
+    }
+    out
+}
+
 /// Apply the cross-platform env FLOOR: clear the child environment, then re-add only the non-secret
 /// allowlist ([`ENV_PASSTHROUGH`]) copied from the current process. Drops API keys / tokens / etc.
 pub(crate) fn apply_minimal_env(cmd: &mut Command) {
@@ -1959,6 +2013,43 @@ pub fn run_validator_reporting_with_env(
     db_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> anyhow::Result<(ValidatorOutcome, SandboxLevel)> {
+    run_validator_rearming(v, cwd, db_path, extra_env, &|roots| {
+        detect_sandbox_launcher_for_roots(roots, NetworkPolicy::Deny, PtyPolicy::Deny)
+    })
+}
+
+/// [`run_validator_reporting_with_env`] with the launcher built by `launch` over the run's write
+/// roots. (core#840) A jail that died BEFORE exec because a socket directory it was told to mask
+/// vanished after the enumeration ([`vanished_mask`]: an ssh session ending, tmux exiting) never
+/// ran the script, so the run is made again, once, with a freshly built launcher; any other
+/// outcome, and the second run's, stands.
+fn run_validator_rearming(
+    v: &DeterministicValidator,
+    cwd: &Path,
+    db_path: Option<&str>,
+    extra_env: &[(String, String)],
+    launch: &dyn Fn(&[&Path]) -> SandboxLauncher,
+) -> anyhow::Result<(ValidatorOutcome, SandboxLevel)> {
+    let (outcome, level, vanished) = run_validator_once(v, cwd, db_path, extra_env, launch, false)?;
+    if !vanished {
+        return Ok((outcome, level));
+    }
+    let (outcome, level, _) = run_validator_once(v, cwd, db_path, extra_env, launch, true)?;
+    Ok((outcome, level))
+}
+
+/// One run of [`run_validator_rearming`]; the flag is whether its jail died before exec on a
+/// vanished mask directory. A `rearm` run spawns nothing unless its launcher arms a real jail
+/// (codex r1): the first run died in bwrap, so a launcher gone since then is `Unrunnable`, never
+/// an unjailed second run.
+fn run_validator_once(
+    v: &DeterministicValidator,
+    cwd: &Path,
+    db_path: Option<&str>,
+    extra_env: &[(String, String)],
+    launch: &dyn Fn(&[&Path]) -> SandboxLauncher,
+    rearm: bool,
+) -> anyhow::Result<(ValidatorOutcome, SandboxLevel, bool)> {
     if !v.approved {
         anyhow::bail!(
             "refusing to run an UNAPPROVED validator (fail-closed): an LLM-authored script must be \
@@ -1995,20 +2086,30 @@ pub fn run_validator_reporting_with_env(
     let tmp = match crate::repo_checks::PrivateTmp::create() {
         Ok(t) => t,
         Err(e) => {
-            let level =
-                detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny)
-                    .level;
+            let level = launch(&roots).level;
             return Ok((
                 ValidatorOutcome::Unrunnable(format!(
                     "the validator's private TMPDIR could not be created under the system temp \
                      dir: {e}"
                 )),
                 level,
+                false,
             ));
         }
     };
     roots.push(tmp.path());
-    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny);
+    let launcher = launch(&roots);
+    if rearm && (launcher.level != SandboxLevel::Sandboxed || launcher.wrapper.is_empty()) {
+        return Ok((
+            ValidatorOutcome::Unrunnable(
+                "the validator's jail died before exec on a mask directory that vanished, and \
+                 could not be armed again"
+                    .to_string(),
+            ),
+            launcher.level,
+            false,
+        ));
+    }
     let mut argv = launcher.wrapper.clone();
     argv.push("sh".to_string());
     argv.push("-c".to_string());
@@ -2073,6 +2174,7 @@ pub fn run_validator_reporting_with_env(
                      (see scripts/install-local.py) or set ${env}."
                 )),
                 launcher.level,
+                false,
             ));
         }
         CoreExeDecision::LeaveUnset => {
@@ -2125,7 +2227,9 @@ pub fn run_validator_reporting_with_env(
         &launcher.wrapper,
         &stderr_head,
     );
-    Ok((outcome, launcher.level))
+    let vanished = matches!(outcome, ValidatorOutcome::Unrunnable(_))
+        && vanished_mask(&launcher.wrapper, stderr_head.lines().next().unwrap_or("")).is_some();
+    Ok((outcome, launcher.level, vanished))
 }
 
 /// A `Failed` whose first stderr line is the LAUNCHER's own diagnostic is
@@ -6128,6 +6232,215 @@ mod tests {
 
     /// core#460/#493: the ONE launcher-failure predicate shared by the floor (`run_one`) and the
     /// validator. Only the launcher's OWN first line, only under an armed wrapper.
+    /// core#840: a mask directory that vanishes between the jail's enumeration and bwrap's mount
+    /// fails the jail before exec. The validator runs again, once, on a launcher built afresh
+    /// (whose enumeration no longer finds the directory); a script that ran and failed is not
+    /// run again; a second pre-exec death stands after two attempts; a retry whose launcher no
+    /// longer arms runs nothing. The stand-in launcher fails exactly as bwrap does on a missing
+    /// `--tmpfs` destination.
+    #[cfg(unix)]
+    #[test]
+    fn a_validator_jail_whose_mask_dir_vanished_runs_again_on_a_fresh_launcher() {
+        let dir = std::env::temp_dir().join(format!("wv-vanished-mask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let tree = dir.join("tree");
+        let bwrap = dir.join("bwrap");
+        crate::test_env::install_stub(
+            &bwrap,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    \
+             --tmpfs) [ -d \"$2\" ] || { echo \"bwrap: Can't mkdir $2: Read-only file system\" >&2; \
+             exit 1; }; shift 2 ;;\n    --) shift; exec \"$@\" ;;\n    *) shift ;;\n  esac\n\
+             done\nexit 1\n",
+        );
+        let mask = dir.join("ssh-session");
+        let ran = dir.join("ran");
+        // How each launcher build behaves: `Vanish` enumerates the mask and then the session
+        // ends (before the mount); `Stay` keeps it; `Unarmed` finds no launcher at all.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Build {
+            Vanish,
+            Stay,
+            Unarmed,
+            Weak,
+            EmptySandboxed,
+        }
+        let plan: std::cell::RefCell<Vec<Build>> = std::cell::RefCell::new(Vec::new());
+        let builds = std::cell::Cell::new(0);
+        let launch = |_roots: &[&Path]| {
+            builds.set(builds.get() + 1);
+            let step = plan.borrow_mut().remove(0);
+            match step {
+                Build::Unarmed => {
+                    return SandboxLauncher {
+                        wrapper: Vec::new(),
+                        level: SandboxLevel::BestEffort,
+                    }
+                }
+                // firejail's shape: a wrapper, but a network-only jail.
+                Build::Weak => {
+                    return SandboxLauncher {
+                        wrapper: vec![bwrap.to_string_lossy().into_owned(), "--".to_string()],
+                        level: SandboxLevel::NetworkOnly,
+                    }
+                }
+                Build::EmptySandboxed => {
+                    return SandboxLauncher {
+                        wrapper: Vec::new(),
+                        level: SandboxLevel::Sandboxed,
+                    }
+                }
+                Build::Vanish | Build::Stay => {}
+            }
+            if step == Build::Vanish {
+                std::fs::create_dir_all(&mask).unwrap();
+            }
+            // Enumerated as `socket_dir_masks` does: only a directory that exists is masked.
+            let mut wrapper = vec![bwrap.to_string_lossy().into_owned()];
+            if mask.is_dir() {
+                wrapper.push("--tmpfs".to_string());
+                wrapper.push(mask.to_string_lossy().into_owned());
+            }
+            wrapper.push("--".to_string());
+            if step == Build::Vanish {
+                let _ = std::fs::remove_dir(&mask);
+            }
+            SandboxLauncher {
+                wrapper,
+                level: SandboxLevel::Sandboxed,
+            }
+        };
+        let v = |script: &str| DeterministicValidator {
+            criterion: "c".to_string(),
+            script: script.to_string(),
+            approved: true,
+        };
+        let run = |steps: &[Build], script: &str| {
+            *plan.borrow_mut() = steps.to_vec();
+            builds.set(0);
+            let _ = std::fs::remove_file(&ran);
+            let got = run_validator_rearming(&v(script), &tree, None, &[], &launch).unwrap();
+            assert!(plan.borrow().is_empty(), "every planned build was used");
+            got
+        };
+        let touch = format!("touch '{}'", ran.display());
+        // The session ends once: the fresh launcher (no mask left) runs the script.
+        let (outcome, level) = run(&[Build::Vanish, Build::Stay], "exit 0");
+        assert_eq!(
+            (outcome, level),
+            (ValidatorOutcome::Passed, SandboxLevel::Sandboxed)
+        );
+        assert_eq!(builds.get(), 2, "one fresh launcher");
+        // A script that ran and said no is `Failed`, run once.
+        std::fs::create_dir_all(&mask).unwrap();
+        let (outcome, _) = run(&[Build::Stay], "exit 1");
+        assert_eq!(outcome, ValidatorOutcome::Failed);
+        // Two pre-exec deaths in a row: two attempts, the script never ran, `Unrunnable`.
+        let (outcome, _) = run(&[Build::Vanish, Build::Vanish], &touch);
+        assert!(
+            matches!(outcome, ValidatorOutcome::Unrunnable(_)),
+            "{outcome:?}"
+        );
+        assert!(!ran.exists());
+        // The launcher is gone or weaker by the retry: nothing runs outside a real jail.
+        for weaker in [Build::Unarmed, Build::Weak, Build::EmptySandboxed] {
+            let (outcome, _) = run(&[Build::Vanish, weaker], &touch);
+            match outcome {
+                ValidatorOutcome::Unrunnable(why) => {
+                    assert!(why.contains("could not be armed again"), "{why}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(!ran.exists(), "no second run outside a real jail");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#840: only bwrap's own `Can't mkdir` for one of the wrapper's masks, whose directory is
+    /// gone now, is the vanished-mask failure; [`without_vanished_masks`] drops exactly those.
+    #[test]
+    fn a_vanished_mask_is_only_a_gone_tmpfs_dest_bwrap_could_not_create() {
+        let dir = std::env::temp_dir().join(format!("wv-mask-pred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kept = dir.join("tmux-1000");
+        std::fs::create_dir_all(&kept).unwrap();
+        let gone = dir.join("ssh-XYZ").to_string_lossy().into_owned();
+        let kept = kept.to_string_lossy().into_owned();
+        let wrapper: Vec<String> = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            kept.as_str(),
+            "--tmpfs",
+            gone.as_str(),
+            "--bind",
+            "/w",
+            "/w",
+            "--",
+            "--tmpfs",
+            gone.as_str(),
+        ]
+        .map(String::from)
+        .to_vec();
+        let line = |p: &str| format!("bwrap: Can't mkdir {p}: Read-only file system\n");
+        assert_eq!(vanished_mask(&wrapper, &line(&gone)), Some(gone.as_str()));
+        assert_eq!(vanished_mask(&wrapper, &line(&kept)), None, "still there");
+        // A mask that cannot be inspected is kept: only a definite absence drops it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shut = dir.join("shut");
+            std::fs::create_dir_all(shut.join("agent")).unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let hidden = shut.join("agent").to_string_lossy().into_owned();
+            // A superuser inspects through any mode: nothing to prove there.
+            if std::fs::symlink_metadata(&hidden).is_err() {
+                let w: Vec<String> = ["/usr/bin/bwrap", "--tmpfs", hidden.as_str(), "--"]
+                    .map(String::from)
+                    .to_vec();
+                assert_eq!(vanished_mask(&w, &line(&hidden)), None);
+                assert_eq!(without_vanished_masks(&w), w);
+            }
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            vanished_mask(&wrapper, &line("/elsewhere")),
+            None,
+            "not a mask"
+        );
+        assert_eq!(vanished_mask(&wrapper, &format!("{gone}: oops")), None);
+        assert_eq!(
+            vanished_mask(&wrapper, &format!("bwrap: Can't mkdir {gone}x: Read-only")),
+            None,
+            "a longer path is another directory"
+        );
+        let rearmed = without_vanished_masks(&wrapper);
+        assert_eq!(
+            rearmed,
+            [
+                "/usr/bin/bwrap",
+                "--ro-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                kept.as_str(),
+                "--bind",
+                "/w",
+                "/w",
+                "--",
+                "--tmpfs",
+                gone.as_str(),
+            ]
+            .map(String::from)
+            .to_vec(),
+            "only the gone mask goes; the command after `--` is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn launcher_failure_names_only_the_launchers_own_first_line() {
         let armed = vec!["/usr/bin/bwrap".to_string(), "--".to_string()];

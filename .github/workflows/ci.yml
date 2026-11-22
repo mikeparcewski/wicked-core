@@ -270,6 +270,33 @@ jobs:
           docker run --rm --network none --entrypoint sh wicked-seat-claude:ci -euc \
             'test -f /opt/wicked-ledger/node_modules/wicked-ledger/package.json && grep "\"version\"" /opt/wicked-ledger/node_modules/wicked-ledger/package.json'
 
+      # core#1210: the fence's push helper, run in the image as a seat runs (read-only root, /tmp a
+      # tmpfs, no network), admits a fixture push to a bare repository in /tmp and refuses the rest.
+      - name: The seat push helper admits a /tmp fixture push and refuses the rest
+        run: |
+          set -eu
+          docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
+            --entrypoint /usr/bin/env wicked-seat-claude:ci -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=url.wicked-nopush://.pushInsteadOf GIT_CONFIG_VALUE_0=https:// \
+            GIT_CONFIG_KEY_1=url.wicked-nopush:///.pushInsteadOf GIT_CONFIG_VALUE_1=/ \
+            GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.invalid \
+            GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.invalid \
+            sh -euc '
+              git init -q -b main /tmp/work
+              git -C /tmp/work commit -q --allow-empty -m fixture
+              git init -q --bare /tmp/fixture.git
+              git -C /tmp/work push -q /tmp/fixture.git HEAD:refs/heads/main
+              git --git-dir=/tmp/fixture.git rev-parse -q --verify refs/heads/main
+              for target in /tmp/../usr /tmp https://example.invalid/r.git; do
+                if git -C /tmp/work push "$target" HEAD:refs/heads/x 2>/tmp/err; then
+                  echo "a push to $target was admitted" >&2; exit 1
+                fi
+                grep -q wicked-nopush /tmp/err || { cat /tmp/err >&2; exit 1; }
+              done
+            '
+
       - name: A crate with rust-toolchain.toml channel = "stable" builds in both images
         run: |
           set -eu
