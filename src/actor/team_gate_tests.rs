@@ -2364,6 +2364,13 @@ fn t6_a_review_whose_result_the_engine_lost_pauses_at_the_failure_gate_and_rerun
         "the member-review state is kept: {:?}",
         u.member_step
     );
+    // (codex xreview) The gate re-runs the PA's review on the PA's seat; it is never re-seated
+    // (onto the member under review least of all).
+    let err = e
+        .core
+        .reassign_unit("t6lr", WRITE, Some("b".into()))
+        .expect_err("a PA review is not re-seated");
+    assert!(err.to_string().contains("PA's review"), "{err}");
     e.core.confirm_gate("t6lr", approve(None)).unwrap();
     wait_status(&e, "t6lr", SessionStatus::Completed);
     let reviews = worker.reviews.lock().unwrap().clone();

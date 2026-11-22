@@ -8321,6 +8321,10 @@ fn apply_step_result(
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
                 // with no seat failover for a Tool, skipping this gate would end the run.
                 && (unit.tool_cmd.is_some()
+                    // (core#1740, codex xreview) The engine's own refusal frame names a settings
+                    // path, which may hold a word the worker-failure classifier keys on
+                    // (`managed-settings.d/network.json`): a recognised refusal is never the CLI's.
+                    || seat_specific_refusal
                     || !crate::acp_runner::is_worker_originated_failure(&output.output))
             {
                 // (core#556) A RETRIED attempt that failed again without starting work (a launch
@@ -11871,6 +11875,19 @@ pub(crate) fn parked_reseat_refusal(
         anyhow::bail!(
             "unit {ord} of run {run_id} already completed; approving the gate advances past it, \
              so there is nothing to reassign"
+        );
+    }
+    // (core#1748, codex xreview) The PA's review of a member's step runs on the PA's seat: a lost
+    // review's `failure` gate re-runs it there. Re-seating it would let another seat (the member
+    // under review included) give the team's verdict on the step.
+    if unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some())
+    {
+        anyhow::bail!(
+            "unit {ord} of run {run_id} is the PA's review of a member's step and runs on the \
+             PA's seat; approve to run the review again, or reject to stop the run"
         );
     }
     refuse_author_reassign(session, units, session.unit_ix, cli)?;
@@ -37285,15 +37302,33 @@ mod seat_failover_tests {
     /// `managed_hooks_only_refusal_reason` (src/execute_wrapped.rs:7697-7718).
     #[test]
     fn core_1740_a_first_try_managed_hooks_refusal_pauses_with_a_card() {
-        let refusal = format!(
-            "(input governance refused the launch: {}: settings in \
-             /srv/worker-home/claude/remote-settings.json silence the engine's gate hook \
-             (`allowManagedHooksOnly: true` or `disableAllHooks: true`); refusing the governed \
-             unit rather than running it ungoverned. Remove that setting for the seat (core#653, \
-             C5))",
-            crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL
-        );
-        for (case, confirm) in [("none", HumanConfirm::None), ("all", HumanConfirm::All)] {
+        let refusal = |settings: &str| {
+            format!(
+                "(input governance refused the launch: {}: settings in {settings} silence the \
+                 engine's gate hook (`allowManagedHooksOnly: true` or `disableAllHooks: true`); \
+                 refusing the governed unit rather than running it ungoverned. Remove that \
+                 setting for the seat (core#653, C5))",
+                crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL
+            )
+        };
+        for (case, confirm, settings) in [
+            (
+                "none",
+                HumanConfirm::None,
+                "/srv/worker-home/claude/remote-settings.json",
+            ),
+            (
+                "all",
+                HumanConfirm::All,
+                "/srv/worker-home/claude/remote-settings.json",
+            ),
+            // (codex xreview) A settings path with a word the worker-failure classifier keys on.
+            (
+                "none-network-path",
+                HumanConfirm::None,
+                "/etc/claude-code/managed-settings.d/network.json",
+            ),
+        ] {
             let run_id = format!("managed-hooks-{case}-{}", std::process::id());
             let mut store = open_store(Some(":memory:")).unwrap();
             seed_session(
@@ -37319,7 +37354,7 @@ mod seat_failover_tests {
                 UnitStatus::Distributed,
             );
             let (applied, session, units, events) =
-                fold_failed_capturing(&mut store, &run_id, &refusal);
+                fold_failed_capturing(&mut store, &run_id, &refusal(settings));
             assert!(matches!(applied, StepApplied::Paused), "{case}");
             assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
             assert!(
