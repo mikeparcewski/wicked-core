@@ -296,7 +296,7 @@ struct Probe<'a> {
 fn unique_passing(ids: &[TestId], t: &TestId, skip: impl Fn(&TestId) -> bool) -> Option<TestId> {
     ids.iter()
         .find(|x| {
-            x.q == t.q && *x != t && !skip(*x) && ids.iter().filter(|y| y.id == x.id).count() == 1
+            x.q == t.q && *x != t && !skip(x) && ids.iter().filter(|y| y.id == x.id).count() == 1
         })
         .cloned()
 }
