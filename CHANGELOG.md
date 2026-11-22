@@ -14,6 +14,169 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.15.48** — 2026-11-22 — patch release on the train-11 cut 7c8ef169, carrying 59 PRs since 0.15.47: #1644, #1645, #1646, #1647, #1648, #1649, #1650, #1651, #1652, #1654, #1655, #1656, #1658, #1659, #1660, #1661, #1664, #1665, #1666, #1669, #1670, #1671, #1672, #1675, #1676, #1677, #1678, #1679, #1680, #1684, #1685, #1686, #1687, #1691, #1692, #1693, #1694, #1695, #1696, #1697, #1704, #1705, #1706, #1707, #1710, #1711, #1712, #1713, #1723, #1725, #1726, #1727, #1728, #1729, #1732, #1733, #1741, #1745, #1749.
+  The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - Answer-only turns (crew's standing-order parse, data-source ask and detect-shape) now run tool-less. The gate hook and the MCP broker refuse every tool call, claude launches with `--tools ""` and pi with `--no-tools --no-mcp`, other seats are refused on the host floor, and a host launch drops the daemon's inherited environment. Gate protocol 4. (core#1257) (#1686)
+
+  - The learn workflow's research reads the web only through the job's web source. With none, it reports "research: no web access" instead of falling back to curl. (core#1362) (#1686)
+
+  - Kubernetes runner: engine images are loaded into kind and k3s (containerd) nodes before use, and an unknown store or failed load refuses the seat with the fix (#1398). Seat images are inspected by reading their export as data, with no helper container (#1440). Seats run an immutable per-id tag of the inspected image (#1423). On WSL2, a checkout under /mnt/<drive> is refused with the fix (#1102). (#1692)
+
+  - Kubernetes runner (#1395, #1413): a run's judge calls reuse one warm judge pod per judge seat. The pod is killed, proven quiescent and wiped between calls. Rule-check passes no longer pay a pod start per batch. (#1695)
+
+  - Added: `unregisterRepo` removes a repository registration when no live run, mapping lease or project uses it. It refuses with `repo_in_use` or `repo_in_project` otherwise, and leaves the checkout and its graph on disk (wicked-crew#1230). (#1696)
+
+  - **Editor conformance:** `Core.runEditorConformance({packRoot, timeoutS?})` runs crew's install-time conformance cases in the same one-port OS jail as the review-time step (garden `--engine`). Any host that cannot jail it gets a refused record (`unjailed_host`), never an unjailed run (wicked-crew#1389). (#1704)
+
+  - **Install consent:** the consent frame carries `consentAsks`, the permissions each editor in the install plan asks for (wicked-crew#1424). (#1707)
+
+  - Team advice: on the automatic floor-retry round, a worker can answer unrelated advice `DEFER`. The finding goes to the hand-off review unaccepted, with no hold round or council in that attempt. The hand-off reviewer must rule on each deferred finding by its id. A DEFER on any other attempt reads as DECLINE (#1206). (#1712)
+
+  - Read API: `Core::session_detail(id)` / core-ts `sessionDetail(id)` reads one run's session and units off the actor, or `null` for an unknown run, so a run page's poll no longer folds the whole store (#1346). (#1733)
+
+  - k8s arms cost less (core#1441, core#1463): (#1678)
+    - A read-only repository (an All-repos chat) is copied into a replica once and re-sent only when it changes, using stamps keyed by a per-process secret in the sync pod.
+    - The replica `.git` is updated incrementally after a new commit.
+    - A published skills generation is signed by its identity.
+    - The pids probe runs at daemon boot.
+
+  - Tests: the sign-in state machine's tests run on the in-memory transport, and the Docker test transport is deleted (#1438). Pod-live parity proofs for the Claude fence, the hook relay and gateway credential routing, plus a gateway-config adoption test (#1439). (#1691)
+
+  - Tests: the gate_hook scan-budget test counts the scan's work instead of timing it (#1293). The team_gate reopen tests wait for the old actor to exit instead of sleeping (#1305). (#1726)
+
+  - Tests: loopback and PTY tests skip loudly inside the seat sandbox (`SKIPPED (seat sandbox denies …)`, counted) and fail as before with `CI` set (#1068). (#1728)
+
+  - fix(k8s): a seat can no longer hide its own tracked edits from the write-back by untracking them first (the protected set comes from the host's copy-in snapshot), and an oversized skip list is refused with a clear error while skip matching stays linear and cancellable (core#1517). (#1644)
+
+  - fix(redact): config-command redaction no longer crosses `)` or a newline, finds a second config command after `$(...)`, and cuts a value after a secret-named key; `git push -u origin`, `mkdir -p`, `env -u` keep their operands; bare GitHub/AWS/sk-/Slack/GitLab/npm tokens are cut (core#1589, core#1575, core#1643). (#1645)
+
+  - Fixed: the pinned validator's author is no longer re-admitted as judge when its seat is a quoted wrapper path or the unit's frozen launch ran it (core#1528). (#1646)
+
+  - A disk-full death is now terminal when it happens in the identical retry or the excluded run inside the floor's decision, or in the check's own log capture: the check is reported as an environment failure (could not run), not a restart or an unseparated red base (core#1627). (#1647)
+
+  - Fixed: the default host floor now denies a seat's writes to the engine's own stores (repo graphs and the registered state-home entries), so a seat can no longer replace `estate.db` (core#1626). `project-graphs` and the governance logs stay writable by design. (#1648)
+
+  - fix(gate): the launcher passes its resolved governance root (`WICKED_GOV_ROOT`) to every hook env, so the hook's evidence fence and the decisions path can no longer name different roots (core#1636). (#1649)
+
+  - Seat prose no longer records a bare well-known secret token: event wire/log, unit denials, stored outputs, gate prompts/answers and run memory pass through the one redactor (core#1643). (#1650)
+
+  - Host floor: the seat's gate hook now goes through the host relay and the governance root and settings file are read-only to the seat, so a seat can no longer rewrite its own decisions log (core#1621). (#1651)
+
+  - fix(gate): an unwritable governance root (for example an absolute but read-only HOME) is now named once at daemon start, with the remedy (a writable HOME or `WICKED_GOV_ROOT`, then restart). Every governed unit is refused with that same reason instead of an unnamed "Permission denied", and there is no silent fallback to temp (core#1620). (#1652)
+
+  - Live seat output no longer leaks a secret that the stream splits across two chunks: a redacting carry holds a short tail and releases only text the matcher confirms, before both the raw and the throttled live streams (core#1653). (#1654)
+
+  - Repo graph: a symlinked `estate.db.writer.lock` (or its SQLite sidecars), `-wal`, `-shm` or `-journal` is refused for read and write like a symlinked `estate.db` (#1599). The checkout re-index and a launch's base index now report it as a named error instead of failing inside the indexer (core#1603). (#1655)
+
+  - Floors on one repository now run one at a time: a second floor on the same repo waits (visibly, cancellably) for the first instead of building a second fresh cargo target beside it (core#1604). (#1656)
+
+  - **core-ts release: the npm publish is resumable (#1556).** A re-run or `workflow_dispatch` of `napi-release.yml` from a `core-ts-v*` tag whose publish already went through, fully or partly, now skips the packages npm already has (`scripts/npm-publish-resumable.py`), publishes the rest with main last, and fails naming any package still missing. A probe that is not a clean E404 or a matching version counts as a failure, never as a skip. The registry wait, lockfile re-stamp and draft Release jobs then run as usual. (#1658)
+
+  - **Floor: the Kubernetes pod floor's tree copy is converted like a checkout** (core#1422). On macOS the pod floor copied raw git blobs, so `.gitattributes` `text`/`eol` rules (for example `*.cmd text eol=crlf`) were never applied, and a line-ending test failed on head and base alike. The pod copy-in and the fill pods now use the host floor's conversion (`--attr-source` + `cat-file --filters` against a private repository with no filter driver or hook). Symlink targets stay raw. `FLOOR_POLICY_VERSION` 15 re-runs cached base results. (#1659)
+
+  - A judge-only re-run carries the reviewed team record instead of re-running the final pass (#1396). (#1660)
+
+  - Fixed: a registered repo's code graph now follows the repo, not its resolved filesystem path. Moving a checkout behind a symlink, moving the home directory or remounting a volume no longer orphans the graph or forces a full re-index. Repos registered before this release keep their current graph directory, which is pinned on the record at the first boot (#1419). (#1661)
+
+  - **k8s write-back skips are decided from host facts only (core#1535).** A root with no repository on the host honors no left-out path, so a planted `CACHEDIR.TAG` in the QE evidence or notes root no longer hides files. A skip covering a file that the unit's incoming commit tracks is refused. Host links kept through a folded alias are link-checked. A host-tracked file that the seat untracked and ignored comes back instead of reading as a deletion. A limit refusal names the file, not the end marker. (#1664)
+
+  - **Fixed**: a seat on a partial clone (`git clone --filter=blob:none`) is refused with `partial_clone`, which names the missing objects and the fix (`git config --unset remote.<name>.partialclonefilter`, `git fetch --refetch <name>`, or a full clone), instead of `copy_in_refused` blaming file size (#1497). (#1665)
+
+  - fix(gate): a daemon on a non-default state home (`--db` outside `~/.wicked-crew`) now keeps its governance files in `<state home>-core-gov` instead of the shared `~/.wicked/core-gov`, so one daemon's boot sweep can no longer remove another daemon's run directories. The default daemon's root is unchanged; `WICKED_GOV_ROOT` still overrides (core#1663). (#1666)
+
+  - Gateway observation (core#1546 items 2-4): a launch reads as observed only from complete gateway evidence of its own run. A redacted request keeps its endpoint envelope; a replaced pod, more than one restart or a failed log read makes the launch unobserved; launch nonces are full UUIDs and records from another run are dropped. (#1669)
+
+  - A partial clone's seat refusal pauses the unit once at a failure gate (environmentRefused) naming the clone, its remote and the fetch fix, instead of failing over seat by seat (core#1667). (#1670)
+
+  - k8s arm failures keep their evidence: earlier attempts' diagnoses, the last pod snapshot on an API error, and the arm detail for every k8s refusal class. A run's namespace is created under its lifecycle lock, and `pod_not_ready` no longer claims a pod was created (core#1541). (#1670)
+
+  - Rule check: a rule skipped on a judge-only re-run is not asked again when the tree moved, and a skip survives a retry of the same step on the same change (a later ruling naming the rule reopens it) (#1374, #1345). A rules hold now also names a judge-unavailable hold behind it. `judgeRerunRequested` carries the skips (#1444). The deliver step no longer tells the judge a deferred rule "applies" (#1306). POL-2101's record clause reads only creator steps that changed code (#1316). (#1671)
+
+  - Judges: every engine-internal session started for a run (rule-check judges, the default judge, triage, re-probes, ballots, member turns, the send-back re-plan) carries that run's id, and cancelling the run now stops them (#1413, #1278). (#1672)
+
+  - Gate answers commit in one store transaction with the state they arm; a plain approve that re-runs QE over a non-verdict spends the same redo budget as `retry_qe` (#1313). (#1675)
+
+  - Approve at a triage gate dispatches a fresh attempt (#1319). (#1675)
+
+  - `operator_judgment` answers the triage gate of a failed tool check, recorded as "tool check overridden by operator" with a required rationale (#1318). (#1675)
+
+  - A stale gate answer emits `gateAnswerRefused` and changes no state (#1038). (#1675)
+
+  - qe-author-tests verify counts a failure as main's only when the same tests fail on the run's base (#1320). (#1676)
+
+  - A re-run that asks only some layers again can no longer approve over an earlier denial that still stands (#1062). (#1676)
+
+  - Judge and evaluator independence (core-C1). Every evaluator, QE reviewer, judge, rule judge and council exclusion now uses one identity: the seat key plus the provider the seat's launches were observed calling, in both directions. (#1677)
+    - review-change's semantic check never sits on the reviewer's seat, and its required judge runs.
+    - The bus judge path uses the same admission, rotation and disclosures as the inline path.
+    - Floor fixes and re-judges carry the work's observed providers.
+    - `judgeCoverage` names a sole independent judge and the seats that share a provider (core#1366, #1540, #1057, #1288, #1594, #1546).
+
+  - Fixed: a domain-extraction run keeps the repository's code graph at its own base until it ends. Another launch on the same repository no longer re-indexes it to a different base; a second mapping at a different base is refused and names the run holding the graph (#1230). (#1679)
+
+  - Fixed: a run resumed or approved while the repository's checkout is being re-indexed waits for the index to finish before its next step starts, instead of reading a half-written graph (#1369). (#1679)
+
+  - Fixed: a domain-extraction `extract` step that writes no rules file for its page now fails at its own gate, instead of passing to a review of nothing; a later page can no longer pass on the previous page's file (#1232). (#1680)
+
+  - Fixed: a domain-extraction run's agent steps may change only `.wicked/domain/` and `coverage-report.json`; a step that changed anything else is stopped at its gate with each path named (#1344). (#1680)
+
+  - Added: host Tool steps receive `WICKED_UPSTREAM_AGENTS` naming the seat that ran each agent step they depend on, so applied rules are authored by the seat that stated them (wicked-garden#1364). (#1680)
+
+  - A capped review (`review_adjudication`) lands with your reason while its open steering rules can be skipped. Each open rule is recorded as skipped with that reason, and the review round does not run again (#1683). A broken error or critical rule still refuses the Land. (#1684)
+
+  - Fixed: a power run's checkpoint no longer fails closed to rigor highest when the repo watcher re-indexed a checkout that is clean at the run's base commit (core#1681). (#1685)
+
+  - Fixed: MCP server, editor plugin and scaffold plans run one security review at the top band instead of two; the preset's specialist review is the floor's security review (core#1682). (#1685)
+
+  - Gate hook: a path's `..` is taken after the links before it are resolved, as the kernel does (unix). (core#1469) (#1687)
+
+  - Gate hook write scan: a `<<` inside a multi-line string is no heredoc, a quote inside a data body no longer hides the next command, a body a shell runs is scanned as a script, and a leading `cd` settles later writes only when the operand scan completed. (core#1470) (#1687)
+
+  - Kubernetes runner (#1423): (#1693)
+    - Ignored host links are re-checked when a write-back changes a link.
+    - Session scope cleanups are retried until they succeed, and the boot sweep prunes scopes a crashed engine left.
+    - A retired check leaf deletes its target claims.
+    - A newly created run namespace is rolled back when its policies fail to apply.
+    - `node_modules` stays out of the pack plan, and its mount destination is prepared.
+    - Per-run claim count and storage quotas, with idle-leaf eviction.
+    - Boot-sweep liveness follows run status, not worktree retention.
+
+  - Kubernetes runner (#1423): (#1694)
+    - Gateway access records survive a gateway pod replacement during a launch; any gap keeps the launch reported incomplete.
+    - A timed-out key-confirmation exec is cleaned up in the gateway's writer sidecar.
+    - The engine's cluster token is renewed on a timer, so an idle daemon's token no longer expires.
+
+  - **Requirements:** a re-map keeps a requirement whose code left the index, flagged `unindexed`, instead of dropping it (#1446). The requirements read returns a typed `satisfied_by` link per requirement: symbol, name, file, kind and confidence (#1483). A build records `metadata.product_only` that a read never relabels (schema bundle 1.3.2, #1236). Structural units no longer list placeholder requirements (#1239). Coverage follows estate's current mainframe vocabulary: no `cics_program`, `reads`/`writes` edges, and the new structural tags (#1372). (#1697)
+
+  - Register k8s-replica-git so a k8s seat arm no longer refuses every later launch (#1699). (#1705)
+
+  - Prose on a red base passes; a boundary deny names its path; launch rules know pack fit (#1701, #1702, #1703). (#1706)
+
+  - Power mode: a QE FAIL's reviewer reason now reaches the builder's send-back and the gate card (#1475). The first build turn is briefed from the authored task and this attempt's notes, a repeated note re-emits its amendment, and nested notes survive (#1520). Failed test runs count toward struggle, a turn with no marker hands off, and the intake QE plan's mandatory phases join the floor (#1178). test-analysis and validate-docs keep their research step (#1255). Boot supersedes the interrupted attempt of a run reconciled to awaiting_human (#1585). (#1710)
+
+  - Fixed: a provider content refusal is recognised only in the CLI's own error frame (codex's refusal sentence, or Claude Code's `API Error:` refusal, including 2.1.311's "safeguards flagged this message"). A seat that quotes those words is no longer failed over. A failed unit now keeps its stderr, so a refusal printed there reaches the classifiers (core#1612). Added a test that a judge seat out of usage is benched as quota_exhausted and drops out of the re-judge seats (core#1069). (#1711)
+
+  - Floor: a cancelled, reassigned or shut-down launch stops its repo-checks floor on every runner (wrapped, ACP, PTY). The floor is keyed by the launch, so a resume never revives an old floor. No check starts or is reused after the stop, and a check's exit after the stop is not taken as a verdict. A resumed floor's note names why the earlier one stopped (a newer launch, a cancel, a restart). Abandoned base asides are reclaimed before the disk guard reads free space, the run's last floor drops the container base target claim, and on Windows the disk guard reads free space and directory junctions are removed (core#1533, core#1542, core#1544, core#1545, core#1151). (#1713)
+
+  - **review:** a retry of a review never re-picks a seat its gate found calling a provider of the work's authors; the finding is kept on the step, so it holds after a restart. When no other helper of the run can review the work, the gate no longer offers Retry: it says no distinct reviewer remains, why, and which helper outside the run could review it (#1719). (#1723)
+
+  - napi-release's lockfile job drops and re-pins the five platform entries, and fails unless each has the released version, tarball URL and integrity (#1551). Its comment no longer describes version-less stubs (#1252). (#1725)
+
+  - Bus: an open of one bus file no longer blocks other bus files in the same process; opens take turns per path (#887). (#1727)
+
+  - **Fixed:** a domain map's extract attempt is no longer failed over as a worker error when the engine, not the seat, failed it after the seat ran (a seat pod's result lost in settlement, a seat-credential scan). Every failover event names its cause (core#1722). (#1729)
+
+  - **Fixed:** a domain map's extract page that states only part of its worklist is asked for again once with the count, and if still partial goes on with "stated N of M" disclosed. It no longer passes as a whole page (core#1724). (#1729)
+
+  - Repo-checks floor: a running check is stopped when the host's free disk falls under `WICKED_FLOOR_STOP_FREE_GB` (default 5 GiB, capped at the admission minimum), as an environment refusal naming the free space, so a build can no longer fill the host's disk (#1731). (#1732)
+
+  - Fixed: on the k8s floor, validator judges arm again. The warm judge guard no longer refuses the judge's own tree as a write root, and a refused warm arm falls back to a true cold arm (W24, a regression from #1695). (#1741)
+
+  - fix(k8s): a container claude seat's temp is the container's `/tmp`, never the unit's tree, so Agent-tool task links no longer refuse the pod write-back. A result lost in settlement pauses at the failure gate with its whole reason and never fails the run (#1743). (#1745)
+
+  - Fix: a change holding a binary file no longer leaves its steering rules unchecked. The rule judge's prompt reached the seat as `<string-with-nul>` and the judge answered without its verdict block (#1746). Follow-up filed separately: the container floor silently replaces any NUL-holding argument with `<string-with-nul>` instead of refusing. (#1749)
+
 - **core-ts 0.15.47** — 2026-11-20 — patch release on main 0105ea07, carrying 27 PRs since 0.15.46: #1590, #1597, #1598, #1599, #1600, #1601, #1606, #1607, #1608, #1609, #1613, #1615, #1623, #1624, #1625, #1628, #1629, #1630, #1631, #1632, #1633, #1635, #1637, #1638, #1639, #1641, #1642.
   The entries below were written from each PR's changelog entry; the PRs that edited this file themselves (#1590, #1597, #1598, #1599, #1613) keep their entries further down.
 
