@@ -561,18 +561,14 @@ pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] = &[
     "BITBUCKET_",
 ];
 
-/// The scheme every seat push is rewritten to. A host has no remote helper for it, so the push
-/// fails before any transport is contacted ("unable to find remote helper for 'wicked-nopush'").
-/// A seat image carries the engine's `git-remote-wicked-nopush` (core#1210,
-/// `containers/seats/seat.Dockerfile`), which refuses every push but one to a bare repository
-/// strictly inside the seat's own scratch dir; a local path arrives there as
-/// [`NOPUSH_LOCAL_BASE`]`<path>`, any other remote as `wicked-nopush://<host>/…`.
-pub const NOPUSH_SCHEME: &str = "wicked-nopush://";
-
-/// What an absolute POSIX-path remote (`/…`) is rewritten to for a push: [`NOPUSH_SCHEME`] with
-/// the path's own leading `/` kept, so the helper reads it as a path, never as a host (core#1210).
-/// `file:///…` arrives in the same form through the `file://` prefix.
-pub const NOPUSH_LOCAL_BASE: &str = "wicked-nopush:///";
+/// The base every seat push is rewritten to: git's `<helper>::<address>` form, so the push is
+/// handed to the `wicked-nopush` remote helper with the remote's own URL as the address, byte for
+/// byte (core#1785). A host has no such helper, so the push fails before any transport is
+/// contacted ("'remote-wicked-nopush' is not a git command"). A seat image carries the engine's
+/// `git-remote-wicked-nopush` (core#1210, `containers/seats/seat.Dockerfile`), which refuses every
+/// push but one to a bare repository strictly inside the seat's own scratch dir; it runs in git's
+/// own working directory, so a relative path means there what it would have meant to git.
+pub const NOPUSH_HELPER: &str = "wicked-nopush::";
 
 /// The ssh program a fenced seat's git is given — as `GIT_SSH_COMMAND` in its environment AND
 /// as `core.sshCommand` in its config: a program that does not exist, so an ssh transport git
@@ -584,63 +580,38 @@ pub const NOPUSH_SSH_COMMAND: &str = "wicked-nopush-ssh";
 /// git transports a fenced seat may not use at all (`protocol.<name>.allow = never`, read AND
 /// write): ssh in every spelling (scp-like included), the bare git protocol and `ext::` (an
 /// arbitrary command as a remote). https/http, `file://` and local paths stay allowed — a seat
-/// still fetches over them — and are push-killed by [`nopush_url_prefixes`].
+/// still fetches over them — and every push is re-aimed by [`NOPUSH_PUSH_PREFIX`]. git has no
+/// push-only protocol policy: `protocol.<name>.allow` and `GIT_ALLOW_PROTOCOL` govern clone,
+/// fetch and push alike (core#1785), so https and file cannot be refused for push alone.
 pub const NOPUSH_PROTOCOLS: &[&str] = &["ssh", "git", "ext"];
 
-/// URL prefixes rewritten for PUSH ONLY (`url.<NOPUSH_SCHEME>.pushInsteadOf`): every transport
-/// git speaks — https/http, ssh (URL and scp-like `git@host:` forms), the git protocol, `file://`
-/// and an absolute POSIX-path remote. `insteadOf` is NOT touched: fetch and pull keep working on
-/// every one of them. A seat fetches from its remotes; it never pushes to them. See
-/// [`nopush_url_prefixes`] for the full list — this base plus the Windows path spellings.
-pub const NOPUSH_URL_PREFIXES: &[&str] = &[
-    "https://",
-    "http://",
-    "ssh://",
-    "git+ssh://",
-    "ssh+git://",
-    "git://",
-    "git@",
-    "file://",
-    "/",
-];
-
-/// EVERY push-killed URL prefix: [`NOPUSH_URL_PREFIXES`] plus the Windows spellings of a local
-/// path remote — a drive letter (`C:`/`c:`, which git normalises to `C:/…` in remote URLs; the
-/// CI Windows runner's `%TEMP%` bare remote is exactly this) and a UNC share (`\\`). Listed on
-/// every platform: a remote URL beginning `X:` or `\\` means a Windows path nowhere else, so
-/// the entries are inert where they do not apply and the seat config is identical everywhere.
-pub fn nopush_url_prefixes() -> Vec<String> {
-    let mut all: Vec<String> = NOPUSH_URL_PREFIXES
-        .iter()
-        .map(|p| (*p).to_string())
-        .collect();
-    for letter in b'A'..=b'Z' {
-        all.push(format!("{}:", letter as char));
-        all.push(format!("{}:", (letter as char).to_ascii_lowercase()));
-    }
-    all.push("\\\\".to_string());
-    all
-}
+/// The one URL prefix rewritten for PUSH ONLY (`url.<NOPUSH_HELPER>.pushInsteadOf`): the EMPTY
+/// prefix, which every URL starts with — https/http, ssh in every spelling, `git://`, `file://`,
+/// an absolute or a relative path, a Windows drive or UNC path, another helper's `x::…`, a name
+/// the repository's `insteadOf` expands (core#1785: a prefix list missed `../outside.git` and
+/// `zz:` aliases). `insteadOf` is NOT touched: fetch and pull keep working on every transport
+/// [`NOPUSH_PROTOCOLS`] leaves open. A seat fetches from its remotes; it never pushes to them.
+///
+/// What no environment entry can reach: a repository's OWN config that re-aims a push. git takes
+/// the longest matching `pushInsteadOf` from any config source (a repository's beats this empty
+/// one) and applies none at all to a remote with an explicit `remote.<name>.pushurl`. No key
+/// unsets a rewrite, and an empty `pushurl` clears only a remote NAMED in advance — a seat can add
+/// a remote of any name. See [`fence_remote_credentials`] for what that leaves reachable.
+pub const NOPUSH_PUSH_PREFIX: &str = "";
 
 /// Every git config entry the fence sets, as `(key, value)` pairs in the order git must read
-/// them (for a single-valued key the later entry wins): the push kill for every URL-form
-/// transport (`url.wicked-nopush://.pushInsteadOf`), credential helpers reset (an empty
-/// `credential.helper` clears the list), no askpass program, the ssh program replaced by
-/// [`NOPUSH_SSH_COMMAND`], and the ssh/git/ext transports refused outright
+/// them (for a single-valued key the later entry wins): the push kill
+/// (`url.wicked-nopush::.pushInsteadOf` = the empty prefix, [`NOPUSH_PUSH_PREFIX`]), credential
+/// helpers reset (an empty `credential.helper` clears the list), no askpass program, the ssh
+/// program replaced by [`NOPUSH_SSH_COMMAND`], and the ssh/git/ext transports refused outright
 /// (`protocol.<name>.allow = never`, [`NOPUSH_PROTOCOLS`]). Carried twice: as the seat's
 /// `GIT_CONFIG_*` environment ([`nopush_git_config_env`]) and, LAST, in the seat-owned global
 /// file ([`seat_git_config_files`]).
 pub fn nopush_git_config_entries() -> Vec<(String, String)> {
-    let mut entries: Vec<(String, String)> = nopush_url_prefixes()
-        .iter()
-        .filter(|p| p.as_str() != "/")
-        .map(|p| (format!("url.{NOPUSH_SCHEME}.pushInsteadOf"), p.clone()))
-        .collect();
-    // (core#1210) A path remote keeps its leading `/`: `/tmp/r.git` → `wicked-nopush:///tmp/r.git`.
-    entries.push((
-        format!("url.{NOPUSH_LOCAL_BASE}.pushInsteadOf"),
-        "/".to_string(),
-    ));
+    let mut entries: Vec<(String, String)> = vec![(
+        format!("url.{NOPUSH_HELPER}.pushInsteadOf"),
+        NOPUSH_PUSH_PREFIX.to_string(),
+    )];
     entries.push(("credential.helper".to_string(), String::new()));
     entries.push(("core.askPass".to_string(), String::new()));
     entries.push((
@@ -655,7 +626,10 @@ pub fn nopush_git_config_entries() -> Vec<(String, String)> {
 
 /// The `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` spelling of
 /// [`nopush_git_config_entries`] — git reads them with the precedence of `-c` (above every
-/// config FILE), so a repo-level `credential.helper` or `url.*.pushInsteadOf` cannot undo them.
+/// config FILE), so a repo-level `credential.helper`, `core.sshCommand` or `protocol.*.allow`
+/// cannot undo them. A multi-valued `url.*` rewrite is the exception: git takes the longest
+/// match from ANY source, so a repository's own `pushInsteadOf` (or `pushurl`) re-aims a push past
+/// the fence's (core#1785, [`NOPUSH_PUSH_PREFIX`]).
 /// Returned as `(name, value)` pairs, `GIT_CONFIG_COUNT` last.
 pub fn nopush_git_config_env() -> Vec<(String, String)> {
     let entries = nopush_git_config_entries();
@@ -993,8 +967,8 @@ fn seat_global_git_config(copied: &[(String, Option<String>)]) -> String {
          # reads THIS as its global config: the operator's identity and presentation settings are\n\
          # COPIED below (never included — nothing about remotes, URLs, credentials, aliases or\n\
          # transports crosses), then every credential helper and askpass program is reset, every\n\
-         # URL-form push transport is re-aimed at the wicked-nopush scheme (no helper on a host; in\n\
-         # a seat image, one that admits only a bare repository inside the seat's /tmp), ssh is\n\
+         # push is re-aimed at the wicked-nopush helper (none on a host; in a seat image, one that\n\
+         # admits only a bare repository inside the seat's /tmp), ssh is\n\
          # replaced by a program that does not exist and the ssh/git/ext transports are refused\n\
          # outright.\n\
          # Fetch over https, file:// and local paths is untouched. Delivery is the deliver phase's\n\
@@ -1148,7 +1122,7 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
 /// seat), `GIT_CONFIG_NOSYSTEM=1`, and `GIT_SSH_COMMAND` → [`NOPUSH_SSH_COMMAND`] (git's ssh is
 /// a program that does not exist — the environment outranks every `core.sshCommand`, a `-c`
 /// included); (3) the transport kill rides the spawn as `GIT_CONFIG_COUNT`/`KEY`/`VALUE` entries
-/// ([`nopush_git_config_env`]) — `-c` precedence, above every file: the URL-form push kill,
+/// ([`nopush_git_config_env`]) — `-c` precedence, above every file: the push kill,
 /// helpers reset, `protocol.ssh|git|ext.allow = never`; (4) `GIT_CONFIG_GLOBAL`/
 /// `GIT_CONFIG_SYSTEM` → the seat-owned files ([`seat_git_config_files`]): the operator's
 /// identity COPIED (never included), their credential helpers, URL rewrites and
@@ -1157,17 +1131,29 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
 /// ([`seat_git_identity_env`], wicked-core#1485), so the commits a seat authors are the
 /// operator's; with none resolved, the seat's commits are refused.
 ///
-/// What this guarantees, exactly (review of #449, r2): a `git` that runs with the seat's
-/// environment intact cannot push anywhere — https/http, `ssh://`, `git@host:`, `user@host:`,
-/// `host:`, `git://`, `file://` and path remotes alike (in a seat image, but for a bare
-/// repository strictly inside the seat's own `/tmp`, core#1210 — [`NOPUSH_SCHEME`]), whether the
-/// remote is spelled on the command line, in the repository's config or through an operator
-/// `pushInsteadOf` — and cannot read a credential helper. A `git` invocation carrying its OWN
-/// override of a fenced key (`-c protocol.ssh.allow=always`, `-c credential.helper=…`;
-/// command-line `-c` outranks the environment entries) or its own `GIT_SSH_COMMAND` is refused as
-/// a literal by the command filter; one hidden in a script file is the stated limit, as is a seat
-/// that scrubs its environment (`env -i`) before calling git — the literal is refused, the script
-/// file is not.
+/// What this guarantees, exactly (review of #449, r2; core#1785): a `git` that runs with the
+/// seat's environment intact cannot read a credential helper, cannot use ssh, `git://` or `ext::`
+/// at all, and hands EVERY push URL it computes to the `wicked-nopush` helper ([`NOPUSH_HELPER`];
+/// none on a host, so nothing is pushed; in a seat image, only a bare repository strictly inside
+/// the seat's own `/tmp` is admitted, core#1210) — https/http, ssh in any spelling, `file://`, an
+/// absolute or a relative path, another helper's `x::…` — whether the remote is spelled on the
+/// command line, as a remote's `url`, through the repository's `insteadOf` or through an operator
+/// `pushInsteadOf`. What it cannot override is a repository config that re-aims the push
+/// ITSELF — a `url.<x>.pushInsteadOf` of its own (git takes the longest match from any source) or
+/// an explicit `remote.<name>.pushurl` (git applies no `pushInsteadOf` to it): no environment
+/// key unsets a rewrite, an empty `pushurl` clears only a remote named in advance (a seat can add
+/// one of any name), and git has no push-only protocol policy. Such a push still gets no
+/// credential from the seat's environment and no ssh: it reaches an https/http endpoint only
+/// with what the seat brings itself — an endpoint that accepts an anonymous push, or a secret the
+/// seat already holds and places in its own config (`http.extraHeader`), which it could equally
+/// send without git — or a local path, which the container floor bounds and which on a host is no
+/// more than the seat could write without git. The command filter refuses the `git push` literal, a
+/// `git config url.*`/`remote.*` write and `git remote set-url --push`; written by a script, it
+/// is the stated limit. Likewise a `git` invocation carrying its OWN override of a fenced key
+/// (`-c protocol.ssh.allow=always`, `-c credential.helper=…`; command-line `-c` outranks the
+/// environment entries) or its own `GIT_SSH_COMMAND` is refused as a literal by the command
+/// filter; one hidden in a script file is the stated limit, as is a seat that scrubs its
+/// environment (`env -i`) before calling git — the literal is refused, the script file is not.
 pub fn fence_remote_credentials(cmd: &mut Command) {
     for key in REMOTE_CREDENTIAL_ENV {
         cmd.env_remove(key);
@@ -2923,7 +2909,7 @@ mod tests {
     }
 
     /// Review of #449, FN-1(b) + r2 R2-1/R2-2: the seat spawn strips the ssh/git credential paths,
-    /// kills every URL-form push transport with `-c` precedence, replaces git's ssh with a program
+    /// re-aims every push at the nopush helper with `-c` precedence, replaces git's ssh with a program
     /// that does not exist, refuses the ssh/git/ext transports, and re-points git's global/system
     /// config at seat-owned files that never include the operator's — while `hardened()` alone
     /// (the deliver tool phase) keeps all of it.
@@ -2999,16 +2985,9 @@ mod tests {
             let val = value(&cmd, &format!("GIT_CONFIG_VALUE_{i}"))
                 .flatten()
                 .unwrap();
-            if key == format!("url.{NOPUSH_SCHEME}.pushInsteadOf") {
-                assert!(nopush_url_prefixes().contains(&val), "{val}");
-                assert_ne!(
-                    val, "/",
-                    "a path remote keeps its leading slash (core#1210)"
-                );
-                push_kills += 1;
-            }
-            if key == format!("url.{NOPUSH_LOCAL_BASE}.pushInsteadOf") {
-                assert_eq!(val, "/", "only a path remote is re-aimed at the local base");
+            if key.to_ascii_lowercase().ends_with(".pushinsteadof") {
+                assert_eq!(key, format!("url.{NOPUSH_HELPER}.pushInsteadOf"));
+                assert_eq!(val, "", "the empty prefix: every push URL starts with it");
                 push_kills += 1;
             }
             if key == "credential.helper" {
@@ -3040,14 +3019,8 @@ mod tests {
             "ssh, git and ext are refused outright; https/file/local stay for reads"
         );
         assert_eq!(
-            push_kills,
-            nopush_url_prefixes().len(),
-            "every transport is killed — drive letters and UNC included"
-        );
-        assert!(
-            nopush_url_prefixes().iter().any(|p| p == "C:")
-                && nopush_url_prefixes().iter().any(|p| p == "c:"),
-            "Windows drive-letter path remotes are killed too"
+            push_kills, 1,
+            "one catch-all rewrite re-aims every push (core#1785)"
         );
         assert!(helper_reset);
         if worker_home_base().is_ok() {
@@ -3062,11 +3035,8 @@ mod tests {
             );
             let text = std::fs::read_to_string(&global).unwrap();
             assert!(
-                text.contains(&format!("[url \"{NOPUSH_SCHEME}\"]")),
+                text.contains(&format!("[url \"{NOPUSH_HELPER}\"]\n\tpushInsteadOf =\n")),
                 "{text}"
-            );
-            assert!(
-                text.contains("pushInsteadOf = ssh://") && text.contains("pushInsteadOf = git@")
             );
             assert!(text.contains("helper =") && text.contains("askPass ="));
             assert!(
@@ -3178,7 +3148,7 @@ rebase.autosquash\0";
             );
         }
         // The fence entries are LAST and single-valued keys resolve to the seat's own values.
-        let fence_start = text.find(&format!("[url \"{NOPUSH_SCHEME}\"]")).unwrap();
+        let fence_start = text.find(&format!("[url \"{NOPUSH_HELPER}\"]")).unwrap();
         let fence = &text[fence_start..];
         assert!(text[..fence_start].contains("[user]"));
         assert!(fence.contains(&format!(
@@ -3189,14 +3159,8 @@ rebase.autosquash\0";
             assert!(fence.contains(&format!("[protocol \"{proto}\"]\n\tallow = never\n")));
         }
         assert!(
-            fence.contains("pushInsteadOf = \"\\\\\\\\\"\n"),
-            "UNC prefix quoted: {fence}"
-        );
-        assert!(
-            fence.contains(&format!(
-                "[url \"{NOPUSH_LOCAL_BASE}\"]\n\tpushInsteadOf = /\n"
-            )),
-            "a path remote keeps its leading slash (core#1210): {fence}"
+            fence.starts_with(&format!("[url \"{NOPUSH_HELPER}\"]\n\tpushInsteadOf =\n[")),
+            "one empty-prefix rewrite, written as an empty value (core#1785): {fence}"
         );
         // Values git could not read back literally are quoted and escaped; odd keys are dropped.
         assert_eq!(git_config_value("plain"), "plain");
@@ -3245,7 +3209,8 @@ rebase.autosquash\0";
     /// fails before any transport is contacted on an ssh remote (URL, `git@host:`, `user@host:`
     /// and bare `host:` scp-like), an https remote the OPERATOR's global config rewrites to ssh
     /// (`url."git@localhost:".pushInsteadOf = https://localhost/`, the reviewer's exp2), a
-    /// `file://` remote and an absolute-path remote, aliased (`git -c alias.p=push p`) or not,
+    /// `file://` remote, an absolute-path remote and (core#1785) a relative-path remote and a name
+    /// the repository's own `insteadOf` expands, aliased (`git -c alias.p=push p`) or not,
     /// and a stub `ssh` on `PATH` proves ssh is never reached; the same commands WITHOUT the
     /// fence reach the stub (the operator rewrite is live) and push to the path remote, and
     /// `git fetch` from the path remote still works under the fence.
@@ -3370,9 +3335,9 @@ rebase.autosquash\0";
                 "{name}"
             );
         }
-        // Under the fence: every push fails on the kill, before any transport is contacted —
-        // the URL-form ones on the missing `wicked-nopush` helper, the scp-like ones on the
-        // refused ssh transport — and ssh is never reached.
+        // Under the fence: every push fails on the kill, before any transport is contacted — on
+        // the missing `wicked-nopush` helper (core#1785: every push URL is handed to it, scp-like
+        // ones included) — and ssh is never reached.
         for (name, _) in &remotes {
             reset_ssh();
             let (ok, out) = git(&clone, &["push", name, "HEAD:refs/heads/main"], true);
@@ -3382,6 +3347,30 @@ rebase.autosquash\0";
                 "the failure is the fence, not a network error (remote {name}): {out}"
             );
             assert!(!ssh_reached(), "ssh was reached for remote {name}: {out}");
+        }
+        // core#1785: a RELATIVE path, and a name the repository's own `insteadOf` expands to the
+        // bare remote's path — both missed by the old prefix list, both pushed for real on it.
+        let base_url = base.to_string_lossy().replace('\\', "/");
+        assert!(
+            git(
+                &clone,
+                &["config", &format!("url.{base_url}/.insteadOf"), "zz:"],
+                false
+            )
+            .0
+        );
+        for (url, branch) in [("../bare.git", "rel"), ("zz:bare.git", "alias")] {
+            let (ok, out) = git(
+                &clone,
+                &["push", url, &format!("HEAD:refs/heads/{branch}")],
+                true,
+            );
+            assert!(
+                !ok && out.contains("wicked-nopush"),
+                "a fenced push to {url} fails on the kill: {out}"
+            );
+            let (_, refs) = git(&bare, &["for-each-ref"], false);
+            assert!(refs.trim().is_empty(), "nothing landed from {url}: {refs}");
         }
         // The alias spelling the review reproduced: still killed by layer 3.
         let (ok, out) = git(

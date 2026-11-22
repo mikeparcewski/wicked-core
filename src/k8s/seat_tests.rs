@@ -755,7 +755,7 @@ fn k8s_git_config_handoff_preserves_operator_identity_and_push_fence() {
          [commit]\ngpgsign = true\n\
          [gpg]\nprogram = /nonexistent\n\
          [filter \"lfs\"]\nrequired = true\nclean = /nonexistent %f\n\
-         [url \"wicked-nopush://\"]\npushInsteadOf = https://\n\
+         [url \"wicked-nopush::\"]\npushInsteadOf =\n\
          [protocol \"ssh\"]\nallow = never\n"
     );
     std::fs::write(&global, content).unwrap();
@@ -824,7 +824,7 @@ fn k8s_git_config_handoff_preserves_operator_identity_and_push_fence() {
         format!(
             "{name} <op@users.noreply.example>|{name} <op@users.noreply.example>\n\
              {name} <override@example.test>|{name} <override@example.test>\n\
-             wicked-nopush://example.invalid/repo\nnever"
+             wicked-nopush::https://example.invalid/repo\nnever"
         )
     );
     assert!(!env.exists());

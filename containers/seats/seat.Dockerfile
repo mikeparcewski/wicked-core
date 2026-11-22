@@ -62,9 +62,10 @@ RUN set -eu; \
       install -o root -g root -m 0555 "$d/$CLI_TARBALL_MEMBER" "/usr/local/bin/$CLI"; \
       rm -rf "$d"; \
     fi
-# The seat fence's push helper (core#1210). The fence re-aims every push at the wicked-nopush
-# scheme (crates/wicked-apps-core/src/spawn.rs nopush_git_config_entries): a local-path or file://
-# remote arrives here as wicked-nopush:///<path>, any other remote as wicked-nopush://<host>/...
+# The seat fence's push helper (core#1210). The fence re-aims every push at this helper
+# (crates/wicked-apps-core/src/spawn.rs nopush_git_config_entries: the empty-prefix
+# url.wicked-nopush::.pushInsteadOf, core#1785), so the remote's own URL arrives here byte for byte,
+# in git's own working directory: a relative path means what it would have meant to git.
 # One push is let through: to a bare repository STRICTLY inside the seat's own scratch dir (/tmp,
 # the engine's tmpfs or emptyDir), resolved with every symlink and `..` followed, so a repository's
 # test fixtures can push to a bare remote they made there. Everything else is refused, as before.
@@ -93,10 +94,14 @@ resolve() {
 }
 url=${2-}
 case "$url" in
+    '') refuse "an empty push URL refused" ;;
     *"$nl"*) refuse "a push URL with a newline refused" ;;
-    wicked-nopush:///*) path=${url#wicked-nopush://} ;;
-    *) refuse "push to a remote ($url) refused" ;;
+    file:///*) path=${url#file://} ;;
+    *://* | *::*) refuse "push to a remote ($url) refused" ;;
+    *) path=$url ;;
 esac
+# git's own rule: a colon before the first slash is an ssh remote (host:path), never a path.
+case "${path%%/*}" in *:*) refuse "push to a remote ($url) refused" ;; esac
 root=$(resolve "$scratch_root") || refuse "the scratch dir is missing"
 [ "$root" = "$scratch_root" ] && [ ! -L "$scratch_root" ] || refuse "the scratch dir $scratch_root is not a real directory"
 real=$(resolve "$path") || refuse "push target $path does not resolve to a directory"
