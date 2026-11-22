@@ -410,6 +410,39 @@ pub(super) fn run_detected(
                 )
             }),
         };
+        // (core#1767) With exclusion on and a usable guide, the head's full run is a RESULTS run,
+        // the base's own shape, and its results text is kept: an exclusion holds only when the
+        // head's list names exactly what this run executed. The text can only refuse one.
+        let results_guide = gcheck.as_ref().ok().copied().filter(|_| {
+            exclude && !is_provisioning(&check.name) && !is_formatter_check(&check.name)
+        });
+        let mut head_results: Option<Result<String, String>> = None;
+        let mut full_run = || match results_guide {
+            Some(g) => {
+                let since = std::time::SystemTime::now();
+                if let Some(h) = held_head {
+                    clear_results(h, check, g);
+                }
+                let mut r = run_one_with(
+                    worktree,
+                    held_head,
+                    &RepoCheck {
+                        argv: g.for_results(&check.argv),
+                        ..check.clone()
+                    },
+                    &results_exec(g),
+                    sandbox,
+                    scratch,
+                    Tree::Head,
+                );
+                head_results = Some(match held_head {
+                    Some(h) => results_text(h, check, g, &mut r, scratch, since),
+                    None => Err("the head's tree is not held".to_string()),
+                });
+                r
+            }
+            None => run_held(worktree, held_head, check, sandbox, scratch, Tree::Head),
+        };
         let mut run = match affected {
             Some((argv, source)) => {
                 let a = RepoCheck {
@@ -421,14 +454,13 @@ pub(super) fn run_detected(
                 if r.passed() || r.environment_failure() {
                     r
                 } else {
-                    let mut full =
-                        run_held(worktree, held_head, check, sandbox, scratch, Tree::Head);
+                    let mut full = full_run();
                     full.earlier_passes
                         .push(("affected".to_string(), r.duration_ms));
                     full
                 }
             }
-            None => run_held(worktree, held_head, check, sandbox, scratch, Tree::Head),
+            None => full_run(),
         };
         run.selection = engine.map(|p| p.selection);
         // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
@@ -643,6 +675,7 @@ pub(super) fn run_detected(
                         prose_change.as_deref(),
                         &gcheck,
                         exclude,
+                        head_results.as_ref(),
                         sandbox,
                         scratch,
                         early_retry,

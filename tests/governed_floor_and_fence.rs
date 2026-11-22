@@ -568,8 +568,8 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
          --list) list=1;; --skip=shared) skip=1;;\n\
          esac; done\necho '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2\n\
          if [ $list = 1 ]; then [ $skip = 0 ] && echo 'shared: test'; echo; echo '1 test, 0 benchmarks'; exit 0; fi\n\
-         if [ $skip = 1 ]; then echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0; fi\n\
-         echo 'test shared ... FAILED'\necho; echo 'failures:'; echo '    shared'; echo\n\
+         if [ $skip = 1 ]; then echo 'running 0 tests'; echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0; fi\n\
+         echo 'running 1 test'; echo 'test shared ... FAILED'\necho; echo 'failures:'; echo '    shared'; echo\n\
          echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101\n",
     )
     .unwrap();

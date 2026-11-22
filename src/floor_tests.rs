@@ -16,7 +16,8 @@ use super::*;
 /// a test (or a forger) prints. It reads its behaviour from files in the tree it runs in:
 /// `-- --list` prints `toc.txt` (exit `toc.exit`, default 0); a run with any `--skip=` is the
 /// excluded run (`excluded.out` / `excluded.err`, exit `excluded.exit`, sleeping
-/// `excluded.sleep` seconds first); any other run prints `run.out` / `run.err` and exits
+/// `excluded.sleep` seconds first); any other run prints libtest's `running N tests` (N: the
+/// `: test` lines of `toc.txt`, or `run.count` verbatim, core#1767), `run.out` / `run.err` and exits
 /// `run.exit` — or, with `flake` present, 101 the first time in this floor and `run.exit`
 /// after (`flake.excluded`: the same for the excluded run). Absolute path, outside every tree.
 #[cfg(unix)]
@@ -53,6 +54,7 @@ fn fake_runner(tag: &str, name: &str) -> String {
              [ -f excluded.signal ] && kill -KILL $$\n\
              if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
            *) if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+             if [ -f run.count ]; then cat run.count; else c=$(grep -c ': test$' toc.txt 2>/dev/null); echo \"running ${c:-0} tests\"; fi\n\
              cat run.out 2>/dev/null; cat run.err >&2 2>/dev/null\n\
              case \"$0\" in *cargo) if [ -f run.out ] && ! grep -q '^test result:' run.out; then \
              f=$(sed -n 's/^test \\(.*\\) \\.\\.\\. FAILED$/    \\1/p' run.out); \
@@ -101,6 +103,7 @@ fn write_tree(repo: &Path, argv: &[String], files: &[(&str, &str)]) {
         "toc.txt",
         "toc.exit",
         "toc.err",
+        "run.count",
         "flake",
         "flake.excluded",
         "skip.prefix",
@@ -295,11 +298,23 @@ fn every_forgery_of_rounds_1_to_21_denies_or_escalates_never_passes() {
             "{round}: {d:?}"
         );
         assert!(!report.passed && c.denies(), "{round}: {d:?}");
-        assert_eq!(
-            d.excluded,
-            s(&["old"]),
-            "{round}: only the base's own failure is deselected: {d:?}"
-        );
+        // (core#1767) Forged count lines can only make the head's list look incomplete: that
+        // refuses the exclusion (escalates), never widens it.
+        if d.excluded.is_empty() {
+            assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{round}: {d:?}");
+            assert!(
+                d.reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("the head's list does not cover its run")),
+                "{round}: {d:?}"
+            );
+        } else {
+            assert_eq!(
+                d.excluded,
+                s(&["old"]),
+                "{round}: only the base's own failure is deselected: {d:?}"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -1041,6 +1056,88 @@ fn the_floor_reads_the_base_guide_and_never_relies_on_a_failed_or_stale_one() {
     for r in [repo, repo2, repo3] {
         let _ = std::fs::remove_dir_all(r);
     }
+}
+
+/// (core#1767) After the listed lib binary's results (`run.out`), a run executes a test binary its
+/// list never names: an integration binary `it` whose one test shares the name `old` (on stderr,
+/// as libtest's `Running` line is; the results run merges the streams in order).
+#[cfg(unix)]
+const UNLISTED_BINARY: &str = "     Running tests/it.rs (target/debug/deps/it-1)\nrunning 1 test\n\
+    test old ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+/// The lib binary's results with `old` failing, closed by libtest's footer.
+#[cfg(unix)]
+const LIB_OLD_FAILS: &str =
+    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\nfailures:\n    old\n\n\
+    test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+/// (core#1767) The guide was verified (every probe, `complete` included) before an integration
+/// binary that the list omits was added; it shares the base failure's name `old`. An exclusion
+/// that relies on the base's or the head's list is refused when that tree's own run executed
+/// tests the list does not name, so the binary's `old` is never skipped unseen.
+#[cfg(unix)]
+#[test]
+fn core_1767_an_unlisted_binary_added_after_verification_refuses_the_exclusion() {
+    let _load = seam::pin(0.5, 4);
+    let head_red = |repo: &Path, argv: &[String], extra: &[(&str, &str)]| {
+        let mut files: Vec<(&str, &str)> = vec![
+            ("run.out", LIB_OLD_FAILS),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+        ];
+        let toc = toc_of(&["old", "new", "fine"]);
+        files.push(("toc.txt", &toc));
+        files.extend_from_slice(extra);
+        write_tree(repo, argv, &files);
+    };
+    // The base's tree has the binary: its own run is not covered by its list.
+    let (repo, mut ctx, argv) = red_base("unlisted-base");
+    std::fs::write(repo.join("run.err"), UNLISTED_BINARY).unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "an integration binary the list omits"],
+    );
+    ctx.base_head = Some(git(&repo, &["rev-parse", "HEAD"]));
+    head_red(&repo, &argv, &[("run.err", UNLISTED_BINARY)]);
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(
+        d.reason.as_deref().is_some_and(|r| r.contains(
+            "the base: the base's list does not cover its run: section `it-1`: the clean run \
+             executed 1 test(s); the list names 0"
+        )),
+        "{d:?}"
+    );
+    assert!(d.excluded.is_empty() && !report.passed, "{d:?}");
+    let _ = std::fs::remove_dir_all(&repo);
+    // Only the head added it: the head's own run is not covered by the head's list.
+    let (repo, ctx, argv) = red_base("unlisted-head");
+    head_red(&repo, &argv, &[("run.err", UNLISTED_BINARY)]);
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(
+        d.reason.as_deref().is_some_and(|r| r.contains(
+            "the head's list does not cover its run: section `it-1`: the clean run executed 1 \
+             test(s); the list names 0"
+        )),
+        "{d:?}"
+    );
+    assert!(d.excluded.is_empty() && !report.passed, "{d:?}");
+    // The same head without the binary: the exclusion holds (control).
+    head_red(&repo, &argv, &[]);
+    let (report, c) = floor_test(&repo, &ctx).unwrap();
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+    assert_eq!(d.excluded, s(&["old"]));
+    assert!(report.passed);
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Every outcome serializes on the wire as `checks[].decision` (the coordinator's addendum):

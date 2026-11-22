@@ -113,7 +113,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
         let guide: GuideCheck = serde_json::from_value(serde_json::json!({
             "name": "test", "run": check.argv, "failedExit": [101],
             "results": {"kind": "text"},
-            "parser": {"failed": ["^FAIL (?P<id>.+)$"]},
+            "parser": {"failed": ["^FAIL (?P<id>.+)$"], "count": "^running (?P<n>\\d+) tests$"},
             "list": {"run": ["sh", "check.sh", "--list"],
                      "item": "^(?P<id>.+): test$"},
             "alone": {"run": ["sh", "check.sh", "{id}"]},
@@ -158,6 +158,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
             None,
             &Ok(&guide),
             true,
+            Some(&Ok("running 2 tests\n".to_string())),
             &sandbox,
             &scratch,
             None,

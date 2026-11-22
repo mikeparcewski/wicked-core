@@ -458,7 +458,8 @@ pub(super) struct BaseSide {
 
 /// (DES-FLOOR-V2 §3) Decide a FAILED head check `head` (its first, unchanged run) against its base
 /// side: the head's exit codes decide, the base's TOC-validated failures are the only ones that
-/// may be excluded, and head text is never read to decide.
+/// may be excluded, and head text is never read to decide (core#1767: the head's results are read
+/// only to refuse an exclusion whose list does not cover the head's run).
 /// wicked-core#1701: a prose-only change may excuse an otherwise unseparated completed base failure.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decide(
@@ -470,6 +471,7 @@ pub(super) fn decide(
     changed: Option<&[String]>,
     guide: &Result<&GuideCheck, String>,
     exclude: bool,
+    head_results: Option<&Result<String, String>>,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
     early_retry: Option<CheckRun>,
@@ -556,6 +558,15 @@ pub(super) fn decide(
             if let Some(why) = &head_toc.incomplete {
                 return Err(format!("the head: {why}"));
             }
+            // (core#1767) The head's list names exactly what the head's own full run executed
+            // (per qualifier): the probe proved the list on its clean copy only, and a binary
+            // added since that the list omits could make a name it shares look unique.
+            let text = head_results
+                .ok_or("the head's run kept no results to check its list against")?
+                .as_ref()
+                .map_err(|e| format!("the head's results: {e}"))?;
+            g.completeness(text, &head_toc.ids)
+                .map_err(|e| format!("the head's list does not cover its run: {e}"))?;
             for t in &failing {
                 if head_toc.count(t) > 1 {
                     return Err(format!(
