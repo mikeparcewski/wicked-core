@@ -681,10 +681,11 @@ impl Drop for InstallCall {
 }
 
 /// (core#1708) Shut install-time conformance down for this process, for a host on its way out.
-/// Every call in flight is stopped: within one poll tick (50 ms) its harness's loop SIGKILLs the
-/// jailed process group while it still holds the unreaped leader (so the kill can never reach a
-/// reused group id), and the call resolves to a refused record. Every later call is refused
-/// before it starts. Returns how many calls were in flight; does not wait for them (see
+/// Every call in flight is stopped: a running harness is SIGKILLed with its jailed process group
+/// within one poll tick (50 ms) by its own loop, which still holds the unreaped leader (so the kill
+/// can never reach a reused group id), and the call resolves to a refused record; a call whose
+/// harness had already finished returns its own record. Every later call is refused before it
+/// starts. Returns how many calls were in flight; does not wait for them (see
 /// [`install_harnesses_settled`]). The harness runs in its own process group, so without this it
 /// would outlive the host until its deadline (up to 15 minutes).
 pub fn shut_down_install_harnesses() -> usize {
@@ -693,13 +694,20 @@ pub fn shut_down_install_harnesses() -> usize {
     reg.in_flight
 }
 
-/// Wait up to `within` for every install-time conformance call to end; `true` when none is left.
-pub fn install_harnesses_settled(within: std::time::Duration) -> bool {
-    let reg = install_harnesses();
-    let (reg, _) = INSTALL_ENDED
-        .wait_timeout_while(reg, within, |r| r.in_flight > 0)
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.in_flight == 0
+/// Wait until `deadline` for every install-time conformance call to end; `true` when none is left.
+pub fn install_harnesses_settled(deadline: std::time::Instant) -> bool {
+    let mut reg = install_harnesses();
+    while reg.in_flight > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        reg = INSTALL_ENDED
+            .wait_timeout(reg, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    true
 }
 
 /// TEST-ONLY: undo [`shut_down_install_harnesses`] for the tests that follow in this process.

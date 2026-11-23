@@ -10,6 +10,6 @@ const resultIsAsyncJson: Equal<ReturnType<typeof Core.runEditorConformance>, Pro
 
 // core#1708: the host's shutdown for in-flight install harnesses.
 const shutdownTakesNothing: Equal<Parameters<typeof Core.shutdownEditorConformance>, []> = true
-const shutdownIsAsyncJson: Equal<ReturnType<typeof Core.shutdownEditorConformance>, Promise<string>> = true
+const shutdownIsSyncJson: Equal<ReturnType<typeof Core.shutdownEditorConformance>, string> = true
 
-export { requestIsJson, resultIsAsyncJson, shutdownTakesNothing, shutdownIsAsyncJson }
+export { requestIsJson, resultIsAsyncJson, shutdownTakesNothing, shutdownIsSyncJson }
