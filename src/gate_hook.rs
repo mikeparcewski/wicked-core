@@ -1186,16 +1186,24 @@ fn boundary_denial_judged(
             // relative write targets in subsequent segments land in the cd destination, not in the
             // process cwd (the worktree). Check the cd destination against the boundary so the
             // escape is caught before the write segments run.  Unit-fatal like any write escape.
-            let mut cds = bash_cd_escape_targets(command, &write_cwds, home);
-            cds.extend(bash_cd_escape_targets(command, &operands.cwds, home));
+            // One classification of the command's programs serves both the `cd` collection and
+            // the judgement below: a later rescan under an exhausted budget must never weaken it.
+            let (capability, classified) = command_write_capability(command);
+            let mut cds = bash_cd_escape_targets(command, &write_cwds, home, capability);
+            cds.extend(bash_cd_escape_targets(
+                command,
+                &operands.cwds,
+                home,
+                capability,
+            ));
             // (crew#1795) A `cd` into a declared READ root (a chat's repository, a skill folder)
-            // is a read: every write target the scan resolves was judged above against the `cd`
-            // destination as its base. What is left is a program whose writes the scan cannot
-            // see. One that writes in the form used (`git commit`, `rm`, `sed -i`) keeps the `cd`
-            // a unit-fatal write escape; one that only MAY write (an interpreter, a shell) is
-            // refused ADVISORY with the form that works, so a question about a repository never
-            // ends at a rules card. Another run's worktree is never such a root.
-            let capability = command_write_capability(command);
+            // in a command whose ONLY possible writer is a program that may write unseen (an
+            // interpreter, a shell) is refused ADVISORY with the form that works, so a question
+            // about a repository never ends at a rules card. Everything else stays a unit-fatal
+            // write escape: a program that writes in the form used (`git commit`, `rm`, `sed -i`),
+            // any write target in the command (a redirect, `cp`: the scan's view of where a
+            // program writes is not complete, `cp -t`, `sort -o`), a scan that ran out of budget,
+            // and another run's worktree.
             for (target, base) in cds
                 .iter()
                 .flat_map(|t| candidates.iter().map(move |b| (t, b)))
@@ -1208,7 +1216,9 @@ fn boundary_denial_judged(
                         advisory.get_or_insert(format!("Bash `cd` leaves the unit boundary: {d}"));
                         continue;
                     }
-                    let read_root = capability < WriteCapability::Writes
+                    let read_root = capability == WriteCapability::Opaque
+                        && classified
+                        && writes.is_empty()
                         && roots
                             .read
                             .iter()
@@ -1222,16 +1232,14 @@ fn boundary_denial_judged(
                     if !read_root {
                         return Some((format!("Bash `cd` leaves the unit boundary: {d}"), true));
                     }
-                    if capability == WriteCapability::Opaque {
-                        advisory.get_or_insert(format!(
-                            "{READ_ROOT_CD_REASON_PREFIX} {} is read-only to this job, and the command \
-                             also runs a program whose writes there cannot be checked (python, \
-                             node or a shell script), so it was not run. Run it from your \
-                             working folder and name the folder in the command instead, for \
-                             example `git -C <folder> log -5` or `ls <folder>`",
-                            d.resolved.display()
-                        ));
-                    }
+                    advisory.get_or_insert(format!(
+                        "{READ_ROOT_CD_REASON_PREFIX} {} is read-only to this job, and the command \
+                         also runs a program whose writes there cannot be checked (python, \
+                         node or a shell script), so it was not run. Run it from your \
+                         working folder and name the folder in the command instead, for \
+                         example `git -C <folder> log -5` or `ls <folder>`",
+                        d.resolved.display()
+                    ));
                 }
             }
             // ESTATE COMMAND FENCE (DES-GROUNDING-001 §7, issue #463): guard write-path access to
@@ -3730,6 +3738,9 @@ fn git_subcommand_reads(args: &[&str]) -> bool {
     let Some((&verb, rest)) = args.split_first() else {
         return true;
     };
+    if rest.iter().any(|a| git_option_writes(verb, a)) {
+        return false;
+    }
     if GIT_READ_VERBS.contains(&verb) {
         return true;
     }
@@ -3762,12 +3773,28 @@ fn git_subcommand_reads(args: &[&str]) -> bool {
         }
         "stash" => matches!(rest.first(), Some(&("list" | "show"))),
         "worktree" => matches!(rest.first(), Some(&"list")),
-        // `git reflog [<options>]` shows; a subcommand word other than `show`/`exists` may not.
+        // Git takes the first word that is not an option as the subcommand, wherever the options
+        // stand (`git reflog --all expire` expires, agy r1 on #1849): `show`, `exists`, or none
+        // at all reads; anything else (`expire`, `delete`, a ref name) is judged a write.
         "reflog" => rest
-            .first()
-            .is_none_or(|a| a.starts_with('-') || matches!(*a, "show" | "exists")),
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .is_none_or(|a| matches!(*a, "show" | "exists")),
         _ => false,
     }
+}
+
+/// (crew#1795 review) Whether one word of a reading git invocation still writes a file or runs a
+/// program: `--output` (log, diff, show, and the verbs that take their options, `stash show` and
+/// `reflog`) and every abbreviation git accepts for it, `archive -o`, `fsck --lost-found`, `grep
+/// -O` / `--open-files-in-pager`. Judged with quotes and backslashes removed (`'--output=f'`).
+fn git_option_writes(verb: &str, word: &str) -> bool {
+    let a = word.replace(['\'', '"', '\\'], "");
+    let short = a.starts_with('-') && !a.starts_with("--");
+    a.starts_with("--out")
+        || (verb == "archive" && short && a.contains('o'))
+        || (verb == "fsck" && a.starts_with("--lo"))
+        || (verb == "grep" && ((short && a.contains('O')) || a.starts_with("--op")))
 }
 
 /// Interpreter programs that can write files with unresolvable targets when invoked with inline
@@ -3796,21 +3823,32 @@ enum WriteCapability {
     Writes,
 }
 
-/// The strongest [`WriteCapability`] among `command`'s programs. Used by `bash_cd_escape_targets`
-/// to judge `cd` destinations even when there is no statically-resolvable write target.
-fn command_write_capability(command: &str) -> WriteCapability {
+/// The strongest [`WriteCapability`] among `command`'s programs, and whether the scan read the
+/// command with the full wrapper grammar (`false`: the shared scan budget was spent, and main's
+/// grammar may have missed a wrapper). Used by `bash_cd_escape_targets` to judge `cd`
+/// destinations even when there is no statically-resolvable write target.
+fn command_write_capability(command: &str) -> (WriteCapability, bool) {
     let _scan = ShellScanGuard::scan(command, false);
+    let mut extended = _scan.extended;
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut seg: Vec<&str> = Vec::new();
+    // Every redirection and its spaced operand leave the argument stream, as in the write-target
+    // scan's segment builder (`git tag 2> /dev/null`: `/dev/null` is no argument of git's).
+    let mut operand_next = false;
     for &t in &toks {
         if SEPS.contains(&t) {
+            operand_next = false;
             if !seg.is_empty() {
                 segments.push(std::mem::take(&mut seg));
             }
-        } else if redirect_glob(t).is_none() {
+        } else if std::mem::take(&mut operand_next) {
+            // The spaced operand of the redirection before it: a file, a delimiter, a descriptor.
+        } else if let Some(takes_next) = redirection_operand(t) {
+            operand_next = takes_next;
+        } else {
             seg.push(t);
         }
     }
@@ -3824,8 +3862,17 @@ fn command_write_capability(command: &str) -> WriteCapability {
             .map(move |unwrapped| (words, unwrapped))
     }) {
         match unwrapped {
-            // Any -c wrapper may write: its code is a string this scan does not run.
-            Unwrapped::Inline { .. } => strongest = strongest.max(WriteCapability::Opaque),
+            // Any -c wrapper may write: its code is a string this scan does not run. What the
+            // inner command line shows is classified too, so wrapping a write in `sh -c` never
+            // makes it weaker (agy r1 on #1849): `bash -c 'rm -rf src'` writes.
+            Unwrapped::Inline { inner, .. } => {
+                let (nested, complete) = command_write_capability(&inner);
+                extended &= complete;
+                if nested == WriteCapability::Writes {
+                    return (WriteCapability::Writes, extended);
+                }
+                strongest = strongest.max(WriteCapability::Opaque);
+            }
             Unwrapped::Program { idx, .. } => {
                 let Some(prog) = words.get(idx) else { continue };
                 let basename = program_basename(prog);
@@ -3852,14 +3899,14 @@ fn command_write_capability(command: &str) -> WriteCapability {
                             j += 1;
                         } else {
                             if !git_subcommand_reads(&args[j..]) {
-                                return WriteCapability::Writes;
+                                return (WriteCapability::Writes, extended);
                             }
                             break;
                         }
                     }
                 }
                 if matches!(basename, "ln" | "rm" | "truncate" | "patch") {
-                    return WriteCapability::Writes;
+                    return (WriteCapability::Writes, extended);
                 }
                 // (PRODUCT-WORKS J6) `sed` writes only in-place, from a script file this scan
                 // cannot read, or through a script command that writes (`w`, `s///w`, `e`). A
@@ -3867,12 +3914,12 @@ fn command_write_capability(command: &str) -> WriteCapability {
                 // after `cd`-ing into a read root) is not write-capable: counting it made a design
                 // step's `cd <skill dir> && ls && sed -n …p` a boundary WRITE that denied the unit.
                 if basename == "sed" && sed_may_write(&words[idx + 1..]) {
-                    return WriteCapability::Writes;
+                    return (WriteCapability::Writes, extended);
                 }
             }
         }
     }
-    strongest
+    (strongest, extended)
 }
 
 /// Whether a `sed` invocation (its arguments, after the program word, as `shell_tokens` spells
@@ -4142,11 +4189,10 @@ fn bash_cd_escape_targets(
     command: &str,
     destinations: &[String],
     home: Option<&Path>,
+    capability: WriteCapability,
 ) -> Vec<ShellTarget> {
     let _scan = ShellScanGuard::session();
-    if bash_write_targets(command).is_empty()
-        && command_write_capability(command) == WriteCapability::None
-    {
+    if bash_write_targets(command).is_empty() && capability == WriteCapability::None {
         return Vec::new();
     }
     // (core#922) Judged as the shell resolves the destination, like the write targets are — and
@@ -8828,13 +8874,14 @@ mod tests {
     /// crew#1795 (sitrep row 27, chat runs 6684f077 and 0f8437c5): a repo-scoped chat's seat
     /// `cd`-ed into the chat's repository — a declared READ root — and the hook judged the `cd` a
     /// boundary WRITE because the command also held a write-capable program, so the answer stopped
-    /// at a rules card. A `cd` into a read root is a read unless the command writes there:
-    /// - only resolved writes (judged against the `cd` destination already) or none: allowed, and
-    ///   the listing forms of git (`branch -a`, `remote -v`, `tag -l`, `stash list`) are reads, at
-    ///   the `cd` and through `git -C`;
-    /// - a program whose writes cannot be seen (python, node, a `-c` shell): refused ADVISORY with
-    ///   the form that works, never unit-fatal;
-    /// - a program that writes in the form used, or a resolved write into the root: unit-fatal;
+    /// at a rules card. A `cd` into a read root is a read unless the command may write there:
+    /// - no write at all: allowed, and the listing forms of git (`branch -a`, `remote -v`, `tag
+    ///   -l`, `stash list`) are reads, at the `cd` and through `git -C`, unless an option writes
+    ///   (`--output`, `archive -o`, `fsck --lost-found`);
+    /// - a program whose writes cannot be seen (python, node, a `-c` shell) and nothing else that
+    ///   writes: refused ADVISORY with the form that works, never unit-fatal;
+    /// - a program that writes in the form used, or ANY write target (the scan's view of where a
+    ///   program writes is not complete: `cp -t`, `sort -o`): unit-fatal, as before;
     /// - outside every root, or into another run's worktree under the read root: unit-fatal.
     #[test]
     fn a_cd_into_a_chat_read_root_is_a_read_unless_it_writes_1795() {
@@ -8879,11 +8926,15 @@ mod tests {
             format!("cd {r} && git tag -l 'v*' && git stash list"),
             format!("cd {r} && git worktree list && git reflog -5"),
             format!("cd {r} && git remote get-url origin"),
-            format!("cd {r} && grep -rn sum src > {w}/notes.txt"),
             format!("cd {r} && git log -3 2>/dev/null | head"),
             format!("git -C {r} branch -a"),
             format!("git -C {r} remote -v"),
             format!("git -C {r} tag"),
+            // agy r1 on #1849: the shell's redirections are not git's words.
+            format!("cd {r} && git branch -a 2>/dev/null"),
+            format!("cd {r} && git remote -v 2>&1 | head"),
+            format!("cd {r} && git tag 2> /dev/null"),
+            format!("git -C {r} branch --show-current 2>/dev/null"),
         ] {
             assert_eq!(check(&read), None, "a read: {read}");
         }
@@ -8892,6 +8943,7 @@ mod tests {
             format!("cd {r} && node -e 'console.log(1)'"),
             format!("cd {r} && bash -c 'ls src'"),
             format!("cd {r}/src && python3 - <<'PY'\nprint(1)\nPY"),
+            format!("cd {r} && python3 -c 'print(1)' 2>/dev/null"),
         ] {
             let (reason, fatal) = check(&maybe).unwrap_or_else(|| panic!("refused: {maybe}"));
             assert!(!fatal, "advisory, never a rules card: {maybe}: {reason}");
@@ -8924,11 +8976,44 @@ mod tests {
             format!("cd {o} && python3 -c 'print(1)'"),
             format!("cd {o} && git branch -a > out.txt"),
             format!("cd {s} && python3 -c 'print(1)'"),
+            // Codex r1 on #1849: an option of a reading git form writes a file.
+            format!("cd {r} && git reflog --output=victim"),
+            format!("cd {r} && git reflog '--output=victim'"),
+            format!("cd {r} && git stash show --output=victim"),
+            format!("cd {r} && git log --outp=victim"),
+            format!("git -C {r} reflog --output={r}/victim"),
+            format!("git -C {r} log --output={o}/new"),
+            format!("git -C {r} archive -o {r}/x.tar HEAD"),
+            format!("cd {r} && git fsck --lost-found"),
+            // Any write target keeps the `cd` fatal: where a program writes is not always the
+            // operand the scan reads (`cp -t`), or a target at all (`sort -o`).
+            format!("cd {r} && cp -t . {w}/payload"),
+            format!("cd {r} && sort -o victim {w}/input > {w}/notes"),
+            format!("cd {r} && grep -rn sum src > {w}/notes.txt"),
+            format!("cd {r} && python3 -c 'print(1)' > {w}/out.txt"),
+            // agy r1 on #1849: options before the reflog subcommand, a wrapped write, a write to a
+            // target only the shell can resolve.
+            format!("cd {r} && git reflog --all expire --expire=now"),
+            format!("git -C {r} reflog --updateref delete HEAD@{{0}}"),
+            format!("cd {r} && bash -c 'rm -rf src'"),
+            format!("cd {r} && sh -c 'git branch -D main'"),
+            format!("cd {r} && echo x > \"$f\""),
         ] {
             let (reason, fatal) =
                 check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
             assert!(fatal, "a write escape is fatal: {write}: {reason}");
         }
+        // Codex r1 on #1849: once the shared scan budget is spent, a rescan reads the command with
+        // main's grammar and can miss the `env -S` wrapper; the one classification made while the
+        // budget held decides, and the call stays blocked.
+        let padded = format!(
+            "{}cd {r} && env -S 'truncate -s 0 victim'",
+            " ".repeat(12_000)
+        );
+        assert!(
+            check(&padded).is_some(),
+            "an exhausted scan never admits it"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8954,6 +9039,10 @@ mod tests {
             &["reflog", "show", "-5"],
             &["reflog", "-5"],
             &["reflog", "exists", "main"],
+            &["grep", "-o", "x"],
+            &["archive", "--format=tar", "HEAD"],
+            &["fsck", "--full"],
+            &["log", "-O", "order.txt"],
             &[],
         ] {
             assert!(git_subcommand_reads(read), "{read:?}");
@@ -8977,9 +9066,24 @@ mod tests {
             &["worktree", "prune"],
             &["reflog", "expire"],
             &["reflog", "delete", "main@{0}"],
+            &["reflog", "--all", "expire", "--expire=now"],
+            &["reflog", "--updateref", "delete", "main@{0}"],
+            &["reflog", "main"],
             &["commit", "-m", "x"],
             &["fetch"],
             &["config", "user.name", "x"],
+            &["log", "--output=x"],
+            &["diff", "--output", "x"],
+            &["show", "'--output=x'"],
+            &["reflog", "--outp=x"],
+            &["stash", "show", "--output=x"],
+            &["stash", "list", "--output=x"],
+            &["branch", "-a", "--output=x"],
+            &["archive", "-o", "x.tar", "HEAD"],
+            &["archive", "-vox.tar", "HEAD"],
+            &["fsck", "--lost-found"],
+            &["grep", "-O", "x"],
+            &["grep", "--open-files-in-pager=vi", "x"],
         ] {
             assert!(!git_subcommand_reads(write), "{write:?}");
         }
