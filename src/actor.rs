@@ -23680,7 +23680,7 @@ pub(crate) mod sessions_detail_fold_tests {
         let s = session("judge-not-due-1799");
         let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
             let mut u = crate::domain::WorkUnit::pending(
-                &format!("judge-not-due-1799:{ord}"),
+                format!("judge-not-due-1799:{ord}"),
                 "judge-not-due-1799",
                 ord,
                 "step",
