@@ -22299,12 +22299,24 @@ fn judge_by_operator(
     let mut receipt = u.assurance.clone().unwrap_or_else(|| {
         crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
     });
-    // (xreview r1 on #1827) A step that never reached its gate's receipt (a failed tool the
-    // operator overrides at triage) says why the run's required judge was not due there, as its
-    // gate would have: the operator judged the failed check, not a seat's work.
-    if fresh {
-        receipt.account_required_judge(|| crate::pipeline::judge_not_due(&u, true, None));
-    }
+    // (xreview r1, r2 on #1827) Every receipt the judgment saves accounts for the run's required
+    // judge: a step that never reached its gate's receipt (a failed tool the operator overrides at
+    // triage) says why, as its gate would have; a receipt from before core#1799 that never said it
+    // is missing evidence, and says that.
+    receipt.account_required_judge(|| {
+        if fresh {
+            crate::pipeline::judge_not_due(&u, true, None)
+        } else {
+            (
+                crate::assurance::SKIP_ERROR,
+                format!(
+                    "unit {}'s gate receipt does not say whether a judge ran (a record from \
+                     before the engine said so): whether one was due is not known",
+                    u.ord
+                ),
+            )
+        }
+    });
     receipt.ran(crate::assurance::OPERATOR_JUDGE);
     // A floor override judges the FLOOR, not the work: the gate's own judge (the seat that ruled,
     // when one did) stays its judge. A judge-unavailable judgment stands in for the judge — and so
@@ -23710,13 +23722,25 @@ pub(crate) mod sessions_detail_fold_tests {
             why.detail
                 .as_deref()
                 .unwrap_or("")
-                .contains("no step reached a gate before this delivery"),
+                .contains("no step finished before this delivery"),
             "{why:?}"
         );
-        // A gate receipt from before core#1799 that never said the judge is missing evidence, not a
-        // judge that was not due: the delivery leaves it as it was.
+        // (xreview r2) A gate receipt from before core#1799 that never said the judge is missing
+        // evidence, not a judge that was not due: the delivery says it is not known — alone, and
+        // beside a newer gate's not-due skip, which never speaks for the whole run then.
         let legacy = |r: &mut a::AssuranceReceipt| r.ran(a::DISTINCT_EVALUATOR);
-        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &legacy), deliver]);
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &legacy), deliver.clone()]);
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[gate(1, &legacy), gate(2, &not_due), deliver.clone()],
+        );
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        // A step that finished with no receipt at all is not a first-step delivery.
+        let mut finished =
+            crate::domain::WorkUnit::pending("judge-not-due-1799:0", "judge-not-due-1799", 0, "x");
+        finished.status = crate::domain::UnitStatus::Done;
+        let d = crate::deliver_lift::delivery_receipt(&s, &[finished, deliver]);
         assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
     }
 
@@ -34056,6 +34080,36 @@ mod request_changes_tests {
         assert_eq!(
             judge(&d).map(|j| j.0).as_deref(),
             Some(a::SKIP_NOT_APPLICABLE)
+        );
+    }
+
+    /// (xreview r2 on #1827) A judgment saved over a receipt from before core#1799 that never
+    /// said the judge accounts for it too: as not known, never as an exemption.
+    #[test]
+    fn an_operator_judgment_over_a_legacy_receipt_says_the_judge_is_not_known() {
+        use crate::assurance as a;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "triage-legacy-1799";
+        seed_triage_check(&mut store, run_id);
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let mut units = crate::domain::session_units(&store, run_id).unwrap();
+        let mut legacy = a::AssuranceReceipt::for_run(&s.assurance, 7);
+        legacy.ran(a::DISTINCT_EVALUATOR);
+        units[3].assurance = Some(legacy);
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let (r, _events) = operator_judgment(&mut store, run_id, "inspected the output by hand");
+        r.unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let receipt = units[3].assurance.as_ref().unwrap();
+        let k = receipt
+            .skipped
+            .iter()
+            .find(|k| k.instrument == a::JUDGE)
+            .expect("the required judge is on the receipt");
+        assert_eq!(k.reason, a::SKIP_ERROR);
+        assert!(
+            k.detail.as_deref().unwrap_or("").contains("not known"),
+            "{k:?}"
         );
     }
 

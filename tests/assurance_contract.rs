@@ -363,7 +363,7 @@ fn a_required_judge_that_was_not_due_is_on_the_receipt_with_its_reason() {
     assert_eq!(skip["reason"], "not_applicable", "{skip}");
     let detail = skip["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("review that changes no files") && detail.contains("unit 2"),
+        detail.contains("unit 2 is a") && detail.contains("declares read-only"),
         "{detail}"
     );
     // Every gate of the run, the build's too, accounts for the required judge.
