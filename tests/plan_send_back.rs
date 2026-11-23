@@ -395,6 +395,7 @@ fn expect(ord: u32, rev: u32) -> Option<GateExpect> {
     Some(GateExpect {
         ord: Some(ord),
         plan_rev: Some(rev),
+        gate_seq: None,
     })
 }
 

@@ -11762,7 +11762,7 @@ fn pause_for_human_keyed(
     // DES-PROJECT-001 §5.3: the prompt is DURABLE STATE, not just an event — the session's
     // AwaitingHuman write and the open interaction_request commit in ONE batch, so a skin that
     // was not connected when this fired (or a daemon restarted after it) still finds the prompt.
-    let request = crate::interaction::open_gate_keyed(
+    let mut request = crate::interaction::open_gate_keyed(
         &session.id,
         ord,
         reviewing_ord,
@@ -11771,6 +11771,9 @@ fn pause_for_human_keyed(
         gate_key,
         crate::interaction::now_millis(),
     );
+    // (core#1808) This opening's number: an answer sent for an earlier opening at the same ord is
+    // refused `gate_changed` ([`confirm_gate_expecting`]).
+    request.gate_seq = crate::interaction::next_gate_seq(&*store, &session.id)?;
     crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
     emit(
         subscribers,
@@ -11803,6 +11806,7 @@ fn pause_for_human_keyed(
                 })
                 .flatten()
                 .map(Box::new),
+            gate_seq: request.gate_seq,
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -19567,6 +19571,27 @@ pub(crate) fn confirm_gate_expecting(
             "run {run_id} is not awaiting confirmation (status is {:?})",
             session.status
         );
+    }
+    // (core#1808) An answer that names the opening it was sent for answers only that opening: a
+    // gate that closed and re-opened since (a retry that landed on a new gate at the same ord, a
+    // re-held plan) is another opening, whatever its ord, kind or plan revision.
+    if let Some(want) = expect.and_then(|e| e.gate_seq) {
+        let open = crate::interaction::list_interactions(
+            &*store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )?
+        .into_iter()
+        .find(|r| r.kind == crate::interaction::InteractionKind::Gate)
+        .map(|r| r.gate_seq);
+        if open != Some(want) {
+            anyhow::bail!(
+                "{}: run {run_id}'s open gate is {}, not the one this answer was sent for \
+                 (opening {want}) — read the gate again",
+                crate::workflow::GATE_CHANGED,
+                open.map_or_else(|| "not open".to_string(), |n| format!("opening {n}")),
+            );
+        }
     }
     // (DES-TEAMING-002 P1) A team fact still in flight, or a `team_transport` pause answered with
     // anything but its three answers, is refused here — before the gate row resolves.
@@ -34060,6 +34085,7 @@ mod request_changes_tests {
             Some(crate::workflow::GateExpect {
                 ord: Some(1),
                 plan_rev: None,
+                gate_seq: None,
             }),
         );
         let why = result.unwrap_err().to_string();
@@ -44836,6 +44862,7 @@ mod plan_gate_confirm_tests {
                     Some(GateExpect {
                         ord: Some(2),
                         plan_rev: Some(1),
+                        gate_seq: None,
                     }),
                     &None,
                     &None,
@@ -44874,6 +44901,7 @@ mod plan_gate_confirm_tests {
                     Some(GateExpect {
                         ord: Some(2),
                         plan_rev: Some(1),
+                        gate_seq: None,
                     }),
                     &None,
                     &None,
@@ -44907,6 +44935,7 @@ mod plan_gate_confirm_tests {
             Some(GateExpect {
                 ord: Some(2),
                 plan_rev: Some(2),
+                gate_seq: None,
             }),
             &None,
             &None,

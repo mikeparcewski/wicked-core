@@ -83,6 +83,12 @@ pub struct InteractionRequest {
     /// Resolution timestamp (unix millis).
     #[serde(default)]
     pub resolved_at: Option<i64>,
+    /// (core#1808) Which opening of a gate this row is: one more than any gate row of its run
+    /// had when it opened ([`next_gate_seq`]), so a gate that closes and re-opens at the same ord
+    /// (a retry that lands on a new gate) is a different opening. A gate answer may name it
+    /// ([`crate::workflow::GateExpect::gate_seq`]); `0` on a row written before the field existed.
+    #[serde(default)]
+    pub gate_seq: u32,
 }
 
 impl ToNode for InteractionRequest {
@@ -187,7 +193,20 @@ pub fn open_gate_keyed(
         answer: None,
         created_at: now_ms,
         resolved_at: None,
+        gate_seq: 0,
     }
+}
+
+/// (core#1808) The number the next gate opening of `session_id` carries: one more than the
+/// highest any of its gate rows holds (answered ones included), so it never repeats in a run.
+pub fn next_gate_seq(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<u32> {
+    Ok(list_interactions(store, Some(session_id), None)?
+        .iter()
+        .filter(|r| r.kind == InteractionKind::Gate)
+        .map(|r| r.gate_seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1))
 }
 
 /// (core#1795) The node name of request `id` on run `session_id`: `{session_id}:{id}`. The name is

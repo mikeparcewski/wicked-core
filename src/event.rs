@@ -612,6 +612,10 @@ pub enum CoreEvent {
         /// (`choices` / `recommended` / `choiceLabels`) and its line (`repeatLine`). `None` for
         /// every other kind, and then ABSENT on the wire.
         repeat: Option<Box<crate::repeat::Signal>>,
+        /// (core#1808) Which opening of a gate this is (the durable row's `gate_seq`): a client
+        /// sends it back with the answer (`GateExpect::gate_seq`), and an answer for an earlier
+        /// opening is refused `gate_changed` even at the same ord. `gateSeq` on the wire.
+        gate_seq: u32,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
@@ -2322,8 +2326,9 @@ impl CoreEvent {
                 finding_ids,
                 consent,
                 repeat,
+                gate_seq,
             } => {
-                let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind });
+                let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind, "gateSeq": gate_seq });
                 if let Some(offer) = consent {
                     for (k, v) in crate::consent_plan::event_fields(offer) {
                         j[k] = v;
@@ -3773,6 +3778,7 @@ mod tests {
                 },
                 consent: None,
                 repeat: None,
+                gate_seq: 0,
             }
             .to_json()
         };

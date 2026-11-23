@@ -85,6 +85,12 @@ pub struct GateActions {
     /// A plan gate's held revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_rev: Option<u32>,
+    /// (core#1808) Which opening of the gate this is (the open row's `gate_seq`, as
+    /// `awaitingHuman.gateSeq` said): an answer names it to answer only this opening. Absent when
+    /// no gate row is open (a held plan whose row a crash left answered), or the open row was
+    /// written before the field existed (`0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_seq: Option<u32>,
     /// In the order a skin offers them: approve, the named arms, send back, reassign, reject.
     /// EMPTY while nothing is answerable (a team fact still publishing).
     pub actions: Vec<GateAction>,
@@ -143,6 +149,12 @@ pub(crate) fn gate_actions(
         .find_map(|r| r.ord)
         .or(cursor.map(|u| u.ord))
         .unwrap_or(0);
+    let gate_seq = open
+        .iter()
+        .find(|r| r.kind == crate::interaction::InteractionKind::Gate)
+        .map(|r| r.gate_seq)
+        // A row written before the field existed carries 0: no opening to name, none to send.
+        .filter(|s| *s > 0);
 
     // A plan gate answers only through its own arm ([`super::confirm_gate_expecting`]): its open
     // row, or a held plan whose row a crash left answered (re-opened there) — unless a team fact
@@ -155,7 +167,9 @@ pub(crate) fn gate_actions(
             .find(|r| r.gate_kind.as_deref() == Some(crate::plan_gate::GATE_KIND))
             .and_then(|r| r.ord)
             .unwrap_or(ord);
-        return Ok(Some(plan_actions(cursor, plan_ord, held.map(|p| p.rev))));
+        let mut plan = plan_actions(cursor, plan_ord, held.map(|p| p.rev));
+        plan.gate_seq = gate_seq;
+        return Ok(Some(plan));
     }
 
     let gate_kind = open
@@ -173,6 +187,7 @@ pub(crate) fn gate_actions(
         ord,
         gate_kind,
         plan_rev: None,
+        gate_seq,
         actions,
     }))
 }
@@ -220,6 +235,7 @@ fn plan_actions(cursor: Option<&WorkUnit>, ord: u32, rev: Option<u32>) -> GateAc
         ord,
         gate_kind: crate::plan_gate::GATE_KIND.to_string(),
         plan_rev: rev,
+        gate_seq: None,
         actions,
     }
 }
