@@ -1109,6 +1109,12 @@ const SEAT_BUILDERS: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "validator.rs",
+        "judge_on_stand_in",
+        1,
+        "under the per-unit Stamping runner (the stand-in gate judge, DES-STANDIN-001 §3.6)",
+    ),
+    (
+        "validator.rs",
         "reprobe_seat",
         1,
         "EXEMPT: seat readiness probe (takes_block refuses it)",
