@@ -1629,6 +1629,12 @@ fn core_1803_a_cite_that_continues_past_a_changed_path_does_not_name_it() {
         "fixtures/data.json-old is unchanged",
         "old+fixtures/data.json is unchanged",
         "fixtures/data.json.bak.",
+        // codex r1: a dash before the path continues another name; an anchor that is no line.
+        "old—fixtures/data.json is unchanged",
+        "old–fixtures/data.json is unchanged",
+        "fixtures/data.json#backup is unchanged",
+        "fixtures/data.json#L4x is unchanged",
+        "fixtures/data.json#L4-backup is unchanged",
     ] {
         assert!(!ok(longer), "{longer:?} names a longer path");
     }
@@ -1645,6 +1651,10 @@ fn core_1803_a_cite_that_continues_past_a_changed_path_does_not_name_it() {
         "src/b.rs,fixtures/data.json keep the shape",
         "fixtures/data.json — keeps the shape",
         "is it fixtures/data.json? yes",
+        "kept — fixtures/data.json keeps the shape",
+        "[the rows](fixtures/data.json#L10-L20) keep the shape",
+        "fixtures/data.json#L4 keeps the shape",
+        "fixtures/data.json#L4-12.",
     ] {
         assert!(ok(named), "{named:?} names the path");
     }
@@ -4345,6 +4355,35 @@ fn core_1474_part_answers_combine_broken_first_then_misses_then_kept() {
         "a part that could not decide leaves it unanswered"
     );
     assert_eq!(c.answers["N"].status, RuleStatus::NotApplicable);
+}
+
+/// (core#1789, codex r1) Two parts that broke one rule keep both claims, and a reviewer's two
+/// BROKEN lines both stand (an echo is one claim): a council scoped to the files the readings name
+/// must see each file a break was claimed in.
+#[test]
+fn core_1789_every_broken_claim_is_kept_in_the_reading() {
+    let a = |c: &str| Answer {
+        status: RuleStatus::Broken,
+        cite: c.into(),
+    };
+    let p = |c: &str| Parsed {
+        answers: [("B".to_string(), a(c))].into_iter().collect(),
+        misses: BTreeMap::new(),
+    };
+    let c = combine_parts(&[p("src/a.rs untyped"), p("src/b.rs untyped")], &["B"], 2);
+    assert_eq!(
+        c.answers["B"].cite,
+        format!("part 1 of 2: src/a.rs untyped{CLAIM_SEP}part 2 of 2: src/b.rs untyped")
+    );
+    let r = seat_positions(
+        "RULE B: BROKEN — src/a.rs untyped\nRULE B: BROKEN — src/b.rs untyped\n\
+         RULE B: BROKEN — src/a.rs untyped\n",
+        &["B"],
+    );
+    assert_eq!(
+        r.by_id["B"].cite,
+        format!("src/a.rs untyped{CLAIM_SEP}src/b.rs untyped")
+    );
 }
 
 /// (core#1474) The issue's case: a 250 KB lock and a code change. Every rule is answered on the

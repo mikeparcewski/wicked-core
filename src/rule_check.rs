@@ -1614,8 +1614,12 @@ fn scoped_sections(diff: &str, scope: &[&str]) -> Option<String> {
     (found.len() == scope.iter().collect::<BTreeSet<_>>().len()).then_some(out)
 }
 
+/// (core#1789) What joins two BROKEN claims on one rule in one reading: two parts that broke it,
+/// or two BROKEN lines of the reviewer's. A scoped council needs a changed file named in each.
+pub const CLAIM_SEP: &str = " ‖ ";
+
 /// (core#1474) The answers of one batch's parts, combined per rule: BROKEN if any part broke it
-/// (its cite names the part); else the first miss, a holding miss first (no answer); else WAIVED if
+/// (its cite names each part that did, [`CLAIM_SEP`]); else the first miss, a holding miss first (no answer); else WAIVED if
 /// any part waived it; else KEPT if any part kept it; else the first part's answer (N/A).
 fn combine_parts(parts: &[Parsed], ids: &[&str], n: usize) -> Parsed {
     let mut out = Parsed::default();
@@ -1630,8 +1634,21 @@ fn combine_parts(parts: &[Parsed], ids: &[&str], n: usize) -> Parsed {
             status: a.status,
             cite: format!("part {k} of {n}: {}", a.cite),
         };
-        if let Some((k, a)) = answers.iter().find(|(_, a)| a.status == RuleStatus::Broken) {
-            out.answers.insert(id.to_string(), named(*k, a));
+        let broke: Vec<String> = answers
+            .iter()
+            .filter(|(_, a)| a.status == RuleStatus::Broken)
+            .map(|(k, a)| named(*k, a).cite)
+            .collect();
+        if !broke.is_empty() {
+            // (core#1789, codex r1) Every part's claim, not the first: a council scoped to the
+            // files the readings name must see each file a break was claimed in.
+            out.answers.insert(
+                id.to_string(),
+                Answer {
+                    status: RuleStatus::Broken,
+                    cite: broke.join(CLAIM_SEP),
+                },
+            );
         } else if let Some(m) = misses.iter().find(|m| m.holds()).or_else(|| misses.first()) {
             out.misses.insert(id.to_string(), (*m).clone());
         } else if let Some((k, a)) = [RuleStatus::Waived, RuleStatus::Kept]
@@ -2008,6 +2025,7 @@ fn rule_line<'a>(
 /// (`data.json+backup`, `data.json._backup`, a non-ASCII letter), so the shorter path is not named.
 /// `,` `;` `:` close a path (`src/a.rs:10`, `a.rs,b.rs`); `.` `!` `?` `…` and dashes close it only
 /// at a sentence end, before whitespace, the text's end or closing punctuation (`see src/a.rs.`).
+/// A dash opens one only after whitespace, and a Markdown line anchor (`#L10-L20`) may follow one.
 fn names_whole_path(text: &str, path: &str) -> bool {
     // Opens a path when it stands before one.
     let opens = |c: char| {
@@ -2031,8 +2049,6 @@ fn names_whole_path(text: &str, path: &str) -> bool {
                     | '«'
                     | '「'
                     | '『'
-                    | '—'
-                    | '–'
             )
     };
     // Closes a path whatever follows.
@@ -2060,17 +2076,51 @@ fn names_whole_path(text: &str, path: &str) -> bool {
     };
     // Closes a path only at a sentence end.
     let ends = |c: char| matches!(c, '.' | '!' | '?' | '…' | '—' | '–');
-    let closed_after = |rest: &str| rest.chars().find(|c| !ends(*c)).is_none_or(closes);
+    let closed_after = |rest: &str| {
+        // A Markdown line anchor (`src/a.rs#L10`, `#L10-L20`) is part of the cite, not the name.
+        let rest = line_anchor(rest).unwrap_or(rest);
+        rest.chars().find(|c| !ends(*c)).is_none_or(closes)
+    };
+    // A dash opens a path only as prose punctuation: after whitespace or at the start (codex r1:
+    // `old—fixtures/data.json` is another name).
+    let opened_before = |head: &str| {
+        let mut back = head.chars().rev();
+        match back.next() {
+            None => true,
+            Some('—' | '–') => back.next().is_none_or(char::is_whitespace),
+            Some(c) => opens(c),
+        }
+    };
     let mut from = 0;
     while let Some(i) = text[from..].find(path) {
         let at = from + i;
-        let before_ok = text[..at].chars().next_back().is_none_or(opens);
+        let before_ok = opened_before(&text[..at]);
         if before_ok && closed_after(&text[at + path.len()..]) {
             return true;
         }
         from = at + path.len();
     }
     false
+}
+
+/// (core#1803, codex r1) What follows a Markdown line anchor at the start of `rest` (`#L10`,
+/// `#L10-L20`, `#L10-20`); `None` when `rest` does not start with one.
+fn line_anchor(rest: &str) -> Option<&str> {
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let r = rest.strip_prefix("#L")?;
+    let n = digits(r);
+    if n == 0 {
+        return None;
+    }
+    let r = &r[n..];
+    let Some(tail) = r.strip_prefix('-') else {
+        return Some(r);
+    };
+    let tail = tail.strip_prefix('L').unwrap_or(tail);
+    match digits(tail) {
+        0 => Some(r),
+        m => Some(&tail[m..]),
+    }
 }
 
 /// A cite that rests on what the person asked rather than on the change.
@@ -2729,7 +2779,8 @@ pub struct SeatPositions {
 /// (DES-RULE-CHECK-001 rev 2, A.1) The reviewer's positions on `ids`, read from its WHOLE output
 /// (no window): its `RULE <id>: KEPT|BROKEN|N/A|DEFERRED — <cite>` lines, with the id matched as the
 /// judge's answers are. ANY BROKEN line for an id makes its position BROKEN — a second, conflicting
-/// or echoed line never hides it. Otherwise the last KEPT or N/A line is the position, and a rule
+/// or echoed line never hides it — and its cite joins every distinct BROKEN line's ([`CLAIM_SEP`]).
+/// Otherwise the last KEPT or N/A line is the position, and a rule
 /// with only DEFERRED lines is DEFERRED. A capture the runner cut is marked `cut`.
 pub fn seat_positions(output: &str, ids: &[&str]) -> SeatPositions {
     const WORDS: &[(&str, Option<RuleStatus>)] = &[
@@ -2751,7 +2802,16 @@ pub fn seat_positions(output: &str, ids: &[&str]) -> SeatPositions {
         };
         match status {
             RuleStatus::Broken => {
-                broken.insert(id.to_string(), cite);
+                // (core#1789, codex r1) Each BROKEN line is a claim a scoped council must see.
+                broken
+                    .entry(id.to_string())
+                    .and_modify(|c: &mut String| {
+                        if !c.split(CLAIM_SEP).any(|k| k == cite) {
+                            c.push_str(CLAIM_SEP);
+                            c.push_str(&cite);
+                        }
+                    })
+                    .or_insert(cite);
             }
             RuleStatus::Deferred => {
                 deferred.insert(id.to_string(), cite);
@@ -2873,35 +2933,58 @@ impl Evidence {
     /// (core#1789) The evidence of a dispute on a change too big for a ballot whole: the whole diff
     /// of each changed file (git's own list) that either reading names by its whole path, the same
     /// way a paged rule's re-check is scoped to the files its parts named (core#1278 item 4), with
-    /// the other changed files listed as not shown. With the files the voters could check: a KEPT
-    /// vote names one of them. `None` (the dispute holds as before) unless the BROKEN reading
-    /// names a changed file, and every file named has a section in the diff (git quoted none).
+    /// the other changed files listed as not shown. With the files shown (both sides of a rename
+    /// whose section is shown): a KEPT vote names one of them.
+    ///
+    /// `None` (the dispute holds as before) unless EVERY BROKEN claim names a changed file (each
+    /// part that broke the rule and each BROKEN line of the reviewer's, [`CLAIM_SEP`]): a claim
+    /// the council cannot be shown the file of could be cleared by a ruling on other files (codex
+    /// r1). Also `None` when a named file has no section in the diff (git quoted its header).
     pub fn of_named_files(
         row: &RuleVerdict,
         change: &Change,
         floor: Option<&str>,
         positions: &[RulePosition],
     ) -> Option<(Evidence, Vec<String>)> {
-        let named_by = |p: &RulePosition| -> Vec<&str> {
-            change
-                .paths
-                .iter()
-                .map(|(f, _)| f.as_str())
-                .filter(|f| f.len() >= 3 && names_whole_path(&p.cite, f))
+        let all: Vec<&str> = change
+            .paths
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .filter(|f| f.len() >= 3)
+            .collect();
+        let named_in = |text: &str| -> Vec<&str> {
+            all.iter()
+                .copied()
+                .filter(|f| names_whole_path(text, f))
                 .collect()
         };
-        let broken = positions.iter().find(|p| p.status == RuleStatus::Broken)?;
-        if named_by(broken).is_empty() {
+        let claims: Vec<&str> = positions
+            .iter()
+            .filter(|p| p.status == RuleStatus::Broken)
+            .flat_map(|p| p.cite.split(CLAIM_SEP))
+            .collect();
+        if claims.is_empty() || claims.iter().any(|c| named_in(c).is_empty()) {
             return None;
         }
-        let named: BTreeSet<&str> = positions.iter().flat_map(named_by).collect();
+        let named: BTreeSet<&str> = positions.iter().flat_map(|p| named_in(&p.cite)).collect();
         let named: Vec<&str> = named.into_iter().collect();
         let shown = scoped_sections(&change.diff, &named)?;
+        // Every changed path a shown section's header names: a rename shows both its sides.
+        let headers: Vec<&str> = shown
+            .lines()
+            .filter(|l| l.starts_with("diff --git "))
+            .collect();
+        let on_view: BTreeSet<&str> = change
+            .paths
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .filter(|f| named.contains(f) || headers.iter().any(|h| header_names(h, f)))
+            .collect();
         let not_shown = change
             .paths
             .iter()
             .map(|(f, _)| f.clone())
-            .filter(|f| !named.contains(&f.as_str()))
+            .filter(|f| !on_view.contains(f.as_str()))
             .collect();
         Some((
             Evidence {
@@ -2909,7 +2992,7 @@ impl Evidence {
                 not_shown: Some(not_shown),
                 ..Evidence::of_change(row, change, floor)
             },
-            named.into_iter().map(str::to_string).collect(),
+            on_view.into_iter().map(str::to_string).collect(),
         ))
     }
 }

@@ -534,6 +534,58 @@ fn core_1789_a_paged_dispute_reaches_a_council_on_the_files_the_readings_named()
     assert!(Evidence::of_named_files(&vague, &c, None, &pos).is_none());
 }
 
+/// (core#1789, codex r1) A scoped council sees every file a BROKEN claim names, and no scope is
+/// drawn when one claim names none (a ruling on other files would clear it). A rename's section
+/// shows both its sides, so a vote naming the new name counts and it is not listed as not shown.
+#[test]
+fn core_1789_a_scoped_council_sees_every_claim_and_both_sides_of_a_rename() {
+    let b = "diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-fn b() {}\n+fn b(x: f64) {}\n";
+    let big = format!(
+        "{DIFF}{b}diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{}",
+        "+\"BIG-ROW\"\n".repeat(20 * 1024)
+    );
+    let c = change_of(&big, &["src/add.rs", "src/b.rs", "gen/big.json"]);
+    let two = judged(
+        "R1",
+        RuleStatus::Broken,
+        &format!("part 1 of 3: src/add.rs:1 untyped{CLAIM_SEP}part 2 of 3: src/b.rs:1 untyped"),
+    );
+    let pos = positions_for(&two, RuleStatus::Kept);
+    let (_, shown) = Evidence::of_named_files(&two, &c, None, &pos).expect("scoped");
+    assert_eq!(
+        shown,
+        vec!["src/add.rs".to_string(), "src/b.rs".to_string()]
+    );
+    let vague = judged(
+        "R1",
+        RuleStatus::Broken,
+        &format!("part 1 of 3: src/add.rs:1 untyped{CLAIM_SEP}part 3 of 3: the rows are untyped"),
+    );
+    let pos = positions_for(&vague, RuleStatus::Kept);
+    assert!(
+        Evidence::of_named_files(&vague, &c, None, &pos).is_none(),
+        "a claim naming no changed file gives no scope"
+    );
+    // A rename: git's list names both sides (no rename detection), the diff one section.
+    let renamed = format!(
+        "diff --git a/src/old.rs b/src/new.rs\nsimilarity index 90%\nrename from src/old.rs\n\
+         rename to src/new.rs\n@@ -1 +1 @@\n-fn o() {{}}\n+fn o(x: i32) {{}}\n\
+         diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{}",
+        "+\"BIG-ROW\"\n".repeat(20 * 1024)
+    );
+    let c = change_of(&renamed, &["src/old.rs", "src/new.rs", "gen/big.json"]);
+    let row = judged("R1", RuleStatus::Broken, "src/old.rs:1 untyped");
+    let pos = positions_for(&row, RuleStatus::Kept);
+    let (ev, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
+    assert_eq!(
+        shown,
+        vec!["src/new.rs".to_string(), "src/old.rs".to_string()]
+    );
+    assert_eq!(ev.not_shown, Some(vec!["gen/big.json".to_string()]));
+}
+
 // ── A.5 reuse ───────────────────────────────────────────────────────────────────────────────────
 
 #[test]
