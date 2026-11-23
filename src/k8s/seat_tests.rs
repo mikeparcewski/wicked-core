@@ -3656,13 +3656,369 @@ fn k8s_one_shot_scopes_never_collide_on_a_label() {
     assert!(seat::one_shot_scope("run-1").is_none());
 }
 
+/// wicked-garden#1365: every claude seat with a config home is handed its record path (so its
+/// units clean it), and only a claude seat signed in by a token is handed a record, in claude's
+/// own env-token shape. Every other CLI gets neither. Red on the reverted wrapper handoff: no
+/// record, so a `claude -p` the seat starts from its Bash tool is "Not logged in".
+#[test]
+fn k8s_only_a_claude_oauth_seat_is_handed_a_credential_record() {
+    // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+    let token = format!("sk-ant-oat01-{}", "W".repeat(40));
+    let vars = vec![
+        ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone()),
+        ("CLAUDE_CONFIG_DIR".to_string(), "/seat/claude/".to_string()),
+    ];
+    let file = (
+        "WICKED_CLAUDE_RECORD_FILE".to_string(),
+        "/seat/claude/.credentials.json".to_string(),
+    );
+    let record = seat::claude_record_vars("claude", &vars);
+    assert_eq!(
+        record.len(),
+        2,
+        "{:?}",
+        record.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+    assert_eq!(record[0], file);
+    assert_eq!(record[1].0, "WICKED_CLAUDE_RECORD");
+    let body: serde_json::Value = serde_json::from_str(&record[1].1).unwrap();
+    assert_eq!(body["claudeAiOauth"]["accessToken"], token.as_str());
+    assert!(body["claudeAiOauth"]["refreshToken"].is_null());
+    assert!(body["claudeAiOauth"]["expiresAt"].is_null());
+    // An API-key claude seat: the path alone, so the wrapper only cleans.
+    assert_eq!(seat::claude_record_vars("claude", &vars[1..]), [file]);
+    assert!(seat::claude_record_vars("codex", &vars).is_empty());
+    assert!(seat::claude_record_vars("claude", &vars[..1]).is_empty());
+}
+
+/// The stub kubectl of the wicked-garden#1365 tests: it logs every call's argv
+/// (`kubectl-argv.log`) and keeps the unit body `finalize` hands the pod on stdin (`unit-body`).
+#[cfg(unix)]
+fn record_kube(dir: &Path) -> super::Kube {
+    let kubectl = dir.join("kubectl");
+    crate::test_env::install_stub(
+        &kubectl,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+             case \" $* \" in *' exec -i '*) /bin/cat > '{body}';; esac\nexit 0\n",
+            log = dir.join("kubectl-argv.log").display(),
+            body = dir.join("unit-body").display()
+        ),
+    );
+    super::Kube {
+        kubectl,
+        kubeconfig: None,
+        context: "t".into(),
+        owner: "o".into(),
+    }
+}
+
+/// A registered `cli` seat (tree `dir`) finalized for a launch command with `envs`, as the runner
+/// does right before the unit's exec. Returns the live seat and its id.
+#[cfg(unix)]
+fn finalized_seat(
+    kube: &super::Kube,
+    dir: &Path,
+    cli: &str,
+    envs: &[(String, String)],
+) -> (std::sync::Arc<seat::Seat>, String) {
+    // Alphanumeric only: `seat_id_of` reads no other marker, and finalize would pass it by.
+    let id = format!("record{}", uuid::Uuid::new_v4().simple());
+    let live = seat::register_for_test(kube, &id, dir, cli);
+    // spawn-audit: test-only — never spawned: finalize reads its args and env, and spawns the stub.
+    let mut cmd = std::process::Command::new("kubectl");
+    cmd.args([
+        "exec",
+        "-i",
+        "-c",
+        "seat",
+        "seat-1",
+        "--",
+        "sh",
+        "-c",
+        seat::WRAPPER,
+    ])
+    .arg(format!("{}{id}", seat::MARKER_PREFIX))
+    .args(["/floor/landrun", "--", "/floor/launch", cli, "-p", "hi"]);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let finalized = seat::finalize(&cmd);
+    assert!(matches!(finalized, Ok(Some(_))), "{:?}", finalized.err());
+    (live, id)
+}
+
+/// The unit file `finalize` hands a registered `cli` seat for a launch command with `envs`, as
+/// the pod's exec receives it on stdin (a stub kubectl keeps it).
+#[cfg(unix)]
+fn unit_body_from_finalize(dir: &Path, cli: &str, envs: &[(String, String)]) -> String {
+    let kube = record_kube(dir);
+    let (live, id) = finalized_seat(&kube, dir, cli, envs);
+    seat::forget_for_test(&id);
+    drop(live);
+    std::fs::read_to_string(dir.join("unit-body")).unwrap()
+}
+
+/// Runs [`seat::WRAPPER`] on the host as the pod runs it, on a unit `body` from
+/// [`unit_body_from_finalize`] whose argv is replaced by `/bin/sh -c script`.
+/// Every argv the wrapper hands `/floor/busybox` is logged to `busybox-argv.log`.
+#[cfg(unix)]
+fn run_wrapper(host: &Path, body: &str, script: &str) -> std::process::Output {
+    let unit = host.join("unit");
+    std::fs::create_dir_all(&unit).unwrap();
+    let body = body.replace("/wicked-unit", &unit.to_string_lossy());
+    let env_part = &body[..body.rfind("set --").expect("the body ends with its argv")];
+    std::fs::write(
+        unit.join("env"),
+        format!(
+            "{env_part}{}",
+            seat::argv_line(&["/bin/sh".into(), "-c".into(), script.into()]).unwrap()
+        ),
+    )
+    .unwrap();
+    // `/floor/busybox` is a shim that logs every argv it is given (`busybox-argv.log`).
+    let shim = host.join("busybox");
+    crate::test_env::install_stub(
+        &shim,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec /usr/bin/env \"$@\"\n",
+            host.join("busybox-argv.log").display()
+        ),
+    );
+    let wrapper = seat::WRAPPER
+        .replace("/wicked-unit", &unit.to_string_lossy())
+        .replace("/floor/busybox", &shim.to_string_lossy());
+    std::process::Command::new("/bin/sh")
+        .hardened()
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .args(["-c", &wrapper])
+        .output()
+        .unwrap()
+}
+
+/// wicked-garden#1365, through the production handoff: the unit file `finalize` builds for a
+/// claude OAuth seat makes the wrapper write the record before the CLI starts, so the CLI and
+/// anything it starts read it from its config home. The carriers never reach the CLI (unset by
+/// the wrapper and never named to landrun). Whatever a seat or an interrupted unit left at the
+/// record path or its temporary name (a directory, a link) is removed first and never followed,
+/// and both names are removed once the CLI exits, whatever its exit code.
+#[cfg(unix)]
+#[test]
+fn k8s_the_wrapper_holds_the_claude_record_only_while_the_cli_runs() {
+    let host = tmp("claude-record");
+    let cfg = host.join("cfg");
+    let rec = cfg.join(".credentials.json");
+    let tmp_name = cfg.join(".credentials.json.wicked-tmp");
+    std::fs::create_dir_all(rec.join("planted-dir")).unwrap();
+    let target = host.join("planted-target");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, &tmp_name).unwrap();
+    let token = format!("sk-ant-oat01-{}", "X".repeat(40));
+    let body = unit_body_from_finalize(
+        &host,
+        "claude",
+        &[
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), token.clone()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                cfg.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+    let argv = &body[body.rfind("set --").unwrap()..];
+    assert!(argv.contains("'--env' 'CLAUDE_CODE_OAUTH_TOKEN'"), "{argv}");
+    assert!(
+        !argv.contains("WICKED_CLAUDE"),
+        "landrun is never told the carriers: {argv}"
+    );
+    let out = run_wrapper(
+        &host,
+        &body,
+        "cat \"$CLAUDE_CONFIG_DIR/.credentials.json\" > seen; env > seen-env; exit 3",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(host.join("seen")).unwrap()).unwrap();
+    assert_eq!(seen["claudeAiOauth"]["accessToken"], token.as_str());
+    let seen_env = std::fs::read_to_string(host.join("seen-env")).unwrap();
+    assert!(
+        !seen_env.contains("WICKED_CLAUDE_RECORD"),
+        "the carriers never reach the CLI"
+    );
+    assert!(
+        !seen_env.contains("claudeAiOauth"),
+        "nor does the record, by any name"
+    );
+    // The record is written by the shell's builtin printf: no exec argv ever carries it (node
+    // exec auditing records argv). Red with `/floor/busybox printf`.
+    let argv = std::fs::read_to_string(host.join("busybox-argv.log")).unwrap();
+    assert!(
+        argv.contains("mv -f"),
+        "the shim saw the wrapper's execs: {argv}"
+    );
+    assert!(!argv.contains(&token), "the token rode an exec argv");
+    assert!(
+        !argv.contains("claudeAiOauth"),
+        "the record rode an exec argv"
+    );
+    assert!(
+        !rec.exists() && !rec.is_symlink(),
+        "removed once the CLI exits"
+    );
+    assert!(!tmp_name.exists() && !tmp_name.is_symlink());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert_eq!(
+        std::fs::read_to_string(host.join("unit/rc")).unwrap(),
+        "3\n"
+    );
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+/// wicked-garden#1365: an API-key claude seat is handed no record, and its unit still removes a
+/// record (and a temporary name) a unit that ended without its wrapper left behind, before its
+/// CLI starts.
+#[cfg(unix)]
+#[test]
+fn k8s_an_api_key_claude_unit_removes_a_left_record() {
+    let host = tmp("claude-record-apikey");
+    let cfg = host.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join(".credentials.json"), "left").unwrap();
+    std::fs::write(cfg.join(".credentials.json.wicked-tmp"), "left").unwrap();
+    let body = unit_body_from_finalize(
+        &host,
+        "claude",
+        &[
+            ("ANTHROPIC_API_KEY".into(), "k".into()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                cfg.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+    assert!(body.contains("export WICKED_CLAUDE_RECORD_FILE="));
+    assert!(!body.contains("export WICKED_CLAUDE_RECORD="));
+    let out = run_wrapper(
+        &host,
+        &body,
+        "for f in \"$CLAUDE_CONFIG_DIR\"/.credentials.json*; do [ -e \"$f\" ] && exit 9; done; exit 0",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_dir(&cfg).unwrap().count(), 0);
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+/// wicked-garden#1365: a record the wrapper cannot remove after the CLI fails the unit (125),
+/// with a named reason, never a success that leaves the token behind silently.
+#[cfg(unix)]
+#[test]
+fn k8s_a_claude_record_that_cannot_be_removed_fails_the_unit() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let host = tmp("claude-record-stuck");
+    let cfg = host.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let body = unit_body_from_finalize(
+        &host,
+        "claude",
+        &[
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                format!("sk-ant-oat01-{}", "Y".repeat(40)),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                cfg.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+    // The CLI makes its config home read-only: the record can no longer be removed.
+    let out = run_wrapper(&host, &body, "chmod a-w \"$CLAUDE_CONFIG_DIR\"; exit 0");
+    let stuck = std::fs::metadata(cfg.join(".credentials.json")).is_ok();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if stuck {
+        assert_eq!(out.status.code(), Some(125));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("could not be removed"));
+        assert_eq!(
+            std::fs::read_to_string(host.join("unit/rc")).unwrap(),
+            "125\n"
+        );
+    } else {
+        // Root ignores the mode bits (a container CI runner): the record was removed after all.
+        assert_eq!(out.status.code(), Some(0));
+    }
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+/// wicked-garden#1365: a claude unit that times out, is cancelled or is abandoned before it
+/// settles (`None`: its guard reaps it) never reaches the wrapper's cleanup (its pod is deleted
+/// under it), so the record and its temporary name are removed in the pod first. No kubectl argv
+/// carries the token.
+#[cfg(unix)]
+#[test]
+fn k8s_a_claude_unit_that_never_reaches_its_cleanup_has_its_record_removed_before_its_pod_goes() {
+    for ending in [Some(Ending::TimedOut), Some(Ending::Cancelled), None] {
+        let host = tmp("claude-record-settle");
+        let cfg = host.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let token = format!("sk-ant-oat01-{}", "Z".repeat(40));
+        let kube = record_kube(&host);
+        let (live, id) = finalized_seat(
+            &kube,
+            &host,
+            "claude",
+            &[
+                ("CLAUDE_CODE_OAUTH_TOKEN".into(), token.clone()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    cfg.to_string_lossy().into_owned(),
+                ),
+            ],
+        );
+        match ending {
+            Some(ending) => assert_eq!(seat::settle(&live, ending), Ok(-1)),
+            None => seat::reap(&id),
+        }
+        seat::forget_for_test(&id);
+        let log = std::fs::read_to_string(host.join("kubectl-argv.log")).unwrap();
+        let rec = format!("{}/.credentials.json", cfg.display());
+        let removal =
+            format!("exec -c seat seat-1 -- /floor/busybox rm -rf {rec} {rec}.wicked-tmp");
+        let lines: Vec<&str> = log.lines().collect();
+        let rm = lines
+            .iter()
+            .position(|l| l.ends_with(&removal))
+            .unwrap_or_else(|| panic!("{ending:?}: no record removal: {log}"));
+        let gone = lines
+            .iter()
+            .position(|l| l.contains("sandboxes.agents.x-k8s.io"))
+            .unwrap_or_else(|| panic!("{ending:?}: no pod deletion: {log}"));
+        assert!(
+            rm < gone,
+            "{ending:?}: removed after the pod's deletion began: {log}"
+        );
+        assert!(!log.contains(&token), "a kubectl argv carried the token");
+        std::fs::remove_dir_all(host).unwrap();
+    }
+}
+
 /// r6 #5: a wrapper setup failure writes its rc, so it is the unit's failure (exit 125), never a
 /// lost stream.
 #[test]
 fn k8s_a_wrapper_setup_failure_is_an_exit_code_not_a_lost_stream() {
     assert_eq!(
         seat::WRAPPER.matches("echo 125 > $u/rc; exit 125").count(),
-        3
+        4
     );
     assert_eq!(seat::exit_code(125, Some("125\n")), Some(125));
 }

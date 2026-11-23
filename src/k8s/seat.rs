@@ -43,13 +43,72 @@ use crate::worker_sandbox::FloorUnarmed;
 /// and `set --` with the launcher and CLI argv, so neither a secret nor the prompt is ever on the
 /// exec's argv, which is a URL query on the API server), its working directory entered, the
 /// launcher run, its exit code written where [`settle`] reads it.
+///
+/// A claude seat's credential record ([`claude_record_vars`], wicked-garden#1365) lives in its
+/// config home only while the launcher runs. Before it, the record path and its temporary name
+/// are removed (whatever a seat or an interrupted unit left there, a planted link or directory
+/// included), and an OAuth seat's record is written under the temporary name with no-clobber,
+/// then renamed in place. After the launcher exits, whatever its exit code, both names are
+/// removed again; a removal that fails makes the unit fail (exit 125). The record is written by
+/// the shell's builtin `printf`, never an exec, so it is on no process's argv (node exec auditing
+/// records argv). An API-key claude seat is handed the path alone, so its units only clean. The
+/// carrier variables are unset before the launcher (and landrun passes no variable it is not
+/// named), so the record never reaches the host or the replica codec. A unit that times out, is
+/// cancelled or loses its exec stream never reaches the wrapper's cleanup: [`settle_unless`]
+/// (or [`reap`], for a unit abandoned before it settles) removes the record in the pod, best
+/// effort and bounded, before deleting it. Residual: a pod or daemon that dies before the unit
+/// settles (eviction, node loss, a daemon crash), or a removal that fails, leaves the record in
+/// that seat's replica until the next unit of that run and posture removes it, or the run's
+/// teardown.
 pub(crate) const WRAPPER: &str = "set -u; u=/wicked-unit; \
 [ -f $u/env ] || { echo 'wicked-seat: the unit env is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 . $u/env; /floor/busybox rm -f $u/env; \
 [ $# -gt 0 ] || { echo 'wicked-seat: the unit argv is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 cd \"$WICKED_UNIT_CWD\" || { echo 'wicked-seat: the unit directory is missing' >&2; echo 125 > $u/rc; exit 125; }; \
-unset WICKED_UNIT_CWD; \"$@\"; rc=$?; \
+unset WICKED_UNIT_CWD; \
+c=${WICKED_CLAUDE_RECORD_FILE:-}; r=${WICKED_CLAUDE_RECORD:-}; unset WICKED_CLAUDE_RECORD WICKED_CLAUDE_RECORD_FILE; \
+drop() { /floor/busybox rm -rf \"$c\" \"$c.wicked-tmp\"; }; \
+[ -z \"$c\" ] || { drop && { [ -z \"$r\" ] || { (umask 077; set -C; printf '%s' \"$r\" > \"$c.wicked-tmp\") && /floor/busybox mv -f \"$c.wicked-tmp\" \"$c\"; }; }; } || { echo 'wicked-seat: the claude credential record could not be written' >&2; drop; echo 125 > $u/rc; exit 125; }; \
+unset r; \
+\"$@\"; rc=$?; \
+[ -z \"$c\" ] || drop || { echo 'wicked-seat: the claude credential record could not be removed' >&2; rc=125; }; \
 echo $rc > $u/rc.tmp && /floor/busybox mv $u/rc.tmp $u/rc; exit $rc";
+
+/// The carrier variables that hand [`WRAPPER`] a claude seat's credential record
+/// (wicked-garden#1365): claude 2.1.296 deletes `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's
+/// env, so a `claude -p` the seat starts from its Bash tool (a harness's rule model) reads its
+/// sign-in from `$CLAUDE_CONFIG_DIR/.credentials.json`. The record is claude's own env-token
+/// shape ([`crate::seat_credentials::claude_oauth_token_record`]). Every claude seat with a config
+/// home is handed the path, so the wrapper cleans it for every unit; only a seat signed in by a
+/// token is handed a record. Empty for every other CLI. A gateway placeholder cannot stand in for
+/// the record: claude's own non-inference calls go straight to api.anthropic.com, past the
+/// gateway (core#1832).
+pub(crate) fn claude_record_vars(cli: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
+    if wicked_apps_core::spawn::SeatCli::from_binary(cli)
+        != wicked_apps_core::spawn::SeatCli::Claude
+    {
+        return Vec::new();
+    }
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| v.as_str())
+    };
+    let Some(home) = get("CLAUDE_CONFIG_DIR") else {
+        return Vec::new();
+    };
+    let mut out = vec![(
+        "WICKED_CLAUDE_RECORD_FILE".to_string(),
+        format!("{}/.credentials.json", home.trim_end_matches('/')),
+    )];
+    if let Some(token) = get("CLAUDE_CODE_OAUTH_TOKEN") {
+        out.push((
+            "WICKED_CLAUDE_RECORD".into(),
+            crate::seat_credentials::claude_oauth_token_record(token),
+        ));
+    }
+    out
+}
 
 /// The marker prefix of a seat's exec (`$0` of [`WRAPPER`]): its id in [`SEATS`].
 pub(crate) const MARKER_PREFIX: &str = "wicked-unit-";
@@ -1200,6 +1259,9 @@ pub(crate) struct Seat {
     /// engine's, never the seat's, and never comes back (B-3 review r2).
     pub(crate) deps: bool,
     warm: Mutex<Option<WarmExecution>>,
+    /// The in-pod path of the claude credential record finalize handed the wrapper
+    /// (wicked-garden#1365): settle removes it when the wrapper cannot (timeout, cancel).
+    pub(crate) claude_record: Mutex<Option<String>>,
 }
 
 /// Live seats by id.
@@ -3289,6 +3351,7 @@ fn arm_physical(
         settled: Mutex::new(false),
         deps: s.deps.is_some(),
         warm: Mutex::new(None),
+        claude_record: Mutex::new(None),
     });
     // (core#1463) The next copy-in must see this seat's writable mounts.
     drop(_arming);
@@ -3629,6 +3692,15 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         ));
         names.push(key);
     }
+    // Read by the wrapper alone (never named to landrun, so never the CLI's env).
+    let record = claude_record_vars(&seat.cli, &vars);
+    if let Some((_, path)) = record
+        .iter()
+        .find(|(k, _)| k == "WICKED_CLAUDE_RECORD_FILE")
+    {
+        *seat.claude_record.lock().unwrap_or_else(|p| p.into_inner()) = Some(path.clone());
+    }
+    vars.extend(record);
     // nopush_git_config_env()'s GIT_CONFIG_COUNT/KEY/VALUE entries also ride this env
     // handoff and landrun's --env entries, so the push fence does not depend on a config file.
     let (git_files, git_reads) =
@@ -3785,11 +3857,12 @@ fn delete_seat_pod(kube: &Kube, ns: &str, sandbox: Option<&str>, pod: &str) -> R
 }
 
 /// Reap a seat however its unit ended (a guard's drop, an early refusal): its pod goes, nothing
-/// is read back.
+/// is read back. A claude unit's credential record goes first (wicked-garden#1365).
 pub(crate) fn reap(id: &str) {
     if let Some(seat) = lookup(id) {
         let mut settled = seat.settled.lock().unwrap_or_else(|p| p.into_inner());
         if !*settled {
+            remove_claude_record(&seat);
             match delete_pod(&seat) {
                 Ok(()) => drop_scratch(&seat),
                 Err(e) => {
@@ -3995,6 +4068,10 @@ pub(crate) fn settle_unless(
         }
         Ending::TimedOut | Ending::Cancelled => Ok(-1),
     };
+    // The wrapper's own cleanup never runs once the pod is deleted under it.
+    if matches!(ending, Ending::TimedOut | Ending::Cancelled) || code.is_err() {
+        remove_claude_record(seat);
+    }
     let warm = seat.warm.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(warm) = warm {
         // A read-only judge's write-back is empty. Prove the stop barrier before returning
@@ -4060,6 +4137,46 @@ pub(crate) fn settle_unless(
     let code = code?;
     let warnings = back?;
     Ok((code, warnings))
+}
+
+/// Best effort, bounded: remove a claude seat's credential record (and its temporary name) in
+/// the pod before the pod is deleted, for a unit whose wrapper will not (wicked-garden#1365). A
+/// failure never blocks the deletion; it is logged by seat id only. The next unit of that run
+/// and posture, or the run's teardown, removes what is left.
+fn remove_claude_record(seat: &Seat) {
+    let Some(c) = seat
+        .claude_record
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let tmp = format!("{c}.wicked-tmp");
+    let r = seat.kube.call(
+        Some(&seat.ns),
+        &[
+            "exec",
+            "-c",
+            "seat",
+            seat.pod.as_str(),
+            "--",
+            "/floor/busybox",
+            "rm",
+            "-rf",
+            c.as_str(),
+            tmp.as_str(),
+        ],
+        None,
+        Duration::from_secs(10),
+    );
+    if !r.ok() {
+        eprintln!(
+            "wicked-core: seat {}: the claude credential record could not be removed before its \
+             pod's deletion; the next unit or the run's teardown removes it",
+            seat.id
+        );
+    }
 }
 
 /// Select the roots returned by a unit; cargo homes and scratch must never be among them.
@@ -5055,6 +5172,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         settled: Mutex::new(false),
         deps: false,
         warm: Mutex::new(None),
+        claude_record: Mutex::new(None),
     })
 }
 
