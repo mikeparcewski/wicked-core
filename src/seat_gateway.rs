@@ -456,15 +456,15 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     .collect(),
                 None => Vec::new(),
             };
-            // claude's own OAuth route reads the unit from `x-wicked-unit`, whatever an older
-            // config says (core#1024): the seat's bearer is its placeholder record's, and the
-            // broker's `claude setup-token` token replaces it below (wicked-garden#1365).
-            let claude_oauth =
+            // claude's own OAuth route passes the seat's Authorization through (core#1024): it is
+            // the operator's own `claude setup-token` token, so the unit rides `x-wicked-unit`,
+            // whatever an older config says. pi's Anthropic route still swaps in the broker's.
+            let pass_through =
                 kind == CredentialKind::ClaudeOauth && route.owner() == Some("claude");
             let unit_header = route
                 .unit_header
                 .as_deref()
-                .or(claude_oauth.then_some(UNIT_HEADER));
+                .or(pass_through.then_some(UNIT_HEADER));
             let location = match (unit_header, kind) {
                 (Some(header), _) => json!({"header": {"name": header}}),
                 (None, CredentialKind::ClaudeApiKey) => json!({"header": {"name": "x-api-key"}}),
@@ -495,7 +495,14 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     | CredentialKind::CodexChatgpt
                     | CredentialKind::ProviderKey
             );
-            if kind == CredentialKind::GeminiApiKey {
+            if pass_through {
+                // Pass-through (core#1024): the client's own Authorization goes upstream
+                // unchanged; the gateway injects nothing and stays the seat's only egress.
+                policies
+                    .as_object_mut()
+                    .expect("policies is an object")
+                    .remove("backendAuth");
+            } else if kind == CredentialKind::GeminiApiKey {
                 // The Gemini API takes its key in `x-goog-api-key`, never a bearer: the broker's
                 // key replaces the unit's in that header (agentgateway v1.6.0
                 // `BackendAuth.key.location`).
@@ -506,9 +513,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             } else if broker_bearer || route.provider == Provider::ChatGpt {
                 // Preserve Authorization as proved by the broker spike. Native Anthropic ai
                 // backends inject x-api-key; OAuth needs a plain host backend instead. For
-                // ChatGPT the broker's access token replaces the seat's placeholder bearer; for
-                // claude's OAuth route the broker's `claude setup-token` token replaces the
-                // placeholder record's (wicked-garden#1365).
+                // ChatGPT the broker's access token replaces the seat's placeholder bearer.
                 policies["backendAuth"] =
                     json!({"key": {"value": {"file": route.credential_file}}});
             }
@@ -914,11 +919,9 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     ) {
         env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
     }
-    // core#1024: a claude OAuth seat's unit rides a header of its own, which claude sends on
-    // every API request and the gateway strips before the upstream. Its Authorization is the
-    // placeholder record's, which the gateway replaces with the broker's token
-    // (wicked-garden#1365). claude keeps ANTHROPIC_CUSTOM_HEADERS in a tool child's env, so a
-    // nested `claude -p` names the same unit.
+    // core#1024: a claude OAuth seat sends the operator's own token as its Authorization (the
+    // arming adds it as CLAUDE_CODE_OAUTH_TOKEN), so its unit rides a header of its own, which
+    // claude sends on every API request and the gateway strips before the upstream.
     if cli == "claude" && kind == CredentialKind::ClaudeOauth {
         env.push((
             "ANTHROPIC_CUSTOM_HEADERS".into(),
@@ -2453,14 +2456,14 @@ mod tests {
         }
     }
 
-    /// wicked-garden#1365: claude's own OAuth route injects the broker's `claude setup-token`
-    /// token in place of the seat's placeholder bearer (the operator's token never enters a
-    /// seat). The unit is read from `x-wicked-unit` and stripped with any `x-api-key`, and the
-    /// route is still a plain host backend at Anthropic (the gateway stays the only egress). An
-    /// older config whose route names no unit header renders the same (core#1024). pi's
-    /// Anthropic route keeps the spike's broker injection.
+    /// core#1024: claude's own OAuth route passes the seat's Authorization (the operator's own
+    /// `claude setup-token` token) through unchanged: no broker credential is injected, the unit
+    /// is read from `x-wicked-unit` and stripped with any `x-api-key`, and the route is still a
+    /// plain host backend at Anthropic (the gateway stays the only egress). An older config
+    /// whose route names no unit header renders the same. pi's Anthropic route keeps the
+    /// spike's broker injection.
     #[test]
-    fn claudes_oauth_route_injects_the_broker_token_as_pis_does() {
+    fn claudes_oauth_route_passes_the_client_auth_through_and_pis_keeps_the_broker() {
         let fixture: Value = serde_yaml::from_str(include_str!(
             "../tests/fixtures/broker/spike-broker-config.yaml"
         ))
@@ -2480,11 +2483,7 @@ mod tests {
             let rendered = render(&config);
             let route = &bind(&rendered, 4005)["listeners"][0]["routes"][0];
             let policies = &route["policies"];
-            assert_eq!(
-                policies["backendAuth"],
-                json!({"key": {"value": {"file": "/broker/anthropic.token"}}}),
-                "{policies}"
-            );
+            assert!(policies.get("backendAuth").is_none(), "{policies}");
             assert_eq!(
                 policies["apiKey"]["location"],
                 json!({"header": {"name": UNIT_HEADER}})
