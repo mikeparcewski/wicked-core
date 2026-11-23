@@ -1,0 +1,220 @@
+{
+ "source": "wicked-core#1836: the J4 certification run edb67a40 (train 12 re-cut 3, core ec105b8a), GET /api/v1/runs/edb67a40-2ff4-51b3-a184-da1158e6b0d9/events on the proof daemon, the gateEvaluated event at seq 208 (unit 3 review), its assurance.rules exactly as the engine wrote them. Run 179bc621 (re-cut 2, seq 216) has the same shape. reviewerOutput: the review step's attempt-0 output (unit 3, seat codex) from the same run's unitOutputDelta events, its engine progress lines left out.",
+ "denialRuleIds": [
+  "POL-2101"
+ ],
+ "denialSource": "rules_unchecked",
+ "rules": [
+  {
+   "council": {
+    "agreementPct": 0,
+    "consensus": false,
+    "eligible": [],
+    "positions": [
+     {
+      "by": "rule_judge",
+      "cite": "the change: src/math.js, hunk @@ -3,7 +3,7 @@: corrects the existing loop’s starting index; JavaScript provides no built-in array sum that this duplicates.; the step records: RECORD 1 does not record a chosen-stack check. RECORD 2 names files inspected but does not state what the stack offers for this change.",
+      "ids": [
+       "codex"
+      ],
+      "seat": "codex",
+      "status": "broken"
+     },
+     {
+      "by": "reviewer",
+      "cite": "the one-line correction preserves the existing stack; built-in check recorded above.",
+      "ids": [
+       "codex"
+      ],
+      "seat": "codex",
+      "status": "kept"
+     }
+    ],
+    "reason": "record_unsettled: the rule's record part (the step records) is broken, and a rule council is shown only the change, so no council can rule on it",
+    "returned": 0,
+    "seated": 0,
+    "seed": 0,
+    "taskId": "",
+    "votes": []
+   },
+   "evidenceComplete": false,
+   "evidenceKey": "4598f8acb7c1dca174aad3805124294bd644c06d07bafe2b752b50ba215886d8",
+   "how": "council",
+   "judge": "codex",
+   "judgeIds": [
+    "codex"
+   ],
+   "origin": "judge",
+   "reason": "the rule judge and the reviewer disagree, and no council could rule: record_unsettled: the rule's record part (the step records) is broken, and a rule council is shown only the change, so no council can rule on it",
+   "recordUnsettled": "broken",
+   "reviewer": {
+    "by": "reviewer",
+    "cite": "the one-line correction preserves the existing stack; built-in check recorded above.",
+    "seat": "codex",
+    "status": "kept"
+   },
+   "ruleId": "POL-2101",
+   "ruleKey": "d818e618df6c84071508f4d91f6ee80a2b98e0a152206169b9aad49581ffbdef",
+   "status": "disputed"
+  },
+  {
+   "blocking": false,
+   "cite": "The unit is not reworked: “Review round 1 of this unit” and “Sent back to the creator so far: 0”.",
+   "evidenceComplete": true,
+   "evidenceKey": "cd1abd618aad1fe67e2da304c4b2c78876d42348279496166a45d1f3743ff8cf",
+   "how": "judge",
+   "judge": "codex",
+   "judgeIds": [
+    "codex"
+   ],
+   "origin": "judge",
+   "party": "reviewer",
+   "reason": "The unit is not reworked: “Review round 1 of this unit” and “Sent back to the creator so far: 0”.",
+   "reviewer": {
+    "by": "reviewer",
+    "cite": "applies to “a reworked unit”; this is review round 1.",
+    "seat": "codex",
+    "status": "n_a"
+   },
+   "ruleId": "RVWL-1001",
+   "ruleKey": "d18c17593301d0adc84ded1addd26caea79eaf3c927b0e4ed72ce64c3bf35114",
+   "status": "n_a"
+  },
+  {
+   "blocking": false,
+   "evidenceKey": "ae643a1cad29f9dbaff5dbde05d6aa31ea31b9919b1224d108a95427265a851a",
+   "how": "none",
+   "party": "engine",
+   "reason": "the judge (pi) was unsure: “this rule is about the worker (fix/verify) turn's command-and-exit-code record, and the engine states that is absent: \"Not recorded by the engine: which checks a worker started or whether they finished, and any history beyond what is shown here.\"”; asked alone, the judge (codex) was unsure: “The engine does not record which checks workers started or whether each finished, each command and exit code in recipe order, or sufficient history to establish treatment of pre-existing failures and all reviewer verdict items.”",
+   "reviewer": {
+    "by": "reviewer",
+    "cite": "all checks started here finished, exit codes are recorded, and all intent requirements are judged.",
+    "seat": "codex",
+    "status": "kept"
+   },
+   "ruleId": "RVWL-1002",
+   "ruleKey": "9a44fb761d1fbf550a2bb54a1f54dc7df3add83ed37945745f3b40bd833e755e",
+   "status": "unchecked"
+  },
+  {
+   "blocking": false,
+   "cite": "\"Review round 1 of this unit. Sent back to the creator so far: 0\" and \"VERDICT: PASS\"; no sendback, third FAIL, rework, seat error, or stalled-unit reassignment occurred in the recorded step.",
+   "evidenceComplete": true,
+   "evidenceKey": "9172cb403ca91c18f89437f52db1870670b7af15cfe27b8def708ca5eb541334",
+   "how": "judge",
+   "judge": "codex",
+   "judgeIds": [
+    "codex"
+   ],
+   "origin": "judge",
+   "party": "engine",
+   "reason": "\"Review round 1 of this unit. Sent back to the creator so far: 0\" and \"VERDICT: PASS\"; no sendback, third FAIL, rework, seat error, or stalled-unit reassignment occurred in the recorded step.",
+   "reviewer": {
+    "by": "reviewer",
+    "cite": "round 1 completes without a sendback or reliance on an earlier tree’s test results.",
+    "seat": "codex",
+    "status": "kept"
+   },
+   "ruleId": "RVWL-1003",
+   "ruleKey": "c779ffd1566556537358af09d283face50e691e7c80834876a7abb7016846b70",
+   "status": "kept"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor), which the MCP and editor gates judge on each call, not the review",
+   "ruleId": "EDITOR-GRANTS",
+   "ruleKey": "15290efa884bdb3e64b04c4d46d4585fd04cbeabeab9e868d707c065a2e59e55",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (mcp), which the MCP and editor gates judge on each call, not the review",
+   "ruleId": "MCP-FIRST-USE",
+   "ruleKey": "70eda7cbcba2eed4d9a396f5ead162443c39c06c2399928e6a96c71b80047586",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (mcp-mode:ask), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"mcp\\\":\\\\{\\\"annotations\\\":\\\\{[^{}]*\\\\},\\\"class\\\":\\\"(write|destructive)\\\"\" matches nothing in the diff",
+   "ruleId": "MCP-MODE-ASK-WRITE",
+   "ruleKey": "5bd1d61384dafe115924ba3f7524aef49272f6c0a6220fa8530b450e8bcaad9d",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (mcp-mode:balanced), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"mcp\\\":\\\\{\\\"annotations\\\":\\\\{[^{}]*\\\\},\\\"class\\\":\\\"(write|destructive)\\\"\" matches nothing in the diff",
+   "ruleId": "MCP-POSTURE-WRITE",
+   "ruleKey": "df998d97d4b0f0632fd81587117508d0f0c79cbd3dfac94eebb0f6da183597bf",
+   "status": "n_a"
+  },
+  {
+   "blocking": false,
+   "how": "fact",
+   "origin": "fact",
+   "party": "person",
+   "reason": "selected for scope, clarify, plan, design; this job's steps are pa-scope, fix, review, verify, deliver",
+   "reviewer": {
+    "by": "reviewer",
+    "cite": "applies to scope, clarify, plan and design; this review follows the supplied instruction to number the intent’s requirements.",
+    "seat": "codex",
+    "status": "n_a"
+   },
+   "ruleId": "RVWL-1004",
+   "ruleKey": "ff28f767f07a1b892fe7685ef30c770fc23821a161ed277decfba98a484ebe0e",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor-origin:first-party), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"permission\\\":\\\"(artifact\\\\.read|artifact\\\\.write|selection\\\\.chip|composer\\\\.draft|checks\\\\.read|checks\\\\.contribute|sources\\\\.read|media\\\\.read|artifact\\\\.export|ui\\\\.fullscreen)\\\"\" matches nothing in the diff",
+   "ruleId": "EDITOR-BUILTIN",
+   "ruleKey": "45c544d748d224e91e81c46fbc013ede6a0b40c97e595162872e0939ec95aae5",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor-origin:first-party), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"id\\\":\\\"wicked-doc\\\",\\\"permission\\\":\\\"network\\\\.media\\\"\" matches nothing in the diff",
+   "ruleId": "EDITOR-BUILTIN-DOC-MEDIA",
+   "ruleKey": "f3e02e7953655875e7a09d945a15cbbd0be48fb4199c46036e5351957472019a",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor-origin:first-party), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"id\\\":\\\"wicked-page\\\",\\\"permission\\\":\\\"network\\\\.media\\\"\" matches nothing in the diff",
+   "ruleId": "EDITOR-BUILTIN-PAGE-MEDIA",
+   "ruleKey": "b7f346c465144ef81ac36c23ae030b5b808b5d65a193d1468c42e86aa0530082",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor-origin:first-party), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"permission\\\":\\\"artifact\\\\.theme\\\"\" matches nothing in the diff",
+   "ruleId": "EDITOR-BUILTIN-THEME",
+   "ruleKey": "cdf61f01c30b946668f141cc0f8a341381b57ab8f3758739599f50afd06132ac",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (editor), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"permission\\\":\\\"(artifact\\\\.read|selection\\\\.chip|checks\\\\.contribute|ui\\\\.fullscreen)\\\"\" matches nothing in the diff",
+   "ruleId": "EDITOR-OPEN-DEFAULTS",
+   "ruleKey": "1f4b08348acd137e9ef07e9d78a83b838ac9147caf8013e0e58de5f62ec83d52",
+   "status": "n_a"
+  },
+  {
+   "how": "fact",
+   "origin": "fact",
+   "reason": "selected only for tool tokens (mcp), which the MCP and editor gates judge on each call, not the review; its trigger \"\\\"mcp\\\":\\\\{\\\"annotations\\\":\\\\{[^{}]*\\\\},\\\"class\\\":\\\"read\\\"\" matches nothing in the diff",
+   "ruleId": "MCP-POSTURE-READ",
+   "ruleKey": "d98e58fea44133256056936831b5bca0148270ca02224554b50e66bd0a35aedd",
+   "status": "n_a"
+  }
+ ],
+ "reviewerOutput": "Evaluator review: confirmed the only change is the loop start in `src/math.js:6`, from `1` to `0`. No files modified.\n\nCommands completed with exit code 0:\n\n- Skill read and repository inspection (`git status`, `git show`, source/tests/package reads).\n- Steering-rule recall for all five supplied rule IDs.\n- `node --test test/math.test.js` — 8 passed, 0 failed.\n- Diff, tree hash, numbered source/test reads and README inspection.\n- Inline Node assertions for singleton, negative/cancelling and empty sums, mean, and its empty-input exception — passed.\n\nCounts: derived 0 / submitted 0 / failed 0. Memories proposed 0: nothing bit for a reason outside the code.\n\nSTACK-CHECK: looked at `package.json` and `src/math.js` :: plain JavaScript ESM with Node’s test runner; this loop-bound correction introduces no dependency or duplicate helper.\n\nITEM 1: PASS — `sum` visits every element starting at index 0 (`src/math.js:6`); the existing `[1,2,3]` assertion and independent singleton/negative checks pass.\nITEM 2: PASS — empty input returns the initialized total of 0 (`src/math.js:5–7`); `test/math.test.js:7` passes.\nITEM 3: PASS — `mean([2,4])` returns 3 and empty input still throws RangeError (`test/math.test.js:10–12`).\nITEM 4: PASS — all 8 existing tests pass independently, with Node exit code 0.\n\nRULE POL-2101: KEPT — the one-line correction preserves the existing stack; built-in check recorded above.\nRULE RVWL-1001: N/A — applies to “a reworked unit”; this is review round 1.\nRULE RVWL-1002: KEPT — all checks started here finished, exit codes are recorded, and all intent requirements are judged.\nRULE RVWL-1003: KEPT — round 1 completes without a sendback or reliance on an earlier tree’s test results.\nRULE RVWL-1004: N/A — applies to scope, clarify, plan and design; this review follows the supplied instruction to number the intent’s requirements.\n\nFollow-ups: the engine floor record for the matching tree `92ca893d7e8851c1ca6f7d579b9ef35e51ac0fc0` reports FAILED because free disk space was 14.9 GiB, below its 15 GiB minimum; no floor check ran. That environment issue remains for the floor retry. Independent tests passed on this tree.\n\nNo code findings or open questions.\n\nVERDICT: PASS"
+}
