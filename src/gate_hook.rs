@@ -17269,10 +17269,12 @@ mod boundary_tests {
              presence check and still allows the governance pin to be rewritten"
         );
         assert!(
-            launcher.contains("armed_write_roots(&cwd, &g.extra_write_roots)"),
+            launcher.contains(
+                "armed_write_roots(&cwd, &hook_write_extras(&g.extra_write_roots, &floor_env))"
+            ),
             "the ONLY widening must be the launch-validated extra_write_roots riding the \
-             governance context (the repo-graph key dir is read-only, core#1602) — not env, not \
-             the unit, not the workflow def"
+             governance context (the repo-graph key dir is read-only, core#1602) plus a container \
+             claude seat's own /tmp (core#1758) — not env, not the unit, not the workflow def"
         );
         // The launch side must actually judge those extras — remove the validation and the
         // widening becomes an unvetted door straight past FINDING-098.
