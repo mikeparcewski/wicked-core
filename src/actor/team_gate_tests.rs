@@ -2426,6 +2426,138 @@ fn t6_a_review_whose_result_the_engine_lost_pauses_at_the_failure_gate_and_rerun
     assert!(u.denial.is_none() && u.denial_reason.is_none(), "{u:?}");
 }
 
+/// The member runner, except that the PA's first review turn runs out of time (the engine's turn
+/// ceiling): `TimedOut`, its partial transcript as the output.
+struct TimedOutFirstReview {
+    inner: Arc<MemberRunner>,
+    reviews: std::sync::Mutex<Vec<StepInput>>,
+}
+
+impl StepRunner for TimedOutFirstReview {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let review = i
+            .unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some());
+        if review {
+            let mut seen = self.reviews.lock().unwrap();
+            seen.push(i.clone());
+            if seen.len() == 1 {
+                return StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output: "the PA's partial review transcript".into(),
+                    status: StepStatus::TimedOut,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+            }
+        }
+        self.inner.run_unit(i)
+    }
+}
+
+/// core#1801: a PA review turn that ran out of time took the generic turn-timeout arm. Its partial
+/// transcript replaced the unit's output record (the MEMBER's output, which the re-run review reads
+/// and which counts when accepted), and the prompt offered a reassign the gate refuses. Now it is
+/// the timeout twin of the lost review (core#1748): the member's output is kept, the prompt offers
+/// approve (re-run the review on the PA) or reject, and a send-back's refusal names both causes.
+/// Red on main: the re-run review read the review's partial text, and the prompt said "reassign".
+#[test]
+fn t6_a_review_that_timed_out_keeps_the_member_output_and_offers_only_what_its_gate_takes() {
+    let rig = rig("t6-timeout-review");
+    let inner = MemberRunner::new(|_| "reviewed\nSTEP write: ACCEPT — it covers it".into());
+    let worker = Arc::new(TimedOutFirstReview {
+        inner,
+        reviews: Default::default(),
+    });
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let e = supervised(
+        &rig,
+        &db,
+        worker.clone(),
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        false,
+    );
+    let mut evs = Vec::new();
+    // An operator in the loop (no run-level pause: no unit has this ord).
+    launch_member_run_confirm(&e, "t6to", HumanConfirm::Before(99));
+    wait_status(&e, "t6to", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    let prompt = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::AwaitingHuman {
+                session,
+                ord,
+                prompt,
+                gate_kind,
+                ..
+            } if session == "t6to" && *ord == WRITE && gate_kind == "failure" => {
+                Some(prompt.clone())
+            }
+            _ => None,
+        })
+        .expect("the timed-out review pauses at the failure gate");
+    assert!(prompt.contains("ran out of time"), "{prompt}");
+    assert!(
+        !prompt.contains("reassign"),
+        "the gate refuses a reassign, so the prompt never offers one: {prompt}"
+    );
+    assert!(prompt.contains("PA's review"), "{prompt}");
+    let u = unit_view(&e, "t6to", WRITE);
+    assert!(
+        u.member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some() && !m.counted),
+        "the member-review state is kept: {:?}",
+        u.member_step
+    );
+    let err = e
+        .core
+        .confirm_gate(
+            "t6to",
+            HumanDecision::RequestChanges {
+                note: Some("rework it".into()),
+            },
+        )
+        .expect_err("a send-back at the timed-out review's gate is refused");
+    assert!(
+        err.to_string().contains("ran out of time"),
+        "the refusal covers a timeout too: {err}"
+    );
+    e.core.confirm_gate("t6to", approve(None)).unwrap();
+    wait_status(&e, "t6to", SessionStatus::Completed);
+    let reviews = worker.reviews.lock().unwrap().clone();
+    assert_eq!(reviews.len(), 2, "approve re-ran the PA's review");
+    assert_eq!(
+        reviews[1].unit.assigned_cli.as_deref(),
+        Some("a"),
+        "on the PA"
+    );
+    for (n, r) in reviews.iter().enumerate() {
+        assert!(
+            r.prior_outputs
+                .iter()
+                .any(|p| p.label == "[team step — write by b]"
+                    && p.output.starts_with("done")
+                    && !p.output.contains("partial review transcript")),
+            "review {n} reads the member's output: {:?}",
+            r.prior_outputs
+                .iter()
+                .map(|p| (&p.label, &p.output))
+                .collect::<Vec<_>>()
+        );
+    }
+    let u = unit_view(&e, "t6to", WRITE);
+    assert_eq!(u.status, crate::domain::UnitStatus::Done);
+}
+
 /// The member runner, except that the member's own step runs out of time on its first two turns.
 struct MemberTimesOutTwice {
     inner: Arc<MemberRunner>,

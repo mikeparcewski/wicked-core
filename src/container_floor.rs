@@ -917,6 +917,33 @@ fn read_seat_facts(path: &Path, id: &str) -> Option<ImageFacts> {
     (facts.id == id).then_some(facts)
 }
 
+/// (core#1805) Set the facts directories above `path` to 0700: its own directory and, when that
+/// sits in `seat-image-facts/`, the `seat-image-facts` root as well (never anything above it). A
+/// recursive `DirBuilder` leaves an existing directory's mode alone, so an install upgraded from a
+/// release before core#1715 keeps the umask's 0755 until this runs; it runs on every facts read
+/// and write, as `k8s::images::archive_dir` re-applies its mode. A missing directory is left alone.
+fn make_facts_dirs_private(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = path.parent();
+        let root = dir
+            .and_then(Path::parent)
+            .filter(|r| r.file_name().is_some_and(|n| n == "seat-image-facts"));
+        for d in [dir, root].into_iter().flatten() {
+            match std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("cannot make {} private: {e}", d.display()));
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     let dir = path.parent().ok_or("seat image facts path has no parent")?;
     // (core#1715) Private like the image exports: every directory this creates is 0700.
@@ -925,6 +952,7 @@ fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir).map_err(|e| e.to_string())?;
+    make_facts_dirs_private(path)?;
     let bytes = serde_json::to_vec(facts).map_err(|e| e.to_string())?;
     // Shared writer creates a unique 0600 file, syncs it, and renames it over the destination.
     crate::acp_runner::write_atomic(dir, path, &bytes).map_err(|e| e.to_string())
@@ -963,6 +991,12 @@ fn inspect_seat_image_cached(
         return Ok(f);
     }
     let facts_path = seat_facts_path(id);
+    // (core#1805) A facts store an earlier release left at 0755 is made private on the read path
+    // too: an upgrade whose images are unchanged reads every fact from its cache and never writes.
+    // A failure here costs nothing the read needs, so it does not refuse the seat.
+    if let Some(path) = facts_path.as_deref() {
+        let _ = make_facts_dirs_private(path);
+    }
     if let Some(facts) = facts_path
         .as_deref()
         .and_then(|path| read_seat_facts(path, id))
@@ -3877,6 +3911,17 @@ mod tests {
         let _restore = Restore(prior);
         let (dir, rt, id, log) = archived_seat(vec![image_tar(&[])], false, false);
         crate::k8s::note_engine_home(&dir.0);
+        // core#1805: an install upgraded from a release before core#1715 already has both facts
+        // directories at the umask's 0755; writing facts makes them private (red on main).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let version_dir = dir.0.join("seat-image-facts").join("v1");
+            std::fs::create_dir_all(&version_dir).unwrap();
+            for d in [&version_dir, &dir.0.join("seat-image-facts")] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
         let first = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
         let path = dir
             .0
@@ -3891,7 +3936,7 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            // core#1715: the facts directories are 0700 (red on main: the umask's 0755).
+            // core#1715 / core#1805: the facts directories are 0700, new or pre-existing.
             for d in [
                 path.parent().unwrap(),
                 path.parent().unwrap().parent().unwrap(),
@@ -3903,7 +3948,41 @@ mod tests {
                     d.display()
                 );
             }
+            // core#1805: a cached read repairs a 0755 store as well, with no export and no write
+            // (an upgrade whose images are unchanged never writes a fact). Nothing above the
+            // `seat-image-facts` root changes mode.
+            let home_mode = std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+            for d in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::write(&log, "").unwrap();
+            let cached = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+            assert_eq!(cached, first);
+            assert!(!std::fs::read_to_string(&log).unwrap().contains("save "));
+            for d in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(d).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "cached read: {}",
+                    d.display()
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+                home_mode
+            );
         }
+        #[cfg(unix)]
+        let home_before = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&dir.0).unwrap().permissions().mode()
+        };
         for version in ["v0", ""] {
             let stale_path = dir
                 .0
@@ -3917,6 +3996,16 @@ mod tests {
             assert_eq!(facts, first);
             assert!(std::fs::read_to_string(&log).unwrap().contains("save "));
             assert_eq!(read_seat_facts(&path, &id), Some(first.clone()));
+        }
+        // core#1805: the version-less stale path's directory IS the facts root; the repair never
+        // reaches the engine home above it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir.0).unwrap().permissions().mode(),
+                home_before
+            );
         }
         std::fs::write(&log, "").unwrap();
         let next = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();

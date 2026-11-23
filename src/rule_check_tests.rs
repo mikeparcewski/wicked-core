@@ -1612,6 +1612,54 @@ fn a_kept_cite_names_a_changed_path_whole() {
     );
 }
 
+/// (core#1803) A cite names a changed path only where the path stands delimited: a longer name
+/// that continues past it (`+backup`, `._backup`, a non-ASCII letter), or starts before it, names
+/// a different file. Ordinary prose, markup and line cites still name it.
+#[test]
+fn core_1803_a_cite_that_continues_past_a_changed_path_does_not_name_it() {
+    let ids = ["K"];
+    let frame = |c: &str| format!("BEGIN VERDICTS n\nRULE K: KEPT — {c}\nEND VERDICTS n\n");
+    let ok = |c: &str| {
+        parse_rule_lines(&frame(c), &ids, "n", &["fixtures/data.json"], None).contains_key("K")
+    };
+    for longer in [
+        "fixtures/data.json+backup is unchanged",
+        "fixtures/data.jsoné is unchanged",
+        "fixtures/data.json._backup is unchanged",
+        "fixtures/data.json-old is unchanged",
+        "old+fixtures/data.json is unchanged",
+        "fixtures/data.json.bak.",
+        // codex r1: a dash before the path continues another name; an anchor that is no line.
+        "old—fixtures/data.json is unchanged",
+        "old–fixtures/data.json is unchanged",
+        "fixtures/data.json#backup is unchanged",
+        "fixtures/data.json#L4x is unchanged",
+        "fixtures/data.json#L4-backup is unchanged",
+    ] {
+        assert!(!ok(longer), "{longer:?} names a longer path");
+    }
+    for named in [
+        "fixtures/data.json:4 keeps the shape",
+        "see fixtures/data.json.",
+        "see fixtures/data.json...",
+        "(fixtures/data.json) keeps the shape",
+        "**fixtures/data.json** keeps the shape",
+        "`fixtures/data.json`: keeps the shape",
+        "\"fixtures/data.json\", line 4",
+        "“fixtures/data.json” keeps the shape",
+        "fixtures/data.json, src/b.rs keep the shape",
+        "src/b.rs,fixtures/data.json keep the shape",
+        "fixtures/data.json — keeps the shape",
+        "is it fixtures/data.json? yes",
+        "kept — fixtures/data.json keeps the shape",
+        "[the rows](fixtures/data.json#L10-L20) keep the shape",
+        "fixtures/data.json#L4 keeps the shape",
+        "fixtures/data.json#L4-12.",
+    ] {
+        assert!(ok(named), "{named:?} names the path");
+    }
+}
+
 #[test]
 fn a_change_in_a_file_the_engine_cannot_name_leaves_languages_unknown() {
     let f = job_facts(
@@ -4307,6 +4355,31 @@ fn core_1474_part_answers_combine_broken_first_then_misses_then_kept() {
         "a part that could not decide leaves it unanswered"
     );
     assert_eq!(c.answers["N"].status, RuleStatus::NotApplicable);
+}
+
+/// (core#1789, codex r1 and r2) Two BROKEN lines on one rule both stand, in a judge's answer and in
+/// the reviewer's reading (an echo is one claim): a council scoped to the files the claims name
+/// must see each.
+#[test]
+fn core_1789_every_broken_line_is_kept_in_the_reading() {
+    let ids = ["B"];
+    let text = "BEGIN VERDICTS n\nRULE B: BROKEN — src/a.rs untyped\n\
+                RULE B: BROKEN — src/b.rs untyped\nRULE B: BROKEN — src/a.rs untyped\n\
+                END VERDICTS n\n";
+    let p = parse_rule_lines(text, &ids, "n", &["src/a.rs", "src/b.rs"], None);
+    assert_eq!(
+        p["B"].cite,
+        format!("src/a.rs untyped{CLAIM_SEP}src/b.rs untyped")
+    );
+    let r = seat_positions(
+        "RULE B: BROKEN — src/a.rs untyped\nRULE B: BROKEN — src/b.rs untyped\n\
+         RULE B: BROKEN — src/a.rs untyped\n",
+        &["B"],
+    );
+    assert_eq!(
+        r.by_id["B"].cite,
+        format!("src/a.rs untyped{CLAIM_SEP}src/b.rs untyped")
+    );
 }
 
 /// (core#1474) The issue's case: a 250 KB lock and a code change. Every rule is answered on the

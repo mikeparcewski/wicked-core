@@ -315,3 +315,66 @@ fn the_workflow_declares_its_required_instruments() {
         "{err:#}"
     );
 }
+
+/// core#1799 (demo critique, train-12 capture-learnings): a full run requires `judge`, and its
+/// review gate (a read-only evaluator, no judge due) recorded `ran: [distinct_evaluator]` with
+/// nothing in `skipped`, so the required judge was silently absent. Through the real engine on a
+/// two-seat build→review run: every gate the judge was not due at says so on its receipt
+/// (`judge` skipped, `not_applicable`, with the reason), and nothing holds (no judge was wanted).
+/// Red on main: the review gate's `skipped` was empty.
+#[test]
+fn a_required_judge_that_was_not_due_is_on_the_receipt_with_its_reason() {
+    let sid = "assure-judge-not-due";
+    let core = engine("judge-not-due");
+    let ev = core.subscribe();
+    let mut launch = spec(sid, "assurance-build-review", false);
+    launch.clis = vec![cli("codex"), cli("claude")];
+    core.launch_run(launch).expect("launch");
+    let evs = collect_until(&ev, Duration::from_secs(60), ends(sid));
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, CoreEvent::SessionCompleted { session } if session == sid)),
+        "a judge that was not due holds nothing: {evs:?}"
+    );
+    let gates = json_of(&evs, "gateEvaluated");
+    let review = gates
+        .iter()
+        .find(|g| g["ord"] == 2)
+        .unwrap_or_else(|| panic!("review gate: {gates:?}"));
+    let r = &review["assurance"];
+    assert_eq!(
+        r["required"],
+        serde_json::json!(["distinct_evaluator", "judge"])
+    );
+    assert!(
+        r["ran"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i == "distinct_evaluator"),
+        "{r}"
+    );
+    let skip = r["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["instrument"] == "judge")
+        .unwrap_or_else(|| panic!("the required judge is never silently absent: {r}"));
+    assert_eq!(skip["reason"], "not_applicable", "{skip}");
+    let detail = skip["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("unit 2 is a") && detail.contains("declares read-only"),
+        "{detail}"
+    );
+    // Every gate of the run, the build's too, accounts for the required judge.
+    for g in &gates {
+        let a = &g["assurance"];
+        let judged = a["ran"].as_array().unwrap().iter().any(|i| i == "judge");
+        let skipped = a["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["instrument"] == "judge");
+        assert!(judged || skipped, "gate {}: {a}", g["ord"]);
+    }
+}

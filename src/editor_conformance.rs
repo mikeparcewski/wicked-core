@@ -627,6 +627,96 @@ pub(crate) fn brief_block(
     head + &body
 }
 
+/// (core#1708) The install-time conformance calls in flight in this process
+/// (`Core.runEditorConformance`, crew's install gate), and whether the host shut them down. The
+/// review-time harness is a run's Tool child and goes through the run's own cancel path; this is
+/// the install call's counterpart, which has no run.
+struct InstallHarnesses {
+    shut_down: bool,
+    in_flight: usize,
+}
+
+static INSTALL_HARNESSES: std::sync::Mutex<InstallHarnesses> =
+    std::sync::Mutex::new(InstallHarnesses {
+        shut_down: false,
+        in_flight: 0,
+    });
+/// Signalled whenever an install call ends.
+static INSTALL_ENDED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn install_harnesses() -> std::sync::MutexGuard<'static, InstallHarnesses> {
+    INSTALL_HARNESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One install-time conformance call, registered from before its preflight until it returns
+/// (core#1708). Its [`stopped`](Self::stopped) is the harness's `stop` hook: the harness's own
+/// loop, which holds the unreaped leader, kills the jailed group when it turns true.
+pub(crate) struct InstallCall(());
+
+impl InstallCall {
+    /// `None` once the host shut install conformance down: the call must not start.
+    pub(crate) fn begin() -> Option<Self> {
+        let mut reg = install_harnesses();
+        if reg.shut_down {
+            return None;
+        }
+        reg.in_flight += 1;
+        Some(Self(()))
+    }
+
+    /// Whether the host shut install conformance down while this call ran.
+    pub(crate) fn stopped(&self) -> bool {
+        install_harnesses().shut_down
+    }
+}
+
+impl Drop for InstallCall {
+    fn drop(&mut self) {
+        let mut reg = install_harnesses();
+        reg.in_flight -= 1;
+        INSTALL_ENDED.notify_all();
+    }
+}
+
+/// (core#1708) Shut install-time conformance down for this process, for a host on its way out.
+/// Every call in flight is stopped: a running harness is SIGKILLed with its jailed process group
+/// within one poll tick (50 ms) by its own loop, which still holds the unreaped leader (so the kill
+/// can never reach a reused group id), and the call resolves to a refused record; a call whose
+/// harness had already finished returns its own record. Every later call is refused before it
+/// starts. Returns how many calls were in flight; does not wait for them (see
+/// [`install_harnesses_settled`]). The harness runs in its own process group, so without this it
+/// would outlive the host until its deadline (up to 15 minutes).
+pub fn shut_down_install_harnesses() -> usize {
+    let mut reg = install_harnesses();
+    reg.shut_down = true;
+    reg.in_flight
+}
+
+/// Wait until `deadline` for every install-time conformance call to end; `true` when none is left.
+pub fn install_harnesses_settled(deadline: std::time::Instant) -> bool {
+    let mut reg = install_harnesses();
+    while reg.in_flight > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        reg = INSTALL_ENDED
+            .wait_timeout(reg, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    true
+}
+
+/// TEST-ONLY: undo [`shut_down_install_harnesses`] for the tests that follow in this process
+/// (its one caller, the shutdown test, is unix-only).
+#[cfg(all(test, unix))]
+pub(crate) fn reopen_install_harnesses_for_test() {
+    install_harnesses().shut_down = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

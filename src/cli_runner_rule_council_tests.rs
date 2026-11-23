@@ -44,6 +44,30 @@ fn rule_council_and_arbiter_exclude_a_seat_seen_on_the_creators_provider() {
     crate::observed_provider::take_receipts();
 }
 
+/// (core#1789) A judge that answers R1 with `there` in a call whose prompt holds `shows` (the part
+/// showing that change), and with `elsewhere` in every other call; the other rules N/A.
+struct ByPart {
+    shows: &'static str,
+    there: &'static str,
+    elsewhere: &'static str,
+}
+
+impl StepRunner for ByPart {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let word = if input.unit.description.contains(self.shows) {
+            self.there
+        } else {
+            self.elsewhere
+        };
+        Judging {
+            r1: word,
+            rest: "N/A — not a fix",
+            calls: AtomicU32::new(0),
+        }
+        .run_unit(input)
+    }
+}
+
 /// The judge: answers every asked rule with `R1`'s word for R1 (and the others' from `rest`).
 struct Judging {
     r1: &'static str,
@@ -334,6 +358,93 @@ fn a_judge_reviewer_split_goes_to_one_council_and_its_ruling_decides() {
             "no dispute on R2"
         );
     }
+}
+
+/// (core#1789, field: the MCP-server run, 6 parts) A judge/reviewer split on a change too big for one
+/// ballot (the judge read it in parts and kept the rule, the reviewer claims it broken) reaches a
+/// council on the files the reviewer named, rather than holding with `incomplete_evidence`; its
+/// ruling decides. A split the paged judge claims still holds.
+#[test]
+fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
+    // The fixture's review step with 200 KB more of change (a generated file), reviewed by codex.
+    let paged = |tag: &str| {
+        let (repo, base, db) = fixture(tag);
+        std::fs::create_dir_all(repo.join("gen")).unwrap();
+        std::fs::write(repo.join("gen/big.json"), "\"BIG-ROW\"\n".repeat(20 * 1024)).unwrap();
+        let mut input = review_input(&repo, &base, &db);
+        input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
+        input
+    };
+    let tag = "paged-dispute";
+    let input = paged(tag);
+    let judge = Judging::says("KEPT — src/a.rs:1 types both numbers");
+    let council = FakeCouncil::new(tag, broken_3_0);
+    let reviewer = "RULE R1: BROKEN — src/a.rs:2 add() is untyped\nRULE R2: N/A — not a fix\n\
+                    VERDICT: FAIL";
+    let r = settle_with(&input, &judge, reviewer, &council, &registry());
+    assert!(
+        judge.calls.load(Ordering::SeqCst) > 1,
+        "the judge read the change in parts"
+    );
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 1, "a council, not a hold: {r1:?}");
+    let (req, _) = &council.seen.lock().unwrap()[0];
+    assert!(
+        req.evidence.contains("THE CHANGE, IN PART"),
+        "{}",
+        req.evidence
+    );
+    assert!(req.evidence.contains("+fn add(a: i32, b: i32)"));
+    assert!(
+        !req.evidence.contains("BIG-ROW"),
+        "the unnamed file is listed, not shown"
+    );
+    assert_eq!(r1.status, RuleStatus::Broken, "{r1:?}");
+    assert_eq!(r1.origin, Some(RuleOrigin::Council));
+    // The paged judge claims the break in the part that shows src/a.rs, N/A elsewhere: its claim
+    // names a file its part showed, so the council sees that file.
+    let judge = ByPart {
+        shows: "+fn add(a: i32, b: i32)",
+        there: "BROKEN — src/a.rs:2 add() takes i32 for floats",
+        elsewhere: "N/A — this part holds generated rows",
+    };
+    let council = FakeCouncil::new("paged-dispute-claim", kept_3_0);
+    let input = paged("paged-dispute-claim");
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 1, "{r1:?}");
+    let (req, _) = &council.seen.lock().unwrap()[0];
+    assert!(req.evidence.contains("+fn add(a: i32, b: i32)"));
+    assert!(!req.evidence.contains("BIG-ROW"));
+    assert_eq!(r1.status, RuleStatus::Kept, "{r1:?}");
+    // A judge claiming src/a.rs in every part (most of which never showed it) still holds.
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("paged-dispute-judge", kept_3_0);
+    let input = paged("paged-dispute-judge");
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    assert_eq!(council.convened(), 0);
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed, "{r1:?}");
+    assert!(r1.reason.contains("incomplete_evidence"), "{r1:?}");
+    // (codex r4) A claim in the part that shows src/a.rs that also names a file another part
+    // shows (src/z.rs, after the generated rows): the council would not see src/z.rs, so the
+    // dispute holds.
+    let input = paged("paged-dispute-off-part");
+    std::fs::write(
+        input.workdir.as_ref().unwrap().join("src/z.rs"),
+        "fn z() {}\n",
+    )
+    .unwrap();
+    let judge = ByPart {
+        shows: "+fn add(a: i32, b: i32)",
+        there: "BROKEN — src/a.rs:2 add() feeds src/z.rs, which takes no floats",
+        elsewhere: "N/A — this part holds generated rows",
+    };
+    let council = FakeCouncil::new("paged-dispute-off-part", kept_3_0);
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 0, "{r1:?}");
+    assert_eq!(r1.status, RuleStatus::Disputed, "{r1:?}");
 }
 
 /// A.7.2: no ruling — 1 of 3 answered, a timeout, an error — is `disputed`, and holds.
