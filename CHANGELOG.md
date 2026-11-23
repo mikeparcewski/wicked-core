@@ -14,8 +14,20 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut bf93b161, carrying 47 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1828.
+- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut b228afff, carrying 52 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831. #1828 was reverted by #1833 before this release, so neither is listed.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - A cited path stands delimited; a paged dispute reaches a council (#1803, #1789) (#1825)
+
+  - Keep the councils' share of the final pass (#1822) (#1826)
+
+  - A required judge that was not due is on the receipt; a timed-out PA review keeps the member's output (core#1799, core#1801) (#1827)
+
+  - A gate answer names the opening it answers (#1808) (#1829)
+
+  - A host shutdown kills the install-time harness; facts dirs made private on upgrade (#1708, #1805) (#1830)
+
+  - A validator's backgrounded descendants end with its verdict (#1810) (#1831)
 
   - Gate answers off the actor, a connection per read, one-run unit reads by name (core#1795) (#1806)
 
@@ -40,8 +52,6 @@ Two release tracks share this file, newest entry first regardless of track:
   - An abandon verb ends one open sign-in (#1673) (#1820)
 
   - A one-run interaction read uses the name index, never a scan of every request (core#1795) (#1824)
-
-  - Claude OAuth seats hold only a placeholder credential: the gateway sends the operator's `claude setup-token` token upstream, so a nested `claude -p` inside a seat (the garden harness's rule model) is signed in, and the token never enters a seat (wicked-garden#1365). **Behaviour change:** claude seats no longer hold the operator token; this reverses the core#1024 design. (#1828)
 
   - Run the real-browser draft-render jail test on ubuntu and macOS (#1770)
 
