@@ -1150,7 +1150,8 @@ fn sign_in_refusal_frame(text: &str) -> bool {
 /// Claude Code: the line starts with its own `API Error:` label and carries one of its refusal
 /// stems. 2.1.311 assembles `<model>'s safeguards flagged this message` and `... flagged this
 /// session` from one template, plus `can't help with this. Start a new session to continue`;
-/// older builds say `appears to violate our Usage Policy`.
+/// older builds say `appears to violate our Usage Policy`. The API's output filter reaches the
+/// same frame as `API Error: 400 Output blocked by content filtering policy` (core#1718).
 /// Quoted source, Markdown bullets and prose about refusals lead neither frame.
 /// ASCII-case-insensitive; a content refusal concerns this unit, not the seat's run-wide health.
 pub fn content_refusal_frame(tail: &str) -> bool {
@@ -1160,6 +1161,9 @@ pub fn content_refusal_frame(tail: &str) -> bool {
         "safeguards flagged this",
         "can't help with this. start a new session to continue",
         "appears to violate our usage policy",
+        // (core#1718) The API's output filter, as Claude Code names it in its error table
+        // (claude-code 2.1.323: `Output blocked by content filtering policy`).
+        "output blocked by content filtering policy",
     ];
     tail.lines().any(|line| {
         let head = refusal_line_head(line);

@@ -38066,6 +38066,12 @@ mod seat_failover_tests {
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cyber.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cant-help.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt"),
+            // (core#1718) The API's output filter, in Claude Code's generic `API Error:` frame.
+            include_str!("../tests/fixtures/refusals/claude-2.1.323-content-filter.txt"),
+            "API Error: Output blocked by content filtering policy",
+            // The raw body, should a build print the API's message unparsed.
+            "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\
+             \"message\":\"Output blocked by content filtering policy\"}}",
         ] {
             assert!(is_content_refusal(&format!(
                 "(cli `claude` exited 1) {claude}"
@@ -38135,6 +38141,115 @@ mod seat_failover_tests {
              cybersecurity risk.",
             "界".repeat(6000)
         )));
+    }
+
+    /// core#1720: a failed unit keeps both streams (`execute_wrapped::failed_detail`). A sign-in,
+    /// approval or quota refusal that ends stdout stays at the end of the output behind a chatty
+    /// stderr, where the classifiers' terminal frame reads it (red on main: stderr followed it and
+    /// pushed it out of the 2 KiB tail). The body of either stream is never made terminal.
+    #[test]
+    fn a_stdout_sign_in_or_quota_refusal_behind_a_chatty_stderr_still_classifies() {
+        use crate::execute_wrapped::failed_detail;
+        use wicked_council::types::SeatFailureReason;
+        // As the wrapped runner's failed arm writes it: `(cli `<key>` exited N) <detail>`.
+        let failed = |key: &str, out: &str, err: &str| {
+            format!(
+                "(cli `{key}` exited 1) {}",
+                failed_detail(out.to_string(), err.to_string(), true)
+            )
+        };
+        let telemetry = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(telemetry.len() > 4096);
+        // Claude Code's own sign-in line (its error table: `Not logged in · Please run /login`).
+        let sign_in = failed("claude", "Not logged in · Please run /login", &telemetry);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&sign_in, true),
+            Some(SeatFailureReason::NotLoggedIn),
+            "{sign_in}"
+        );
+        let (_, judged) = crate::cli_runner::judge_refusal("claude", &sign_in)
+            .expect("the judge rotation classifies it too");
+        assert_eq!(judged.reason, "not_logged_in");
+        assert!(sign_in.contains(telemetry.trim()), "both streams are kept");
+        // pi's captured out-of-usage line (run 290a7fee), the same way.
+        let pi = include_str!("../tests/fixtures/refusals/pi-out-of-extra-usage.txt");
+        let pi_out = pi.strip_prefix("(cli `pi` exited 1) ").unwrap();
+        let quota = failed("pi", pi_out, &telemetry);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&quota, true),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        // codex's host-forced approval refusal, the same way.
+        let approval = failed(
+            "codex",
+            "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \
+             \"Rejected(\\\"approval request failed\\\")\" }",
+            &telemetry,
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&approval, true),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
+        // A stream's body stays the body: a sign-in line 6+ lines before the end of stdout, or a
+        // quota phrase more than 2 KiB before it, is subject matter behind the same stderr.
+        for out in [
+            format!(
+                "Not logged in · Please run /login\n{}",
+                "more work\n".repeat(6)
+            ),
+            format!(
+                "the seat said \"You're out of extra usage\"\n{}",
+                "x".repeat(4096)
+            ),
+        ] {
+            let text = failed("claude", &out, &telemetry);
+            let first = out.lines().next().unwrap();
+            assert!(
+                text.find("warning: retrying") > text.find(first),
+                "stdout keeps its place: {first}"
+            );
+            assert_eq!(
+                SeatFailureReason::classify_refusal(&text, true),
+                None,
+                "{out}"
+            );
+        }
+        // (review r2) The swap never changes the reason: it would cut stderr's 2 KiB tail at a new
+        // place (lifting `not logged in` out of `diagnostic: not logged in`) or join an approval
+        // pair across the streams. Then the streams keep their order.
+        let cut = failed(
+            "claude",
+            "usage limit exceeded\n",
+            &format!("diagnostic: not logged in\n{}", "x".repeat(2012)),
+        );
+        let joined = failed(
+            "codex",
+            "exec_command failed\nusage limit exceeded\n",
+            &format!("{}\napproval request failed\n", "x".repeat(4096)),
+        );
+        for text in [&cut, &joined] {
+            assert!(text.find("exceeded") < text.find("xxxx"), "{text}");
+            let reason = SeatFailureReason::classify_refusal(text, true);
+            assert!(
+                !matches!(
+                    reason,
+                    Some(SeatFailureReason::NotLoggedIn | SeatFailureReason::ApprovalUnavailable)
+                ),
+                "{reason:?}"
+            );
+            assert!(crate::cli_runner::judge_refusal("claude", text)
+                .is_none_or(|(_, r)| r.reason == "quota_exhausted"));
+        }
+        // A refusal on stderr keeps its place after stdout's progress (core#1612).
+        let stderr_refusal = failed(
+            "claude",
+            "starting the review",
+            "Not logged in · Please run /login",
+        );
+        assert!(
+            stderr_refusal.ends_with("Please run /login"),
+            "{stderr_refusal}"
+        );
     }
 
     /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier
