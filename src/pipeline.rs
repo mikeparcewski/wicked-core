@@ -1690,6 +1690,18 @@ pub(crate) fn apply_and_finish_unit(
     // the `stand_in_needed` hold (grant a stand-in, sign a helper in and retry, or reject), never
     // the reduced offer.
     let stand_in_hold = crate::standin::active(&assurance) && assurance.stand_in.is_none();
+    // (T-R12) …and so is a judge whose every seat failed as a seat (lost during the run, no
+    // fallback): a verdict-less answer stays the human's, as today.
+    let agent_denial = agent_denial.map(|(source, why)| {
+        let lost = agent_verdict
+            .and_then(|v| v.seat_failure.as_deref())
+            .is_some_and(|f| !f.contains(crate::validator::JUDGE_NO_VERDICT));
+        if stand_in_hold && lost && source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE {
+            (crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED, why)
+        } else {
+            (source, why)
+        }
+    });
     let judge_hold = evidence
         .judge_skipped
         .as_ref()
@@ -1986,7 +1998,12 @@ pub(crate) fn apply_and_finish_unit(
         .is_none_or(|r| r.starts_with("pinned validator failed"));
     let det_note = det_denial.clone();
     let (unavailable, judged) = match agent_denial {
-        Some((source, r)) if source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE => {
+        // A judge that could not run (and an aware run's held judge, `stand_in_needed`) is no
+        // verdict on the work: it never outranks a layer that gave one.
+        Some((source, r))
+            if source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
+                || source == crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED =>
+        {
             (Some((source, r)), None)
         }
         other => (None, other),

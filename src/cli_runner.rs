@@ -6408,6 +6408,29 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 &without_author_binaries(&unbenched_run, &excluded, &author_ids),
             );
             let registry = roster;
+            // (DES-STANDIN-001 §3.6) The stand-in judge: the offer the actor made this unit, on its
+            // base's record. Its own path: no identity or provider fence, stamped not distinct;
+            // the fold records its binding. `None` with no offer, or a base with no record (fail
+            // closed: no invocation, no judge).
+            let stand_in_verdict = || -> Option<crate::validator::AgentVerdict> {
+                let b = fallback.stand_in_judge?;
+                let invocation = crate::standin::resolve(&[], registry, &b.key)?;
+                let (verdict, refused) =
+                    with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                        crate::validator::judge_on_stand_in(
+                            b,
+                            &invocation,
+                            &judge_criterion,
+                            work_for_agent,
+                            &**runner,
+                            Some(&input.run_id),
+                        )
+                    });
+                note_refusals(&refused);
+                Some(verdict.unwrap_or_else(|e| {
+                    crate::validator::AgentVerdict::from_judge_error("stand-in judge", e)
+                }))
+            };
             let mut roster = judge_roster(&excluded, &configured_x, &eligible_x);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
@@ -6456,6 +6479,14 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
+                // (DES-STANDIN-001 §3.6, T-R12) Every real judge lost during the run and no
+                // fallback seat answered: the consented stand-in judges instead of the hold. A
+                // fallback's verdict-less answer keeps today's handling (the human).
+                if !matches!(fb, FallbackJudge::Answered(_)) {
+                    if let Some(v) = stand_in_verdict() {
+                        break 'pinned Some(v);
+                    }
+                }
                 break 'pinned Some(held_with_fallback_failures(
                     "agent validator",
                     b.held,
@@ -6465,27 +6496,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
             }
             if !crate::validator::distinct_judge_available(&excluded, roster) {
                 // (DES-STANDIN-001 §3.6) No distinct judge, on a run that consented: the stand-in
-                // the actor offered judges instead of a skip. Its own path: no identity or provider
-                // fence, stamped not distinct; the fold records its binding. A base with no record
-                // falls through to the skip (fail closed: no invocation, no judge).
-                if let Some((b, invocation)) = fallback.stand_in_judge.and_then(|b| {
-                    crate::standin::resolve(&[], registry, &b.key).map(|inv| (b, inv))
-                }) {
-                    let (verdict, refused) =
-                        with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
-                            crate::validator::judge_on_stand_in(
-                                b,
-                                &invocation,
-                                &judge_criterion,
-                                work_for_agent,
-                                &**runner,
-                                Some(&input.run_id),
-                            )
-                        });
-                    note_refusals(&refused);
-                    break 'pinned Some(verdict.unwrap_or_else(|e| {
-                        crate::validator::AgentVerdict::from_judge_error("stand-in judge", e)
-                    }));
+                // the actor offered judges instead of a skip.
+                if let Some(v) = stand_in_verdict() {
+                    break 'pinned Some(v);
                 }
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
                 let validator_id = crate::validator::excluded_identity(
