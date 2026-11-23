@@ -127,9 +127,14 @@ pub(crate) fn shares_identity(
     author_keys: &[String],
     author_providers: &[Provider],
 ) -> Option<String> {
+    // (DES-STANDIN-001 §3.3) A stand-in (`codex#2~1`) is its credential (`codex#2`) and its family
+    // (`codex`), on both sides: an author stand-in reads as its credential too. A real seat key is
+    // its own credential, so a real roster reads as before.
+    let credential = wicked_apps_core::spawn::seat_id::credential;
     if author_keys
         .iter()
-        .any(|a| a == seat || a == crate::team::runner::seat_key(seat))
+        .map(|a| credential(a))
+        .any(|a| a == seat || a == credential(seat) || a == crate::team::runner::seat_key(seat))
     {
         return Some(format!("seat `{seat}` authored the work"));
     }
@@ -249,6 +254,26 @@ pub(crate) fn observed_for(receipts: &[LaunchReceipt], seat: &str) -> Observed {
 mod tests {
     use super::*;
     use crate::seat_gateway::GatewayRecord;
+
+    /// (DES-STANDIN-001 §3.3, rev 3 R7) A stand-in on an explicit credential instance shares
+    /// that instance's identity: `codex#2~1` is `codex#2` (the family alone would miss it). A real
+    /// second instance keeps today's reading: `codex#2` authoring does not make `codex` a party.
+    #[test]
+    fn a_stand_in_shares_its_credential_instances_identity() {
+        let none: Vec<Provider> = Vec::new();
+        let by = |author: &str| vec![author.to_string()];
+        assert!(shares_identity("codex#2~1", Some(&[]), &by("codex#2"), &none).is_some());
+        assert!(shares_identity("codex#2~1", Some(&[]), &by("codex"), &none).is_some());
+        assert!(shares_identity("claude~1", Some(&[]), &by("claude"), &none).is_some());
+        assert!(shares_identity("codex", Some(&[]), &by("codex#2"), &none).is_none());
+        assert!(shares_identity("codex#3~1", Some(&[]), &by("codex#2"), &none).is_none());
+        // codex r1 on C1: both sides normalize. An author stand-in is its credential, so its
+        // credential seat and a sibling stand-in share it; another instance still does not.
+        assert!(shares_identity("codex#2", Some(&[]), &by("codex#2~1"), &none).is_some());
+        assert!(shares_identity("codex#2~2", Some(&[]), &by("codex#2~1"), &none).is_some());
+        assert!(shares_identity("claude", Some(&[]), &by("claude~1"), &none).is_some());
+        assert!(shares_identity("codex", Some(&[]), &by("codex#2~1"), &none).is_none());
+    }
 
     #[test]
     fn identity_uses_the_attempt_before_last_seen_and_always_the_seat_key() {
