@@ -26,9 +26,10 @@
 //!
 //! ## Which values it looks for
 //!
-//! Every value the seat launcher injects is registered here at the moment it is handed to a seat
-//! ([`register`], from `container_floor::arm`), so a unit's settled diff is checked against what
-//! THIS process put into seats. A delivery also asks the broker for the token it holds now
+//! Every real credential a seat's units run on is registered here when the seat is armed
+//! ([`register`], from `container_floor::arm`), so a unit's settled diff is checked against it.
+//! Since wicked-garden#1365 none is handed to the seat itself (the gateway holds the claude
+//! setup-token), and the guard checks for it all the same. A delivery also asks the broker for the token it holds now
 //! ([`from_broker`]), because the units that produced the work may have run before a daemon
 //! restart. Only real credentials count: the per-unit gateway keys a seat also holds are revoked when
 //! the unit's lease drops, and they authorize nothing outside the gateway.
@@ -160,8 +161,8 @@ fn with_registry<R>(f: impl FnOnce(&mut Vec<SeatSecret>) -> R) -> R {
     INJECTED.with(|r| f(&mut r.borrow_mut()))
 }
 
-/// Record a credential the launcher is handing to a seat. Called where the value is injected, so
-/// every unit's settled diff is checked against everything this process put into seats.
+/// Record a real credential a seat's units run on (the gateway sends it; the seat never holds it).
+/// Called when the seat is armed, so every unit's settled diff is checked against it.
 pub(crate) fn register(kind: SecretKind, value: &str) {
     let Some(secret) = SeatSecret::new(kind, value) else {
         return;
@@ -177,7 +178,7 @@ pub(crate) fn register(kind: SecretKind, value: &str) {
     });
 }
 
-/// Every credential this process has put into a seat.
+/// Every real credential this process has armed a seat's units with ([`register`]).
 pub(crate) fn injected() -> Vec<SeatSecret> {
     with_registry(|reg| reg.clone())
 }

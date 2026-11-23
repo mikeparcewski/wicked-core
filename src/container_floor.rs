@@ -2332,6 +2332,32 @@ fn placeholder_handoff(
     (key, env, files)
 }
 
+/// The credential a seat is armed with: placeholders only, for every kind (wicked-garden#1365). A
+/// claude OAuth seat's real token (`setup_token`, read from the broker) never enters the seat: the
+/// gateway sends it upstream in place of the placeholder record's bearer. claude scrubs
+/// `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's env, so a seat signed in by that variable left
+/// a nested `claude -p` signed out. The seat-secret guard still learns the token, so every unit's
+/// diff is checked for it. `Err` = the broker holds no token (claude is signed out).
+fn armed_credential(
+    cli: &str,
+    sign_in: impl Into<crate::seat_credentials::SeatSignIn>,
+    run: &str,
+    unit: &str,
+    setup_token: impl FnOnce() -> Result<String, String>,
+) -> Result<SeatCredential, String> {
+    let sign_in = sign_in.into();
+    let oauth = cli == "claude"
+        && sign_in.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
+    let credential = placeholder_handoff(cli, sign_in, run, unit);
+    if oauth {
+        crate::seat_secret_guard::register(
+            crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+            &setup_token()?,
+        );
+    }
+    Ok(credential)
+}
+
 /// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
 /// exec any single argument over `MAX_ARG_STRLEN` (32 pages, 128 KiB): docker-init then fails
 /// with "argument list too long" before the CLI starts. A longer prompt rides a file instead
@@ -2767,21 +2793,10 @@ pub(crate) fn arm_noting(
                         .subscriptions
                         .contains(&crate::seat_credentials::Subscription::Copilot))
                 .then(|| crate::seat_gateway::copilot_account(dir));
-                let oauth = cli == "claude"
-                    && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
-                // Every kind, a claude OAuth seat included, gets placeholders only: the gateway
-                // sends the broker's credential upstream (wicked-garden#1365).
-                let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
-                if oauth {
-                    // The operator's setup-token never enters the seat; the seat-secret guard
-                    // still learns it, so a unit's diff is checked for it all the same.
-                    let token = crate::k8s::gw::claude_seat_token(&gw)
-                        .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
-                    crate::seat_secret_guard::register(
-                        crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
-                        &token,
-                    );
-                }
+                let (key, env, files) = armed_credential(cli, kind, run_id, &unit, || {
+                    crate::k8s::gw::claude_seat_token(&gw)
+                })
+                .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -5147,6 +5162,52 @@ esac
         }
     }
 
+    /// wicked-garden#1365: the credential a claude OAuth seat is ARMED with (the final step, after
+    /// the handoff) holds no real token in its env or files, while the seat-secret guard still
+    /// learns the broker's token. A signed-out broker refuses the arm, and no other kind asks the
+    /// broker for a claude token.
+    #[test]
+    fn an_armed_claude_oauth_seat_holds_only_placeholders_and_the_guard_learns_the_token() {
+        use crate::seat_credentials::CredentialKind;
+        use crate::seat_secret_guard::injected;
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token = format!("sk-ant-oat01-{}", "R".repeat(40));
+        // The test registry is this thread's own.
+        let before = injected().len();
+        let (key, env, files) = armed_credential(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "test-run",
+            "test-unit",
+            || Ok(token.clone()),
+        )
+        .unwrap();
+        let armed = format!("{env:?}{files:?}");
+        assert!(!armed.contains(&token), "the token never enters the seat");
+        assert!(!env.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"));
+        let record: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+        assert_eq!(record["claudeAiOauth"]["accessToken"], key.key.as_str());
+        let registered = injected();
+        assert_eq!(registered.len(), before + 1, "the guard learns the token");
+        assert!(format!("{:?}", registered.last().unwrap()).contains("ClaudeSetupToken"));
+        let signed_out = armed_credential(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "test-run",
+            "test-unit",
+            || Err("claude is not signed in".into()),
+        );
+        assert!(signed_out.is_err());
+        armed_credential(
+            "codex",
+            CredentialKind::CodexChatgpt,
+            "test-run",
+            "test-unit",
+            || panic!("only a claude OAuth seat reads the broker's claude token"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
         use crate::seat_credentials::CredentialKind;
@@ -5271,11 +5332,19 @@ esac
         }
         let rt = runtime().expect("a container runtime answers");
         let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        let (key, env, files) =
-            placeholder_handoff("claude", CredentialKind::ClaudeOauth, "nested-run", "u1");
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token = format!("sk-ant-oat01-{}", "N".repeat(40));
+        let (key, env, files) = armed_credential(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "nested-run",
+            "u1",
+            || Ok(token.clone()),
+        )
+        .unwrap();
         assert!(
-            !env.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
-            "no credential rides the seat's env"
+            !format!("{env:?}{files:?}").contains(&token),
+            "the operator's token never enters the seat"
         );
         let dir = tmp("nested-claude");
         std::fs::create_dir_all(dir.join("cfg")).unwrap();
@@ -5352,6 +5421,14 @@ esac
             "the nested claude -p is not signed in: {tool_result}"
         );
         assert!(tool_result.contains("INNER-OK"), "{tool_result}");
+        assert!(
+            claude_out.contains("OUTER-DONE"),
+            "the outer turn ends: {claude_out}"
+        );
+        assert!(
+            !requests.contains(&token),
+            "the operator's token never leaves the seat"
+        );
         let requests: Vec<serde_json::Value> = requests
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())

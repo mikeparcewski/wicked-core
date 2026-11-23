@@ -1171,8 +1171,8 @@ mod live {
             let renewed = if renews_on_host(cli) {
                 renew_on_host(dir, cli, &record, entry.as_deref(), force, now)
             } else {
-                // claude: an earlier `claude auth login` record, never renewed (its seats now
-                // pass a `claude setup-token` token through).
+                // claude: an earlier `claude auth login` record, never renewed (claude now signs
+                // in with a `claude setup-token` token, which the gateway sends upstream).
                 Err(CLAUDE_SIGN_IN_AGAIN.to_string())
             };
             let new = match renewed {

@@ -69,10 +69,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         request = json.loads(body or b"{}")
         text = json.dumps(request.get("messages", []))
-        if "PROBE-INNER" in text:
-            content, stop = [{"type": "text", "text": "INNER-OK"}], "end_turn"
-        elif "tool_result" in text:
+        # The outer continuation first: it carries the Bash command, which names PROBE-INNER.
+        if "tool_result" in text:
             content, stop = [{"type": "text", "text": "OUTER-DONE"}], "end_turn"
+        elif "PROBE-INNER" in text:
+            content, stop = [{"type": "text", "text": "INNER-OK"}], "end_turn"
         elif "PROBE-OUTER" in text:
             content = [{"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:12],
                         "name": "Bash", "input": {"command": NESTED, "description": "nested"}}]

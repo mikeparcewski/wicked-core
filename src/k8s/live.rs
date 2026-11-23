@@ -1605,9 +1605,8 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
                 .iter()
                 .filter(|r| r.owner() == Some(*owner))
             {
-                if *owner == "claude" && route.kind == Some(CredentialKind::ClaudeOauth) {
-                    continue;
-                }
+                // claude's OAuth route included (wicked-garden#1365): its gateway now sends the
+                // broker's token, so an emptied broker file must stop reaching the upstream too.
                 // The unit is still live: sign-out itself must stop broker credentials and
                 // account literals reaching the upstream, without relying on key revocation.
                 route_eventually(&h, &seat_a, route, &unit.key, |status, body| {
