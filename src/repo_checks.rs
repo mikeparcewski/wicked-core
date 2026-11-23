@@ -3785,10 +3785,11 @@ impl Drop for CheckScratch {
 /// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
 /// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
 /// the lock is released before the slow removal, so the run's next floor never waits on it.
-/// (core#1542) A container floor's base target claim is deleted UNDER that lock, waiting until it is
-/// gone (normally about a second: no pod mounts it any more; bounded at 180 s): released first, the
-/// run's next floor could re-apply the claim while it is still terminating and start a pod on a
-/// claim that then disappears. Meanwhile the next floor waits at its shared lease.
+/// (core#1542, core#1714) A container floor's base target claim is marked for deletion under that
+/// lock without waiting for it to go: the run's next floor that claims the same name waits for the
+/// terminating claim to be gone before it applies it, so it never starts a pod on a claim that then
+/// disappears. A floor at its shared lease meanwhile waits only for the marking calls (the
+/// ownership GET and the DELETE, each bounded), never for the claim's termination.
 /// Returns whether the base output is gone.
 fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
     let aside = format!(".base-drop-{}", random_tmp_name());
