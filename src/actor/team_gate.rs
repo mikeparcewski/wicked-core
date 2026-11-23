@@ -1885,6 +1885,18 @@ fn reopen_transport_gate(
     pending: PendingTeamFact,
 ) {
     let run_id = session.id.clone();
+    // (core#1808) A re-opened pause is a new opening: numbered before anything changes, so a
+    // numbering that fails writes nothing — the run keeps its previous durable state and the next
+    // boot re-opens it (a `0` here would let an earlier opening's answer match a later one).
+    let opening = match crate::interaction::next_gate_seq(&*store, &run_id) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: boot could not number the re-opened team_transport pause of {run_id}: {e}"
+            );
+            return;
+        }
+    };
     let t = session.team.get_or_insert_with(RunTeamState::default);
     t.gate_seq += 1;
     t.open_gate = Some(tev::gate_id(&run_id, t.gate_seq));
@@ -1914,8 +1926,7 @@ fn reopen_transport_gate(
         TEAM_TRANSPORT_GATE,
         crate::interaction::now_millis(),
     );
-    // (core#1808) A re-opened pause is a new opening.
-    request.gate_seq = crate::interaction::next_gate_seq(&*store, &run_id).unwrap_or(0);
+    request.gate_seq = opening;
     if let Err(e) = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]) {
         // The run keeps its previous durable state; the next boot re-opens the pause again.
         eprintln!("wicked-core: boot could not re-open the team_transport pause of {run_id}: {e}");
