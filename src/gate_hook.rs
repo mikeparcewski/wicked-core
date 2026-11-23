@@ -9132,10 +9132,14 @@ mod tests {
             format!("cd {r} && git stash show $'--output=victim'"),
             format!("git -C {r} log \"$out\""),
             format!("git -C {r} log --out\"put\"={r}/victim"),
-            format!("cd {r} && bash -c \"\\\"git\\\" branch injected\""),
             format!("cd {r} && python3 --version && cp -t . /dev/null"),
             format!("cd {r} && cp -t . /dev/null"),
-        ] {
+        ]
+        .into_iter()
+        // A backslash escapes only where the gate reads commands as a POSIX shell does.
+        .chain(
+            (!cfg!(windows)).then(|| format!("cd {r} && bash -c \"\\\"git\\\" branch injected\"")),
+        ) {
             let (reason, fatal) =
                 check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
             assert!(fatal, "a write escape is fatal: {write}: {reason}");
@@ -9244,9 +9248,12 @@ mod tests {
             &["log", "--out$x"],
             &["log", "-$x"],
             &["archive", "-v$x", "HEAD"],
-            &["log", "--o\\utput=x"],
             &["branch", "-a", "$x"],
-        ] {
+        ]
+        .into_iter()
+        // A backslash escapes only where the gate reads commands as a POSIX shell does.
+        .chain((!cfg!(windows)).then_some(&["log", "--o\\utput=x"][..]))
+        {
             assert!(!git_subcommand_reads(write), "{write:?}");
         }
     }
