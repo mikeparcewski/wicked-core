@@ -1231,9 +1231,10 @@ pub fn ledger_authors(ledger: &TeamLedger) -> Vec<String> {
     out
 }
 
-/// The CLI key of a seat instance (`claude#2` → `claude`).
+/// The CLI key of a seat instance (`claude#2` → `claude`, a stand-in `claude~1` → `claude`): the
+/// one parser's family (DES-STANDIN-001 §3.3).
 pub fn seat_key(seat: &str) -> &str {
-    seat.split('#').next().unwrap_or(seat)
+    wicked_apps_core::spawn::seat_id::family(seat)
 }
 
 /// Whether `judge` is excluded by `excluded` on instance OR cli key (DES-001 §6.2).

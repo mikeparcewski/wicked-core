@@ -131,9 +131,18 @@ pub(crate) fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
 /// review unit on its creator. A second instance of one CLI is spelled
 /// `claude{SEAT_INSTANCE_SEP}2`, which is a different key.
 fn refuse_duplicate_seat_keys(configured: &[AgenticCli]) -> anyhow::Result<()> {
-    use wicked_apps_core::spawn::SEAT_INSTANCE_SEP;
+    use wicked_apps_core::spawn::{seat_id, SEAT_INSTANCE_SEP, STAND_IN_SEP};
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for c in configured {
+        // (DES-STANDIN-001 §3.3) `~` spells an engine-minted stand-in binding, never a roster
+        // seat: a launcher cannot hand the engine a seat that reads as a stand-in.
+        if seat_id::is_stand_in(&c.key) {
+            anyhow::bail!(
+                "launch roster names the seat key '{key}', which contains '{STAND_IN_SEP}': that \
+                 separator is reserved for the stand-ins the engine seats itself. Rename the seat.",
+                key = c.key
+            );
+        }
         if !seen.insert(c.key.as_str()) {
             anyhow::bail!(
                 "launch roster names the seat key '{key}' more than once. A key is a seat \
@@ -2280,6 +2289,17 @@ mod tests {
         let mut two = b.clone();
         two.key = "claude#2".into();
         refuse_duplicate_seat_keys(&[a.clone(), two.clone()]).expect("two instances, two keys");
+
+        // (DES-STANDIN-001 T-R1) A key spelled like a stand-in binding is refused on the same
+        // whole-plan path: only the engine mints one.
+        let mut forged = seat("claude");
+        forged.key = "claude~1".into();
+        let err = refuse_duplicate_seat_keys(&[a.clone(), forged.clone()])
+            .expect_err("a reserved stand-in key must be refused");
+        assert!(err.to_string().contains("'claude~1'"), "{err}");
+        let err = distribute_units_against_benched(&build_and_review(), &[forged], "s1", None, &[])
+            .expect_err("the plan is refused before anything routes");
+        assert!(err.to_string().contains("reserved"), "{err}");
         assert_eq!(
             invocation_of(&[a.clone(), two.clone()], "claude").as_deref(),
             Some("claude --instance-a {PROMPT}")

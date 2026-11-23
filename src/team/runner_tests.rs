@@ -1132,6 +1132,14 @@ fn ledger_authors_are_computed_from_the_ledger() {
         "the cli key of an excluded instance"
     );
     assert!(!is_excluded("codex", &ex));
+    // (DES-STANDIN-001 §3.3, codex r1 on C1) The team parser is the one seat-key parser: a
+    // stand-in's cli key is its family, so a stand-in on an excluded cli is excluded.
+    assert_eq!(seat_key("claude~1"), "claude");
+    assert_eq!(seat_key("codex#2~1"), "codex");
+    assert!(
+        is_excluded("claude~1", &ex),
+        "a stand-in on an excluded cli"
+    );
     let _ = GateOpenedKind::TeamDispute {
         finding_ids: vec![],
     };

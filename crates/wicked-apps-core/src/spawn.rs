@@ -1502,12 +1502,43 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 pub const SEAT_INSTANCE_SEP: char = '#';
 
 /// The CLI (MODEL) key a seat key names — what a predicate about the MODEL must read (core#591):
-/// `"claude#2"` → `"claude"`, `"claude"` → `"claude"`, `"my-claude"` → `"my-claude"`.
+/// `"claude#2"` → `"claude"`, `"claude"` → `"claude"`, `"my-claude"` → `"my-claude"`, and a
+/// stand-in binding `"claude~1"` → `"claude"` ([`seat_id::family`], DES-STANDIN-001 §3.3).
 #[must_use]
 pub fn seat_cli_key(seat_key: &str) -> &str {
-    match seat_key.split_once(SEAT_INSTANCE_SEP) {
-        Some((cli, _)) => cli,
-        None => seat_key,
+    seat_id::family(seat_key)
+}
+
+/// (DES-STANDIN-001 §3.3) The separator of a STAND-IN binding key: `claude~1` is the first
+/// stand-in minted on the `claude` credential, `codex#2~1` the first on `codex#2`. Reserved for the
+/// engine: a launch roster key carrying it is refused where a duplicate key is (the launch's
+/// distribution, core#591), so no launched run works on a key that reads as a stand-in.
+pub const STAND_IN_SEP: char = '~';
+
+/// (DES-STANDIN-001 §3.3) The three identities a seat key names, parsed in this one place.
+pub mod seat_id {
+    use super::{SEAT_INSTANCE_SEP, STAND_IN_SEP};
+
+    /// The CLI family (the model key): up to the first `#` or `~`. `codex#2~1` → `codex`.
+    #[must_use]
+    pub fn family(key: &str) -> &str {
+        key.split([SEAT_INSTANCE_SEP, STAND_IN_SEP])
+            .next()
+            .unwrap_or(key)
+    }
+
+    /// The credential instance: the key without a stand-in's `~n`. `codex#2~1` → `codex#2`,
+    /// `claude~1` → `claude`; a real seat key is its own credential.
+    #[must_use]
+    pub fn credential(key: &str) -> &str {
+        key.split_once(STAND_IN_SEP).map_or(key, |(c, _)| c)
+    }
+
+    /// Whether `key` has the reserved stand-in syntax (a `~`). Syntax only: whether the engine
+    /// minted it, and whether the binding is valid, are its admission's and resolution's checks.
+    #[must_use]
+    pub fn is_stand_in(key: &str) -> bool {
+        key.contains(STAND_IN_SEP)
     }
 }
 
@@ -4039,12 +4070,36 @@ rebase.autosquash\0";
             .expect_err("a seat with a root fails closed when the base is unresolvable");
     }
 
+    /// (DES-STANDIN-001 §3.3, T-R1) One parser, three identities: the family (model), the
+    /// credential instance a stand-in runs on, and whether a key is a stand-in at all. A real
+    /// seat key is its own credential, so nothing about a real roster reads differently.
+    #[test]
+    fn a_seat_key_names_its_family_its_credential_and_whether_it_stands_in() {
+        use super::seat_id::{credential, family, is_stand_in};
+        for (key, fam, cred, stand_in) in [
+            ("claude", "claude", "claude", false),
+            ("claude#2", "claude", "claude#2", false),
+            ("my-claude", "my-claude", "my-claude", false),
+            ("claude~1", "claude", "claude", true),
+            ("codex#2~1", "codex", "codex#2", true),
+            ("codex#2~12", "codex", "codex#2", true),
+        ] {
+            assert_eq!(family(key), fam, "{key}");
+            assert_eq!(credential(key), cred, "{key}");
+            assert_eq!(is_stand_in(key), stand_in, "{key}");
+        }
+    }
+
     /// (core#591) The seat-key split is total and the joiner is injective: every seat key has a
     /// CLI key, and no two acceptable instance keys name one directory.
     #[test]
     fn a_seat_key_splits_into_a_cli_key_and_an_instance() {
         assert_eq!(seat_cli_key("claude"), "claude");
         assert_eq!(seat_cli_key("claude#2"), "claude");
+        // (DES-STANDIN-001 T-R1) A stand-in binding's model is its base's: red before the one
+        // parser, which returned `claude~1` whole.
+        assert_eq!(seat_cli_key("claude~1"), "claude");
+        assert_eq!(seat_cli_key("codex#2~1"), "codex");
         assert_eq!(seat_cli_key("my-claude"), "my-claude");
         assert_eq!(seat_cli_key(""), "");
         assert_eq!(seat_instance_suffix("claude"), None);
