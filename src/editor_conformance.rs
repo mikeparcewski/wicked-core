@@ -710,8 +710,9 @@ pub fn install_harnesses_settled(deadline: std::time::Instant) -> bool {
     true
 }
 
-/// TEST-ONLY: undo [`shut_down_install_harnesses`] for the tests that follow in this process.
-#[cfg(test)]
+/// TEST-ONLY: undo [`shut_down_install_harnesses`] for the tests that follow in this process
+/// (its one caller, the shutdown test, is unix-only).
+#[cfg(all(test, unix))]
 pub(crate) fn reopen_install_harnesses_for_test() {
     install_harnesses().shut_down = false;
 }
