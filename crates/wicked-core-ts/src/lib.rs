@@ -2655,6 +2655,21 @@ impl Core {
         task(move || wicked_core::run_editor_conformance(&request_json).map_err(err))
     }
 
+    /// (core#1708) Shut install-time conformance down for this process, for a host on its way out:
+    /// every `runEditorConformance` call in flight is stopped (a running harness is killed with
+    /// its jailed process group within one 50 ms poll, and the call resolves to a refused record),
+    /// and every later call is refused before it starts. Synchronous, off the worker pool: it waits
+    /// at most 5 seconds for the calls in flight to end, so a host may exit once it returns.
+    /// Returns JSON `{ "stopped": number, "settled": boolean }`: the calls that were in flight, and
+    /// whether all of them had ended by then.
+    #[napi]
+    pub fn shutdown_editor_conformance() -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stopped = wicked_core::shut_down_install_harnesses();
+        let settled = wicked_core::install_harnesses_settled(deadline);
+        serde_json::json!({ "stopped": stopped, "settled": settled }).to_string()
+    }
+
     /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
     /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
     /// `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

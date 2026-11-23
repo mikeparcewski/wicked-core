@@ -16485,6 +16485,10 @@ pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
     run_editor_conformance_with(request_json, &crate::validator::serve_jail)
 }
 
+/// (core#1708) The refused record's reason for an install call the host shut down.
+const SHUTTING_DOWN: &str =
+    "the conformance run was stopped: the engine is shutting down (no install conformance runs now)";
+
 fn run_editor_conformance_with(
     request_json: &str,
     jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
@@ -16501,12 +16505,6 @@ fn run_editor_conformance_with(
     let pack_root = std::path::Path::new(&request.pack_root);
     if !pack_root.is_absolute() {
         return Err("packRoot must be an absolute path to an existing directory".into());
-    }
-    let pack_root = pack_root
-        .canonicalize()
-        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
-    if !pack_root.is_dir() {
-        return Err("packRoot must be an existing directory".into());
     }
     let deadline = match request.timeout_s {
         Some(s) if !(1..=900).contains(&s) => {
@@ -16528,6 +16526,19 @@ fn run_editor_conformance_with(
             None,
         ))
     };
+    // (core#1708) Registered once the request is well-formed and before any host work (the pack's
+    // resolution included), so a host's shutdown (`ec::shut_down_install_harnesses`) reaches the
+    // call wherever it is: the review-time harness is a run's Tool child, stopped by the run's
+    // cancel path, and this call has no run.
+    let Some(call) = ec::InstallCall::begin() else {
+        return refused(SHUTTING_DOWN.into());
+    };
+    let pack_root = pack_root
+        .canonicalize()
+        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
+    if !pack_root.is_dir() {
+        return Err("packRoot must be an existing directory".into());
+    }
     // Match the review step's ladder when the run has no admitted skills generation.
     let garden_root = match crate::skills_snapshot::resolve_ladder() {
         Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
@@ -16566,10 +16577,15 @@ fn run_editor_conformance_with(
         0,
         deadline,
         jail,
-        &|| None,
+        // `shutdown`: nothing else signals the group, so the loop that holds the unreaped leader
+        // kills it at once (`actor_kill_grace`), as for a run's Tool child when its engine stops.
+        &|| call.stopped().then_some(STOP_SHUTDOWN),
         &|_| {},
         &|_| {},
     );
+    if call.stopped() {
+        return refused(SHUTTING_DOWN.into());
+    }
     Ok(result(record, raw))
 }
 
@@ -16581,6 +16597,10 @@ mod editor_install_conformance_tests {
 
     #[test]
     fn invalid_requests_are_errors_before_any_host_work() {
+        // Serialized with the shutdown test, whose flag would refuse a well-formed request first.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
         let file = tmp.path().join("file");
         std::fs::write(&file, "not a directory").unwrap();
@@ -16687,6 +16707,97 @@ mod editor_install_conformance_tests {
                     assert!(response["report"].is_null());
                 }
             }
+        });
+    }
+
+    /// core#1708: a host's shutdown kills an install-time harness's jailed process group and the
+    /// call resolves to a refused record; a later call is refused before any host work. Red on
+    /// main: the install call passed no-op hooks, so nothing reached the group and it ran on to
+    /// its deadline. The "jail" ignores TERM and loops, standing in for a hung browser.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_shutdown_kills_the_install_harness_group() {
+        with_host_inputs(|root| {
+            struct Reopen;
+            impl Drop for Reopen {
+                fn drop(&mut self) {
+                    ec::reopen_install_harnesses_for_test();
+                }
+            }
+            let _reopen = Reopen;
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let marker = root.join("harness-pid");
+            // Bounded on its own (about 30 s): a failing assertion leaves nothing behind for long,
+            // and the test never signals a group id it does not own.
+            let script = format!(
+                "trap '' TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 600 ]; do sleep 0.05; \
+                 i=$((i+1)); done",
+                marker.display()
+            );
+            let jail = move |_: &[&Path], _: u16| crate::validator::SandboxLauncher {
+                wrapper: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.clone(),
+                    "jail".to_string(),
+                ],
+                level: crate::validator::SandboxLevel::Sandboxed,
+            };
+            let request = serde_json::json!({ "packRoot": pack, "timeoutS": 900 }).to_string();
+            let call = std::thread::spawn(move || run_editor_conformance_with(&request, &jail));
+            let started = std::time::Instant::now();
+            let pid: i32 = loop {
+                if let Some(pid) = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(20),
+                    "the harness never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            extern "C" {
+                fn killpg(pgrp: i32, sig: i32) -> i32;
+            }
+            let stopping = std::time::Instant::now();
+            // The call registered before its harness spawned, so it is in flight now.
+            assert_eq!(ec::shut_down_install_harnesses(), 1);
+            assert!(ec::install_harnesses_settled(
+                std::time::Instant::now() + std::time::Duration::from_secs(10)
+            ));
+            let raw = call.join().unwrap().unwrap();
+            assert!(
+                stopping.elapsed() < std::time::Duration::from_secs(5),
+                "the shutdown must end the call within a poll and a kill, not at the deadline"
+            );
+            // The leader is reaped and nothing is left in its group: a killed descendant may stay
+            // a zombie until its new parent reaps it, so the check is a bounded poll.
+            let gone = std::time::Instant::now();
+            while unsafe { killpg(pid, 0) } == 0 {
+                assert!(
+                    gone.elapsed() < std::time::Duration::from_secs(5),
+                    "the harness's process group survived the shutdown"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["outcome"], "refused");
+            assert_eq!(response["record"]["cause"], "engine_refused");
+            assert_eq!(response["record"]["reason"], SHUTTING_DOWN);
+            assert!(response["report"].is_null());
+            // After the shutdown a call is refused before any host work: the jail is never built.
+            let request = serde_json::json!({ "packRoot": pack }).to_string();
+            let never = |_: &[&Path], _: u16| -> crate::validator::SandboxLauncher {
+                panic!("a call after the shutdown must not reach the jail")
+            };
+            let raw = run_editor_conformance_with(&request, &never).unwrap();
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["reason"], SHUTTING_DOWN);
+            assert_eq!(ec::shut_down_install_harnesses(), 0);
         });
     }
 
