@@ -663,6 +663,10 @@ pub enum HumanDecision {
 pub struct GateExpect {
     pub ord: Option<u32>,
     pub plan_rev: Option<u32>,
+    /// (core#1808) The opening of the gate the answer was sent for (the open row's and the
+    /// `awaitingHuman` frame's `gate_seq`): a gate that closed and re-opened at the same ord, the
+    /// same kind or the same plan revision is another opening, and its answer is refused.
+    pub gate_seq: Option<u32>,
 }
 
 /// The refusal token that opens the error of an answer whose [`GateExpect`] no longer holds (the

@@ -111,6 +111,7 @@ pub(super) fn fold(
             expect: Some(GateExpect {
                 ord: Some(unit.ord),
                 plan_rev: None,
+                gate_seq: None,
             }),
             reply,
         });
@@ -344,6 +345,7 @@ mod tests {
                     Some(crate::workflow::GateExpect {
                         ord: Some(7),
                         plan_rev: None,
+                        gate_seq: None,
                     })
                 );
             }

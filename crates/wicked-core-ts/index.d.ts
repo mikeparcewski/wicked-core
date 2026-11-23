@@ -446,8 +446,12 @@ export declare class Core {
    * mismatch with an error that starts `gate_changed:`. A plan-gate SEND-BACK
    * (`approve=false`, `action` `request_changes`, the person's words in `amend`) needs
    * `expectPlanRev`: the lead re-plans with the note, and the next revision is held for approval.
+   *
+   * (core#1808, additive.) `expectGateSeq` names the OPENING the answer was sent for
+   * (`awaitingHuman.gateSeq`): a gate that closed and re-opened since, at the same ord too, is
+   * another opening, and the answer is refused with an error that starts `gate_changed:`.
    */
-  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectPlanRev?: number | undefined | null): Promise<string>
+  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectPlanRev?: number | undefined | null, expectGateSeq?: number | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
@@ -585,7 +589,7 @@ export declare class Core {
   rejudgeReadiness(runId: string): Promise<string>
   /**
    * (studio#1170, crew#1512) Every answer the run's open gate takes NOW, as a JSON
-   * `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
+   * `GateActions` object `{ord, gateKind, planRev?, gateSeq?, actions: [{action, intent, note,
    * noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
    * human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
    * approve) accepts; nothing else is — except at an Apps publish's consent gate, judged on the QE
@@ -1441,6 +1445,9 @@ export declare class Subscription {
  * are given later in Plugins. With no plan it carries only
  * `writeTargetsMissing` (why nothing is listed). Answer with `action: 'consent:<id>'`, approve
  * (= the default) or reject.
+ * core#1808 (additive): every awaitingHuman carries `gateSeq` (a number): which opening of a gate
+ * this is, one more than any gate of the run opened before. Send it back as `confirmGate`'s
+ * `expectGateSeq`: an answer for an earlier opening is refused `gate_changed:`, even at the same ord.
  * core#762 / core#418 (additive, new events): `acpTurnSettled` {session, ord, attempt, cliKey,
  * quietSecs, outputBytes} — the bridge sent no stopReason for quietSecs after the worker's final
  * message with no tool call open, so the ENGINE ended the turn and kept its output as the

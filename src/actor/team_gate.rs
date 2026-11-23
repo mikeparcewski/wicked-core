@@ -1906,7 +1906,7 @@ fn reopen_transport_gate(
             pending.event_type
         )
     };
-    let request = crate::interaction::open_gate(
+    let mut request = crate::interaction::open_gate(
         &run_id,
         ord,
         None,
@@ -1914,6 +1914,8 @@ fn reopen_transport_gate(
         TEAM_TRANSPORT_GATE,
         crate::interaction::now_millis(),
     );
+    // (core#1808) A re-opened pause is a new opening.
+    request.gate_seq = crate::interaction::next_gate_seq(&*store, &run_id).unwrap_or(0);
     if let Err(e) = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]) {
         // The run keeps its previous durable state; the next boot re-opens the pause again.
         eprintln!("wicked-core: boot could not re-open the team_transport pause of {run_id}: {e}");

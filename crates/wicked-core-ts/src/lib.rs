@@ -1453,6 +1453,10 @@ impl Core {
     /// mismatch with an error that starts `gate_changed:`. A plan-gate SEND-BACK
     /// (`approve=false`, `action` `request_changes`, the person's words in `amend`) needs
     /// `expectPlanRev`: the lead re-plans with the note, and the next revision is held for approval.
+    ///
+    /// (core#1808, additive.) `expectGateSeq` names the OPENING the answer was sent for
+    /// (`awaitingHuman.gateSeq`): a gate that closed and re-opened since, at the same ord too, is
+    /// another opening, and the answer is refused with an error that starts `gate_changed:`.
     #[napi(ts_return_type = "Promise<string>")]
     #[allow(clippy::too_many_arguments)]
     pub fn confirm_gate(
@@ -1473,14 +1477,19 @@ impl Core {
         // (`request_changes` at `plan_approval`) needs `expectPlanRev`.
         expect_ord: Option<u32>,
         expect_plan_rev: Option<u32>,
+        // (core#1808) The opening the answer was sent for (`awaitingHuman.gateSeq`, the open
+        // row's `gate_seq`): an answer for an earlier opening at the same ord is refused
+        // `gate_changed:`. Optional and trailing.
+        expect_gate_seq: Option<u32>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
-        let expect = (expect_ord.is_some() || expect_plan_rev.is_some()).then_some(
-            wicked_core::GateExpect {
-                ord: expect_ord,
-                plan_rev: expect_plan_rev,
-            },
-        );
+        let expect =
+            (expect_ord.is_some() || expect_plan_rev.is_some() || expect_gate_seq.is_some())
+                .then_some(wicked_core::GateExpect {
+                    ord: expect_ord,
+                    plan_rev: expect_plan_rev,
+                    gate_seq: expect_gate_seq,
+                });
         task(move || {
             // (DES-TEAMING-002 T3) Approve a `plan_approval` gate WITH AN EDIT: `planJson` is the
             // edited plan (`action` omitted or `edit_plan`, `approve=true`). The engine accepts it
@@ -1942,7 +1951,7 @@ impl Core {
     }
 
     /// (studio#1170, crew#1512) Every answer the run's open gate takes NOW, as a JSON
-    /// `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
+    /// `GateActions` object `{ord, gateKind, planRev?, gateSeq?, actions: [{action, intent, note,
     /// noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
     /// human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
     /// approve) accepts; nothing else is — except at an Apps publish's consent gate, judged on the
@@ -4359,6 +4368,7 @@ mod tests {
                 finding_ids: Vec::new(),
                 consent: None,
                 repeat: None,
+                gate_seq: 0,
             },
             "awaitingHuman",
             &[
@@ -4368,6 +4378,7 @@ mod tests {
                 "reviewingOrd",
                 "prompt",
                 "gateKind",
+                "gateSeq",
             ],
         );
         check(
