@@ -240,12 +240,20 @@ fn reroute(
 ) -> anyhow::Result<()> {
     let run_id = session.id.clone();
     let mut units = crate::domain::session_units(store, &run_id)?;
-    let registry = crate::registry_roster();
-    let roster: Vec<crate::AgenticCli> = session
-        .clis
-        .iter()
-        .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
-        .collect();
+    // (codex r1 B16) The launch's own records when the plan state kept them (a team run's
+    // `team_plan.roster`: instances and launch overrides as admitted); otherwise the run's keys over
+    // the registry, as the dispatch resolves them.
+    let launch = super::launch_roster(session)?;
+    let roster: Vec<crate::AgenticCli> = if launch.is_empty() {
+        let registry = crate::registry_roster();
+        session
+            .clis
+            .iter()
+            .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
+            .collect()
+    } else {
+        launch
+    };
     // The run's live benches stand: consent is no evidence that a credential recovered (a bench
     // lifts through its own re-probe).
     let dists = crate::distribute::distribute_units_on_benched(
