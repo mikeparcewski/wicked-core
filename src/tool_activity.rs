@@ -132,6 +132,26 @@ fn attempt_failures() -> &'static FailedTests {
     S.get_or_init(Default::default)
 }
 
+// (core#1674) What the seat's own layer refused inside the work tree, per unit attempt.
+type Refusals = std::sync::Mutex<HashMap<(String, u32, u32), Vec<SeatRefusal>>>;
+
+fn attempt_refusals() -> &'static Refusals {
+    static S: std::sync::OnceLock<Refusals> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// (core#1674) The paths inside its work tree that this unit attempt's seat was refused by its
+/// own layer (its CLI sandbox, a read-only mount, file permissions) and never wrote afterwards, in
+/// the order first refused: work the step could not do, which no engine hook saw.
+pub fn seat_refusals(run_id: &str, ord: u32, attempt: u32) -> Vec<SeatRefusal> {
+    attempt_refusals()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(run_id.to_string(), ord, attempt))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Failed test results seen in this unit attempt's tool streams (core#1178).
 pub fn failed_tests(run_id: &str, ord: u32, attempt: u32) -> u32 {
     attempt_failures()
@@ -146,6 +166,10 @@ pub fn failed_tests(run_id: &str, ord: u32, attempt: u32) -> u32 {
 pub fn forget_run(run_id: &str) {
     crate::skill_use::forget_run(run_id);
     attempt_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(r, _, _), _| r != run_id);
+    attempt_refusals()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retain(|(r, _, _), _| r != run_id);
@@ -531,12 +555,35 @@ pub fn codex_item(v: &Value) -> Option<CodexCall> {
         ),
         _ => return None,
     };
+    // (core#1674) What the seat's own layer refused this call: a command's output, or a file
+    // change codex itself could not apply.
+    let refused = match item.get("type").and_then(Value::as_str) {
+        _ if started => Vec::new(),
+        Some("command_execution") => refusals_of(
+            item.get("aggregated_output")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ),
+        Some("file_change") if failed => item
+            .get("changes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("path").and_then(Value::as_str))
+            .map(|p| SeatRefusal {
+                path: p.to_string(),
+                why: "the edit was not applied",
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     Some(CodexCall {
         started,
         id,
         tool,
         input,
         ok,
+        refused,
     })
 }
 
@@ -547,6 +594,79 @@ pub struct CodexCall {
     pub tool: String,
     pub input: Value,
     pub ok: bool,
+    /// (core#1674) What the seat's own layer refused this call, as the completed item showed it
+    /// ([`refusals_of`]). Empty for a start and for every stream that shows no command output (pi).
+    pub refused: Vec<SeatRefusal>,
+}
+
+/// (core#1674) One refusal the seat's own layer (its CLI sandbox, a read-only mount, file
+/// permissions) gave a call, read off the call's output: the path, as the call named it, and the
+/// system's words for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatRefusal {
+    pub path: String,
+    pub why: &'static str,
+}
+
+/// The system's words a refused file operation ends with (`<path>: <words>`), in the forms shells,
+/// coreutils and Python print them.
+const REFUSAL_WORDS: [&str; 3] = [
+    "Permission denied",
+    "Operation not permitted",
+    "Read-only file system",
+];
+
+/// What a refusal line may put before the path it names (`cannot create <path>`, …).
+const REFUSAL_VERBS: [&str; 7] = [
+    "cannot create regular file ",
+    "cannot create directory ",
+    "cannot create ",
+    "cannot touch ",
+    "cannot remove ",
+    "cannot open directory ",
+    "cannot open ",
+];
+
+/// (core#1674) The refusals a command's output shows: every line naming a path the system refused
+/// (`bash: line 1: <path>: Permission denied`, `/bin/sh: 1: cannot create <path>: Read-only file
+/// system`, `touch: cannot touch '<path>': Operation not permitted`, Python's `PermissionError:
+/// [Errno 1] Operation not permitted: '<path>'`). A line naming no path is not one.
+pub fn refusals_of(output: &str) -> Vec<SeatRefusal> {
+    let quote = |c: char| matches!(c, '\'' | '"' | '`' | '\u{2018}' | '\u{2019}');
+    let mut out: Vec<SeatRefusal> = Vec::new();
+    for line in output.lines().map(str::trim) {
+        let Some((at, why)) = REFUSAL_WORDS
+            .iter()
+            .find_map(|w| line.find(w).map(|at| (at, *w)))
+        else {
+            continue;
+        };
+        let before = line[..at].trim_end();
+        // `<…>: <path>: <words>` (shells, coreutils), or `<words>: '<path>'` (Python).
+        let named = match before.strip_suffix(':') {
+            Some(head) => head.rsplit(": ").next().unwrap_or(head),
+            None => line[at + why.len()..].trim_start_matches(':'),
+        };
+        let mut path = named.trim();
+        for v in REFUSAL_VERBS {
+            if let Some(rest) = path.strip_prefix(v) {
+                path = rest;
+                break;
+            }
+        }
+        let path = path.trim_matches(quote);
+        if path.is_empty() || path.contains(char::is_whitespace) {
+            continue;
+        }
+        let r = SeatRefusal {
+            path: path.to_string(),
+            why,
+        };
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// codex runs every command as `bash -lc '<script>'` (formatted with `shlex::try_join`, so the
@@ -702,6 +822,7 @@ pub fn pi_event(v: &Value) -> Option<CodexCall> {
         tool,
         input,
         ok,
+        refused: Vec::new(),
     })
 }
 
@@ -709,6 +830,9 @@ impl ToolActivitySink {
     /// A call read off a non-claude stream ([`codex_item`], [`pi_event`]). A completion whose start
     /// was never seen (codex emits a file change only when done) is shown starting and finishing.
     pub fn call(&mut self, c: &CodexCall) {
+        if !c.started {
+            self.note_refusals(c);
+        }
         if c.started {
             self.started(&c.id, &c.tool, &c.input);
         } else {
@@ -718,6 +842,55 @@ impl ToolActivitySink {
             self.finished(&c.id, c.ok);
         }
     }
+}
+
+impl ToolActivitySink {
+    /// (core#1674) Keep what the seat was refused inside its work tree (a path under the tree,
+    /// never its `.git`), as the tree's own relative path; a later edit of that path that went
+    /// through answers it.
+    fn note_refusals(&self, c: &CodexCall) {
+        let key = (self.run_id.clone(), self.ord, self.attempt);
+        let mut all = attempt_refusals().lock().unwrap_or_else(|p| p.into_inner());
+        if c.ok && c.tool == "Edit" {
+            if let Some(p) = c.input.get("file_path").and_then(Value::as_str) {
+                if let (Some(done), Some(list)) = (in_tree(&self.root, p), all.get_mut(&key)) {
+                    list.retain(|r| r.path != done);
+                }
+            }
+        }
+        for r in &c.refused {
+            let Some(path) = in_tree(&self.root, &r.path) else {
+                continue;
+            };
+            let list = all.entry(key.clone()).or_default();
+            if !list.iter().any(|x| x.path == path) {
+                list.push(SeatRefusal { path, why: r.why });
+            }
+        }
+    }
+}
+
+/// (core#1674) `path` (as a seat named it: relative to its work tree, or absolute) as the tree's
+/// own relative path, when it is under `root` and not in its `.git`; `None` otherwise.
+fn in_tree(root: &Path, path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let rel = if p.is_absolute() {
+        p.strip_prefix(root).ok()?
+    } else {
+        p
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(n) => parts.push(n.to_str()?),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() || parts.contains(&".git") {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 /// Words that make a shell command a test run.
@@ -1336,6 +1509,105 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    /// (core#1674) The refusals a codex command's output shows, read off the container capture
+    /// `tests/fixtures/headless/codex-gw.ndjson` (a codex seat's own transcript): each refused path
+    /// with the system's words, a write or a read alike, and nothing from a line that names none.
+    #[test]
+    fn core1674_refusals_are_read_off_a_real_codex_transcript() {
+        let fixture = include_str!("../tests/fixtures/headless/codex-gw.ndjson");
+        let refused: Vec<(String, &str)> = fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| codex_item(&v))
+            .flat_map(|c| c.refused)
+            .map(|r| (r.path, r.why))
+            .collect();
+        for want in [
+            ("/tmp/outside/filetool-outside.txt", "Permission denied"),
+            ("/tmp/outside/shell-outside.txt", "Permission denied"),
+            ("/opt/rootfs-outside.txt", "Read-only file system"),
+            ("/tmp/outside/child-sh-outside.txt", "Permission denied"),
+            ("/work/held/link.txt", "Permission denied"),
+            ("/tmp/outside", "Permission denied"),
+            ("/run/fake-secret/.ssh/id_rsa", "Permission denied"),
+        ] {
+            assert!(
+                refused.iter().any(|(p, w)| p == want.0 && *w == want.1),
+                "{want:?} in {refused:?}"
+            );
+        }
+        // Python's form names its path after the words.
+        let py = refusals_of(
+            "PermissionError: [Errno 1] Operation not permitted: '/w/src/add.py'\nrc=1",
+        );
+        assert_eq!(py.len(), 1);
+        assert_eq!(py[0].path, "/w/src/add.py");
+        // coreutils' quoted form, and a line with no path at all.
+        let cu = refusals_of(
+            "touch: cannot touch 'src/new.rs': Operation not permitted\n\
+             execvp() of '/bin/ps' failed: Operation not permitted now",
+        );
+        assert_eq!(cu.len(), 1, "{cu:?}");
+        assert_eq!(cu[0].path, "src/new.rs");
+        // A start shows no output; a clean run refuses nothing.
+        assert!(refusals_of("rc=0\n").is_empty());
+    }
+
+    /// (core#1674) Driven through the codex adapter as a seat's live stream is, with the work tree
+    /// at `/work` (that capture's tree): only the refusal INSIDE the tree is kept for the attempt,
+    /// as the tree's own path; refusals outside it are the boundary working, and a later edit
+    /// that went through answers its path.
+    #[test]
+    fn core1674_the_attempt_keeps_only_refusals_inside_its_work_tree() {
+        let run = "core1674-sink";
+        let sink = ToolActivitySink::new(run, 2, 0, Path::new("/work"), Box::new(|_| {}));
+        let mut codex = crate::execute_wrapped::CodexJsonl::with_activity(Some(sink));
+        for line in include_str!("../tests/fixtures/headless/codex-gw.ndjson").lines() {
+            let _ = crate::execute_wrapped::OutputAdapter::on_line(&mut codex, line);
+        }
+        let kept = seat_refusals(run, 2, 0);
+        assert_eq!(
+            kept,
+            vec![SeatRefusal {
+                path: "held/link.txt".into(),
+                why: "Permission denied"
+            }]
+        );
+        assert!(seat_refusals(run, 2, 1).is_empty(), "another attempt");
+        // A `.git` path is the engine's, not the step's work; a file change codex could not
+        // apply is a refusal; a later applied edit of it answers it.
+        let mut sink = ToolActivitySink::new(run, 3, 0, Path::new("/work"), Box::new(|_| {}));
+        let item = |status: &str, path: &str| {
+            codex_item(
+                &json!({"type": "item.completed", "item": {"id": format!("f-{status}"),
+                "type": "file_change", "changes": [{"path": path, "kind": "update"}],
+                "status": status}}),
+            )
+            .expect("a file change")
+        };
+        sink.call(
+            &codex_item(
+                &json!({"type": "item.completed", "item": {"id": "g", "type":
+                "command_execution", "command": "git commit -m x", "aggregated_output":
+                "/bin/bash: line 1: /work/.git/index.lock: Permission denied",
+                "exit_code": 255, "status": "failed"}}),
+            )
+            .unwrap(),
+        );
+        sink.call(&item("failed", "/work/src/math.js"));
+        assert_eq!(
+            seat_refusals(run, 3, 0),
+            vec![SeatRefusal {
+                path: "src/math.js".into(),
+                why: "the edit was not applied"
+            }]
+        );
+        sink.call(&item("completed", "/work/src/math.js"));
+        assert!(seat_refusals(run, 3, 0).is_empty());
+        forget_run(run);
+        assert!(seat_refusals(run, 2, 0).is_empty());
+    }
 
     #[test]
     fn redact_stream_matches_whole_text_at_every_split() {

@@ -255,6 +255,7 @@ fn run_steps(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         machine,
@@ -584,6 +585,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,
@@ -831,6 +833,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,
@@ -1471,6 +1474,7 @@ fn run_told(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -1752,6 +1756,7 @@ fn changed_instructions_check_the_rule_again() {
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,
@@ -1933,6 +1938,7 @@ fn run_packs(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -3158,6 +3164,7 @@ fn pol_2101_needs_no_judge_when_no_agent_wrote_code_and_holds_when_creators_are_
                 deferred: &[],
                 settled: &[],
                 carried: &[],
+                same_change: &[],
             },
             &judge,
             &NoMachine,
@@ -3237,6 +3244,7 @@ fn run_stage(
             deferred,
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -3456,6 +3464,7 @@ fn run_seated(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -3933,6 +3942,17 @@ fn run_pol_2101(
     records: &[CreatorRecord],
     reviewer: Option<&str>,
 ) -> RuleCheckReport {
+    run_pol_2101_after(c, judge, records, reviewer, &[])
+}
+
+/// [`run_pol_2101`] at a later gate, with the rows of the run's other gates that read this change.
+fn run_pol_2101_after(
+    c: &Change,
+    judge: &dyn RuleJudge,
+    records: &[CreatorRecord],
+    reviewer: Option<&str>,
+    same_change: &[RuleVerdict],
+) -> RuleCheckReport {
     let rules = [pack("POL-2101")];
     let f = job_facts(&mcp_steps(), None, None, c);
     let seats = seats();
@@ -3959,6 +3979,7 @@ fn run_pol_2101(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change,
         },
         judge,
         &NoMachine,
@@ -4001,6 +4022,117 @@ fn core1381_the_reviewers_recorded_check_keeps_the_record_clause() {
     let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
     let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), None);
     assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+}
+
+/// (core#1842) J4 re-cut 3, run edb67a40: the review gate (unit 3) KEPT POL-2101 (gateEvaluated
+/// seq 432, its row below as the engine wrote it), then the QE step (unit 4) checked the SAME
+/// change again. Its only other judge seat (pi) was seen calling the work's provider, so its KEPT
+/// did not count, and codex failed as a seat mid-check (`image_unavailable`): the row came back
+/// UNCHECKED (seq 545) and the gate held until the person pressed "Re-check the rules". The
+/// earlier gate's verdict on the same change now answers it, with no judge asked.
+#[test]
+fn core1842_a_later_step_on_the_same_change_reuses_the_reviews_pol_2101_verdict() {
+    struct QeSeats(PackJudge);
+    impl RuleJudge for QeSeats {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            if seat == "codex" {
+                return JudgeAnswer::SeatFailed(
+                    "the container floor did not arm (image_unavailable)".into(),
+                );
+            }
+            self.0.ask(seat, prompt)
+        }
+        fn approval_failure(&self, _seat: &str) -> Option<String> {
+            Some(
+                "observed calling the work's provider: observed calling \
+                 `api.anthropic.com:443`, a provider of the work"
+                    .into(),
+            )
+        }
+    }
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_k = "KEPT — RECORD 2: \"looked at the std::ops::Add docs at the pinned toolchain\"";
+    let qe = || {
+        QeSeats(PackJudge::with(
+            &[("POL-2101", sub_k)],
+            &[],
+            &[("POL-2101", rec_k)],
+        ))
+    };
+    // The review gate's POL-2101 row as the engine wrote it (run edb67a40, seq 432).
+    let mut reviewed: RuleVerdict = serde_json::from_value(serde_json::json!({
+        "cite": "src/math.js:6 corrects the existing JavaScript loop\u{2019}s start index; JavaScript has no built-in array sum, and the change introduces no library substitution or duplicate built-in.",
+        "evidenceComplete": true,
+        "evidenceKey": "e17b1a0facb5d96bb0d3d1914ebc95d6e0d0ab8e05b0f17a73c3770ca5e922e9",
+        "how": "judge",
+        "judge": "codex",
+        "judgeIds": ["codex"],
+        "origin": "judge",
+        "reason": "the change: src/math.js:6 corrects the existing JavaScript loop\u{2019}s start index; JavaScript has no built-in array sum, and the change introduces no library substitution or duplicate built-in.; the step records: RECORD 2: \"looked at package.json and src/math.js\" and \"offers plain JavaScript with no built-in array sum; correcting the existing loop requires no library.\"",
+        "reviewer": {"by": "reviewer", "cite": "Existing stack retained; stack check recorded, satisfying the operator\u{2019}s ruling.", "seat": "codex", "status": "kept"},
+        "ruleId": "POL-2101",
+        "ruleKey": "d818e618df6c84071508f4d91f6ee80a2b98e0a152206169b9aad49581ffbdef",
+        "status": "kept"
+    }))
+    .expect("the receipt's rule row");
+    reviewed.rule_key = rule_key(&pack("POL-2101"));
+    let c = change();
+
+    // As it was: the QE step's own check, with nothing carried, holds.
+    let held = run_pol_2101(&c, &qe(), &record(REC_NO_CHECK), Some(REVIEWER_CHECKED));
+    assert_eq!(row_of(&held, "POL-2101").status, RuleStatus::Unchecked);
+    assert!(held.hold().is_some(), "{held:?}");
+
+    // Every review-stage check records the change it read.
+    assert_eq!(held.change_key, Some(change_key(&c)));
+
+    // The review's KEPT on this same change answers it: no judge is asked, the gate does not hold.
+    let judge = qe();
+    let r = run_pol_2101_after(
+        &c,
+        &judge,
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+        std::slice::from_ref(&reviewed),
+    );
+    let row = row_of(&r, "POL-2101");
+    assert_eq!(row.status, RuleStatus::Kept, "{row:?}");
+    assert_eq!(row.how, RuleHow::Cache);
+    assert_eq!(row.origin, Some(RuleOrigin::Judge));
+    assert!(row.reason.starts_with(SAME_CHANGE_REUSED), "{}", row.reason);
+    assert!(r.hold().is_none() && r.denial().is_none(), "{r:?}");
+    assert!(judge.0.prompts.lock().unwrap().is_empty());
+
+    // Only a KEPT or N/A is reused: a BROKEN (or anything else) is asked again.
+    let mut broken = reviewed.clone();
+    broken.status = RuleStatus::Broken;
+    let r = run_pol_2101_after(
+        &c,
+        &qe(),
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+        &[broken],
+    );
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+
+    // Another rule text (the rule changed since) is asked again.
+    let mut other_rule = reviewed.clone();
+    other_rule.rule_key = "an older text".into();
+    let r = run_pol_2101_after(
+        &c,
+        &qe(),
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+        &[other_rule],
+    );
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+
+    // A different change has a different key: the caller hands over no row from it.
+    let other = change_of(
+        "diff --git a/src/b.rs b/src/b.rs\n+fn b() {}\n",
+        &["src/b.rs"],
+    );
+    assert_ne!(change_key(&other), change_key(&c));
 }
 
 /// Deny-dominates holds: a substance BROKEN (a duplicated built-in) breaks the rule whatever the
@@ -4445,6 +4577,7 @@ fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,
@@ -4605,6 +4738,7 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,
@@ -4689,6 +4823,7 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
                 deferred: &[],
                 settled: &[],
                 carried: &[],
+                same_change: &[],
             },
             judge,
             &NoMachine,
@@ -4845,6 +4980,7 @@ fn run_carried_in(
             deferred: &[],
             settled: &[],
             carried,
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -5151,6 +5287,7 @@ fn run_own_skip(
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -5558,6 +5695,7 @@ fn span_check(rules: &[ConformanceRule], c: &Change, judge: &SpanJudge) -> RuleC
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         judge,
         &NoMachine,
@@ -5879,6 +6017,7 @@ fn core_1278_a_file_an_undecided_part_showed_but_did_not_name_is_listed_as_not_s
             deferred: &[],
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachine,

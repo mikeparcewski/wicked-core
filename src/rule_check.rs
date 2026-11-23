@@ -426,6 +426,11 @@ pub struct RuleCheckReport {
     /// only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub carry_keys: BTreeMap<String, String>,
+    /// (core#1842) [`change_key`] of the change this check read (review stage only): a later
+    /// step's check of the same change reuses this one's POL-2101 verdict
+    /// ([`CheckInput::same_change`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_key: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -793,6 +798,12 @@ pub fn job_facts(
 /// never truncated).
 fn digest(parts: &[&str]) -> String {
     digest_bytes(&parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
+}
+
+/// (core#1842) The identity of a change under review: its exact bytes, nothing else (no floor, no
+/// records, no instructions). Two gates of one run with an equal key read the same change.
+pub fn change_key(change: &Change) -> String {
+    digest_bytes(&[b"change", &change.raw])
 }
 
 fn digest_bytes(parts: &[&[u8]]) -> String {
@@ -1268,6 +1279,13 @@ pub struct CheckInput<'a> {
     /// change alone (not a process rule, a step-record clause or a machine obligation). Anything
     /// else is judged again.
     pub carried: &'a [RuleSkip],
+    /// (core#1842) The rows of the run's OTHER gates whose check read this very change (an equal
+    /// [`change_key`]). A KEPT or N/A a judge or council reached there on a rule judged on the
+    /// change and the creator steps' records (POL-2101) answers it here: the change is the same
+    /// bytes, the creator records are the same steps (a creator that changed code changed the
+    /// change), and this step's own record can only add a check, never remove one. Anything else
+    /// is judged again.
+    pub same_change: &'a [RuleVerdict],
 }
 
 /// (Part B) One creator step's record, as the run stored it (its last output), for POL-2101's
@@ -3477,6 +3495,9 @@ pub const NO_AGENT_WROTE_CODE: &str = "no agent wrote code in this run (its code
                                        are the engine's own tool steps, or there are none), and \
                                        the rule binds agents writing code";
 
+/// (core#1842) How a POL-2101 row reused from an earlier step's check of the same change says so.
+pub const SAME_CHANGE_REUSED: &str = "already checked at an earlier step on this same change";
+
 /// (Part B) Where POL-2101's record part waits for the engine to combine it with its substance.
 const RECORD_SLOT: &str = "\u{0}record";
 
@@ -3947,6 +3968,33 @@ pub fn check(
             rows.insert(rule.id.clone(), c);
             continue;
         }
+        // (core#1842) POL-2101 already ruled KEPT or N/A at an earlier step's check of this same
+        // change (the review before QE): the question is the same, so it is not asked again. A
+        // judge seat failing here (J4: the only other seat shares the work's provider) would
+        // otherwise hold a step that changed nothing.
+        if pack == Some(PackKind::WorkWithRecord) {
+            if let Some(r) = input
+                .same_change
+                .iter()
+                .rev()
+                .filter(|r| {
+                    r.rule_id == rule.id
+                        && r.rule_key == rk
+                        && matches!(r.status, RuleStatus::Kept | RuleStatus::NotApplicable)
+                })
+                .find_map(reuse)
+            {
+                rows.insert(
+                    rule.id.clone(),
+                    RuleVerdict {
+                        reason: format!("{SAME_CHANGE_REUSED}: {}", r.reason),
+                        evidence_key: Some(ek),
+                        ..r
+                    },
+                );
+                continue;
+            }
+        }
         if is_machine {
             // Decided from the change where it can be: no model call, no run. A change with no
             // source code is not applicable whatever the scope; a finding against the change
@@ -4098,6 +4146,7 @@ pub fn check(
             0
         },
         carry_keys,
+        change_key: (input.stage == CheckStage::Review).then(|| change_key(input.change)),
         ..Default::default()
     };
     // (S3) The machine check runs beside the judge batches; one base run answers every rule that
