@@ -101,6 +101,9 @@ pub(crate) struct FakeHost {
     /// (core#1822) A turn whose prompt holds the needle takes this long, honouring its budget as
     /// the real host does: past the budget it fails after the budget.
     pub slow: Mutex<Option<(String, Duration)>>,
+    /// (core#1822, codex r3) How long a turn past its budget takes to stop after it, as the ACP
+    /// host's cancel drain does (zero by default).
+    pub drain: Mutex<Duration>,
     /// The budget each turn was handed, beside its prompt.
     pub budgets: Mutex<Vec<(String, Duration)>>,
 }
@@ -121,6 +124,7 @@ impl FakeHost {
             closed: Mutex::default(),
             closed_runs: Mutex::default(),
             slow: Mutex::default(),
+            drain: Mutex::default(),
             budgets: Mutex::default(),
         }
     }
@@ -195,6 +199,7 @@ impl MonitorHost for FakeHost {
         if let Some((_, d)) = slow.filter(|(needle, _)| prompt.contains(needle.as_str())) {
             std::thread::sleep(d.min(budget));
             if d > budget {
+                std::thread::sleep(*self.drain.lock().unwrap());
                 self.open_keys.lock().unwrap().remove(pool_key);
                 return Err(format!("the turn exceeded its {budget:?} budget"));
             }
@@ -1988,6 +1993,8 @@ fn core_1822_a_long_final_batch_leaves_the_council_its_share_of_the_final_pass()
     // batch would run the whole final pass (a turn up to its own budget).
     h.fx.write("src/other.rs", "fn c() {}\n");
     *h.host.slow.lock().unwrap() = Some(("final pass".into(), Duration::from_secs(120)));
+    // The cut turn's seat takes the host's whole cancel drain to stop.
+    *h.host.drain.lock().unwrap() = super::super::MEMBER_CANCEL_DRAIN;
     h.complete(3, 1, "claude#1", "ok");
     h.pump();
     assert_eq!(
@@ -2006,9 +2013,8 @@ fn core_1822_a_long_final_batch_leaves_the_council_its_share_of_the_final_pass()
         .find(|(p, _)| p.contains("final pass"))
         .map(|(_, b)| *b)
         .expect("the final batch's budget");
-    let drain = super::super::MEMBER_CANCEL_DRAIN.min(review / 4);
     assert!(
-        !drain.is_zero() && batch + drain <= review,
+        batch + super::super::MEMBER_CANCEL_DRAIN <= review,
         "the turn and its cancel drain end inside the review window: {batch:?} of {review:?}"
     );
     assert_eq!(
