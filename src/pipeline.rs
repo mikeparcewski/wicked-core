@@ -1672,6 +1672,20 @@ pub(crate) fn apply_and_finish_unit(
         d.findings_trimmed = v.findings_trimmed;
         d
     });
+    // (core#1674) SEAT REFUSALS — a step that writes code whose own seat layer (its CLI sandbox, a
+    // read-only mount, file permissions) refused writes inside its work tree it never made
+    // afterwards did not do its work as built. No engine hook saw those refusals (they are not in
+    // the decisions log), so without this a later check was the first to find the missing work.
+    // Read only for the attempt the seat ran (a re-judge or floor re-run keeps the last word).
+    let seat_refused_denial = (seat_ran && crate::execute_wrapped::writes_code(unit))
+        .then(|| crate::tool_activity::seat_refusals(session_id, unit.ord, attempt))
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            crate::domain::UnitDenial::new(
+                crate::domain::DENIAL_SOURCE_SEAT_REFUSED,
+                seat_refused_reason(&r),
+            )
+        });
     // (BC-80, core#535) CAPTURE REPORT — the output-marker deny layer for a phase that declared
     // `requires_capture_report`. A capture run whose skill loads and never runs produced 0
     // proposals and reported `completed`: nothing in the fold could tell that apart from a repo
@@ -1962,6 +1976,7 @@ pub(crate) fn apply_and_finish_unit(
         same_seat_denial,
         det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)),
         checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
+        seat_refused_denial,
         capture_denial,
         evaluator_verdict_denial,
         qe_veto,
@@ -2971,6 +2986,27 @@ impl FoldRefresh {
             || prior.tree.is_none()
             || self.tree == prior.tree
     }
+}
+
+/// (core#1674) The words of a [`crate::domain::DENIAL_SOURCE_SEAT_REFUSED`] denial: what was
+/// refused (the first few paths, each with the system's words), and what the person can do.
+fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String {
+    const SHOWN: usize = 5;
+    let mut named: Vec<String> = refused
+        .iter()
+        .take(SHOWN)
+        .map(|r| format!("`{}` ({})", r.path, r.why))
+        .collect();
+    if refused.len() > SHOWN {
+        named.push(format!("and {} more", refused.len() - SHOWN));
+    }
+    format!(
+        "the agent's own sandbox refused {} write(s) inside the project that this step never \
+         made afterwards: {}. The step's work is not complete as built. Send it back to try \
+         again, or reassign the step to another agent",
+        refused.len(),
+        named.join(", ")
+    )
 }
 
 /// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
@@ -6827,6 +6863,102 @@ mod judge_bench_tests {
             .detail
             .as_deref()
             .is_some_and(|d| d.contains("distinct")));
+    }
+
+    /// (core#1674) crew#972 item 2: a codex creator whose own sandbox refused its implementation
+    /// write passed its gate as built. The refusal (the codex item as the seat's stream carried
+    /// it, the tree-relative path the sink kept) now denies the creator's gate under its own
+    /// source, naming the path; the same fold with nothing refused approves.
+    #[test]
+    fn core1674_a_creator_refused_a_write_inside_its_tree_does_not_pass_its_gate() {
+        fn fold(sid: &str, refused: bool) -> (bool, Option<crate::domain::UnitDenial>) {
+            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+            let mut sink = |_e: CoreEvent| {};
+            let Planned {
+                mut units,
+                workflow_id,
+                cli_keys,
+                ..
+            } = plan_and_distribute(
+                &mut store,
+                &[cli("a")],
+                "Do step one.",
+                EntityMode::Shared,
+                sid,
+                crate::domain::HumanConfirm::None,
+                false,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                &mut sink,
+                None,
+                false,
+                false,
+                Vec::new(),
+                None,
+                true,
+                &crate::assurance::QeOverride::Auto,
+            )
+            .expect("plan");
+            units[0].role = crate::workflow::PhaseRole::Creator;
+            assert!(crate::execute_wrapped::writes_code(&units[0]));
+            if refused {
+                // The seat's stream, as `CodexJsonl` hands each item to the unit's sink.
+                let mut live = crate::tool_activity::ToolActivitySink::new(
+                    sid,
+                    units[0].ord,
+                    0,
+                    std::path::Path::new("/w/repo"),
+                    Box::new(|_| {}),
+                );
+                let item = serde_json::json!({"type": "item.completed", "item": {
+                    "id": "item_7", "type": "command_execution",
+                    "command": "/bin/bash -lc \"cat > src/math.js <<'EOF'\nexport const sum = (xs) => xs.reduce((a, b) => a + b, 0);\nEOF\"",
+                    "aggregated_output": "/bin/bash: line 1: src/math.js: Operation not permitted\n",
+                    "exit_code": 1, "status": "failed"}});
+                live.call(&crate::tool_activity::codex_item(&item).expect("a command"));
+            }
+            let evidence = crate::workflow::UnitEvidence {
+                judge_skipped: Some("no eligible judge seat distinct from creator 'a'".into()),
+                ..Default::default()
+            };
+            let output = crate::workflow::stub_output(&units[0]);
+            let outcome = apply_and_finish_unit(
+                &mut store,
+                &mut units[0],
+                &output,
+                &workflow_id,
+                EntityMode::Shared,
+                sid,
+                0,
+                false,
+                false,
+                &cli_keys,
+                None,
+                &evidence,
+                &mut |_e| {},
+                None,
+            )
+            .expect("apply");
+            crate::tool_activity::forget_run(sid);
+            (outcome.approved, outcome.denial)
+        }
+        let (approved, denial) = fold("core1674-clean", false);
+        assert!(approved, "{denial:?}");
+        let (approved, denial) = fold("core1674-refused", true);
+        assert!(!approved);
+        let d = denial.expect("denied");
+        assert_eq!(d.source, crate::domain::DENIAL_SOURCE_SEAT_REFUSED);
+        assert!(
+            d.reason.contains("`src/math.js` (Operation not permitted)"),
+            "{}",
+            d.reason
+        );
+        assert!(d.reason.contains("Send it back"), "{}", d.reason);
     }
 
     /// core#969 (codex r1): the required judge's hold (`judge_unavailable`) answers only the judge's

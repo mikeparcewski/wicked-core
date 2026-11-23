@@ -8744,7 +8744,7 @@ pub(crate) const QE_SKILL: &str = "wicked-garden-qe";
 /// (core#1381) Whether `unit` is an agent step that writes code: a creator, or a phase that declares
 /// `executes_code` — the predicate `cli_runner::creator_records` reads POL-2101's records by. Never a
 /// tool step or an engine-internal judge/triage prompt.
-fn writes_code(unit: &WorkUnit) -> bool {
+pub(crate) fn writes_code(unit: &WorkUnit) -> bool {
     unit.tool_cmd.is_none()
         && !is_engine_internal(unit)
         && (unit.role == crate::workflow::PhaseRole::Creator || unit.executes_code)

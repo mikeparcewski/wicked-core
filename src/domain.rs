@@ -932,6 +932,12 @@ impl FromNode for AgentSession {
 /// (core#461) — the payload the escalation gate's reassign arm keys on.
 pub const DENIAL_SOURCE_DEAD_SEAT: &str = "dead_seat";
 
+/// (core#1674) [`UnitDenial::source`] when a step that writes code was refused, by its seat's own
+/// layer (its CLI sandbox, a read-only mount, file permissions), writes inside its work tree it
+/// never made afterwards: the work is not as built, whatever later checks find. No engine hook saw
+/// those refusals, so nothing else in the fold names them.
+pub const DENIAL_SOURCE_SEAT_REFUSED: &str = "seat_refused";
+
 /// (core#772) [`UnitDenial::source`] when the agent JUDGE could not run: every eligible
 /// identity-distinct judge seat failed as a seat (quota, sign-in, not installed, an empty
 /// answer), so no verdict exists. Fail-closed — the unit is still denied into the escalation

@@ -2128,6 +2128,7 @@ pub(crate) fn delivery_rule_check(
             deferred: &ctx.deferred,
             settled: &[],
             carried: &[],
+            same_change: &[],
         },
         &judge,
         &NoMachineHere,
@@ -2499,9 +2500,16 @@ fn run_rule_check_with(
     let no_agent_creator = creators.is_empty()
         && no_agent_code
         && no_agent_creator_of(&gov.db_path, &input.run_id, &input.unit);
-    let creator_providers = run_units_strict(&gov.db_path, &input.run_id)
-        .map(|mut units| {
+    // The run's other units, read once: the work's providers and (core#1842) the rows of the
+    // other gates that read this same change.
+    let others: Option<Vec<crate::domain::WorkUnit>> =
+        run_units_strict(&gov.db_path, &input.run_id).map(|mut units| {
             units.retain(|u| u.ord != input.unit.ord);
+            units
+        });
+    let creator_providers = others
+        .clone()
+        .map(|mut units| {
             units.push(input.unit.clone());
             crate::pipeline::work_author_providers(&units, input.unit.ord)
         })
@@ -2541,6 +2549,24 @@ fn run_rule_check_with(
         .iter()
         .filter(|r| exclusions.may_reuse(r, registry))
         .cloned()
+        .collect();
+    // (core#1842) The rows of the run's EARLIER gates (the review before a QE step that changed
+    // nothing), earliest first, each with what its check read; the check reuses only one that read
+    // what this one reads, under the same exclusions as every cached verdict. A later unit's row
+    // never answers an earlier one sent back.
+    let mut earlier: Vec<&crate::domain::WorkUnit> = others
+        .iter()
+        .flatten()
+        .filter(|u| u.ord < input.unit.ord)
+        .collect();
+    earlier.sort_by_key(|u| u.ord);
+    let same_change: Vec<(String, crate::rule_check::RuleVerdict)> = earlier
+        .into_iter()
+        .filter_map(|u| u.rule_check.as_ref())
+        .filter_map(|rc| rc.change_key.as_ref().map(|k| (k, &rc.rows)))
+        .flat_map(|(k, rows)| rows.iter().map(move |r| (k, r)))
+        .filter(|(_, r)| exclusions.may_reuse(r, registry))
+        .map(|(k, r)| (k.clone(), r.clone()))
         .collect();
     let facts = crate::rule_check::job_facts(
         &input.unit.rule_steps,
@@ -2642,6 +2668,7 @@ fn run_rule_check_with(
                     deferred: &[],
                     settled: &settled,
                     carried: &input.unit.rule_carried_skips,
+                    same_change: &same_change,
                 },
                 &judge,
                 &FloorMachine {
