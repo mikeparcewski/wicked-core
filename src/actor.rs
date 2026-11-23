@@ -7476,9 +7476,16 @@ fn apply_step_result(
             }
         }
         put_node(store, unit.to_node())?;
+        // (core#1801) A timed-out PA review of a member's step is the timeout twin of a lost one
+        // (core#1748): the unit's one output record holds the MEMBER's output, which the re-run
+        // review reads and which counts if it is accepted. The review's partial text never
+        // replaces it; its gate re-runs the review on the PA's seat, or stops the run.
+        let pa_review = team_gate::is_review(unit);
         // The partial transcript survives the rejection (usability review #1) — it is what the
         // operator reads to decide between retry, reassign and stop.
-        persist_rejected_transcript(store, &session, unit, &output.output);
+        if !pa_review {
+            persist_rejected_transcript(store, &session, unit, &output.output);
+        }
         emit(
             subscribers,
             CoreEvent::StepFailed {
@@ -7503,13 +7510,24 @@ fn apply_step_result(
                 ord,
             ));
         }
-        let prompt = format!(
-            "{why} Approve to re-dispatch the unit as attempt {} on the same tree (optionally \
-             amend with a narrower instruction, e.g. which checks to skip); reassign it to \
-             another seat first if this one was the slow part; or reject to stop the run — the \
-             worktree is kept either way.",
-            output.attempt + 2
-        );
+        // (core#1801) A PA review is never re-seated (`parked_reseat_refusal`), so its prompt
+        // offers only what its gate takes: approve re-runs the review, reject stops.
+        let prompt = if pa_review {
+            format!(
+                "{why} This was the PA's review of a member's step: approve to run the review \
+                 again on the PA's seat as attempt {}, or reject to stop the run — the worktree \
+                 is kept either way.",
+                output.attempt + 2
+            )
+        } else {
+            format!(
+                "{why} Approve to re-dispatch the unit as attempt {} on the same tree (optionally \
+                 amend with a narrower instruction, e.g. which checks to skip); reassign it to \
+                 another seat first if this one was the slow part; or reject to stop the run — \
+                 the worktree is kept either way.",
+                output.attempt + 2
+            )
+        };
         pause_for_human(
             store,
             subscribers,
@@ -21372,9 +21390,11 @@ pub(crate) fn refuse_before_resolving(
                 .is_some_and(|m| m.reviewing.is_some())
         })
     {
+        // (core#1801) The gate is a lost review's or a timed-out one's: the words cover both.
         anyhow::bail!(
-            "unit {cursor_ord} is the PA's review of a member's step, and the engine lost its \
-             result: approve to run the review again, or reject to stop the run"
+            "unit {cursor_ord} is the PA's review of a member's step, and that review did not \
+             finish (it ran out of time, or the engine lost its result): approve to run the \
+             review again, or reject to stop the run"
         );
     }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
@@ -23613,6 +23633,60 @@ pub(crate) mod sessions_detail_fold_tests {
             power: None,
             run_context: None,
         }
+    }
+
+    /// core#1799: a gate where no judge was due records `judge` skipped `not_applicable`. On the
+    /// delivery that skip speaks only when no gate ran a judge and none skipped one for another
+    /// reason: a judged build beside a read-only review keeps its label ("independent"), a run no
+    /// judge ever ran on says so, and a real skip (no distinct seat) is never hidden behind it.
+    #[test]
+    fn a_not_due_judge_speaks_on_the_delivery_only_when_no_gate_ran_one() {
+        use crate::assurance as a;
+        let s = session("judge-not-due-1799");
+        let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
+            let mut u = crate::domain::WorkUnit::pending(
+                &format!("judge-not-due-1799:{ord}"),
+                "judge-not-due-1799",
+                ord,
+                "step",
+            );
+            let mut r = a::AssuranceReceipt::for_run(&s.assurance, 0);
+            f(&mut r);
+            u.assurance = Some(r);
+            u
+        };
+        let not_due = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::DISTINCT_EVALUATOR);
+            r.skip(
+                a::JUDGE,
+                a::SKIP_NOT_APPLICABLE,
+                Some("unit 2 is a review that changes no files".into()),
+            )
+        };
+        let judged = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::JUDGE);
+            r.judge = Some("claude".into());
+        };
+        let judge_skips = |d: &a::AssuranceReceipt| {
+            d.skipped
+                .iter()
+                .filter(|k| k.instrument == a::JUDGE)
+                .map(|k| k.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        // The review first, the judged build after it: the judge ran, so no skip.
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due), gate(1, &judged)]);
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
+        // No gate ran a judge: the delivery says so.
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due)]);
+        assert_eq!(judge_skips(&d), [a::SKIP_NOT_APPLICABLE]);
+        // A real skip after a not-due one is the delivery's word, never hidden behind it.
+        let no_seat = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NO_DISTINCT_SEAT, Some("no seat".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due), gate(3, &no_seat)]);
+        assert_eq!(judge_skips(&d), [a::SKIP_NO_DISTINCT_SEAT]);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored

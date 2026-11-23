@@ -1435,6 +1435,10 @@ pub(crate) fn delivery_receipt(
     units: &[crate::domain::WorkUnit],
 ) -> crate::assurance::AssuranceReceipt {
     let mut r = crate::assurance::AssuranceReceipt::for_run(&session.assurance, 0);
+    // (core#1799) A gate where no judge was due (`not_applicable`) speaks for the delivery only
+    // when no gate of the run ran a judge and none skipped one for another reason: a review that
+    // changed no files beside a judged build is not a skipped judge.
+    let mut judge_not_due: Option<crate::assurance::SkippedInstrument> = None;
     for g in units.iter().filter_map(|u| u.assurance.as_ref()) {
         for i in &g.ran {
             r.ran(i);
@@ -1446,6 +1450,12 @@ pub(crate) fn delivery_receipt(
             .iter()
             .filter(|k| k.instrument != crate::assurance::QE_ACCEPTANCE)
         {
+            if k.instrument == crate::assurance::JUDGE
+                && k.reason == crate::assurance::SKIP_NOT_APPLICABLE
+            {
+                judge_not_due.get_or_insert_with(|| k.clone());
+                continue;
+            }
             r.skip(&k.instrument, &k.reason, k.detail.clone());
         }
         // Every council the run's gates recorded: who decided its disputes.
@@ -1499,6 +1509,11 @@ pub(crate) fn delivery_receipt(
             r.operator_judges.push(j.clone());
         }
         r.ran(crate::assurance::OPERATOR_JUDGE);
+    }
+    if let Some(k) = judge_not_due {
+        if !r.ran.iter().any(|i| i == crate::assurance::JUDGE) {
+            r.skip(&k.instrument, &k.reason, k.detail);
+        }
     }
     r.tree = session.verified_tree.clone();
     r

@@ -2355,6 +2355,7 @@ pub(crate) fn apply_and_finish_unit(
                 .and_then(operator_waiver),
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
+            judge_not_due: judge_not_due(unit, workdir.is_some(), evidence.tree_changed),
             rules: evidence.rule_check.as_ref(),
             eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
             eval_error: eval_error.as_deref(),
@@ -3759,11 +3760,43 @@ struct GateFacts<'a> {
     checks_waived: Option<String>,
     judge: Option<&'a crate::validator::AgentVerdict>,
     judge_skipped: Option<&'a str>,
+    /// (core#1799) Why no judge was due at this gate ([`judge_not_due`]): recorded as a skip when
+    /// the run's contract lists `judge` and no judge ran or was skipped.
+    judge_not_due: String,
     /// (DES-RULE-CHECK-001 S2) The review step's rule check, when it ran.
     rules: Option<&'a crate::rule_check::RuleCheckReport>,
     eval_ran: bool,
     eval_error: Option<&'a str>,
     tree: Option<String>,
+}
+
+/// (core#1799) Why the engine's judge was not due at `unit`'s gate, in the words the receipt
+/// carries: the judge reviews a seat's change to the tree (or a report under a cited-findings
+/// rubric), so a gate without one says which of those it lacked.
+fn judge_not_due(
+    unit: &crate::domain::WorkUnit,
+    has_workdir: bool,
+    tree_changed: Option<bool>,
+) -> String {
+    let ord = unit.ord;
+    if unit.tool_cmd.is_some() {
+        format!("unit {ord} is a scripted step: no seat's work for a judge to review")
+    } else if crate::execute_wrapped::is_engine_internal(unit) {
+        format!("unit {ord} is the engine's own step: no seat's work for a judge to review")
+    } else if unit.role == crate::workflow::PhaseRole::Evaluator
+        || crate::worktree_guard::applies_to(unit)
+    {
+        format!(
+            "unit {ord} is a review that changes no files: its evaluator's own verdict decides \
+             this gate (a judge reviews a changed tree, or a report under a cited-findings rubric)"
+        )
+    } else if !has_workdir {
+        format!("unit {ord} ran without a worktree: no change for a judge to review")
+    } else if tree_changed == Some(false) {
+        format!("unit {ord} changed no files: no change for a judge to review")
+    } else {
+        format!("unit {ord}'s step does not take the engine's judge")
+    }
 }
 
 /// (core#850) A gate's assurance receipt: the run's contract, the instruments that ran and the
@@ -3871,6 +3904,12 @@ fn gate_receipt(
             },
             Some(why.to_string()),
         ),
+        // (core#1799) The run's contract lists the judge, but none was due at this gate (a review
+        // that changes no files, a step that changed none, a scripted step): said on the receipt,
+        // never a required instrument that silently did not run. Not a hold — nothing wanted one.
+        (None, None) if run.required.iter().any(|i| i == a::JUDGE) => {
+            r.skip(a::JUDGE, a::SKIP_NOT_APPLICABLE, Some(f.judge_not_due))
+        }
         (None, None) => {}
     }
     // (operator ruling 2026-10-14) A fallback judge is labelled on the receipt whatever it came
@@ -7262,6 +7301,7 @@ mod guarded_read_step_tests {
                 checks_waived: None,
                 judge: None,
                 judge_skipped: None,
+                judge_not_due: String::new(),
                 rules: None,
                 eval_ran: false,
                 eval_error: None,
