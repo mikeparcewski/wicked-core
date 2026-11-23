@@ -383,7 +383,21 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
         )
         .is_err());
 
-    core.grant_stand_ins(sid, "job", Some("operator".into()), None)
+    // T-R12: a grant names the opening it answers. The first opening is gone (the retry re-opened
+    // the gate): a grant for it is refused, and the current one is taken.
+    let first = listed.gate_seq.expect("the open row's gate_seq");
+    let now = core
+        .gate_actions(sid)
+        .unwrap()
+        .expect("the gate re-opened")
+        .gate_seq
+        .expect("gate_seq");
+    assert_ne!(first, now, "the retry is another opening");
+    let stale = core
+        .grant_stand_ins(sid, "job", Some("operator".into()), first, None)
+        .expect_err("a grant for an earlier opening is refused");
+    assert!(stale.to_string().starts_with("gate_changed"), "{stale:#}");
+    core.grant_stand_ins(sid, "job", Some("operator".into()), now, None)
         .expect("the grant is taken");
     let evs = collect_until(
         &ev,
@@ -438,8 +452,13 @@ fn an_unaware_launch_parks_at_dead_seat_as_on_main() {
     assert!(!session.assurance.stand_in_aware);
     assert!(session.assurance.roles.is_none());
     // `use_stand_ins` is refused on an unaware run.
+    let seq = core
+        .gate_actions(sid)
+        .unwrap()
+        .and_then(|g| g.gate_seq)
+        .unwrap_or(0);
     assert!(core
-        .grant_stand_ins(sid, "job", Some("operator".into()), None)
+        .grant_stand_ins(sid, "job", Some("operator".into()), seq, None)
         .is_err());
 }
 

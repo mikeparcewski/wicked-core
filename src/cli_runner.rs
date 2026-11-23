@@ -3169,7 +3169,7 @@ pub(crate) fn run_unit_and_judge(
     team: Option<&crate::team::runner::TeamRunner>,
     rule_council: Option<&CouncilCtx<'_>>,
     stop: Option<crate::repo_checks::FloorStop>,
-    stand_in_judge: Option<&crate::standin::StandInBinding>,
+    stand_in_judge: Option<&crate::standin::JudgeStandIn>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -4213,7 +4213,7 @@ pub(crate) struct JudgeFallbackCtx<'a> {
     /// (DES-STANDIN-001 §3.6) The stand-in the run's actor offered this unit's pinned judge
     /// ([`crate::standin::judge_offer`]): taken only when no distinct judge is left. `None` on an
     /// unaware or unconsented run, the bus path and tests.
-    pub stand_in_judge: Option<&'a crate::standin::StandInBinding>,
+    pub stand_in_judge: Option<&'a crate::standin::JudgeStandIn>,
 }
 
 /// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
@@ -6280,7 +6280,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
     };
     // (DES-STANDIN-001 §3.4) A stand-in judge never reads the team's ledger or comms: its work is
     // taken here, before the team render. Only when the actor offered one.
-    let stand_in_work: Option<String> = fallback.stand_in_judge.map(|_| work_owned.to_string());
+    let stand_in_offer: Option<&crate::standin::StandInBinding> =
+        fallback.stand_in_judge.and_then(|j| j.offer.as_ref());
+    // On an aware run a work creator is never re-admitted as its judge (DES-STANDIN-001 §3.6).
+    let stand_in_aware = fallback.stand_in_judge.is_some_and(|j| j.aware);
+    let stand_in_work: Option<String> = stand_in_offer.map(|_| work_owned.to_string());
     // T5 / DES-001 §6.2: the judge sees the team's outcomes AND its comms — the rendered ledger
     // and compact transcript ride INSIDE the WORK fence (untrusted data, never instructions).
     let work_owned = match will_judge
@@ -6385,7 +6389,16 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     &format!("agent validator: {why} — a team monitor may judge it, disclosed"),
                 );
             }
-            let creator_fallback = exclude_creators(&mut excluded, &creators, has_judge);
+            let creator_fallback = if stand_in_aware {
+                for c in &creators {
+                    if !excluded.contains(&c.as_str()) {
+                        excluded.push(c.as_str());
+                    }
+                }
+                None
+            } else {
+                exclude_creators(&mut excluded, &creators, has_judge)
+            };
             if let Some(why) = &creator_fallback {
                 engine_note(
                     emit_delta,
@@ -6416,7 +6429,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             // the fold records its binding. `None` with no offer, or a base with no record (fail
             // closed: no invocation, no judge).
             let stand_in_verdict = || -> Option<crate::validator::AgentVerdict> {
-                let b = fallback.stand_in_judge?;
+                let b = stand_in_offer?;
                 let work = stand_in_work.as_deref()?;
                 let invocation = crate::standin::resolve(&[], registry, &b.key)?;
                 let (verdict, refused) =
@@ -6736,7 +6749,16 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     &format!("default judge: {why} — a team monitor may judge it, disclosed"),
                 );
             }
-            let creator_fallback = exclude_creators(&mut excluded, &creators, has_judge);
+            let creator_fallback = if stand_in_aware {
+                for c in &creators {
+                    if !excluded.contains(&c.as_str()) {
+                        excluded.push(c.as_str());
+                    }
+                }
+                None
+            } else {
+                exclude_creators(&mut excluded, &creators, has_judge)
+            };
             if let Some(why) = &creator_fallback {
                 engine_note(
                     emit_delta,

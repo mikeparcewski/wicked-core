@@ -475,11 +475,11 @@ export declare class Core {
    * answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
    * or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
    * on the run's contract and exactly the held check continues. Refused at any other gate, on a
-   * run that is not stand-in-aware or runs reduced, and — with `expectOrd` / `expectGateSeq` —
-   * with an error that starts `gate_changed:` when that gate is no longer the open one. Resolves
-   * to the status token.
+   * run that is not stand-in-aware or runs reduced, and with an error that starts `gate_changed:`
+   * when the opening `expectGateSeq` names (the open gate's `gateSeq`, required) or `expectOrd` is
+   * no longer the open one. Resolves to the status token.
    */
-  grantStandIns(runId: string, scope: string, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectGateSeq?: number | undefined | null): Promise<string>
+  grantStandIns(runId: string, scope: string, expectGateSeq: number, actor?: string | undefined | null, expectOrd?: number | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.

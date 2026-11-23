@@ -1396,15 +1396,22 @@ impl Core {
         run_id: &str,
         scope: &str,
         actor: Option<String>,
-        expect: Option<crate::workflow::GateExpect>,
+        gate_seq: u32,
+        ord: Option<u32>,
     ) -> anyhow::Result<SessionStatus> {
+        // (DES-STANDIN-001 §3.10, T-R12) A grant always names the opening it answers: a delayed
+        // grant never answers a later `stand_in_needed` opening (`gate_changed`).
         self.confirm_gate_expecting(
             run_id,
             HumanDecision::UseStandIns {
                 scope: scope.to_string(),
             },
             actor,
-            expect,
+            Some(crate::workflow::GateExpect {
+                ord,
+                plan_rev: None,
+                gate_seq: Some(gate_seq),
+            }),
         )
     }
 

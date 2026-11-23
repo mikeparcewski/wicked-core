@@ -1670,6 +1670,14 @@ impl Core {
                          retry_rules, skip_rules and retry_qe require approve=true)"
                     )))
                 }
+                // (DES-STANDIN-001 §3.10) The stand-in answer carries a scope and the opening it
+                // answers: it has its own door, one mechanism, never a second decoder here.
+                (Some("use_stand_ins"), _) => {
+                    return Err(err(anyhow::anyhow!(
+                        "action `use_stand_ins` is answered through grantStandIns(runId, scope, \
+                         gateSeq), with scope `job` or `always`"
+                    )))
+                }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
@@ -1689,28 +1697,21 @@ impl Core {
     /// answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
     /// or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
     /// on the run's contract and exactly the held check continues. Refused at any other gate, on a
-    /// run that is not stand-in-aware or runs reduced, and — with `expectOrd` / `expectGateSeq` —
-    /// with an error that starts `gate_changed:` when that gate is no longer the open one. Resolves
-    /// to the status token.
+    /// run that is not stand-in-aware or runs reduced, and with an error that starts
+    /// `gate_changed:` when the opening `expectGateSeq` names (required) or `expectOrd` is no
+    /// longer the open one. Resolves to the status token.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn grant_stand_ins(
         &self,
         run_id: String,
         scope: String,
+        expect_gate_seq: u32,
         actor: Option<String>,
         expect_ord: Option<u32>,
-        expect_gate_seq: Option<u32>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
-        let expect = (expect_ord.is_some() || expect_gate_seq.is_some()).then_some(
-            wicked_core::GateExpect {
-                ord: expect_ord,
-                plan_rev: None,
-                gate_seq: expect_gate_seq,
-            },
-        );
         task(move || {
-            core.grant_stand_ins(&run_id, &scope, actor, expect)
+            core.grant_stand_ins(&run_id, &scope, actor, expect_gate_seq, expect_ord)
                 .map(status_token)
                 .map_err(err)
         })

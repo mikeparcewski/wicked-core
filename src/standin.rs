@@ -439,6 +439,15 @@ pub(crate) fn fill(req: FillRequest<'_>) -> Fill {
     }
 }
 
+/// (§3.6) What a unit's judge knows of the run's stand-ins, handed to it by the actor: the run is
+/// stand-in-aware (then a work creator is never re-admitted as its judge: the stand-in path or the
+/// hold decides instead), and the stand-in it may take ([`judge_offer`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JudgeStandIn {
+    pub aware: bool,
+    pub offer: Option<StandInBinding>,
+}
+
 /// (§3.6) The stand-in a unit's pinned judge may run on when no distinct judge is left: minted on
 /// the actor at dispatch (so slots never repeat), on the work's own seat (its base when that seat
 /// is itself a stand-in), and recorded only if the judge path takes it ([`judge_answered`]).

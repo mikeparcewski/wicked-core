@@ -4068,6 +4068,25 @@ fn gate_receipt(
                 (None, _) => {}
             }
         }
+        // (DES-STANDIN-001 §3.8) A review of work built outside the run (no in-run builder) on a
+        // stand-in — a party's stand-in — is still stamped, and projected like any other.
+        None if stand_in.is_some() => {
+            let b = stand_in.expect("guarded");
+            // It built nothing: no creator to name (and never the binding's key).
+            r.creator = None;
+            let mut answered = b.clone();
+            answered.state = crate::standin::STATE_ANSWERED.to_string();
+            answered.ord = Some(unit.ord);
+            answered.attempt = Some(attempt);
+            r.skip(
+                a::DISTINCT_EVALUATOR,
+                a::SKIP_STAND_IN,
+                Some(crate::standin::label(&answered, answered.display())),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+            }
+        }
         None => r.creator = seat,
     }
     match f.pinned {

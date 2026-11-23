@@ -14100,6 +14100,9 @@ fn dispatch_unit_with(
     // and dropping (1) is the bug. Declared-dependency membership is by PHASE ID, the token the def
     // uses; `phase_id()` returns None for prose-planned units, which correctly matches nothing.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
+    // (DES-STANDIN-001 §3.4) A stand-in's packet is ALLOW-LISTED: of the earlier units it gets only
+    // a builder's final output (the work product), never an earlier review's verdict.
+    let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
     let (mut prior_outputs, mut context_items): (
@@ -14107,6 +14110,7 @@ fn dispatch_unit_with(
         Vec<crate::event::InjectedContext>,
     ) = units
         .iter()
+        .filter(|u| !stand_in || u.role == crate::workflow::PhaseRole::Creator)
         .filter_map(|u| {
             let label = prior_context_label(unit, u, current_cli)?;
             let output = crate::domain::get_work_output(store, &u.id)?;
@@ -14330,7 +14334,6 @@ fn dispatch_unit_with(
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
     // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
-    let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
     if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
@@ -15263,14 +15266,20 @@ fn dispatch_unit_with(
     // (DES-STANDIN-001 §3.6) The stand-in this unit's pinned judge may run on, minted HERE on the
     // actor (slots never repeat); the judge takes it only when no distinct judge is left, and the
     // fold records it then.
-    let stand_in_judge = crate::standin::judge_offer(
-        &session.assurance,
-        unit,
-        input.attempt,
-        &crate::registry_roster(),
-        &session.clis,
-        &session.benched_seats,
-    );
+    let stand_in_judge = session
+        .assurance
+        .stand_in_aware
+        .then(|| crate::standin::JudgeStandIn {
+            aware: true,
+            offer: crate::standin::judge_offer(
+                &session.assurance,
+                unit,
+                input.attempt,
+                &crate::registry_roster(),
+                &session.clis,
+                &session.benched_seats,
+            ),
+        });
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
