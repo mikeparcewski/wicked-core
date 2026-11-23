@@ -368,10 +368,10 @@ mod tests {
         );
     }
 
-    /// (core#1109) The engine checks a run on this repo out at `<clone>/wicked-worktrees/<id>`
-    /// ([`crate::repo::worktrees_root`]), INSIDE the main clone. Cargo finds a package's
-    /// workspace by walking up to the first `[workspace]` that does not exclude it: from the
-    /// worktree's `crates/wicked-core-ts` it passes the worktree's own root (which excludes
+    /// (core#1109) An engine before core#1109 checked a run on this repo out at
+    /// `<clone>/wicked-worktrees/<id>`, INSIDE the main clone, and such trees keep running there.
+    /// Cargo finds a package's workspace by walking up to the first `[workspace]` that does not
+    /// exclude it: from the worktree's `crates/wicked-core-ts` it passes the worktree's own root (which excludes
     /// core-ts) and reaches the main clone's manifest. Unless that manifest excludes the worktrees
     /// directory, it claims core-ts and cargo refuses the package ("believes it's in a workspace
     /// when it's not"). The fixture lays out that nesting with this repo's real `[workspace]`
@@ -403,7 +403,9 @@ mod tests {
                 .as_nanos()
         ));
         let clone = fixture.join("clone");
-        let tree = crate::repo::worktrees_root(&clone.to_string_lossy()).join("run-1");
+        // The in-clone layout: new run trees sit beside the clone (core#1109), but trees an engine
+        // minted before that keep running inside it, so the manifest's exclude still matters.
+        let tree = clone.join("wicked-worktrees").join("run-1");
         let core_ts = tree.join("crates").join("wicked-core-ts");
         std::fs::create_dir_all(&core_ts).unwrap();
         std::fs::write(clone.join("Cargo.toml"), &table).unwrap();
