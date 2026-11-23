@@ -4011,8 +4011,10 @@ mod tests {
     }
 
     /// A stand-in `cargo test` that reads its tests off `tests/*.red` (failing) and `tests/*.ok`
-    /// markers, lists them under `-- --list` in libtest's format and honours `--skip=<name>` — a
-    /// runner the floor can inventory and deselect precisely (DES-FLOOR-V2). Absolute path.
+    /// markers, lists them under `-- --list` in libtest's format, says libtest's `running N tests`
+    /// for what it executes (core#1767: an exclusion needs the run covered by the list) and honours
+    /// `--skip=<name>` — a runner the floor can inventory and deselect precisely (DES-FLOOR-V2).
+    /// Absolute path.
     #[cfg(unix)]
     fn deselecting_runner() -> String {
         use std::os::unix::fs::PermissionsExt;
@@ -4026,6 +4028,8 @@ mod tests {
              if [ $list = 1 ]; then n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; \
              b=$(basename \"$f\"); t=${b%.*}; case \"$skips\" in *\" $t \"*) continue;; esac; echo \"$t: test\"; n=$((n+1)); done; \
              echo; echo \"$n tests, 0 benchmarks\"; exit 0; fi\n\
+             n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; b=$(basename \"$f\"); t=${b%.*}; \
+             case \"$skips\" in *\" $t \"*) continue;; esac; n=$((n+1)); done; echo \"running $n tests\"\n\
              r=0; n=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
              case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; fl=\"$fl $t\"; r=101; n=$((n+1)); done; \
              if [ $n -gt 0 ]; then echo; echo failures:; for t in $fl; do echo \"    $t\"; done; echo; fi; \
