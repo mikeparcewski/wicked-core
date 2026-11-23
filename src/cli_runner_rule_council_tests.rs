@@ -426,6 +426,25 @@ fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
     let r1 = row(&r, "R1");
     assert_eq!(r1.status, RuleStatus::Disputed, "{r1:?}");
     assert!(r1.reason.contains("incomplete_evidence"), "{r1:?}");
+    // (codex r4) A claim in the part that shows src/a.rs that also names a file another part
+    // shows (src/z.rs, after the generated rows): the council would not see src/z.rs, so the
+    // dispute holds.
+    let input = paged("paged-dispute-off-part");
+    std::fs::write(
+        input.workdir.as_ref().unwrap().join("src/z.rs"),
+        "fn z() {}\n",
+    )
+    .unwrap();
+    let judge = ByPart {
+        shows: "+fn add(a: i32, b: i32)",
+        there: "BROKEN — src/a.rs:2 add() feeds src/z.rs, which takes no floats",
+        elsewhere: "N/A — this part holds generated rows",
+    };
+    let council = FakeCouncil::new("paged-dispute-off-part", kept_3_0);
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 0, "{r1:?}");
+    assert_eq!(r1.status, RuleStatus::Disputed, "{r1:?}");
 }
 
 /// A.7.2: no ruling — 1 of 3 answered, a timeout, an error — is `disputed`, and holds.

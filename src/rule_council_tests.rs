@@ -646,16 +646,18 @@ fn core_1789_a_scoped_rename_shows_both_sides_and_only_them() {
         &decoy,
         &["src/old.rs", "decoy b/src/a.rs", "src/a.rs", "gen/big.json"],
     );
-    let (ev, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
-    assert!(!shown.contains(&"src/a.rs".to_string()), "{shown:?}");
-    assert!(
-        ev.not_shown
-            .as_ref()
-            .unwrap()
-            .contains(&"src/a.rs".to_string()),
-        "{:?}",
-        ev.not_shown
+    // (codex r4) A header holding ` b/` twice cannot be read as one pair: no scope at all.
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    // (codex r4) A plain section followed by a file whose header git quoted: no scope (the
+    // quoted section would otherwise ride along, and its file be called not shown).
+    let after =
+        format!("{DIFF}diff --git \"a/z/big\\\".json\" \"b/z/big\\\".json\"\n@@ -0,0 +1 @@\n{big}");
+    let c = change_of(&after, &["src/add.rs", "z/big\".json"]);
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 2: src/add.rs:1 typed"),
+        (RuleStatus::Broken, "src/add.rs:1 untyped"),
     );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
     // (codex r3) A file whose own header git quoted (a rename to an unusual name) and a decoy
     // whose name ends in ` b/src/a.rs`: the decoy never stands in for it, so there is no scope.
     let quoted = format!(
