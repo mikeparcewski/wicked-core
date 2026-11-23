@@ -3572,6 +3572,25 @@ impl WrappedCliStepRunner {
                 "{}\n\n{DELIVERABLE_ROOTS_INSTRUCTION}",
                 unit_prompt(input, form, handed)
             )
+        } else if let Some(scratch) = names_scratch(write_posture, input.unit.pre_build_scope)
+            .then(|| {
+                // (core#1758) The full posture's scratch, named: a seat that fans work out needs
+                // somewhere to stage it, and without a name it tried `/tmp` (refused) and then
+                // the tree (refused at hand-off, outside the write set).
+                let in_container = uses_container_seat(
+                    runs_in_seat(input),
+                    crate::container_floor::container_mode(),
+                );
+                prepared_unit_scratch(input.workdir.as_deref().unwrap_or(&sandbox), in_container)
+                    .map(|dir| (dir, in_container))
+            })
+            .flatten()
+        {
+            format!(
+                "{}\n\n{}",
+                unit_prompt(input, form, handed),
+                scratch_instruction(&scratch.0, !scratch.1)
+            )
         } else {
             unit_prompt(input, form, handed)
         };
@@ -4162,7 +4181,7 @@ impl WrappedCliStepRunner {
             // governed unit runs only when the FINAL argv keeps a per-call check — claude (its gate
             // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
             // floor resolves below. Anything else is refused, never run with only a disclosure.
-            // Routing knows the rule through the launch bench (`seat_keeps_host_floor_check`, the
+            // Routing knows the rule through the launch bench (`host_floor_bench_reason`, the
             // same predicate over the seat's launch argv), so this is reached only by a launch the
             // seat's record did not predict (a template the bench never saw).
             if governed
@@ -4445,6 +4464,17 @@ impl WrappedCliStepRunner {
                         }
                         floor_env = plan.env;
                         floor_build_env = plan.build_env;
+                        // (core#1758) The container claude seat's scratch is its own `/tmp`:
+                        // an added directory, so its Write/Edit tools reach it under
+                        // `acceptEdits` (the gate hook admits it as a write root below).
+                        if seat_cli == wicked_apps_core::spawn::SeatCli::Claude {
+                            if let Some(scratch) = seat_scratch_root(&floor_env) {
+                                add_dir_before_setting_sources(
+                                    &mut argv,
+                                    scratch.to_string_lossy().into_owned(),
+                                );
+                            }
+                        }
                         floor = Ok(c.tool);
                         Some(crate::validator::WorkerSandbox {
                             wrapper: c.wrapper,
@@ -4874,9 +4904,11 @@ impl WrappedCliStepRunner {
                 // governance context (core#259 — validated at launch against the pin tree).
                 // The graph key dir is READ only: granting directory writes would let a seat
                 // replace estate.db (core#1602). Its journal is settled before arming the seat.
+                // (core#1758) …and, for a container claude seat, its own `/tmp` (the seat's
+                // scratch, named in its brief): container-local, never a mount, never written back.
                 cmd.env(
                     crate::gate_hook::WRITE_ROOTS_ENV,
-                    armed_write_roots(&cwd, &g.extra_write_roots),
+                    armed_write_roots(&cwd, &hook_write_extras(&g.extra_write_roots, &floor_env)),
                 );
                 // Arm the unit's PHASE SCOPE (core#296) — the SECOND boundary, orthogonal to the
                 // roots above. The write roots answer "where may this unit write" and the worktree
@@ -4939,11 +4971,10 @@ impl WrappedCliStepRunner {
                 // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
                 // widened (the helper's shape check), reported here so the operator sees why.
                 // (core#1743) A container claude seat's own temp (its task outputs) is outside
-                // the tree: readable through the hook, never mounted (it is the container's own).
+                // the tree: a hook WRITE root since core#1758 (above), so readable too.
                 let read_roots: Vec<std::ffi::OsString> = g
                     .read_roots(self.operational_home.as_deref())
                     .into_iter()
-                    .chain(seat_temp_read_root(&floor_env))
                     .map(PathBuf::into_os_string)
                     .collect();
                 if let Some(db) = g.code_graph_db.as_deref() {
@@ -5467,17 +5498,56 @@ fn host_floor_keeps_a_check(argv: &[String]) -> bool {
 /// unbounded is benched, although the read-only lever would bound it for a no-code unit — the
 /// bench is per seat, not per unit (no shipped record is such a seat: the builtin posture is
 /// bounded, and [`bound_ungated_posture`] caps an override).
-pub(crate) fn seat_keeps_host_floor_check(
+///
+/// (core#1744) The answer is why seat `cli_key` is benched there, or `None` when the executor
+/// would run it. Two refusals the executor makes for EVERY governed unit of the seat, so routing
+/// (and crew's `host_floor_bench`) must know them up front: no per-call check on the host floor
+/// ([`seat_keeps_host_floor_check_with`]), and a claude seat whose
+/// managed settings silence the gate hook ([`claude_hooks_silenced`], the same check
+/// `run_unit_streaming` refuses the unit on, #653). Before #1744 only the first was a bench, so
+/// every host-floor turn landed on such a claude and failed.
+pub(crate) fn host_floor_bench_reason(
     cli_key: &str,
     assigned_invocation: Option<String>,
-) -> bool {
-    seat_keeps_host_floor_check_with(
-        &launch_invocation(cli_key, assigned_invocation),
+) -> Option<String> {
+    let invocation = launch_invocation(cli_key, assigned_invocation);
+    let binary = template_binary(&invocation);
+    let silenced = if binary_is_claude(&binary) {
+        claude_hooks_silenced(&binary, cli_key)
+    } else {
+        None
+    };
+    host_floor_bench_reason_with(
+        &invocation,
         resolve_seat_posture(cli_key),
+        silenced.as_deref(),
     )
 }
 
-/// [`seat_keeps_host_floor_check`] with the template and the resolved posture handed in (the
+/// [`host_floor_bench_reason`] with the template, the resolved posture and the silencing settings
+/// file handed in (the testable seam: no registry or settings read).
+pub(crate) fn host_floor_bench_reason_with(
+    invocation: &str,
+    posture: Vec<String>,
+    silenced: Option<&std::path::Path>,
+) -> Option<String> {
+    if !seat_keeps_host_floor_check_with(invocation, posture) {
+        return Some(crate::distribute::HOST_FLOOR_BENCH.to_string());
+    }
+    silenced.map(managed_hooks_only_refusal_reason)
+}
+
+/// (#653, core#1744) The managed settings file that silences the gate hook of claude seat
+/// `cli_key` (launched as `binary`) on this host, read exactly as a governed unit's launch reads
+/// it: the seat's configuration home (the worker home's, or the operator's under the hatch) and
+/// this OS's system managed settings. `None` when nothing silences it, or the seat's home cannot
+/// be resolved (the launch then refuses on its own resolver error).
+pub(crate) fn claude_hooks_silenced(binary: &str, cli_key: &str) -> Option<std::path::PathBuf> {
+    let config = wicked_apps_core::spawn::seat_config_for_carrier_seat(binary, cli_key).ok()?;
+    managed_hooks_only_source(&claude_settings_candidates(config.claude_dir()))
+}
+
+/// The per-call-check half of [`host_floor_bench_reason`], with the template and the resolved posture handed in (the
 /// testable seam: no registry read).
 pub(crate) fn seat_keeps_host_floor_check_with(invocation: &str, posture: Vec<String>) -> bool {
     let mut argv = build_argv(invocation, "", &[]);
@@ -5549,6 +5619,72 @@ pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
     false
 }
 
+/// (core#1758) The governed hook's write roots beyond the unit's cwd: the launch-validated
+/// `extra_write_roots` (core#259), then a container claude seat's own scratch
+/// ([`seat_scratch_root`]) — an engine constant inside the container, never a worker-controlled
+/// path.
+pub(crate) fn hook_write_extras(
+    extra_write_roots: &[String],
+    floor_env: &[(&'static str, PathBuf)],
+) -> Vec<String> {
+    extra_write_roots
+        .iter()
+        .cloned()
+        .chain(seat_scratch_root(floor_env).map(|p| p.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// (core#1758) Whether a unit's brief names its scratch: the full posture, except a pre-build
+/// rung, whose phase fence admits documentation writes only (`gate_hook::phase_scope_denial`), so
+/// scratch files would be refused there anyway. The fenced postures carry their own instruction.
+pub(crate) fn names_scratch(
+    posture: crate::write_posture::WritePosture,
+    pre_build_scope: bool,
+) -> bool {
+    posture == crate::write_posture::WritePosture::Full && !pre_build_scope
+}
+
+/// (core#1758) The scratch directory a full-posture unit is told to use, outside its change, or
+/// `None` when it cannot be had (never name a directory the seat cannot write). In a seat
+/// container (`in_container`, both the container and the k8s floor) it is the container's own
+/// `/tmp` ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]: rwx under every container floor, per
+/// container, never written back). On the host it is the engine scratch `<cwd>/tmp`
+/// ([`crate::worktree_guard::ENGINE_SCRATCH_DIR`], the `TMPDIR` [`redirect_scratch_into_boundary`]
+/// sets), inside the unit's write root and excluded from its write set, and made here as that
+/// does: a tree whose `tmp` is a file, a link or read-only has none. Never `/tmp` on the host:
+/// that is outside the unit's boundary.
+pub(crate) fn prepared_unit_scratch(cwd: &Path, in_container: bool) -> Option<PathBuf> {
+    if in_container {
+        return Some(PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP));
+    }
+    let dir = cwd.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+    let _ = std::fs::create_dir_all(&dir);
+    // A real, writable directory of the tree's own: never a link (it could lead outside the
+    // unit's boundary, which the hook refuses), never a file or a read-only directory (codex r2).
+    std::fs::symlink_metadata(&dir)
+        .is_ok_and(|m| m.file_type().is_dir() && !m.permissions().readonly())
+        .then_some(dir)
+}
+
+/// (core#1758) The brief's line naming the unit's scratch directory ([`prepared_unit_scratch`]).
+/// `shared`: the host's `<cwd>/tmp`, which every step of the run in that tree uses (a repo-less
+/// run's is its sandbox's, with no cleanup promised); a container's `/tmp` is the step's own and
+/// goes with the container.
+pub(crate) fn scratch_instruction(scratch: &Path, shared: bool) -> String {
+    let lifetime = if shared {
+        "it is not part of your change, and other steps of this run use it too (keep your files \
+         in a subdirectory named for this step)"
+    } else {
+        "it is yours for this step, it is not part of your change, and it is discarded afterwards"
+    };
+    format!(
+        "Scratch space: put temporary files (chunks, intermediate data, helper scripts) in {} — \
+         {lifetime}. Never stage them anywhere else in the repository, and use no other temp \
+         directory.",
+        scratch.display()
+    )
+}
+
 /// Point a worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at `<cwd>/tmp` (core#264, crew#427):
 /// `mktemp`, `> $TMPDIR/x`, vitest's `.vite-temp`/sockets and every tool honoring the platform temp
 /// env then land in-boundary — reaped with the sandbox/worktree, and inside codex's own
@@ -5566,11 +5702,12 @@ pub(crate) fn redirect_scratch_into_boundary(cmd: &mut Command, cwd: &Path) {
     }
 }
 
-/// (core#1743) The governed hook's read root for a container claude seat's own temp: the
-/// `CLAUDE_CODE_TMPDIR` the floor plan set when it is the container-local dir
-/// ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]), which no mount backs. A fenced unit's temp (its
-/// mounted scratch) and every host-floor seat get none.
-pub(crate) fn seat_temp_read_root(floor_env: &[(&'static str, PathBuf)]) -> Option<PathBuf> {
+/// (core#1743, core#1758) A container claude seat's own temp, its scratch: the `CLAUDE_CODE_TMPDIR`
+/// the floor plan set when it is the container-local dir ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]),
+/// which no mount backs and the floor grants rwx. The governed hook admits it as a write root and
+/// claude gets it as an added directory. A fenced unit's temp (its mounted scratch) and every
+/// host-floor seat get none.
+pub(crate) fn seat_scratch_root(floor_env: &[(&'static str, PathBuf)]) -> Option<PathBuf> {
     floor_env
         .iter()
         .rev()
@@ -7161,6 +7298,23 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
     }
 }
 
+/// (core#1257, core#1744) The refusal of a tool-less turn on seat `binary`, which has no verified
+/// tool-disabling lever on the host floor. It names only remedies this host can satisfy: the
+/// container floor always, and a claude seat only when its gate hook is not silenced here
+/// (`claude_governable`). pi is never named: on the host floor it is benched from governed work
+/// (`needs_container_floor`), so a turn routed to it is refused too.
+fn tool_less_host_refusal(binary: &str, claude_governable: bool) -> String {
+    let claude = if claude_governable {
+        "route the turn to a claude seat, or "
+    } else {
+        ""
+    };
+    format!(
+        "tool-less seat `{binary}` has no verified tool-disabling lever on the host floor; \
+         {claude}run it on the container floor (WICKED_SEAT_FLOOR=container) (core#1257)"
+    )
+}
+
 /// Apply the verified tool-disabling levers. Other seats need the container floor, where
 /// their existing read-only lever and the prompt carry the rule without host secrets (core#1257).
 pub(crate) fn apply_tool_less_posture(
@@ -7179,9 +7333,9 @@ pub(crate) fn apply_tool_less_posture(
     };
     if !matches!(seat, Some("claude" | "pi")) {
         if !in_container {
-            return Err(format!(
-                "tool-less seat `{binary}` has no verified tool-disabling lever on the host floor; \
-                 route the turn to claude or pi, or run it on the container floor (core#1257)"
+            return Err(tool_less_host_refusal(
+                &binary,
+                claude_hooks_silenced("claude", "claude").is_none(),
             ));
         }
         apply_no_code_posture(argv, posture, None)?;
@@ -7674,9 +7828,20 @@ fn system_managed_settings_dir() -> Option<std::path::PathBuf> {
 pub(crate) fn managed_hooks_only_source(
     candidates: &[std::path::PathBuf],
 ) -> Option<std::path::PathBuf> {
-    candidates
+    managed_hooks_only_source_in(candidates, system_managed_settings_dir().as_deref())
+}
+
+/// [`managed_hooks_only_source`] with the system managed-settings directory handed in. A silencing
+/// file there wins over an earlier one elsewhere (codex r1 on #1818): it binds claude on either
+/// floor, so the refusal's remedy must come from it ([`managed_hooks_remedy`]), never the
+/// container floor that a sign-in policy alone would allow.
+pub(crate) fn managed_hooks_only_source_in(
+    candidates: &[std::path::PathBuf],
+    system: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let silencing: Vec<&std::path::PathBuf> = candidates
         .iter()
-        .find(|p| {
+        .filter(|p| {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -7687,7 +7852,12 @@ pub(crate) fn managed_hooks_only_source(
                         || v.get("disableAllHooks") == Some(&serde_json::Value::Bool(true))
                 })
         })
-        .cloned()
+        .collect();
+    silencing
+        .iter()
+        .find(|p| system.is_some_and(|s| p.starts_with(s)))
+        .or(silencing.first())
+        .map(|p| (*p).clone())
 }
 
 /// Stable prefix of the #653 spawn refusal — the escalation an operator and crew read.
@@ -7698,9 +7868,30 @@ fn managed_hooks_only_refusal_reason(source: &std::path::Path) -> String {
     format!(
         "{MANAGED_HOOKS_ONLY_REFUSAL}: settings in {} silence the engine's gate hook \
          (`allowManagedHooksOnly: true` or `disableAllHooks: true`); refusing the governed unit \
-         rather than running it ungoverned. Remove that setting for the seat (core#653, C5)",
-        source.display()
+         rather than running it ungoverned. {} (core#653, C5)",
+        source.display(),
+        managed_hooks_remedy(source, system_managed_settings_dir().as_deref())
     )
+}
+
+/// (core#1744) What a person can do about a managed setting that silences claude's gate hook. The
+/// setting is organization policy, which the person usually cannot remove, so the remedy depends
+/// on where it lives. In this OS's system managed settings (`system`), it binds every claude this
+/// host launches on either floor. Anywhere else it came with the seat's own sign-in (the
+/// configuration home's `remote-settings.json`), which a container seat never carries: its home
+/// is seeded with preferences only (`container_floor::seed_container_settings`).
+fn managed_hooks_remedy(
+    source: &std::path::Path,
+    system: Option<&std::path::Path>,
+) -> &'static str {
+    if system.is_some_and(|s| source.starts_with(s)) {
+        "It is this machine's system policy for Claude Code: route governed work to another seat, \
+         or ask whoever manages this machine to change it"
+    } else {
+        "It is organization policy that came with the seat's sign-in: run governed work on the \
+         container floor (WICKED_SEAT_FLOOR=container), whose claude seat does not carry it, or \
+         route it to another seat"
+    }
 }
 
 /// A governed unit the wrapped carrier cannot govern (#653): nothing ran, no gate was armed.
@@ -12919,6 +13110,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#1744 (red on main): on the host floor, a claude seat whose managed settings silence the
+    /// gate hook is BENCHED from governed work, with the engine's refusal as the reason (crew reads
+    /// it as `host_floor_bench`, so no answer-only turn is seated on it); a claude that keeps its
+    /// hook, and a bounded codex, keep their seats; a seat with no per-call check keeps the C5
+    /// reason. The refusal names a remedy the person can act on: the container floor for policy
+    /// that came with the seat's sign-in, never "Remove that setting" for org policy.
+    #[test]
+    fn core_1744_a_claude_seat_whose_hook_is_silenced_is_host_floor_benched() {
+        let worker = std::path::Path::new("/w/worker/claude/remote-settings.json");
+        let reason = host_floor_bench_reason_with("claude -p {PROMPT}", vec![], Some(worker))
+            .expect("a silenced claude is benched");
+        assert!(reason.starts_with(MANAGED_HOOKS_ONLY_REFUSAL), "{reason}");
+        assert!(reason.contains("WICKED_SEAT_FLOOR=container"), "{reason}");
+        assert!(!reason.contains("Remove that setting"), "{reason}");
+        assert_eq!(
+            host_floor_bench_reason_with("claude -p {PROMPT}", vec![], None),
+            None
+        );
+        assert_eq!(
+            host_floor_bench_reason_with(
+                "codex exec --sandbox workspace-write {PROMPT}",
+                vec![],
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            host_floor_bench_reason_with("pi -p {PROMPT}", vec![], None).as_deref(),
+            Some(crate::distribute::HOST_FLOOR_BENCH)
+        );
+        // Through the bench routing and crew read: claude benched, codex kept, pi the C5 bench.
+        let mut clis = Vec::new();
+        for (key, inv) in [
+            ("claude", "claude -p {PROMPT}"),
+            ("codex", "codex exec --sandbox workspace-write {PROMPT}"),
+            ("pi", "pi -p {PROMPT}"),
+        ] {
+            let mut c = wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == key)
+                .unwrap();
+            c.headless_invocation = inv.into();
+            clis.push(c);
+        }
+        let bench = crate::distribute::host_floor_benched_with(&clis, true, |c| {
+            host_floor_bench_reason_with(
+                &c.headless_invocation,
+                vec![],
+                (c.key == "claude").then_some(worker),
+            )
+        });
+        let keys: Vec<&str> = bench.iter().map(|b| b.cli.as_str()).collect();
+        assert_eq!(keys, ["claude", "pi"]);
+        assert!(bench.iter().all(|b| b.governed_only));
+        assert!(bench[0].reason.starts_with(MANAGED_HOOKS_ONLY_REFUSAL));
+    }
+
+    /// core#1744 (codex r1 on #1818): with both a sign-in policy and a system policy silencing the
+    /// hook, the system one is the source, so the refusal never suggests the container floor,
+    /// where the system policy is still read.
+    #[test]
+    fn core_1744_a_system_silencer_wins_over_a_sign_in_one() {
+        let dir = std::env::temp_dir().join(format!("wc-1744-both-{}", std::process::id()));
+        let system = dir.join("system");
+        std::fs::create_dir_all(&system).unwrap();
+        let remote = dir.join("remote-settings.json");
+        std::fs::write(&remote, r#"{"allowManagedHooksOnly": true}"#).unwrap();
+        let sys = system.join("managed-settings.json");
+        std::fs::write(&sys, r#"{"disableAllHooks": true}"#).unwrap();
+        let both = [remote.clone(), sys.clone()];
+        assert_eq!(
+            managed_hooks_only_source_in(&both, Some(&system)),
+            Some(sys)
+        );
+        assert_eq!(
+            managed_hooks_only_source_in(&both, None),
+            Some(remote.clone())
+        );
+        let kept = system.join("kept.json");
+        std::fs::write(&kept, r#"{"disableAllHooks": false}"#).unwrap();
+        assert_eq!(
+            managed_hooks_only_source_in(&[remote.clone(), kept], Some(&system)),
+            Some(remote)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#1744: a system-managed setting binds every claude this host launches, on either floor,
+    /// so its remedy is another seat or the machine's administrator, never the container floor.
+    #[test]
+    fn core_1744_the_managed_hooks_remedy_follows_where_the_setting_lives() {
+        let system = std::path::Path::new("/Library/Application Support/ClaudeCode");
+        let sys = managed_hooks_remedy(&system.join("managed-settings.json"), Some(system));
+        assert!(
+            sys.contains("another seat") && !sys.contains("container floor"),
+            "{sys}"
+        );
+        let dropin = managed_hooks_remedy(&system.join("managed-settings.d/a.json"), Some(system));
+        assert_eq!(dropin, sys);
+        let own = managed_hooks_remedy(
+            std::path::Path::new("/w/worker/claude/remote-settings.json"),
+            Some(system),
+        );
+        assert!(own.contains("WICKED_SEAT_FLOOR=container"), "{own}");
+        assert_eq!(
+            managed_hooks_remedy(std::path::Path::new("/x/remote-settings.json"), None),
+            own
+        );
+    }
+
     /// core#653 (red on main): a GOVERNED claude unit on the wrapped carrier whose worker home
     /// carries `allowManagedHooksOnly: true` is REFUSED before spawn with the escalation — the
     /// `--settings` gate-hook would never run. The fake claude must never start, and no armed
@@ -13821,8 +14122,10 @@ mod tests {
         for seat in ["codex", "copilot", "agy", "opencode", "unknown"] {
             let mut argv = vec![format!("/opt/bin/{seat}")];
             let why = apply_tool_less_posture(&mut argv, vec![], false, false).unwrap_err();
-            assert!(why.contains(seat) && why.contains("claude or pi"));
+            assert!(why.contains(seat));
             assert!(why.contains("container floor"));
+            // core#1744: pi is host-floor benched, so it is never offered as a remedy.
+            assert!(!why.contains("claude or pi"), "{why}");
             let mut argv = vec![format!("/opt/bin/{seat}")];
             apply_tool_less_posture(&mut argv, vec![], false, true).unwrap();
             if seat == "codex" {
@@ -13830,6 +14133,24 @@ mod tests {
                     .windows(2)
                     .any(|w| w[0] == "--sandbox" && w[1] == "read-only"));
             }
+        }
+    }
+
+    /// core#1744 (red on main): the host-floor refusal of a tool-less turn names only remedies
+    /// this host can satisfy — a claude seat only while its gate hook is not silenced here, and
+    /// the container floor always; never pi, which the host floor benches from governed work.
+    #[test]
+    fn core_1744_the_tool_less_refusal_names_only_remedies_this_host_has() {
+        let kept = tool_less_host_refusal("/opt/bin/codex", true);
+        assert!(kept.contains("claude seat") && kept.contains("WICKED_SEAT_FLOOR=container"));
+        let silenced = tool_less_host_refusal("/opt/bin/codex", false);
+        assert!(!silenced.contains("claude"), "{silenced}");
+        assert!(
+            silenced.contains("WICKED_SEAT_FLOOR=container"),
+            "{silenced}"
+        );
+        for why in [kept, silenced] {
+            assert!(!why.contains(" pi") && !why.contains("or pi"), "{why}");
         }
     }
 
@@ -15106,22 +15427,147 @@ mod tests {
         );
     }
 
-    /// core#1743: a container claude seat's temp is the container's own `/tmp`, outside the tree,
-    /// so the governed hook's READ roots (and only those: never the mount read roots, which would
-    /// mount a host path) carry it, or a Read of a task output is a boundary block. Red on main:
-    /// the temp was `<tree>/tmp`, inside the write root, and nothing wires it.
+    /// core#1743, core#1758: a container claude seat's temp is the container's own `/tmp`,
+    /// outside the tree. It is the seat's scratch: the governed hook's WRITE roots carry it (so
+    /// it is readable too) and claude gets it as an added directory, and nothing mounts it (the
+    /// mount read roots would mount a host path). Red on main: it was a hook read root only, so
+    /// `mkdir -p /tmp/dx` and a Write to `/tmp/st7.json` were boundary denials (train-11 J6, run
+    /// c38b8c59), and the seat staged its scratch in the tree instead.
     #[test]
-    fn core_1743_the_hook_read_roots_carry_the_container_claude_temp_and_only_there() {
+    fn core_1758_the_container_claude_scratch_is_a_hook_write_root_and_an_added_dir() {
         let src = include_str!("execute_wrapped.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();
         assert!(
-            production.contains(".chain(seat_temp_read_root(&floor_env))"),
-            "the governed hook's WICKED_READ_ROOTS no longer carries the container claude temp"
+            production.contains(
+                "armed_write_roots(&cwd, &hook_write_extras(&g.extra_write_roots, &floor_env))"
+            ),
+            "the governed hook's WICKED_WRITE_ROOTS no longer carries the container claude scratch"
+        );
+        assert!(
+            production.contains("if let Some(scratch) = seat_scratch_root(&floor_env)"),
+            "the container claude seat no longer gets its scratch as an added directory"
+        );
+        let local = PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP);
+        let floor = [("CLAUDE_CODE_TMPDIR", local.clone())];
+        let inbox = "/abs/drafts-inbox".to_string();
+        assert_eq!(
+            hook_write_extras(std::slice::from_ref(&inbox), &floor),
+            vec![inbox.clone(), "/tmp".to_string()]
+        );
+        // The host floor (no container temp) and a fenced unit (its mounted scratch) add nothing.
+        assert_eq!(
+            hook_write_extras(std::slice::from_ref(&inbox), &[]),
+            vec![inbox.clone()]
+        );
+        let fenced = [("CLAUDE_CODE_TMPDIR", PathBuf::from("/w/scratch/tmp"))];
+        assert_eq!(
+            hook_write_extras(std::slice::from_ref(&inbox), &fenced),
+            vec![inbox]
+        );
+        // The hook then admits the scratch writes the seat made, and still fences the rest.
+        let wt = PathBuf::from("/w/tree");
+        let joined = armed_write_roots(&wt, &hook_write_extras(&[], &floor));
+        let roots = crate::path_policy::AllowedRoots {
+            write: std::env::split_paths(&joined).collect(),
+            read: Vec::new(),
+        };
+        let deny = |ctx: serde_json::Value, tool: &str| {
+            crate::gate_hook::boundary_denial_with(&roots, &wt, None, None, &ctx, tool)
+        };
+        assert_eq!(
+            deny(serde_json::json!({"path": "/tmp/st7.json"}), "Write"),
+            None
         );
         assert_eq!(
-            production.matches("seat_temp_read_root(").count(),
-            2,
-            "defined once and used once: in the hook env, never the mount read roots"
+            deny(
+                serde_json::json!({"command": "mkdir -p /tmp/dx && echo ok"}),
+                "Bash"
+            ),
+            None
+        );
+        assert!(deny(serde_json::json!({"path": "/etc/x.json"}), "Write").is_some());
+        // Red on main: the cwd alone denied both.
+        let main = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![local],
+        };
+        assert!(crate::gate_hook::boundary_denial_with(
+            &main,
+            &wt,
+            None,
+            None,
+            &serde_json::json!({"path": "/tmp/st7.json"}),
+            "Write"
+        )
+        .is_some());
+    }
+
+    /// core#1758: the brief names one scratch per unit — the container's own `/tmp` in a seat
+    /// container (container and k8s floors), the engine scratch `<cwd>/tmp` on the host (inside
+    /// the write root, excluded from the write set) — and never the host's `/tmp`.
+    #[test]
+    fn core_1758_the_brief_names_the_units_scratch_on_every_floor() {
+        use crate::write_posture::WritePosture;
+        let base = std::env::temp_dir().join(format!("wc-1758-scratch-{}", std::process::id()));
+        let wt = base.join("tree");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(
+            prepared_unit_scratch(&wt, true),
+            Some(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            prepared_unit_scratch(&wt, false),
+            Some(wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR))
+        );
+        assert!(wt.join("tmp").is_dir(), "made as the launch makes it");
+        // (codex r1 on #1818) A tree whose `tmp` is a file has no scratch to name.
+        let odd = base.join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("tmp"), b"a file").unwrap();
+        assert_eq!(prepared_unit_scratch(&odd, false), None);
+        // (codex r2) …nor one whose `tmp` links elsewhere, or is read-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let linked = base.join("linked");
+            std::fs::create_dir_all(base.join("outside")).unwrap();
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(base.join("outside"), linked.join("tmp")).unwrap();
+            assert_eq!(prepared_unit_scratch(&linked, false), None);
+            let locked = base.join("locked");
+            std::fs::create_dir_all(locked.join("tmp")).unwrap();
+            std::fs::set_permissions(locked.join("tmp"), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            assert_eq!(prepared_unit_scratch(&locked, false), None);
+            std::fs::set_permissions(locked.join("tmp"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        // The host's is shared by the run's steps; a container's is the step's own.
+        let host = scratch_instruction(&wt.join("tmp"), true);
+        assert!(
+            host.contains(&wt.join("tmp").display().to_string()),
+            "{host}"
+        );
+        assert!(host.contains("not part of your change") && host.contains("other steps"));
+        let pod = scratch_instruction(Path::new("/tmp"), false);
+        assert!(pod.contains("yours for this step") && !pod.contains("other steps"));
+        // Only the full posture names it, and never a pre-build rung (its phase fence admits
+        // documentation writes only).
+        assert!(names_scratch(WritePosture::Full, false));
+        assert!(!names_scratch(WritePosture::Full, true));
+        for fenced in [
+            WritePosture::ReadOnly,
+            WritePosture::DeliverableRoots,
+            WritePosture::ToolLess,
+        ] {
+            assert!(!names_scratch(fenced, false));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let src = include_str!("execute_wrapped.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            production.contains("scratch_instruction(&scratch.0, !scratch.1)"),
+            "the full-posture brief no longer names the unit's scratch"
         );
     }
 
@@ -15132,15 +15578,15 @@ mod tests {
     fn core_1743_the_seat_temp_read_root_and_the_lost_result_reason() {
         let local = PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP);
         assert_eq!(
-            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", local.clone())]),
+            seat_scratch_root(&[("CLAUDE_CODE_TMPDIR", local.clone())]),
             Some(local.clone())
         );
         assert_eq!(
-            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", PathBuf::from("/w/scratch/tmp"))]),
+            seat_scratch_root(&[("CLAUDE_CODE_TMPDIR", PathBuf::from("/w/scratch/tmp"))]),
             None
         );
-        assert_eq!(seat_temp_read_root(&[("TMPDIR", local)]), None);
-        assert_eq!(seat_temp_read_root(&[]), None);
+        assert_eq!(seat_scratch_root(&[("TMPDIR", local)]), None);
+        assert_eq!(seat_scratch_root(&[]), None);
         let owner = ("run-1743", 2, 1);
         let out = settle_failure_output(
             "claude",

@@ -324,9 +324,10 @@ pub(crate) const CODEX_WORKTREE_BENCH: &str = "codex cannot work in this run's w
 /// 1. (C5) The HOST-FLOOR bench: when the interim host floor is chosen
 ///    ([`crate::container_floor::host_floor_chosen`]) and this run's units are armed (`contained`,
 ///    below), every seat that cannot keep a per-call check there
-///    ([`crate::execute_wrapped::seat_keeps_host_floor_check`] — claude, or a bounded codex) is
+///    ([`crate::execute_wrapped::host_floor_bench_reason`] — claude, or a bounded codex) is
 ///    benched with [`HOST_FLOOR_BENCH`], bound or not: the executor refuses such a governed unit
-///    `needs_container_floor`, so routing one to it only strands the run.
+///    `needs_container_floor`, so routing one to it only strands the run. So is a claude seat whose
+///    managed settings silence its gate hook, with the engine's #653 refusal (core#1744).
 /// 2. (F-EDIT-5 / F-LEARN-3) The worktree bench: on a run BOUND to a repository, every codex seat
 ///    (any instance) is benched with [`CODEX_WORKTREE_BENCH`], so it is never routed a unit, failed
 ///    over to, or seated as a judge — a codex seat that cannot run a command used to pass a build
@@ -346,9 +347,7 @@ pub(crate) fn launch_benched(
     let mut benched = host_floor_benched_with(
         clis,
         contained && crate::container_floor::host_floor_chosen(),
-        |c| {
-            crate::execute_wrapped::seat_keeps_host_floor_check(&c.key, invocation_of(clis, &c.key))
-        },
+        |c| crate::execute_wrapped::host_floor_bench_reason(&c.key, invocation_of(clis, &c.key)),
     );
     let worktree = worktree_benched_with(
         clis,
@@ -373,20 +372,21 @@ pub(crate) const HOST_FLOOR_BENCH: &str = "runs only on the container floor: on 
     refused (needs_container_floor) — set WICKED_SEAT_FLOOR=container or remove the seat";
 
 /// The host-floor rule of [`launch_benched`], pure: with the host floor in force, every seat
-/// `keeps_check` says no to, with [`HOST_FLOOR_BENCH`] (source `launcher`).
+/// `bench_reason` gives a reason for ([`HOST_FLOOR_BENCH`], or core#1744's managed-hooks refusal),
+/// with that reason (source `launcher`).
 pub(crate) fn host_floor_benched_with(
     clis: &[AgenticCli],
     host_floor: bool,
-    keeps_check: impl Fn(&AgenticCli) -> bool,
+    bench_reason: impl Fn(&AgenticCli) -> Option<String>,
 ) -> Vec<BenchedSeat> {
     if !host_floor {
         return Vec::new();
     }
     clis.iter()
-        .filter(|c| !keeps_check(c))
-        .map(|c| BenchedSeat {
+        .filter_map(|c| bench_reason(c).map(|reason| (c, reason)))
+        .map(|(c, reason)| BenchedSeat {
             cli: c.key.clone(),
-            reason: HOST_FLOOR_BENCH.to_string(),
+            reason,
             source: "launcher".to_string(),
             governed_only: true,
             benched_until: None,
@@ -3780,7 +3780,9 @@ mod worktree_bench_tests {
             record("copilot"),
             record("pi"),
         ];
-        let keeps = |c: &AgenticCli| matches!(c.key.as_str(), "claude" | "codex");
+        let keeps = |c: &AgenticCli| {
+            (!matches!(c.key.as_str(), "claude" | "codex")).then(|| HOST_FLOOR_BENCH.to_string())
+        };
         let b = host_floor_benched_with(&clis, true, keeps);
         let keys: Vec<&str> = b.iter().map(|s| s.cli.as_str()).collect();
         assert_eq!(keys, vec!["opencode", "copilot", "pi"]);
