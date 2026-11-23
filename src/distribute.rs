@@ -3839,6 +3839,207 @@ mod tests {
             }
         }
     }
+
+    // ── DES-STANDIN-001 C3: stand-in fill at distribution ──────────────────────────────────
+
+    fn aware(consent: bool, parties: &[&str]) -> crate::assurance::RunAssurance {
+        crate::standin::LaunchStandIn {
+            aware: true,
+            parties: parties.iter().map(|p| p.to_string()).collect(),
+            consent: consent.then(|| crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+        }
+        .apply(crate::assurance::RunAssurance::new(None, false))
+    }
+
+    fn seat_named(key: &str, name: &str) -> AgenticCli {
+        let mut c = seat(key);
+        c.display_name = name.into();
+        c
+    }
+
+    /// T-R4 (distribution half): a one-seat aware run with consent seats its review on the
+    /// stand-in `claude~1`, routed `stand_in`, on claude's own template, with the binding for the
+    /// actor to persist; no creator-seat disclosure.
+    #[test]
+    fn t_r4_a_one_seat_review_with_consent_is_seated_on_a_stand_in() {
+        let dists = distribute_seated(
+            &build_and_review(),
+            &[seat_named("claude", "Claude Code")],
+            "r1",
+            None,
+            &[],
+            &aware(true, &[]),
+        )
+        .expect("filled by a stand-in");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert!(dists[0].stand_in.is_none());
+        assert_eq!(dists[1].assigned_cli, "claude~1");
+        assert_eq!(
+            dists[1].routing,
+            RoutingInfo::StandIn {
+                winner: "claude~1".into(),
+                base: "claude".into(),
+                role: "evaluator".into(),
+            }
+        );
+        assert_eq!(
+            dists[1].assigned_invocation.as_deref(),
+            Some("run-claude {PROMPT}")
+        );
+        assert_eq!(dists[1].distinctness_fallback, None);
+        assert_eq!(dists[1].pool, None);
+        let b = dists[1].stand_in.as_ref().expect("the binding rides");
+        assert_eq!((b.base.as_str(), b.slot, b.ord), ("claude", 1, Some(2)));
+        assert_eq!(b.display(), "Claude Code");
+        assert_eq!(
+            b.reason,
+            crate::standin::Reason::OnlyOneHelper {
+                cli: "Claude Code".into()
+            }
+        );
+    }
+
+    /// T-R4 (no consent): the same run is refused with the typed `StandInNeeded` naming the
+    /// review, never a creator-seat review and never `NoEligibleSeat`.
+    #[test]
+    fn t_r4_without_consent_the_review_needs_a_stand_in() {
+        let err = distribute_seated(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+            &aware(false, &[]),
+        )
+        .expect_err("short with no consent");
+        let need = err
+            .downcast_ref::<StandInNeeded>()
+            .unwrap_or_else(|| panic!("typed StandInNeeded: {err:?}"));
+        assert_eq!(need.ords, [2]);
+        assert_eq!(need.role, crate::standin::Role::Evaluator);
+        assert!(err.downcast_ref::<crate::NoEligibleSeat>().is_none());
+    }
+
+    /// T-B1: a roster with a distinct seat, consent `always`: no binding, and every distribution
+    /// is exactly the unaware run's.
+    #[test]
+    fn t_b1_a_full_roster_never_mints_a_stand_in() {
+        let roster = [seat("claude"), seat("codex")];
+        let mut consented = aware(true, &[]);
+        consented.stand_in.as_mut().unwrap().scope = crate::standin::SCOPE_ALWAYS.into();
+        let with = distribute_seated(&build_and_review(), &roster, "r1", None, &[], &consented)
+            .expect("routes");
+        let without = distribute_seated(
+            &build_and_review(),
+            &roster,
+            "r1",
+            None,
+            &[],
+            &crate::assurance::RunAssurance::new(None, false),
+        )
+        .expect("routes");
+        for (a, b) in with.iter().zip(without.iter()) {
+            assert_eq!(a.assigned_cli, b.assigned_cli);
+            assert_eq!(a.assigned_invocation, b.assigned_invocation);
+            assert_eq!(a.routing, b.routing);
+            assert_eq!(a.distinctness_fallback, b.distinctness_fallback);
+            assert_eq!(a.pool, b.pool);
+            assert!(a.stand_in.is_none());
+        }
+    }
+
+    /// T-B3: an unaware launch keeps today's refusal (full) and creator-seat fallback (reduced).
+    #[test]
+    fn t_b3_an_unaware_one_seat_run_is_unchanged() {
+        let full = distribute_seated(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+            &crate::assurance::RunAssurance::new(None, false),
+        )
+        .expect_err("refused as on main");
+        assert!(full.downcast_ref::<crate::NoEligibleSeat>().is_some());
+        let reduced = distribute_seated(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+            &crate::assurance::RunAssurance::new(None, true),
+        )
+        .expect("reduced keeps the creator seat");
+        assert_eq!(reduced[1].assigned_cli, "claude");
+        assert_eq!(
+            reduced[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+        assert!(reduced.iter().all(|d| d.stand_in.is_none()));
+    }
+
+    /// §3.8: a party is never the real reviewer. `codex` is the only seat distinct from the
+    /// builder and a party, so the review is stood in on its builder's base; with a third,
+    /// non-party seat it is reviewed for real there.
+    #[test]
+    fn a_party_is_never_the_real_reviewer() {
+        let dists = distribute_seated(
+            &build_and_review(),
+            &[seat("claude"), seat("codex")],
+            "r1",
+            None,
+            &[],
+            &aware(true, &["codex"]),
+        )
+        .expect("filled");
+        assert_eq!(dists[1].assigned_cli, "claude~1");
+        let dists = distribute_seated(
+            &build_and_review(),
+            &[seat("claude"), seat("codex"), seat("pi")],
+            "r1",
+            None,
+            &[],
+            &aware(true, &["codex"]),
+        )
+        .expect("routes");
+        assert_eq!(dists[1].assigned_cli, "pi");
+        assert!(dists[1].stand_in.is_none());
+        // A party names an instance or a whole CLI.
+        assert!(is_party("codex#2", &["codex".to_string()]));
+        assert!(is_party("codex#2~1", &["codex#2".to_string()]));
+        assert!(!is_party("codex", &["codex#2".to_string()]));
+    }
+
+    /// T-B2: no candidate set, pool or bench a distribution writes ever holds a `~` key; the only
+    /// one is the stand-in unit's own seat.
+    #[test]
+    fn t_b2_no_candidate_set_holds_a_stand_in_key() {
+        let roster = [seat("claude")];
+        assert!(eligible_seats(&roster, &[])
+            .iter()
+            .all(|c| !c.key.contains('~')));
+        let dists = distribute_seated(
+            &build_and_review(),
+            &roster,
+            "r1",
+            None,
+            &[],
+            &aware(true, &[]),
+        )
+        .expect("filled");
+        for d in &dists {
+            assert!(d.benched.iter().all(|b| !b.cli.contains('~')));
+            if let Some(p) = &d.pool {
+                assert!(p.monitors.iter().all(|k| !k.contains('~')));
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

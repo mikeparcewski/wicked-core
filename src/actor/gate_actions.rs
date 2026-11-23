@@ -568,6 +568,9 @@ fn approve_intent(
         "terminal" => "complete",
         // A failed step's gate (triage could not apply its flag, or escalated): approve re-runs it.
         "failure" | "triage" => "retry",
+        // (DES-STANDIN-001 §3.10) A stand-in hold's approve retries the seating: real helpers
+        // first, a stand-in only with consent by then.
+        _ if super::stand_in_gate::gate_open(cursor) => "retry",
         _ if cursor.is_some_and(|u| u.status == crate::domain::UnitStatus::Rejected) => "retry",
         _ => "continue",
     }
