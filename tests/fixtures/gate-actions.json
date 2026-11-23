@@ -264,6 +264,27 @@
     "gateKind": "escalation",
     "ord": 3
   },
+  "floor-disk-refused": {
+    "actions": [
+      {
+        "action": "approve",
+        "intent": "retry",
+        "note": "optional"
+      },
+      {
+        "action": "amend_intent",
+        "intent": "amend_intent",
+        "note": "required"
+      },
+      {
+        "action": "reject",
+        "intent": "stop",
+        "note": "none"
+      }
+    ],
+    "gateKind": "escalation",
+    "ord": 4
+  },
   "floor-fix": {
     "actions": [
       {
