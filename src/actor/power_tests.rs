@@ -369,9 +369,20 @@ fn only_the_orchestrator_hears_the_voice_never_the_pa_reviewers_or_judges() {
         .unwrap();
     let voice = format!("## Voice\n\n- {MARK}.\n- Keep it short.\n");
     launch_power_voiced(&e, "pv", &repo.id, Some(voice));
-    wait_for("the rework round after the review's NOT-PASS", || {
-        e.worker.calls().iter().filter(|c| c.2 == "pv:fix").count() >= 2
-    });
+    // (core#1794) Wait on the briefs themselves: the worker records a dispatch before its script
+    // runs, so a dispatch count can reach 2 while the second brief is not yet recorded.
+    wait_for(
+        "the rework round's brief after the review's NOT-PASS",
+        || {
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p == "fix")
+                .count()
+                >= 2
+        },
+    );
     let prompts = prompts.lock().unwrap().clone();
     let fixes: Vec<&String> = prompts
         .iter()
