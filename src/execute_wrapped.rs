@@ -5655,23 +5655,29 @@ pub(crate) fn names_scratch(
 /// container, never written back). On the host it is the engine scratch `<cwd>/tmp`
 /// ([`crate::worktree_guard::ENGINE_SCRATCH_DIR`], the `TMPDIR` [`redirect_scratch_into_boundary`]
 /// sets), inside the unit's write root and excluded from its write set, and made here as that
-/// does: a tree whose `tmp` is a file has none. Never `/tmp` on the host: that is outside the
-/// unit's boundary.
+/// does: a tree whose `tmp` is a file, a link or read-only has none. Never `/tmp` on the host:
+/// that is outside the unit's boundary.
 pub(crate) fn prepared_unit_scratch(cwd: &Path, in_container: bool) -> Option<PathBuf> {
     if in_container {
         return Some(PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP));
     }
     let dir = cwd.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
-    (std::fs::create_dir_all(&dir).is_ok() && dir.is_dir()).then_some(dir)
+    let _ = std::fs::create_dir_all(&dir);
+    // A real, writable directory of the tree's own: never a link (it could lead outside the
+    // unit's boundary, which the hook refuses), never a file or a read-only directory (codex r2).
+    std::fs::symlink_metadata(&dir)
+        .is_ok_and(|m| m.file_type().is_dir() && !m.permissions().readonly())
+        .then_some(dir)
 }
 
 /// (core#1758) The brief's line naming the unit's scratch directory ([`prepared_unit_scratch`]).
-/// `shared`: the host's `<cwd>/tmp`, which every step of the run in that tree uses and which goes
-/// with the run's worktree; a container's `/tmp` is the step's own and goes with the container.
+/// `shared`: the host's `<cwd>/tmp`, which every step of the run in that tree uses (a repo-less
+/// run's is its sandbox's, with no cleanup promised); a container's `/tmp` is the step's own and
+/// goes with the container.
 pub(crate) fn scratch_instruction(scratch: &Path, shared: bool) -> String {
     let lifetime = if shared {
-        "it is not part of your change, other steps of this run use it too (keep your files in a \
-         subdirectory named for this step), and it is removed with the run's worktree"
+        "it is not part of your change, and other steps of this run use it too (keep your files \
+         in a subdirectory named for this step)"
     } else {
         "it is yours for this step, it is not part of your change, and it is discarded afterwards"
     };
@@ -15473,6 +15479,23 @@ mod tests {
         std::fs::create_dir_all(&odd).unwrap();
         std::fs::write(odd.join("tmp"), b"a file").unwrap();
         assert_eq!(prepared_unit_scratch(&odd, false), None);
+        // (codex r2) …nor one whose `tmp` links elsewhere, or is read-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let linked = base.join("linked");
+            std::fs::create_dir_all(base.join("outside")).unwrap();
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(base.join("outside"), linked.join("tmp")).unwrap();
+            assert_eq!(prepared_unit_scratch(&linked, false), None);
+            let locked = base.join("locked");
+            std::fs::create_dir_all(locked.join("tmp")).unwrap();
+            std::fs::set_permissions(locked.join("tmp"), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            assert_eq!(prepared_unit_scratch(&locked, false), None);
+            std::fs::set_permissions(locked.join("tmp"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
         // The host's is shared by the run's steps; a container's is the step's own.
         let host = scratch_instruction(&wt.join("tmp"), true);
         assert!(
