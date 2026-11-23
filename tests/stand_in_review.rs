@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    get_session, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, LaunchStandIn,
-    SessionStatus, StandInConsent, StepInput, StepOutput, StepRunner, StepStatus,
+    get_session, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec,
+    LaunchStandIn, SessionStatus, StandInConsent, StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -25,10 +25,8 @@ fn arm_hermetic_emit_spool() {
 }
 
 fn db_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "wicked-core-standin-{name}-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("wicked-core-standin-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()
@@ -163,10 +161,8 @@ fn engine(name: &str) -> (Core, Arc<Mutex<Vec<Seen>>>) {
 
 /// The run's session as the store holds it (read-only).
 fn session(name: &str, sid: &str) -> Option<wicked_core::AgentSession> {
-    let dir = std::env::temp_dir().join(format!(
-        "wicked-core-standin-{name}-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("wicked-core-standin-{name}-{}", std::process::id()));
     let db = dir.join("estate.db");
     let store = wicked_apps_core::open_store_ro(Some(db.to_str().unwrap())).expect("store");
     get_session(&store, sid).unwrap()
@@ -343,7 +339,10 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
         })
         .unwrap_or_else(|| panic!("gateEscalated: {evs:?}"));
     assert_eq!(condition, "stand_in_needed");
-    assert!(seen.lock().unwrap().is_empty(), "nothing ran before consent");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing ran before consent"
+    );
 
     let listed = core.gate_actions(sid).unwrap().expect("a gate is open");
     let tokens: Vec<(String, String)> = listed
@@ -386,9 +385,11 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
 
     core.grant_stand_ins(sid, "job", Some("operator".into()), None)
         .expect("the grant is taken");
-    let evs = collect_until(&ev, Duration::from_secs(30), |e| {
-        matches!(e, CoreEvent::SessionCompleted { session } if session == sid)
-    });
+    let evs = collect_until(
+        &ev,
+        Duration::from_secs(30),
+        |e| matches!(e, CoreEvent::SessionCompleted { session } if session == sid),
+    );
     assert!(
         evs.iter().any(|e| matches!(
             e,

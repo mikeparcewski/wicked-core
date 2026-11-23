@@ -906,7 +906,7 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
 /// may run (quote-aware), nor this unit's own authors or launch-excluded seats; no fallback. With
 /// none, the reason.
 #[allow(clippy::too_many_arguments)]
-fn rule_judge_seats(
+pub(crate) fn rule_judge_seats(
     creators: &[String],
     creator_bins: Option<&[String]>,
     creator_providers: &[crate::observed_provider::Provider],
@@ -1275,7 +1275,7 @@ pub(crate) fn rule_council_seats(
 /// [`rule_council_seats`] before its quorum check: every seat distinct from every party, however
 /// few (core#1379: a hold names them). `Err` only for an identity that cannot be established.
 #[allow(clippy::too_many_arguments)]
-fn rule_council_candidates(
+pub(crate) fn rule_council_candidates(
     creators: &[String],
     creator_bins: Option<&[String]>,
     creator_providers: &[crate::observed_provider::Provider],

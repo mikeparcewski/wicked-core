@@ -133,14 +133,19 @@ impl LaunchStandIn {
             c.validate()?;
         }
         if let Some(p) = self.parties.iter().find(|p| seat_id::is_stand_in(p)) {
-            return Err(format!("party `{p}` is a stand-in key: parties are roster seats"));
+            return Err(format!(
+                "party `{p}` is a stand-in key: parties are roster seats"
+            ));
         }
         Ok(())
     }
 
     /// Persist the facts on the run's contract (§3.3, rev 3 N3): every later fill, grant, replay
     /// and fence reads them from there.
-    pub(crate) fn apply(&self, mut run: crate::assurance::RunAssurance) -> crate::assurance::RunAssurance {
+    pub(crate) fn apply(
+        &self,
+        mut run: crate::assurance::RunAssurance,
+    ) -> crate::assurance::RunAssurance {
         run.stand_in_aware = self.aware;
         if self.aware {
             let mut parties: Vec<String> = Vec::new();
@@ -468,11 +473,7 @@ pub(crate) fn resolve(
         .iter()
         .find(|c| c.key == base)
         .or_else(|| registry.iter().find(|c| c.key == base))
-        .or_else(|| {
-            registry
-                .iter()
-                .find(|c| c.key == seat_id::family(base))
-        })
+        .or_else(|| registry.iter().find(|c| c.key == seat_id::family(base)))
         .map(|c| c.headless_invocation.clone())
 }
 
@@ -658,8 +659,9 @@ mod tests {
         };
         assert_eq!(stand_ins[0].key, "codex#2~1");
         assert_eq!(seat_id::credential(&stand_ins[0].key), "codex#2");
-        let Fill::Seats { stand_ins: again, .. } =
-            fill(req(&[], &["codex#2"], Some(&c), &stand_ins))
+        let Fill::Seats {
+            stand_ins: again, ..
+        } = fill(req(&[], &["codex#2"], Some(&c), &stand_ins))
         else {
             panic!("filled")
         };

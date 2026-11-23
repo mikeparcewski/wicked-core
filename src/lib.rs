@@ -447,6 +447,10 @@ pub use repo_intel::{
 pub use scope::{resolve_scope, EntityMode};
 pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use standin::{
+    refuse_forged_stand_ins, LaunchStandIn, Reason as StandInReason, Role as StandInRole,
+    StandInBinding, StandInConsent,
+};
 pub use state_home::{
     preflight_state_home, StateHomeConfigError, StateHomePreflight, UnregisteredEntry,
 };
@@ -465,10 +469,6 @@ pub use workflow::{
     GateSpec, GateType, HumanDecision, PhaseDef, PhaseRole, PhaseScopeRead, PostStepTree,
     StepInput, StepOutput, StepOwner, StepRunner, StepStatus, StubStepRunner, UnitEvidence, Usage,
     WorkflowDef, WorkflowDefError, WorkflowRegistry, GATE_CHANGED,
-};
-pub use standin::{
-    refuse_forged_stand_ins, LaunchStandIn, Reason as StandInReason, Role as StandInRole,
-    StandInBinding, StandInConsent,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 

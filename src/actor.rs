@@ -2630,13 +2630,9 @@ pub(crate) fn run(
                         &run_id,
                         refusal,
                     ),
-                    (None, Some(need)) => stand_in_gate::park(
-                        &mut store,
-                        &mut subscribers,
-                        &self_tx,
-                        &run_id,
-                        need,
-                    ),
+                    (None, Some(need)) => {
+                        stand_in_gate::park(&mut store, &mut subscribers, &self_tx, &run_id, need)
+                    }
                     (None, None) => Ok(false),
                 };
                 match parked {

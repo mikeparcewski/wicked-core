@@ -439,7 +439,11 @@ pub struct RunAssurance {
     #[serde(default, rename = "roles", skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<RoleRecord>>,
     /// (§3.7) The run's stand-in label: the first reason, and "and later: …" once.
-    #[serde(default, rename = "standInLabel", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "standInLabel",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stand_in_label: Option<String>,
     /// (§3.10, rev 3 R8) The check a `stand_in_needed` gate is holding, consumed by the gate's
     /// retry or a grant, which continue exactly it.
@@ -749,7 +753,11 @@ pub struct AssuranceReceipt {
     /// `independent` | `stand_in` | `mixed` ([`independence_of`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub independence: Option<String>,
-    #[serde(default, rename = "standInLabel", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "standInLabel",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stand_in_label: Option<String>,
 }
 

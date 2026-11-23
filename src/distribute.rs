@@ -771,7 +771,10 @@ pub(crate) fn distribute_seated(
                 taken: &taken,
             }) {
                 crate::standin::Fill::Seats { stand_ins, .. } => {
-                    let mut b = stand_ins.into_iter().next().expect("one stand-in asked for");
+                    let mut b = stand_ins
+                        .into_iter()
+                        .next()
+                        .expect("one stand-in asked for");
                     b.display = Some(crate::standin::display_name(configured, &b.base));
                     d.assigned_invocation = invocation_of(clis, &b.base);
                     d.routing = RoutingInfo::StandIn {
@@ -974,7 +977,7 @@ fn pool_seating(
     if unit.tool_cmd.is_some() || requested <= 1 {
         return None;
     }
-    let distinct = |k: &str| k != creator && Some(k) != pa;
+    let distinct = |k: &str| monitor_seat_admitted(k, creator, pa);
     let monitors: Vec<String> = if unit.team_run {
         let (model_distinct, same_cli): (Vec<&String>, Vec<&String>) = eligible
             .iter()
@@ -1301,7 +1304,8 @@ fn enforce_evaluator_distinct(
         }
         let gathered = crate::pipeline::report_gatherer_seats(&seated_units, u);
         let forbidden = |k: &String| {
-            builder_clis.contains(k) || gathered.contains(k) || is_party(k, parties)
+            !evaluator_seat_admitted(k, &|b| builder_clis.contains(b), parties)
+                || gathered.contains(k)
         };
         if matches!(u.stage, StageKind::Review | StageKind::Test) && forbidden(&d.assigned_cli) {
             let admits = |k: &String| match candidates {
@@ -1367,6 +1371,25 @@ fn enforce_evaluator_distinct(
         .map(|((u, _), _)| u.ord)
         .collect();
     (same_seat, same_cli_instance)
+}
+
+/// (core#1847) The evaluator gate's admission of one seat, shared with the launch preflight
+/// (`independence::independence_preflight_in`): never a seat that built the work (by SEAT key, so a
+/// configured second instance `claude#2` of a `claude` builder is admitted and disclosed
+/// `same_cli_instance`), never one of a stand-in-aware run's parties. The per-unit report
+/// gatherers are excluded on top, at the gate only (no report exists at launch).
+pub(crate) fn evaluator_seat_admitted(
+    k: &str,
+    is_builder: &dyn Fn(&str) -> bool,
+    parties: &[String],
+) -> bool {
+    !is_builder(k) && !is_party(k, parties)
+}
+
+/// (core#1847) The worker pool's admission of one monitor, shared with the launch preflight: a
+/// seat instance distinct from the unit's creator and from the run's PA.
+pub(crate) fn monitor_seat_admitted(k: &str, creator: &str, pa: Option<&str>) -> bool {
+    k != creator && Some(k) != pa
 }
 
 /// (DES-STANDIN-001 §3.8) Whether seat `k` is one of the run's parties: the party names the seat
@@ -4039,7 +4062,6 @@ mod tests {
             }
         }
     }
-
 }
 
 #[cfg(test)]

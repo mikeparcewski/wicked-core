@@ -1907,34 +1907,33 @@ pub(crate) fn apply_and_finish_unit(
     // conservative legacy projection) instead of this denial.
     let on_stand_in =
         crate::standin::binding_for(&assurance, unit.assigned_cli.as_deref()).is_some();
-    let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR)
-        && !on_stand_in
-    {
-        let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
-        // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
-        let rel = evaluator_relation(
-            &units,
-            unit,
-            evidence.observed_providers.as_deref().or(Some(&[])),
-        )
-        .filter(|rel| rel.on_builder_seat);
-        // (core#1719) A seat seen calling an author's provider is on the unit's record, so no
-        // retry re-picks it, and when no other seat could review the work the gate says so.
-        if let (Some(true), Some(seat)) = (
-            rel.as_ref().map(|r| r.provider_only),
-            unit.assigned_cli.clone(),
-        ) {
-            if !unit.provider_shared_seats.contains(&seat) {
-                unit.provider_shared_seats.push(seat);
+    let same_seat_denial =
+        if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) && !on_stand_in {
+            let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
+            // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
+            let rel = evaluator_relation(
+                &units,
+                unit,
+                evidence.observed_providers.as_deref().or(Some(&[])),
+            )
+            .filter(|rel| rel.on_builder_seat);
+            // (core#1719) A seat seen calling an author's provider is on the unit's record, so no
+            // retry re-picks it, and when no other seat could review the work the gate says so.
+            if let (Some(true), Some(seat)) = (
+                rel.as_ref().map(|r| r.provider_only),
+                unit.assigned_cli.clone(),
+            ) {
+                if !unit.provider_shared_seats.contains(&seat) {
+                    unit.provider_shared_seats.push(seat);
+                }
             }
-        }
-        rel.map(|rel| {
-            let dead_end = no_distinct_reviewer(&units, unit, cli_keys);
-            rel.denial(unit, dead_end.as_deref())
-        })
-    } else {
-        None
-    };
+            rel.map(|rel| {
+                let dead_end = no_distinct_reviewer(&units, unit, cli_keys);
+                rel.denial(unit, dead_end.as_deref())
+            })
+        } else {
+            None
+        };
     // What the pinned validator concluded, for the receipt: `None` passed; a "failed" reason is a
     // verdict it REACHED; a timeout or an unrunnable script reached none.
     let det_reached_verdict = det_denial
