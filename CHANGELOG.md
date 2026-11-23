@@ -14,8 +14,34 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 cut 8da16279, carrying 34 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804.
+- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut bf93b161, carrying 47 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1828.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - Gate answers off the actor, a connection per read, one-run unit reads by name (core#1795) (#1806)
+
+  - Stop a handed-off validator when its attempt is superseded (core#1742) (#1807)
+
+  - Plan events carry each step's controls; the gate says what put the plan in its band (core#1259, core#1382) (#1809)
+
+  - Content-filter refusal stem; a stdout refusal stays last behind a chatty stderr (core#1718, core#1720) (#1811)
+
+  - Wait on the event, not a wall-clock margin, in the power voice and dispute deadline tests (core#1794) (#1812)
+
+  - Delete the ACP session registry and other ACP-only code (#1813)
+
+  - An exclusion needs the base's and the head's lists to cover their own runs (core#1767) (#1815)
+
+  - Retire the base target claim without waiting under the leaf lock (core#1714) (#1816)
+
+  - Bench a hook-silenced claude on the host floor; name each unit's scratch (core#1744, core#1758) (#1818)
+
+  - Prove gateway record follower catch-up at release, else report incomplete (core#1716) (#1819)
+
+  - An abandon verb ends one open sign-in (#1673) (#1820)
+
+  - A one-run interaction read uses the name index, never a scan of every request (core#1795) (#1824)
+
+  - Claude OAuth seats hold only a placeholder credential: the gateway sends the operator's `claude setup-token` token upstream, so a nested `claude -p` inside a seat (the garden harness's rule model) is signed in, and the token never enters a seat (wicked-garden#1365). **Behaviour change:** claude seats no longer hold the operator token; this reverses the core#1024 design. (#1828)
 
   - Run the real-browser draft-render jail test on ubuntu and macOS (#1770)
 
