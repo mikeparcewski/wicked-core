@@ -2558,6 +2558,126 @@ fn t6_a_review_that_timed_out_keeps_the_member_output_and_offers_only_what_its_g
     assert_eq!(u.status, crate::domain::UnitStatus::Done);
 }
 
+/// The member runner, except that the member's own step runs out of time on its first two turns.
+struct MemberTimesOutTwice {
+    inner: Arc<MemberRunner>,
+    turns: AtomicUsize,
+}
+
+impl StepRunner for MemberTimesOutTwice {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let member_turn = i
+            .unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_none());
+        if member_turn && self.turns.fetch_add(1, AtomicOrdering::SeqCst) < 2 {
+            return StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "partial".into(),
+                status: StepStatus::TimedOut,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+        }
+        self.inner.run_unit(i)
+    }
+}
+
+/// The `gateSeq` of the newest `awaitingHuman` for `run` at `ord`.
+fn last_gate_seq(evs: &[CoreEvent], run: &str, ord: u32) -> u32 {
+    evs.iter()
+        .rev()
+        .find_map(|ev| match ev {
+            CoreEvent::AwaitingHuman {
+                session,
+                ord: o,
+                gate_seq,
+                ..
+            } if session == run && *o == ord => Some(*gate_seq),
+            _ => None,
+        })
+        .expect("an awaitingHuman at the unit")
+}
+
+/// core#1808: a gate answer named its gate by ord (and plan rev) only, so a gate that closed and
+/// re-opened at the same ord took an answer sent from the earlier card. Each opening now carries
+/// its own `gateSeq` (on `awaitingHuman` and the durable row), and an answer naming an earlier
+/// opening is refused `gate_changed`, leaving the gate open. Red on main: the stale answer passed
+/// the ord check and re-dispatched the unit.
+#[test]
+fn an_answer_for_an_earlier_opening_at_the_same_ord_is_refused_gate_changed() {
+    let rig = rig("t6-gate-seq");
+    let worker = Arc::new(MemberTimesOutTwice {
+        inner: MemberRunner::new(|_| "reviewed\nSTEP write: ACCEPT — it covers it".into()),
+        turns: AtomicUsize::new(0),
+    });
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let e = supervised(
+        &rig,
+        &db,
+        worker,
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        false,
+    );
+    let mut evs = Vec::new();
+    launch_member_run_confirm(&e, "t6gs", HumanConfirm::Before(99));
+    wait_status(&e, "t6gs", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    let first = last_gate_seq(&evs, "t6gs", WRITE);
+    let expect = |seq: u32| crate::workflow::GateExpect {
+        ord: Some(WRITE),
+        plan_rev: None,
+        gate_seq: Some(seq),
+    };
+    // The card of the first opening is answered: the step runs again and times out again, so a
+    // NEW gate opens at the same ord, of the same kind.
+    e.core
+        .confirm_gate_expecting("t6gs", approve(None), None, Some(expect(first)))
+        .expect("the answer for the open gate is taken");
+    wait_status(&e, "t6gs", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    let second = last_gate_seq(&evs, "t6gs", WRITE);
+    assert!(
+        second > first,
+        "a re-opened gate is a new opening: {first} then {second}"
+    );
+    let store = wicked_apps_core::open_store_ro(Some(&e.db)).unwrap();
+    let rows = crate::interaction::list_interactions(
+        &store,
+        Some("t6gs"),
+        Some(crate::interaction::InteractionStatus::Open),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].ord, rows[0].gate_seq), (Some(WRITE), second));
+    drop(store);
+    // The card's read (`GET /gate`) names the same opening.
+    let card = e
+        .core
+        .gate_actions("t6gs")
+        .unwrap()
+        .expect("a gate is open");
+    assert_eq!(card.gate_seq, Some(second));
+    // The earlier card's answer (same ord, same kind) is refused, and the gate stays open.
+    let err = e
+        .core
+        .confirm_gate_expecting("t6gs", approve(None), None, Some(expect(first)))
+        .expect_err("an answer for an earlier opening");
+    assert!(err.to_string().starts_with("gate_changed:"), "{err}");
+    assert_eq!(status(&e, "t6gs"), Some(SessionStatus::AwaitingHuman));
+    // The current opening's answer is taken.
+    e.core
+        .confirm_gate_expecting("t6gs", approve(None), None, Some(expect(second)))
+        .expect("the answer for the open gate is taken");
+    wait_status(&e, "t6gs", SessionStatus::Completed);
+}
+
 // ── (k) restart mid-step ─────────────────────────────────────────────────────────────────────────
 
 /// Attempt 0 of unit 0 plays the supervisor raising one HIGH on it, then hangs (the daemon dies
