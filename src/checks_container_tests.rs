@@ -34,7 +34,7 @@ case "$1 $2 $3" in
             while [ -f "$dir/pause-pod-list" ]; do sleep 0.01; done
         fi
         ;;
-    get\ pvc\ *) cat "$dir/$3.json" ;;
+    get\ pvc\ *) if [ -f "$dir/$3.json" ]; then cat "$dir/$3.json"; fi ;;
     delete\ pvc\ *) printf '%s\n' "$3" >> "$dir/deleted" ;;
     apply\ *) cat > "$dir/applied.json" ;;
     *) echo "unexpected kubectl: $*" >&2; exit 1 ;;

@@ -991,6 +991,21 @@ fn a_first_creator_change_with_no_touch_fails_closed_with_the_pa_declared_no_sco
         scored[0].reasons.first().map(String::as_str),
         Some(crate::plan_gate::scope::PA_DECLARED_NO_SCOPE)
     );
+    // (core#1382) The held plan says what put it in its band: this change's own score.
+    let held = r.state.pending.as_ref().expect("held");
+    assert_eq!(held.band_why.first().map(String::as_str), Some("score 100"));
+    assert!(
+        held.band_why
+            .iter()
+            .any(|w| w == crate::plan_gate::scope::PA_DECLARED_NO_SCOPE),
+        "{:?}",
+        held.band_why
+    );
+    let prompt = crate::plan_gate::gate_prompt(held, 2, true);
+    assert!(
+        prompt.contains(". Band 70-100 from: score 100; "),
+        "{prompt}"
+    );
 }
 
 /// (codex #738 finding 2) The first-creator row fires under its OWN reason in every mode: manual

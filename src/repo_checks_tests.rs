@@ -59,10 +59,13 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
     }
     let _restore = Restore(std::env::var_os("WICKED_FLOOR_MIN_FREE_GB"));
     std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", "15");
-    for (tag, precise, on_retry) in [
-        ("unseparated-retry", false, true),
-        ("excluded-retry", true, true),
-        ("excluded-head", true, false),
+    // (tag, the base inventory is precise, the spawn of `decide` low space starts at, a retry
+    // runs, the head's results run is the one refused — core#1767)
+    for (tag, precise, low_at, on_retry, results_refused) in [
+        ("unseparated-retry", false, 1, true, false),
+        ("excluded-retry", true, 5, true, false),
+        ("excluded-head", true, 4, false, false),
+        ("results-head", true, 3, false, true),
     ] {
         let wt = scratch(tag);
         std::fs::write(
@@ -71,6 +74,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
                    echo 'new: test'; case \"$*\" in *--skip=old*) ;; *) echo 'old: test';; esac; exit 0;;\n\
                  esac\n\
                  echo run >> attempts\n\
+                 echo 'running 2 tests'\n\
                  echo 'No space left on device (os error 28)' >&2\n\
                  exit 101\n",
             )
@@ -113,7 +117,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
         let guide: GuideCheck = serde_json::from_value(serde_json::json!({
             "name": "test", "run": check.argv, "failedExit": [101],
             "results": {"kind": "text"},
-            "parser": {"failed": ["^FAIL (?P<id>.+)$"]},
+            "parser": {"failed": ["^FAIL (?P<id>.+)$"], "count": "^running (?P<n>\\d+) tests$"},
             "list": {"run": ["sh", "check.sh", "--list"],
                      "item": "^(?P<id>.+): test$"},
             "alone": {"run": ["sh", "check.sh", "{id}"]},
@@ -136,19 +140,17 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
             fresh: Vec::new(),
         };
         assert!(seed.set_aside_by(&check, &head).is_some());
-        if precise && on_retry {
-            // The two head inventories and the excluded run see plenty; only its retry
-            // sees low space. Inventory probes also use the existing spawn seam.
-            test_seam::before_spawn(|| {
-                test_seam::before_spawn(|| {
-                    test_seam::before_spawn(|| {
-                        test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)))
-                    })
-                })
-            });
-        } else {
-            test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+        // Low space from the `n`th spawn of `decide` on: the head inventory (1), the deselected
+        // head inventory (2), the head's results run (3, core#1767), the excluded run (4) and
+        // its retry (5). Inventory probes also use the existing spawn seam.
+        fn low_from(n: u32) {
+            if n <= 1 {
+                test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+            } else {
+                test_seam::before_spawn(move || low_from(n - 1));
+            }
         }
+        low_from(low_at);
         decide(
             &wt,
             None,
@@ -163,10 +165,19 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
             None,
             false,
         );
-        let deciding = head.reruns.last().expect("a deciding run ran");
-        assert!(deciding.environment_failure(), "{head:?}");
         assert!(head.environment_failure(), "{head:?}");
-        assert_eq!(head.spawn_error, deciding.spawn_error, "{head:?}");
+        if results_refused {
+            // The refusal is the check's, though no deciding run ran after it.
+            assert!(head.reruns.is_empty(), "{head:?}");
+            assert!(
+                head.earlier_passes.iter().any(|(l, _)| l == "head results"),
+                "{head:?}"
+            );
+        } else {
+            let deciding = head.reruns.last().expect("a deciding run ran");
+            assert!(deciding.environment_failure(), "{head:?}");
+            assert_eq!(head.spawn_error, deciding.spawn_error, "{head:?}");
+        }
         assert_eq!(head.outcome(), OUTCOME_COULD_NOT_RUN, "{head:?}");
         let decision = head.decision.as_ref().unwrap();
         assert_eq!(decision.outcome, OUTCOME_COULD_NOT_RUN, "{head:?}");
@@ -178,7 +189,7 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
         assert_eq!(head.retry.is_some(), on_retry, "{head:?}");
         assert_eq!(
             head.reruns.len(),
-            usize::from(precise) + usize::from(on_retry)
+            usize::from(precise && !results_refused) + usize::from(on_retry)
         );
         for rerun in &head.reruns {
             for log in &rerun.logs {
@@ -190,7 +201,11 @@ fn core_1627_deciding_enospc_is_terminal_after_reuse() {
                 .unwrap()
                 .lines()
                 .count(),
-            1 + usize::from(precise) + usize::from(on_retry)
+            // The head, (precise) its results run, the excluded run unless the results run was
+            // refused (it ran and met the low space), and the retry.
+            1 + usize::from(precise)
+                + usize::from(precise && !results_refused)
+                + usize::from(on_retry)
         );
         drop(scratch);
         let _ = std::fs::remove_dir_all(&wt);
@@ -2535,6 +2550,12 @@ fn core_1542_last_floor_out_drops_the_base_target_claim_and_keeps_the_head() {
         calls.contains(&format!("delete pvc {base_claim}")),
         "{calls}"
     );
+    // (core#1714) Only marked under the leaf's lock: the next floor's claim waits it out.
+    let delete = calls
+        .lines()
+        .find(|l| l.contains(&format!("delete pvc {base_claim}")))
+        .unwrap();
+    assert!(delete.contains("--wait=false"), "{delete}");
     assert!(!calls.contains(&format!("delete pvc {head}")), "{calls}");
     // The head claim is still the leaf's: retiring the leaf deletes it.
     assert!(retire_leaf(&leaf));

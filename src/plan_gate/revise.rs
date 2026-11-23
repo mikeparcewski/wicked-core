@@ -395,6 +395,8 @@ pub(crate) fn revise(
     let mut events = Vec::new();
     let mut obligations = prior.obligations.clone();
     let mut recalled = prior.recalled.clone();
+    // (core#1382) What put a first-creator change in its band, when it has a score of its own.
+    let mut scored_why: Vec<String> = Vec::new();
     let (additions, proposal_id, reason, score, destructive, by_human, pa_touch, first_creator) =
         match change {
             Change::Floor(r) => {
@@ -471,6 +473,7 @@ pub(crate) fn revise(
                         )
                     };
                     events.push(super::path_scored(run_id, &pid, &scored.assessment, now)?);
+                    scored_why = super::band_why(&scored, &for_score, prior.max_score);
                     // (§4.7 F11) A step that executes code needs a worktree: refused on a repo-less
                     // path, on the record, before anything is planned.
                     if scope.graph_key.is_none()
@@ -743,6 +746,9 @@ pub(crate) fn revise(
                 touch_source: Some(touch_source),
                 rules,
                 done: done.to_vec(),
+                // A first-creator change scores itself; any other revision has no score of its
+                // own to explain the band with.
+                band_why: scored_why,
             });
             Ok(Revised {
                 state,
@@ -1172,6 +1178,8 @@ pub(crate) fn send_back(
         touch_source: held.touch_source,
         rules,
         done: held.done.clone(),
+        // A send-back re-plans under the held plan's score: the same band, for the same reasons.
+        band_why: held.band_why.clone(),
     });
     Ok(Revised {
         state,

@@ -16,11 +16,17 @@
 //! command is midway through.
 //!
 //! Served here: `Core::sessions`, `Core::sessions_detail` (crew's GET /runs, the stall watchdog's
-//! `listExecuting`) and `Core::run_team`. Transcripts stay on the actor: their store helpers fold a
+//! `listExecuting`), `Core::session_detail`, `Core::run_team` and (core#1795) `Core::gate_actions`,
+//! the gate card's list of answers. Transcripts stay on the actor: their store helpers fold a
 //! read error into "no record", which this path could not tell from a real answer.
 //!
+//! Each read takes a connection of its own from a small pool (core#1795), so a slow read, or one
+//! waiting for a quiet moment, never holds another read up.
+//!
 //! What it is NOT: an input to any decision. Gates, reassigns, delivery, the hook-decision fold and
-//! every deny are decided on the actor from the actor's own store. A read here may show a state a
+//! every deny are decided on the actor from the actor's own store. `gate_actions` lists the answers
+//! a gate takes by running the decision path's own pre-checks on this read; the answer itself is
+//! checked again on the actor when it arrives. A read here may show a state a
 //! command is midway through (it committed the session, not yet the units); the actor re-validates
 //! every answer sent on such a read (`check_gate_expect`, the reassign's cursor check), exactly as
 //! it refuses an answer sent on a read that is a second old. The guard test
@@ -42,10 +48,26 @@ use wicked_apps_core::{GraphWrite, SqliteStore};
 /// committed state anyway.
 pub(crate) const QUIET_BUDGET: Duration = Duration::from_millis(100);
 
+/// (core#1795) How many idle read connections a core keeps. Each read takes a connection of its
+/// own (an idle one, or a new one), so reads never queue behind each other: a slow read (a gate
+/// read's worktree snapshot) or one waiting for a quiet moment holds only its own connection.
+/// Past this many idle connections, a finished read's connection is closed.
+const IDLE_CONNECTIONS: usize = 4;
+
+/// The idle connections, and whether the pool is closed: once the actor stops, every idle
+/// connection is dropped and none is taken back, so nothing of this core holds the store open.
+#[derive(Default)]
+struct Pool {
+    conns: Vec<SqliteStore>,
+    closed: bool,
+}
+
 pub(crate) struct ReadModel {
     /// The store file, or `None` when this store has no read model (in-memory, Postgres).
     path: Option<String>,
-    conn: Mutex<Option<SqliteStore>>,
+    /// Idle read-only connections ([`IDLE_CONNECTIONS`] at most). The lock is held only to take
+    /// or return one, never across a read.
+    idle: Mutex<Pool>,
     /// The actor's command counters: where "between commands" is read from.
     actor: Arc<crate::actor_stats::ActorStats>,
     /// How long a read waits for a between-commands moment ([`QUIET_BUDGET`]; tests widen it so a
@@ -109,7 +131,7 @@ impl ReadModel {
             std::env::var("WICKED_READ_MODEL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
         Self {
             path: (!off).then(|| read_path(spec)).flatten(),
-            conn: Mutex::new(None),
+            idle: Mutex::new(Pool::default()),
             actor,
             budget: QUIET_BUDGET,
             #[cfg(test)]
@@ -132,17 +154,55 @@ impl ReadModel {
     /// failed (the connection is then dropped and reopened next time).
     pub(crate) fn read<T>(&self, f: impl FnOnce(&SqliteStore) -> anyhow::Result<T>) -> Option<T> {
         let path = self.path.as_deref()?;
-        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         // A stopped actor answers every read with its own error ("core actor stopped"), as before;
-        // the connection goes with it, so nothing of this core holds the store open after it.
+        // the connections go with it, so nothing of this core holds the store open after it.
         if self.actor.is_stopped() {
-            *slot = None;
+            self.close_idle();
             return None;
         }
-        if slot.is_none() {
-            *slot = wicked_apps_core::open_store_ro(Some(path)).ok();
+        // (core#1795) This read's own connection: the pool's lock is released before the read
+        // waits or reads, so concurrent reads run side by side. A connection that fails is
+        // dropped (never returned), and the next read opens a fresh one.
+        let taken = self
+            .idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .conns
+            .pop();
+        let mut store = match taken {
+            Some(store) => store,
+            None => wicked_apps_core::open_store_ro(Some(path)).ok()?,
+        };
+        let out = self.read_on(&mut store, f);
+        // A stop seen at any point closes the pool, whatever this read answered.
+        if self.actor.is_stopped() {
+            self.close_idle();
+            return None;
         }
-        let store = slot.as_mut()?;
+        let out = out?;
+        let mut pool = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the pool's lock: a read that returns after another closed the pool drops
+        // its connection instead of reopening the pool.
+        if !pool.closed && pool.conns.len() < IDLE_CONNECTIONS {
+            pool.conns.push(store);
+        }
+        Some(out)
+    }
+
+    /// Close the pool for good (the actor stopped): drop every idle connection, take none back.
+    fn close_idle(&self) {
+        let mut pool = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        pool.closed = true;
+        pool.conns.clear();
+    }
+
+    /// [`ReadModel::read`] on one connection: `None` when the read must go to the actor, and the
+    /// connection is then not reused.
+    fn read_on<T>(
+        &self,
+        store: &mut SqliteStore,
+        f: impl FnOnce(&SqliteStore) -> anyhow::Result<T>,
+    ) -> Option<T> {
         let deadline = Instant::now() + self.budget;
         loop {
             let quiet = self
@@ -158,7 +218,6 @@ impl ReadModel {
             // writing (pinned by `one_read_sees_one_committed_state_even_when_a_write_lands_midway`).
             if store.begin_batch().is_err() || store.meta_get("history_enabled").is_err() {
                 let _ = store.commit_batch();
-                *slot = None;
                 return None;
             }
             #[cfg(test)]
@@ -168,7 +227,6 @@ impl ReadModel {
             // An actor that took `Shutdown` while this read waited answers it itself (stopped).
             if self.actor.is_stopped() {
                 let _ = store.commit_batch();
-                *slot = None;
                 return None;
             }
             match quiet {
@@ -183,7 +241,6 @@ impl ReadModel {
             self.retries
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if store.commit_batch().is_err() {
-                *slot = None;
                 return None;
             }
         }
@@ -192,7 +249,6 @@ impl ReadModel {
         // what it read is not trusted either: the actor answers instead.
         let ended = store.commit_batch().is_ok();
         if !ended || out.is_err() || self.actor.is_stopped() {
-            *slot = None;
             return None;
         }
         out.ok()
@@ -291,6 +347,113 @@ mod tests {
             n, 3,
             "never the half-written state: the read waited the command out"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1795) A slow read holds only its own connection: a second read answers while the
+    /// first is still inside its read transaction, and both connections stay for the next reads.
+    #[test]
+    fn a_slow_read_does_not_hold_another_read_up() {
+        use std::sync::mpsc::channel;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-pool-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let rm = Arc::new(ReadModel::for_store(db.to_str().unwrap(), actor));
+        let bound = Duration::from_secs(20);
+        let (inside_tx, inside) = channel::<()>();
+        let (release_tx, release) = channel::<()>();
+        let slow = {
+            let rm = rm.clone();
+            std::thread::spawn(move || {
+                rm.read(|_| {
+                    inside_tx.send(()).unwrap();
+                    release.recv_timeout(bound).expect("released");
+                    Ok("slow")
+                })
+            })
+        };
+        inside
+            .recv_timeout(bound)
+            .expect("the slow read is inside its read");
+        let (fast_tx, fast) = channel();
+        {
+            let rm = rm.clone();
+            std::thread::spawn(move || {
+                let _ = fast_tx.send(rm.read(|_| Ok("fast")));
+            });
+        }
+        let got = fast.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            got.expect("the second read answered while the first was still reading"),
+            Some("fast")
+        );
+        assert_eq!(slow.join().unwrap(), Some("slow"));
+        assert_eq!(
+            rm.idle.lock().unwrap().conns.len(),
+            2,
+            "both connections are kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1795, codex round 1) An actor that stops while a read runs closes the whole pool: the
+    /// idle connections are dropped, the running read's connection is not taken back, and no read
+    /// after it reopens one.
+    #[test]
+    fn a_stop_during_a_read_closes_the_pool_and_nothing_is_taken_back() {
+        use std::sync::mpsc::channel;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-close-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let rm = Arc::new(ReadModel::for_store(db.to_str().unwrap(), actor.clone()));
+        let bound = Duration::from_secs(20);
+        let hold = |rm: &Arc<ReadModel>, answer: i32| {
+            let (inside_tx, inside) = channel::<()>();
+            let (release_tx, release) = channel::<()>();
+            let rm = rm.clone();
+            let h = std::thread::spawn(move || {
+                rm.read(|_| {
+                    inside_tx.send(()).unwrap();
+                    release.recv_timeout(bound).expect("released");
+                    Ok(answer)
+                })
+            });
+            inside.recv_timeout(bound).expect("inside its read");
+            (h, release_tx)
+        };
+        // Two connections out at once, both returned: two idle.
+        let (held, release) = hold(&rm, 1);
+        assert_eq!(rm.read(|_| Ok(2)), Some(2));
+        release.send(()).unwrap();
+        assert_eq!(held.join().unwrap(), Some(1));
+        assert_eq!(rm.idle.lock().unwrap().conns.len(), 2);
+        // A read takes one of them; the actor stops while it reads.
+        let (reading, release) = hold(&rm, 3);
+        actor.mark_stopped();
+        release.send(()).unwrap();
+        assert_eq!(reading.join().unwrap(), None, "the actor answers it");
+        let pool = rm.idle.lock().unwrap();
+        assert!(pool.closed, "the stop closed the pool");
+        assert!(
+            pool.conns.is_empty(),
+            "the other idle connection was dropped without another read"
+        );
+        drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

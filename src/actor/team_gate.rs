@@ -407,6 +407,14 @@ fn plan_accepted(session: &AgentSession, units: &[WorkUnit], plan_rev: u32) -> T
                         floor_reason: None,
                         floor_rule: None,
                         late: None,
+                        pool: None,
+                        executes_code: None,
+                        validator_pin: None,
+                        writes_nothing: None,
+                        verified_evidence: None,
+                        requires_capture_report: None,
+                        answer_only: None,
+                        required_deliverables: None,
                     }
                 })
                 .collect(),

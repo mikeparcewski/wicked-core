@@ -26,7 +26,7 @@ use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
 use wicked_governance::{conform, decide, select_any};
 
-use crate::acp_runner::{ElicitationMaps, KillHandle, WriteReg};
+use crate::acp_runner::ElicitationMaps;
 use crate::command::Command;
 use crate::domain::{put_node, AgentSession, SessionStatus};
 use crate::event::CoreEvent;
@@ -818,11 +818,6 @@ fn finish_run_carries(
 /// released. `dispatcher`/`runner` are the injectable council + step-execution seams (real in prod,
 /// stubbed in tests).
 #[allow(clippy::too_many_arguments)]
-/// Lock ordering: `write_reg` must always be acquired BEFORE `elicitation_maps`.
-/// Never hold both simultaneously; acquire `write_reg`, read/snapshot state, release,
-/// then acquire `elicitation_maps` if needed. Violating this ordering risks ABBA deadlock
-/// between `shared_run_terminal` (holds `write_reg`, then acquires `maps`) and
-/// session-start helpers (acquire `maps` alone).
 pub(crate) fn run(
     bus_bridge: crate::bus::BridgeSlot,
     path: String,
@@ -834,7 +829,6 @@ pub(crate) fn run(
     exec_bus: Option<String>,
     is_acp: bool,
     elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    write_reg: WriteReg,
     team_link: crate::team::publish::TeamLink,
     qe_host: crate::assurance::HostQeAcceptance,
     stats: Arc<crate::actor_stats::ActorStats>,
@@ -863,6 +857,14 @@ pub(crate) fn run(
             return;
         }
     };
+    // (core#1795) Before any startup work: interaction rows written before they were named under
+    // their run are renamed, so a one-run read (the gate card's) reaches them by the name index. A
+    // pass that fails is tried again before a later command (`name_rows_when_due`).
+    let mut interaction_naming_due = crate::interaction::name_rows_when_due(
+        &mut store,
+        Some(std::time::Instant::now()),
+        std::time::Instant::now(),
+    );
 
     crate::gate_hook::gov_root_for_state_home(operational_home.as_deref());
     if let Err(why) = crate::gate_hook::gov_root_ready() {
@@ -1041,8 +1043,6 @@ pub(crate) fn run(
     // `actor_maps` — ACP-delivery arc (deliver, cancel_epoch, EmitEvent suppression, epoch ops).
     //   `Some` for ACP runners (is_acp=true, shares the same Arc as lifecycle_maps).
     //   `None` for PTY and injected runners.
-    //
-    // Lock ordering: `write_reg` BEFORE `elicitation_maps` (see module-level doc on `run`).
     let lifecycle_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = elicitation_maps.clone();
     let actor_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = if is_acp {
         elicitation_maps.clone()
@@ -1365,6 +1365,14 @@ pub(crate) fn run(
     let mut backlog: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     loop {
+        // (core#1795) A naming pass that failed at boot, once it is due again.
+        if interaction_naming_due.is_some() {
+            interaction_naming_due = crate::interaction::name_rows_when_due(
+                &mut store,
+                interaction_naming_due,
+                std::time::Instant::now(),
+            );
+        }
         // Check before every command as well as idle ticks: a chatty UI cannot starve the sweep.
         if last_dead_seat_sweep.elapsed() >= dead_seat_reprobe::DEAD_SEAT_SWEEP {
             last_dead_seat_sweep = std::time::Instant::now();
@@ -2710,6 +2718,7 @@ pub(crate) fn run(
                 if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
                     fold_reads::start(
                         &self_tx,
+                        lifecycle_maps.as_ref(),
                         reads,
                         fold_reads::Posted {
                             output,
@@ -2885,8 +2894,8 @@ pub(crate) fn run(
                 }
             }
             Command::CancelRun { run_id, reply } => {
-                // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
-                shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                // Teardown: tombstone the run and cancel its epoch (no-op for PTY).
+                shared_run_terminal(&run_id, &lifecycle_maps);
                 // core#1653: preserve the raw stream's tail even when throttled text is discarded.
                 for (ord, _, chunk) in finish_run_carries(&mut live_redact, &run_id) {
                     emit(
@@ -5053,9 +5062,8 @@ pub(crate) fn run(
                 stats.mark_stopped();
                 crate::power::unregister_actor(process_gen);
                 subscribers.close_asks();
-                // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
-                // do not poll the elicitation tombstone, so they must be interrupted through
-                // the registered child kill handles; elicitation waits also observe the flag.
+                // Stop in-flight workers before dropping the actor channel: raise the shutdown
+                // flag and tombstone every active run.
                 let mut acp_run_ids = if let Some(ref maps) = lifecycle_maps {
                     let mut maps = maps.lock().unwrap_or_else(|p| p.into_inner());
                     maps.set_shutdown_flag();
@@ -5063,14 +5071,10 @@ pub(crate) fn run(
                 } else {
                     Vec::new()
                 };
-                {
-                    let registry = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-                    acp_run_ids.extend(registry.keys().map(|(run_id, _, _)| run_id.clone()));
-                }
                 acp_run_ids.sort();
                 acp_run_ids.dedup();
                 for run_id in acp_run_ids {
-                    shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                    shared_run_terminal(&run_id, &lifecycle_maps);
                     runner.on_run_complete(&run_id);
                 }
                 runner.on_shutdown();
@@ -22960,73 +22964,21 @@ fn rewind_to_creator_scoped(
     }
 }
 
-/// Ordered ACP teardown helper shared by CancelRun, FailureTriageReady, and Shutdown.
-///
-/// Performs steps 1–3 + 6 of the spec:
-/// 1. Snapshot sessions for `run_id` from the write-lock registry.
-/// 2. Per-session: try_lock the write_lock; tombstone the epoch; signal kill.
-/// 3. Tombstone under maps lock (catches pre-registration workers).
-/// 6. Second registry sweep (catches sessions inserted between step 1 and now).
-///
-/// Steps 4+5 (emit RunCancelled / call on_run_complete) are the caller's responsibility.
-///
-/// Lock ordering: `write_reg` BEFORE `maps` — never hold both simultaneously.
-/// For CancelRun the second sweep uses run_id only; for ReassignUnit it filters
-/// by `(run_id, previous_cli, gen <= old_max_gen)`.
+/// Run teardown shared by CancelRun and Shutdown: tombstone the run's bus
+/// workers and cancel its current epoch, under the maps lock. (The ACP session registry and its
+/// kill handles went with ACP, C5 / core#1106.)
 fn shared_run_terminal(
     run_id: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    write_reg: &WriteReg,
 ) {
     let Some(maps_arc) = lifecycle_maps else {
         return;
     };
-
-    // Step 1: snapshot (run_id, session_key, gen) → (write_lock, kill_handle).
-    let sessions: Vec<(Arc<std::sync::Mutex<()>>, Arc<KillHandle>)> = {
-        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-        reg.iter()
-            .filter(|((r, _, _), _)| r.as_str() == run_id)
-            .map(|(_, (wl, kh))| (Arc::clone(wl), Arc::clone(kh)))
-            .collect()
-    };
-
-    // Step 2: per-session tombstone + kill.
-    for (wl, kh) in &sessions {
-        {
-            // Acquire write_lock to serialise with an in-flight write; then tombstone.
-            // If try_lock fails the write is in-flight — tombstone under maps, then signal.
-            // Either way, the epoch is tombstoned before kh.signal().
-            let _maybe_guard = wl.try_lock();
-            let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
-            if maps.has_active_run(run_id) {
-                let epoch = maps.current_epoch(run_id);
-                maps.cancel_epoch(run_id, epoch);
-            }
-        }
-        kh.signal(); // unconditional — covers rpc_expect suspensions
-    }
-
-    // Step 3: tombstone under maps lock (covers pre-registration workers not yet in write_reg).
-    {
-        let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
-        maps.tombstone_bus_run(run_id);
-        if maps.has_active_run(run_id) {
-            let epoch = maps.current_epoch(run_id);
-            maps.cancel_epoch(run_id, epoch);
-        }
-    }
-
-    // Step 6: second sweep — catches sessions inserted between step 1 and now.
-    let late_sessions: Vec<Arc<KillHandle>> = {
-        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
-        reg.iter()
-            .filter(|((r, _, _), _)| r.as_str() == run_id)
-            .map(|(_, (_, kh))| Arc::clone(kh))
-            .collect()
-    };
-    for kh in late_sessions {
-        kh.signal();
+    let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
+    maps.tombstone_bus_run(run_id);
+    if maps.has_active_run(run_id) {
+        let epoch = maps.current_epoch(run_id);
+        maps.cancel_epoch(run_id, epoch);
     }
 }
 
@@ -38130,6 +38082,12 @@ mod seat_failover_tests {
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cyber.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cant-help.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt"),
+            // (core#1718) The API's output filter, in Claude Code's generic `API Error:` frame.
+            include_str!("../tests/fixtures/refusals/claude-2.1.323-content-filter.txt"),
+            "API Error: Output blocked by content filtering policy",
+            // The raw body, should a build print the API's message unparsed.
+            "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\
+             \"message\":\"Output blocked by content filtering policy\"}}",
         ] {
             assert!(is_content_refusal(&format!(
                 "(cli `claude` exited 1) {claude}"
@@ -38199,6 +38157,115 @@ mod seat_failover_tests {
              cybersecurity risk.",
             "界".repeat(6000)
         )));
+    }
+
+    /// core#1720: a failed unit keeps both streams (`execute_wrapped::failed_detail`). A sign-in,
+    /// approval or quota refusal that ends stdout stays at the end of the output behind a chatty
+    /// stderr, where the classifiers' terminal frame reads it (red on main: stderr followed it and
+    /// pushed it out of the 2 KiB tail). The body of either stream is never made terminal.
+    #[test]
+    fn a_stdout_sign_in_or_quota_refusal_behind_a_chatty_stderr_still_classifies() {
+        use crate::execute_wrapped::failed_detail;
+        use wicked_council::types::SeatFailureReason;
+        // As the wrapped runner's failed arm writes it: `(cli `<key>` exited N) <detail>`.
+        let failed = |key: &str, out: &str, err: &str| {
+            format!(
+                "(cli `{key}` exited 1) {}",
+                failed_detail(out.to_string(), err.to_string(), true)
+            )
+        };
+        let telemetry = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(telemetry.len() > 4096);
+        // Claude Code's own sign-in line (its error table: `Not logged in · Please run /login`).
+        let sign_in = failed("claude", "Not logged in · Please run /login", &telemetry);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&sign_in, true),
+            Some(SeatFailureReason::NotLoggedIn),
+            "{sign_in}"
+        );
+        let (_, judged) = crate::cli_runner::judge_refusal("claude", &sign_in)
+            .expect("the judge rotation classifies it too");
+        assert_eq!(judged.reason, "not_logged_in");
+        assert!(sign_in.contains(telemetry.trim()), "both streams are kept");
+        // pi's captured out-of-usage line (run 290a7fee), the same way.
+        let pi = include_str!("../tests/fixtures/refusals/pi-out-of-extra-usage.txt");
+        let pi_out = pi.strip_prefix("(cli `pi` exited 1) ").unwrap();
+        let quota = failed("pi", pi_out, &telemetry);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&quota, true),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        // codex's host-forced approval refusal, the same way.
+        let approval = failed(
+            "codex",
+            "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \
+             \"Rejected(\\\"approval request failed\\\")\" }",
+            &telemetry,
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&approval, true),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
+        // A stream's body stays the body: a sign-in line 6+ lines before the end of stdout, or a
+        // quota phrase more than 2 KiB before it, is subject matter behind the same stderr.
+        for out in [
+            format!(
+                "Not logged in · Please run /login\n{}",
+                "more work\n".repeat(6)
+            ),
+            format!(
+                "the seat said \"You're out of extra usage\"\n{}",
+                "x".repeat(4096)
+            ),
+        ] {
+            let text = failed("claude", &out, &telemetry);
+            let first = out.lines().next().unwrap();
+            assert!(
+                text.find("warning: retrying") > text.find(first),
+                "stdout keeps its place: {first}"
+            );
+            assert_eq!(
+                SeatFailureReason::classify_refusal(&text, true),
+                None,
+                "{out}"
+            );
+        }
+        // (review r2) The swap never changes the reason: it would cut stderr's 2 KiB tail at a new
+        // place (lifting `not logged in` out of `diagnostic: not logged in`) or join an approval
+        // pair across the streams. Then the streams keep their order.
+        let cut = failed(
+            "claude",
+            "usage limit exceeded\n",
+            &format!("diagnostic: not logged in\n{}", "x".repeat(2012)),
+        );
+        let joined = failed(
+            "codex",
+            "exec_command failed\nusage limit exceeded\n",
+            &format!("{}\napproval request failed\n", "x".repeat(4096)),
+        );
+        for text in [&cut, &joined] {
+            assert!(text.find("exceeded") < text.find("xxxx"), "{text}");
+            let reason = SeatFailureReason::classify_refusal(text, true);
+            assert!(
+                !matches!(
+                    reason,
+                    Some(SeatFailureReason::NotLoggedIn | SeatFailureReason::ApprovalUnavailable)
+                ),
+                "{reason:?}"
+            );
+            assert!(crate::cli_runner::judge_refusal("claude", text)
+                .is_none_or(|(_, r)| r.reason == "quota_exhausted"));
+        }
+        // A refusal on stderr keeps its place after stdout's progress (core#1612).
+        let stderr_refusal = failed(
+            "claude",
+            "starting the review",
+            "Not logged in · Please run /login",
+        );
+        assert!(
+            stderr_refusal.ends_with("Please run /login"),
+            "{stderr_refusal}"
+        );
     }
 
     /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier
@@ -44636,6 +44703,7 @@ mod plan_gate_confirm_tests {
             touch_source: None,
             rules: Vec::new(),
             done: Vec::new(),
+            band_why: Vec::new(),
         }
     }
 

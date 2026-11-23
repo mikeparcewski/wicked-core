@@ -17,7 +17,7 @@ use crate::container_floor::output_within;
 #[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: wicked-core seat-login <argv|ingest|status|sign-out|refresh> <claude|codex|pi|opencode|copilot|agy>\n  Set WICKED_SEAT_GATEWAY_DIR to the daemon's absolute gateway directory.";
+const USAGE: &str = "usage: wicked-core seat-login <argv|ingest|status|sign-out|refresh|abandon> <claude|codex|pi|opencode|copilot|agy>\n  Set WICKED_SEAT_GATEWAY_DIR to the daemon's absolute gateway directory.";
 const GATEWAY_DIR_ENV: &str = "WICKED_SEAT_GATEWAY_DIR";
 #[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -908,8 +908,9 @@ pub(crate) fn extract_tokens(
     broker_files(cli)?;
     match cli {
         "claude" => {
-            // The seat's pass-through token (core#1024). It is not an OAuth record: nothing to
-            // renew, and it replaces any record an earlier `claude auth login` left.
+            // The token claude's gateway route sends upstream (core#1024, wicked-garden#1365).
+            // It is not an OAuth record: nothing to renew, and it replaces any record an earlier
+            // `claude auth login` left.
             if let Some(bytes) = input_file(cli, files, CLAUDE_SETUP_TOKEN_PATH)? {
                 return Ok(vec![token_file("anthropic.token", &setup_token(bytes)?)]);
             }
@@ -2072,10 +2073,10 @@ pub(crate) fn seat_sign_in(
     }
 }
 
-/// The token a claude seat signed in with OAuth passes through (core#1024): the operator's own
+/// The token a claude seat signed in with OAuth (core#1024): the operator's own
 /// `claude setup-token` token (or what an earlier `claude auth login` left, until it expires),
-/// read from the broker under its lock. The seat's claude sends it upstream itself; the gateway
-/// relays it unchanged.
+/// read from the broker under its lock. The gateway sends it upstream in place of the seat's
+/// placeholder; it never enters a seat (wicked-garden#1365).
 #[cfg(unix)]
 pub(crate) fn claude_seat_token(io: &dyn BrokerIo, dir: &Path) -> Result<String, String> {
     claude_broker_token(io, dir)?.ok_or_else(|| "claude is not signed in".into())
@@ -2207,6 +2208,33 @@ pub(crate) fn sign_out_and_route(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Re
         crate::seat_refresh::create_private_file(&tombstone, b"sign-out")?;
     }
     complete_sign_out(io, dir, cli).map(|_| ())
+}
+
+/// End the sign-in the last `argv` opened for `cli` (core#1673, crew#1523): its login pod or host
+/// process is stopped and its credential-bearing store removed, then its session marker. The
+/// broker's credential is left alone. `Ok(false)` when no sign-in is open (idempotent).
+///
+/// A session whose ingest already committed is only finished (its store goes; the credential it
+/// published stays). An interrupted publication is repaired first, as a new sign-in does, and
+/// refused when it cannot be: its session marker is how the ingest retry finds it.
+#[cfg(unix)]
+pub(crate) fn abandon_login(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<bool, String> {
+    broker_files(cli)?;
+    let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    io.cleanup(dir)?;
+    complete_sign_out(io, dir, cli)?;
+    // As a new sign-in does: an interrupted publication is finished first (it needs the marker).
+    if signin_pending(dir, cli) && !repair_ingest(io, dir, cli)? {
+        return Err("sign-in incomplete; retry ingest first".into());
+    }
+    let Some(volume) = read_session(dir, cli)? else {
+        return Ok(false);
+    };
+    // The marker goes only once the store is confirmed gone (codex lg-r4): a failed removal
+    // leaves it for the next abandon, sign-in or sign-out to clear.
+    discard_login(io, dir, cli, &volume)?;
+    crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
+    Ok(true)
 }
 
 fn signout_path(dir: &Path, cli: &str) -> std::path::PathBuf {
@@ -2719,7 +2747,7 @@ fn parse_args(args: &[String]) -> Result<(&str, &str), String> {
     if args.len() == 2
         && matches!(
             args[0].as_str(),
-            "argv" | "ingest" | "status" | "sign-out" | "refresh"
+            "argv" | "ingest" | "status" | "sign-out" | "refresh" | "abandon"
         )
         && supported_cli(&args[1])
     {
@@ -2864,6 +2892,11 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
     // The seats run on the daemon's cluster (k8s-swap): so do their sign-ins. A status read never
     // starts anything; every other verb may provision the gateway's storage on a first sign-in,
     // never taking the daemon's ownership (`k8s::gw::attach`).
+    // Abandon with no open sign-in is done before any cluster call: nothing to end (idempotent).
+    if verb == "abandon" && read_session(dir, cli)?.is_none() {
+        println!("{}", serde_json::json!({ "abandoned": false }));
+        return Ok(0);
+    }
     let io = match crate::k8s::login::K8sIo::for_dir(dir, verb != "status") {
         Ok(io) => io,
         // A status read always answers a status (review B-4 pi #9): a cluster that cannot be read
@@ -2922,6 +2955,11 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
         }
         "sign-out" => {
             sign_out_and_route(io, dir, cli)?;
+            Ok(0)
+        }
+        "abandon" => {
+            let abandoned = abandon_login(io, dir, cli)?;
+            println!("{}", serde_json::json!({ "abandoned": abandoned }));
             Ok(0)
         }
         "refresh" => {
@@ -3647,13 +3685,13 @@ mod tests {
 
     /// core#1024: claude signs in with `claude setup-token` (the real CLI's own flow, run in the
     /// login container): the token it prints is pasted back unechoed and left for ingest, which
-    /// moves it to the broker as the seat's pass-through token. No OAuth record is kept, an
+    /// moves it to the broker, where claude's gateway route reads it. No OAuth record is kept, an
     /// earlier one is emptied, and there is nothing for the broker to renew.
     #[cfg(unix)]
     #[test]
-    fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
+    fn a_claude_setup_token_sign_in_is_brokered_for_the_gateway() {
         if crate::validator::skip_when_nested(
-            "a_claude_setup_token_sign_in_is_brokered_for_pass_through",
+            "a_claude_setup_token_sign_in_is_brokered_for_the_gateway",
         ) {
             return;
         }
@@ -3763,7 +3801,7 @@ mod tests {
         assert_eq!(
             crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", true).unwrap(),
             crate::seat_refresh::Outcome::NotRefreshable,
-            "a pass-through token is never renewed by the broker"
+            "a setup-token is never renewed by the broker"
         );
         // A bad paste is refused before the broker changes, and never repeated.
         new_session(&fake.io, &fake.dir, "claude").unwrap();
@@ -5951,13 +5989,14 @@ mod tests {
             vec!["status", "unknown"],
             vec!["ingest", "../claude"],
             vec!["sign-out", "claude", "extra"],
+            vec!["abandon", "claude", "extra"],
             vec!["argv", "claude", "FAKE-misplaced-secret"],
         ] {
             let args: Vec<String> = input.into_iter().map(str::to_string).collect();
             assert_eq!(parse_args(&args).unwrap_err(), USAGE);
             assert_eq!(seat_login_main(&args), 2);
         }
-        for verb in ["argv", "ingest", "status", "sign-out"] {
+        for verb in ["argv", "ingest", "status", "sign-out", "refresh", "abandon"] {
             for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
                 let args = vec![verb.to_string(), cli.to_string()];
                 assert_eq!(parse_args(&args).unwrap(), (verb, cli));

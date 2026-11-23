@@ -342,7 +342,58 @@ fn session_detail_answers_one_run_off_the_actor() {
 
 /// The Core methods allowed to answer from the read model. Every one is a read a caller shows or
 /// polls; none decides a gate, a reassign, a delivery or a deny.
-const READ_ONLY_METHODS: [&str; 4] = ["sessions", "sessions_detail", "session_detail", "run_team"];
+/// (core#1795) A gate card's read of the answers a gate takes does not wait for the actor: it is
+/// answered from the read model while a long command holds the actor, and it is the list the
+/// actor's own fold gives on the same store.
+#[test]
+fn gate_actions_answer_while_the_actor_is_held() {
+    let (dir, db) = temp_db("gate");
+    seed(&db);
+    let core = crate::Core::spawn_with_engine(
+        db.clone(),
+        Arc::new(NoCouncil),
+        Arc::new(crate::workflow::StubStepRunner),
+    );
+    core.ping();
+    let (entered_tx, entered) = channel();
+    let (release, release_rx) = channel();
+    core.hold_actor(entered_tx, release_rx);
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the actor parks on the hold");
+    // The read runs on its own thread behind a bounded wait, and the hold is released whatever it
+    // does: a read that went to the actor fails this test instead of hanging it.
+    let (done_tx, done) = channel();
+    {
+        let core = core.clone();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(core.gate_actions("run-a"));
+        });
+    }
+    let got = done.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    let listed = got.expect("the gate read answered while the actor was held");
+    let listed = listed.expect("gate_actions").expect("run-a awaits a human");
+    let store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+    let on_actor = crate::actor::gate_actions::gate_actions(&store, "run-a")
+        .unwrap()
+        .expect("the actor's fold lists the same gate");
+    assert_eq!(listed, on_actor, "the same list the actor's fold gives");
+    assert!(!listed.actions.is_empty(), "{listed:?}");
+    // A run the store does not hold is the actor's own error, as before (asked after the hold).
+    let err = core.gate_actions("no-such-run").expect_err("unknown run");
+    assert!(err.to_string().contains("run not found"), "{err}");
+    drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const READ_ONLY_METHODS: [&str; 5] = [
+    "sessions",
+    "sessions_detail",
+    "session_detail",
+    "run_team",
+    "gate_actions",
+];
 
 /// `(method, line)` for each line of `lib` inside a `fn`.
 fn methods_of(lib: &str) -> Vec<(String, &str)> {

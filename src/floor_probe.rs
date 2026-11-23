@@ -373,10 +373,9 @@ impl Probe<'_> {
         if r.timed_out || r.spawn_error.is_some() {
             return (None, Err(format!("did not finish ({})", r.summary())));
         }
-        let text = self
-            .g
-            .compile()
-            .and_then(|_| results_text(&c.held, &self.rc, self.g, &mut r, self.scratch, since));
+        let text = self.g.compile().and_then(|_| {
+            results_text(Some(&c.held), &self.rc, self.g, &mut r, self.scratch, since)
+        });
         (r.exit_code, text)
     }
 

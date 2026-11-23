@@ -1880,7 +1880,7 @@ fn run_bounded_status_capturing_stderr(
 ) -> (std::io::Result<Option<std::process::ExitStatus>>, String) {
     own_process_group(&mut cmd);
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = match cmd.spawn() {
+    let mut child = match watched_spawn(&mut || cmd.spawn()) {
         Ok(c) => c,
         Err(e) => return (Err(e), String::new()),
     };
@@ -1906,10 +1906,62 @@ fn run_bounded_status_capturing_stderr(
             let _ = done_tx.send(());
         });
     }
+    let pgid = child.id();
     let status = wait_bounded(&mut child, timeout);
+    watch_done(pgid);
     let _ = done_rx.recv_timeout(Duration::from_millis(500));
     let kept = head.lock().unwrap_or_else(|p| p.into_inner());
     (status, String::from_utf8_lossy(&kept).into_owned())
+}
+
+/// The spawn a [`SpawnWatch`] wraps.
+pub(crate) type Spawn<'a> = dyn FnMut() -> std::io::Result<std::process::Child> + 'a;
+
+/// A watcher's wrapper around a [`Spawn`]: it may refuse (an `Err`) or run it.
+pub(crate) type WatchedSpawn = dyn Fn(&mut Spawn<'_>) -> std::io::Result<std::process::Child>;
+
+/// (core#1742) Who owns a validator's process group on this thread: the fold's off-actor reads
+/// ([`crate::actor`]'s `fold_reads`) register it under the run, as a tool child is, so a reassign
+/// or a cancel of the run stops it.
+pub(crate) struct SpawnWatch {
+    /// Runs the spawn, so the watcher can refuse it (an `Err`: nothing is started) and register
+    /// the new group atomically with it.
+    pub(crate) spawn: Box<WatchedSpawn>,
+    /// The group is released: the wait for its leader has ended.
+    pub(crate) on_done: Box<dyn Fn(u32)>,
+}
+
+thread_local! {
+    static SPAWN_WATCH: std::cell::RefCell<Option<SpawnWatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `watch` told of every validator group spawned on this thread meanwhile.
+pub(crate) fn with_spawn_watch<R>(watch: SpawnWatch, f: impl FnOnce() -> R) -> R {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            SPAWN_WATCH.with(|w| *w.borrow_mut() = None);
+        }
+    }
+    SPAWN_WATCH.with(|w| *w.borrow_mut() = Some(watch));
+    let _clear = Clear;
+    f()
+}
+
+fn watched_spawn(spawn: &mut Spawn<'_>) -> std::io::Result<std::process::Child> {
+    SPAWN_WATCH.with(|w| match w.borrow().as_ref() {
+        Some(w) => (w.spawn)(spawn),
+        None => spawn(),
+    })
+}
+
+fn watch_done(pgid: u32) {
+    SPAWN_WATCH.with(|w| {
+        if let Some(w) = w.borrow().as_ref() {
+            (w.on_done)(pgid);
+        }
+    });
 }
 
 /// The deterministic RE-VERIFY (no LLM at run time): run the validator's script in `cwd` and report

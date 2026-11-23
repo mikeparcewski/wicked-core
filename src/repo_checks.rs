@@ -3785,10 +3785,11 @@ impl Drop for CheckScratch {
 /// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
 /// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
 /// the lock is released before the slow removal, so the run's next floor never waits on it.
-/// (core#1542) A container floor's base target claim is deleted UNDER that lock, waiting until it is
-/// gone (normally about a second: no pod mounts it any more; bounded at 180 s): released first, the
-/// run's next floor could re-apply the claim while it is still terminating and start a pod on a
-/// claim that then disappears. Meanwhile the next floor waits at its shared lease.
+/// (core#1542, core#1714) A container floor's base target claim is marked for deletion under that
+/// lock without waiting for it to go: the run's next floor that claims the same name waits for the
+/// terminating claim to be gone before it applies it, so it never starts a pod on a claim that then
+/// disappears. A floor at its shared lease meanwhile waits only for the marking calls (the
+/// ownership GET and the DELETE, each bounded), never for the claim's termination.
 /// Returns whether the base output is gone.
 fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
     let aside = format!(".base-drop-{}", random_tmp_name());
@@ -8082,8 +8083,13 @@ impl BaseTree {
                 .exit_code
                 .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
             // The results first: the list must not overwrite them.
-            let results =
-                verdict.then(|| results_of(&self.held, &target, g, &mut run, scratch, since));
+            let text = verdict
+                .then(|| results_text(Some(&self.held), &target, g, &mut run, scratch, since));
+            let results = text.as_ref().map(|t| {
+                t.as_ref()
+                    .map_err(String::clone)
+                    .and_then(|t| parse_results(g, t))
+            });
             let mut t = match results {
                 Some(_) => inventory(
                     &self.dir,
@@ -8112,6 +8118,14 @@ impl BaseTree {
                 }
                 Some(Err(e)) => t.incomplete = Some(format!("the base's results: {e}")),
                 None => {}
+            }
+            // (core#1767) The `complete` probe proved the list on the probe's clean copy only: the
+            // base's own run must have executed exactly what its list names (per qualifier), or a
+            // binary the list omits could make a name shared with it look unique.
+            if let (None, Some(Ok(text))) = (&t.incomplete, &text) {
+                if let Err(e) = g.completeness(text, &t.ids) {
+                    t.incomplete = Some(format!("the base's list does not cover its run: {e}"));
+                }
             }
             let candidates: Vec<TestId> = t
                 .failing
@@ -8305,9 +8319,11 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// copy is not reused; v16, wicked-core#1701: a prose-only change sharing a completed base failure
 /// passes, so earlier floor decisions must be reconsidered; v17, core#1110/#1408: the base reads
 /// its package through the held directory and builds the root's declared native addons for a
-/// member, so a base result recorded without them is not reused): a record of any other version,
-/// or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 17;
+/// member, so a base result recorded without them is not reused; v18, core#1767: a red base's
+/// inventory holds only when its own run executed exactly what its list names, so an inventory
+/// recorded without that check is not reused): a record of any other version, or a bare
+/// `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 18;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -8460,27 +8476,12 @@ pub(crate) fn inventory(
     }
 }
 
-/// A results run's ids per the guide: every testcase (junit; text names failures only) and the
-/// failing ones. The results file (`how.path`, relative to the check's directory) must be a
-/// regular file inside the tree, written since `since` (the run's start), within the log cap; it
-/// is stored in the log store beside the run's streams. Anything else is no results.
-pub(crate) fn results_of(
-    held: &HeldDir,
-    check: &RepoCheck,
-    g: &GuideCheck,
-    run: &mut CheckRun,
-    scratch: &CheckScratch,
-    since: std::time::SystemTime,
-) -> Result<(Vec<TestId>, Vec<TestId>), String> {
-    g.compile()?;
-    parse_results(g, &results_text(held, check, g, run, scratch, since)?)
-}
-
-/// (core#1101) The text [`results_of`] parses: the results file `how.path` names (written by this
-/// run, read through the held directory, stored beside the run's logs), else the run's stored
-/// output.
+/// (core#1101) The text a results run leaves, which [`parse_results`] reads: the results file
+/// `how.path` names (a regular file inside the tree, relative to the check's directory, written
+/// since `since` — the run's start — within the log cap, read through the held directory and
+/// stored beside the run's logs), else the run's stored output. Anything else is no results.
 pub(crate) fn results_text(
-    held: &HeldDir,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     g: &GuideCheck,
     run: &mut CheckRun,
@@ -8489,6 +8490,7 @@ pub(crate) fn results_text(
 ) -> Result<String, String> {
     let r = match &g.results.how.path {
         Some(path) => {
+            let held = held.ok_or_else(|| format!("`{path}`: the tree is not held"))?;
             let f = open_results(
                 held,
                 &Path::new(&check.dir).join(path).to_string_lossy(),
