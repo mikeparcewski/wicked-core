@@ -722,6 +722,24 @@
   }
  },
  {
+  "type": "wicked.team.council.convened",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000027,
+   "re": "council.called#finding:4",
+   "subject": "finding:4",
+   "finding_id": "f-7bf84000911d564c",
+   "seats": [
+    "codex",
+    "opencode",
+    "pi"
+   ]
+  }
+ },
+ {
   "type": "wicked.team.finding.raised",
   "payload": {
    "run_id": "r1",

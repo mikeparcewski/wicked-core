@@ -1,6 +1,6 @@
 //! DES-TEAMING-002 T1 acceptance: (a) four segments, (b) value-compared round trips, (c) `fold`
 //! on DES-001's fixtures #8, #11, #15, #16 a–k, (d) `fold` under duplicates, (e) the §4.1 key
-//! vectors, (g) the §6.1 identity rule over all 26 types plus the key-builder source guard.
+//! vectors, (g) the §6.1 identity rule over all 27 types plus the key-builder source guard.
 //! Every expected value is fixed here; the keys were computed by an independent transcription of
 //! the §4.1 algorithm, not by the code under test.
 
@@ -55,7 +55,7 @@ fn every_type_is_four_segments_under_wicked_team() {
         );
         assert!(seen.insert(t), "{t} listed twice");
     }
-    assert_eq!(seen.len(), 26);
+    assert_eq!(seen.len(), 27);
 }
 
 /// DES-002 §7 assertion 1: each type has exactly one owner, as the matrix assigns it.
@@ -63,7 +63,7 @@ fn every_type_is_four_segments_under_wicked_team() {
 fn every_type_has_the_one_owner_the_matrix_assigns() {
     use Owner::{Engine as E, Runner as R, Supervisor as S};
     let matrix = [
-        E, E, E, E, E, E, S, S, R, R, S, R, R, R, S, S, R, R, S, S, S, S, E, E, E, E,
+        E, E, E, E, E, E, S, S, R, R, S, R, R, R, S, S, R, R, S, S, S, S, E, E, E, E, S,
     ];
     for (t, want) in ALL_TYPES.iter().zip(matrix) {
         assert_eq!(owner(t), Some(want), "{t}");
@@ -77,7 +77,7 @@ fn every_type_has_the_one_owner_the_matrix_assigns() {
 fn every_fixture_round_trips_by_value() {
     let all = fixtures();
     let covered: std::collections::BTreeSet<&str> = all.iter().map(|(t, _)| t.as_str()).collect();
-    assert_eq!(covered.len(), 26, "a fixture per type");
+    assert_eq!(covered.len(), 27, "a fixture per type");
     for (t, payload) in &all {
         let ev = TeamEvent::from_payload(t, payload).unwrap_or_else(|e| panic!("{t}: {e:#}"));
         assert_eq!(ev.event_type(), t.as_str());
@@ -362,6 +362,10 @@ fn every_fixture_keys_to_its_fixed_value() {
             "6801a7c425b0492bae48fc28bb7538fd",
         ),
         (
+            "wicked.team.council.convened",
+            "da13dfc143eb41fb5a7591da19376d43",
+        ),
+        (
             "wicked.team.finding.raised",
             "90d0992402c6961990fd4132ba689970",
         ),
@@ -445,7 +449,7 @@ fn a_keyed_type_with_a_null_ord_has_no_key() {
     assert!(ev.key().is_err());
 }
 
-// ── (g) the §6.1 identity rule, table-driven over all 26 types ───────────────────────────────────
+// ── (g) the §6.1 identity rule, table-driven over all 27 types ───────────────────────────────────
 
 /// Set the producer-assigned part of a fixture to the `n`th value. Returns the payload keys that
 /// part lives in (every other key must be identical between two requests).
@@ -566,6 +570,10 @@ fn identity_table() -> Vec<(&'static str, Assign)> {
         (PATH_REPICKED, |p, n| {
             p["pick_seq"] = json!(n);
             &["pick_seq"]
+        }),
+        (COUNCIL_CONVENED, |p, n| {
+            p["subject"] = json!(subject_finding(n));
+            &["subject"]
         }),
     ]
 }
@@ -918,6 +926,19 @@ impl Stream {
                 seed: None,
                 eligible: Vec::new(),
                 ballots_in: None,
+                detail: None,
+            }),
+        )
+    }
+
+    /// (core#1822) The council for finding `seq` started its ballots.
+    fn convened(&mut self, seq: u32) -> &mut Self {
+        self.push(
+            "engine",
+            TeamBody::CouncilConvened(CouncilConvened {
+                subject: subject_finding(seq),
+                finding_id: Some(fid(seq)),
+                seats: vec!["codex".into()],
             }),
         )
     }
@@ -992,6 +1013,142 @@ fn dispute_yes_no(verdict: &str) -> Value {
 
 fn no_verdict(reason: &str) -> Value {
     json!({"verdict": "no_verdict", "agreementPct": null, "dissent": null, "seats": [], "reason": reason})
+}
+
+fn not_convened(detail: &str) -> Value {
+    json!({"verdict": "no_verdict", "agreementPct": null, "dissent": null, "seats": [],
+           "reason": "not_convened", "detail": detail})
+}
+
+/// core#1822 (T-R16; the shape of run f88faa2f, unit 6): a HIGH held past the final-pass budget.
+/// Attempt 3 had no `council.convened` and read `timeout, seats []`; attempt 4's council convened
+/// and was still voting when the unit ended. Red before: both read `timeout`.
+#[test]
+fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
+    let held_high = |convened: bool| {
+        let mut s = Stream::new();
+        s.joined("m1", "claude#2")
+            .raised(1, "high")
+            .injected(1)
+            .answered(1, "build", "declined", "documented");
+        if convened {
+            s.convened(1);
+        }
+        s.completed("ok");
+        // Run f88faa2f's unit 6: attempt 3 never convened, attempt 4 did.
+        for r in &mut s.rows {
+            r.event.env.run_id = "f88faa2f".into();
+            r.event.env.ord = Some(6);
+            r.event.env.attempt = Some(if convened { 4 } else { 3 });
+        }
+        s
+    };
+    // Attempt 3: no council started before the unit ended.
+    let s = held_high(false);
+    assert!(convened_findings(&s.rows).is_empty());
+    let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
+    let d = l.findings[0]
+        .dispute
+        .as_ref()
+        .expect("a no-verdict dispute");
+    assert_eq!(d.reason, Some(NoVerdictReason::NotConvened));
+    assert_eq!(d.detail.as_deref(), Some("the step ended before its turn"));
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "finalPass is unchanged");
+    assert!(l.team_pause, "a no-verdict HIGH still pauses");
+    assert_eq!(
+        serde_json::to_value(d).unwrap(),
+        not_convened("the step ended before its turn")
+    );
+    // Attempt 4: the council convened and was still voting.
+    let s = held_high(true);
+    assert_eq!(
+        convened_findings(&s.rows),
+        std::collections::HashSet::from([fid(1)])
+    );
+    let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
+    let d = l.findings[0]
+        .dispute
+        .as_ref()
+        .expect("a no-verdict dispute");
+    assert_eq!(d.reason, Some(NoVerdictReason::Timeout));
+    assert_eq!(serde_json::to_value(d).unwrap(), no_verdict("timeout"));
+    // A `council.convened` of another attempt does not count for this one.
+    let mut s = held_high(false);
+    s.convened(1);
+    let stray = s.rows.last_mut().unwrap();
+    stray.event.env.run_id = "f88faa2f".into();
+    stray.event.env.ord = Some(6);
+    stray.event.env.attempt = Some(4);
+    assert!(convened_findings(&s.rows).is_empty());
+    // A member step's council names no finding: it never stands in for one.
+    let mut s = held_high(false);
+    s.push(
+        "engine",
+        TeamBody::CouncilConvened(CouncilConvened {
+            subject: subject_step("build", 3),
+            finding_id: Some(fid(1)),
+            seats: vec!["codex".into()],
+        }),
+    );
+    let step = s.rows.last_mut().unwrap();
+    step.event.env.run_id = "f88faa2f".into();
+    step.event.env.ord = Some(6);
+    step.event.env.attempt = Some(3);
+    assert!(convened_findings(&s.rows).is_empty());
+}
+
+/// core#1822: `not_convened` and a ruling's `detail` are additive on the wire — a no-verdict
+/// ruling recorded before them reads back byte-identical, and the detail rides onto the dispute.
+#[test]
+fn core_1822_a_not_convened_ruling_carries_its_detail_and_old_rows_are_unchanged() {
+    let old = fixture(COUNCIL_RULED);
+    assert!(old.get("detail").is_none());
+    let ev = TeamEvent::from_payload(COUNCIL_RULED, &old).unwrap();
+    assert_eq!(
+        ev.to_payload().unwrap(),
+        old,
+        "an old row re-serializes unchanged"
+    );
+    // The engine's own no-verdict row (`supervisor::convene_one`'s `no`, src/team/supervisor.rs:
+    // 3400-3415): nothing seated, nothing returned, no task.
+    let mut new = old.clone();
+    for (k, v) in [
+        ("by", json!("engine")),
+        ("verdict", json!("no_verdict")),
+        ("reason", json!("not_convened")),
+        ("task_id", Value::Null),
+        ("consensus", json!(false)),
+        ("agreement_pct", json!(0)),
+        ("dissent", json!([])),
+        ("returned", json!(0)),
+        ("seated", json!(0)),
+        ("detail", json!("another council held the host slot")),
+    ] {
+        new[k] = v;
+    }
+    let ev = TeamEvent::from_payload(COUNCIL_RULED, &new).unwrap();
+    assert_eq!(ev.to_payload().unwrap(), new);
+    let TeamBody::CouncilRuled(r) = &ev.body else {
+        panic!("not a ruling")
+    };
+    let d = dispute_of(r);
+    assert_eq!(d.reason, Some(NoVerdictReason::NotConvened));
+    assert_eq!(
+        d.detail.as_deref(),
+        Some("another council held the host slot")
+    );
+    // A receipt's `councils[]` are these disputes verbatim (`pipeline.rs` gate receipt). The one
+    // run f88faa2f recorded (core#1822 evidence, gateEvaluated seq 3711) reads back unchanged and
+    // keeps no `detail`; a new one carries its detail through a round trip.
+    let recorded = json!({"verdict": "no_verdict", "agreementPct": null, "dissent": null,
+                          "seats": [], "reason": "timeout"});
+    let back: crate::team::Dispute = serde_json::from_value(recorded.clone()).unwrap();
+    assert_eq!(back.detail, None);
+    assert_eq!(serde_json::to_value(&back).unwrap(), recorded);
+    let wire = serde_json::to_value(&d).unwrap();
+    assert_eq!(wire["detail"], "another council held the host slot");
+    let again: crate::team::Dispute = serde_json::from_value(wire).unwrap();
+    assert_eq!(again, d);
 }
 
 /// core#959 (operator decision 2026-10-17): a `withdrawn` row on a BOUNDARY finding was written
@@ -1367,7 +1524,7 @@ fn fixture_16_continue_or_pause() {
         .answered(3, "build", "declined", "documented")
         .settled(3, "held", "the finding stands", Some(43))
         .ruled(3, "yes", None);
-    let j = synthesize_timeout(s.fold());
+    let j = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
     let want = ledger(
         "timed_out",
         true,
@@ -1382,7 +1539,8 @@ fn fixture_16_continue_or_pause() {
                 "declined",
                 json!("documented"),
                 hold("no reply (final pass timed out)"),
-                no_verdict("timeout"),
+                // (core#1822) Its council never started: not a timeout.
+                not_convened(NOT_CONVENED_STEP_ENDED),
             ),
             lf(
                 2,
@@ -2214,6 +2372,7 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
             "pi".into(),
         ],
         ballots_in: Some("seat_container".into()),
+        detail: None,
     };
     let d = dispute_of(&r);
     assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
@@ -2268,7 +2427,7 @@ fn deferred_high_round_trips_without_pause_or_timeout_settlement() {
         restored.findings[0].worker_reason.as_deref(),
         Some("unrelated to failing checks")
     );
-    let timeout = synthesize_timeout(restored);
+    let timeout = synthesize_timeout(restored, &Default::default());
     assert_eq!(timeout.final_pass, FinalPass::TimedOut);
     assert!(!timeout.team_pause);
     assert!(timeout.findings[0].monitor_reply.is_none());

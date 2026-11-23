@@ -11,6 +11,15 @@ use crate::workflow::{HumanDecision, StepOutput};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
+/// (core#1822) What a decision council reports to whoever convened it: `Convened(seats)` once its
+/// ballots START (the council worker polled its drawn voters), then `Ruled` with the verdict. A
+/// council that never reports `Convened` never voted.
+#[derive(Debug)]
+pub(crate) enum CouncilReply {
+    Convened(Vec<String>),
+    Ruled(anyhow::Result<crate::decision::DecisionVerdict>),
+}
+
 /// A request processed by the [`crate::actor`] store-owning thread. Internal — callers use the
 /// typed methods on [`crate::Core`].
 pub(crate) enum Command {
@@ -473,11 +482,14 @@ pub(crate) enum Command {
     /// actor hands the ballots to a worker thread and replies from there. (core#1289) `lock` is the
     /// host's council slot, taken by the sender before this was sent (never on the actor): the
     /// council thread drops it after its last ballot, as a rule council's.
+    ///
+    /// (core#1822) `reply` carries [`CouncilReply::Convened`] when the council's ballots start
+    /// (before any returns), then exactly one [`CouncilReply::Ruled`].
     ConveneDecision {
         req: crate::decision::DecisionRequest,
         clis: Vec<wicked_council::AgenticCli>,
         lock: crate::cli_runner::HostCouncilLock,
-        reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
+        reply: std::sync::mpsc::Sender<CouncilReply>,
     },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before
     /// it starts; replies `false` once the run has spent its budget.
