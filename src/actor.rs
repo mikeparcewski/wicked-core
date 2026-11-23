@@ -857,6 +857,14 @@ pub(crate) fn run(
             return;
         }
     };
+    // (core#1795) Before any startup work: interaction rows written before they were named under
+    // their run are renamed, so a one-run read (the gate card's) reaches them by the name index. A
+    // pass that fails is tried again before a later command (`name_rows_when_due`).
+    let mut interaction_naming_due = crate::interaction::name_rows_when_due(
+        &mut store,
+        Some(std::time::Instant::now()),
+        std::time::Instant::now(),
+    );
 
     crate::gate_hook::gov_root_for_state_home(operational_home.as_deref());
     if let Err(why) = crate::gate_hook::gov_root_ready() {
@@ -1357,6 +1365,14 @@ pub(crate) fn run(
     let mut backlog: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     loop {
+        // (core#1795) A naming pass that failed at boot, once it is due again.
+        if interaction_naming_due.is_some() {
+            interaction_naming_due = crate::interaction::name_rows_when_due(
+                &mut store,
+                interaction_naming_due,
+                std::time::Instant::now(),
+            );
+        }
         // Check before every command as well as idle ticks: a chatty UI cannot starve the sweep.
         if last_dead_seat_sweep.elapsed() >= dead_seat_reprobe::DEAD_SEAT_SWEEP {
             last_dead_seat_sweep = std::time::Instant::now();
