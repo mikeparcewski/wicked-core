@@ -490,3 +490,76 @@ fn a_failed_broker_remove_retains_the_file_until_retry() {
     io.remove_broker(Path::new("/unused"), "claude", file)
         .unwrap();
 }
+
+/// core#1673 (crew#1523): cancelling a sign-in ends exactly the session the last `argv` opened:
+/// its login pod stops and its credential-bearing store goes, then its marker, while the
+/// credential the broker already holds stays. A second abandon is a no-op.
+#[test]
+fn abandon_ends_the_open_login_pod_and_store_and_keeps_the_broker_credential() {
+    let (io, dir) = (MemIo::default(), temp_dir());
+    sign_claude_in(&io, &dir);
+    prepare_login_argv(&io, &dir, "claude").unwrap();
+    let open = read_session(&dir, "claude")
+        .unwrap()
+        .expect("an open sign-in");
+    // The person typed half a sign-in: the store already holds a (newer) token.
+    io.seed_login(&dir, "claude", CLAUDE_SETUP_TOKEN_PATH, b"half-finished");
+    assert!(io.pods.borrow().contains(&open));
+    assert!(abandon_login(&io, &dir, "claude").unwrap());
+    assert!(!io.pods.borrow().contains(&open), "the login pod is gone");
+    assert!(!io.stores.borrow().contains_key(&open), "its store is gone");
+    assert_eq!(read_session(&dir, "claude").unwrap(), None);
+    assert_eq!(
+        io.broker_file("anthropic.token"),
+        Some(token().into_bytes()),
+        "the broker's credential is left alone"
+    );
+    assert!(!io.calls().contains("confirm claude"), "no sign-out ran");
+    // Idempotent: nothing open now.
+    assert!(!abandon_login(&io, &dir, "claude").unwrap());
+    // The cancelled sign-in is over: a late ingest finds no session to import.
+    let err = ingest_and_route(&io, &dir, "claude").unwrap_err();
+    assert!(err.contains("login session"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// core#1673: a store whose removal fails keeps its session marker, so the next abandon (or
+/// sign-in, or sign-out) still finds and clears it.
+#[test]
+fn a_failed_abandon_keeps_the_session_marker_for_a_retry() {
+    let (io, dir) = (MemIo::default(), temp_dir());
+    prepare_login_argv(&io, &dir, "claude").unwrap();
+    let open = read_session(&dir, "claude").unwrap().unwrap();
+    io.fail(Fail::RemoveLogin);
+    assert!(abandon_login(&io, &dir, "claude").is_err());
+    assert_eq!(read_session(&dir, "claude").unwrap(), Some(open.clone()));
+    assert!(io.stores.borrow().contains_key(&open));
+    io.recover(Fail::RemoveLogin);
+    assert!(abandon_login(&io, &dir, "claude").unwrap());
+    assert!(!io.stores.borrow().contains_key(&open));
+    assert_eq!(read_session(&dir, "claude").unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// core#1673: an ingest whose publication was interrupted is finished before anything is
+/// abandoned (its session marker is how that repair finds it), as a new sign-in does.
+#[test]
+fn abandon_finishes_an_interrupted_publication_first() {
+    let (io, dir) = (MemIo::default(), temp_dir());
+    prepare_login_argv(&io, &dir, "claude").unwrap();
+    io.seed_login(&dir, "claude", CLAUDE_SETUP_TOKEN_PATH, token());
+    io.fail(Fail::Publish);
+    assert!(ingest_and_route(&io, &dir, "claude").is_err());
+    assert!(signin_pending(&dir, "claude"));
+    io.recover(Fail::Publish);
+    assert!(abandon_login(&io, &dir, "claude").unwrap());
+    assert!(!signin_pending(&dir, "claude"));
+    assert_eq!(
+        io.broker_file("anthropic.token"),
+        Some(token().into_bytes()),
+        "the interrupted sign-in was published, not dropped"
+    );
+    assert!(io.stores.borrow().is_empty());
+    assert_eq!(read_session(&dir, "claude").unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

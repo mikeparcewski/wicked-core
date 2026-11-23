@@ -208,9 +208,10 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "seat-login",
-        "wicked-core seat-login <argv|ingest|status|sign-out|refresh> <cli>\n  \
+        "wicked-core seat-login <argv|ingest|status|sign-out|refresh|abandon> <cli>\n  \
          Open a throwaway container login via crew's PTY, ingest credentials into the broker, \
-         report broker status as JSON, or sign out. Set WICKED_SEAT_GATEWAY_DIR to the daemon's \
+         report broker status as JSON, sign out, or abandon the open sign-in (its login pod and \
+         store go; the broker's credential stays). Set WICKED_SEAT_GATEWAY_DIR to the daemon's \
          absolute gateway directory. Needs a container runtime (Unix host).",
     ),
     (
@@ -3267,7 +3268,7 @@ mod seat_login_usage_tests {
             .find(|(name, _)| *name == "seat-login")
             .unwrap()
             .1;
-        assert!(usage.contains("|refresh>"));
+        assert!(usage.contains("|refresh|abandon>"));
     }
 }
 
