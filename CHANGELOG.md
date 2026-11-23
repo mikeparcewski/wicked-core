@@ -14,6 +14,77 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 cut 8da16279, carrying 34 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804.
+  The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - Run the real-browser draft-render jail test on ubuntu and macOS (#1770)
+
+  - `repo_checks.rs` net-negative by a verbatim move into child modules (#1768)
+
+  - Re-stamp the platform lockfile entries for the published 0.15.48 (#1778)
+
+  - Wait out a fork-held duplicate of the council slot before calling it leaked (core#1794) (#1800)
+
+  - Resumed creator floors publish guarded journal checks; base runs kept per failing set; pre-floor wait named (#1152, #1217) (#1734)
+
+  - A cancel never waits on the actor; its worktree cleanup stays on the record (#1409, #1434, #1435) (#1735)
+
+  - The fold's pinned validator and creator diff, and the dispatch's project-graph vouch, run off the actor (#1739)
+
+  - A relaunch never waits on the actor for a node tree's earlier reap (#1736)
+
+  - Interactive-chat measures its revision (#1755)
+
+  - The record keeps the case set it judged (#1756)
+
+  - Run the counter directly, read-allowlist the render jail, record tool identity (#1336, #1337, #1335) (#1754)
+
+  - A unit's stored output no longer carries the host temp path of a note the seat linked; the link is kept as `wicked-core-notes/<run>/unit-<n>/<file>` (#1380). (#1751)
+
+  - A governed run on wicked-core can build `crates/wicked-core-ts` in its worktree: the root manifest excludes `wicked-worktrees` (#1109). (#1752)
+
+  - Worktree owner markers are found through the admin dir git pairs with the tree from both ends, read without following links or blocking, and stamped (off the actor) on every re-entry of a persisted tree; a fresh mint that loses its daemon claim refuses (#1436). (#1760)
+
+  - Base detection reads the held package dir; base provisions the root's native build for a member (#1110, #1408) (#1763)
+
+  - Drop a run's blocks when it ends and at shutdown; a first block reaches a launch in preparation (#1777)
+
+  - Strict snapshot for the introduced-dir read: force-added paths kept, unreadable subtree refused (#1764)
+
+  - On boot, the daemon repairs the git links of its own run worktrees after their checkout moved, so a container seat can use a pre-move tree without a manual `git worktree repair` (#1662). (#1759)
+
+  - Odd export paths keep their own attributes; in-memory core dates deliverables; memory URIs get no log root (#1765)
+
+  - Team councils exclude parties by identity and take the host council slot (#1771)
+
+  - Exclusion-guide probes — complete list, bound qualifiers, unique pass, first-alone multi (part of #1101) (#1766)
+
+  - Reap carried ballots before the host slot is released; read seat stdout byte-bounded (#1774)
+
+  - A container seat never mounts its code graph, so a project graph over 512 MiB no longer refuses every seat (#1782)
+
+  - One-port jails for the walkthrough and Linux demo recorders; captioned demo copy (#1783)
+
+  - Refuse a missing seat base before the build, ship the nopush helper, re-arm a jail whose mask dir vanished (#1784)
+
+  - **Container seats, codex:** a codex container (k8s) seat signed in with ChatGPT now recovers from an upstream 401. Its token refresh goes to the gateway's gate-hook route (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`), never to auth.openai.com. The relay renews the broker's sign-in with one forced refresher pass, shared by every seat within a minute (a waiting refresh holds no gate-hook connection slot; at most 16 wait at once), and answers with no token, so the seat retries with its placeholder and the gateway sends the renewed token. An unknown key gets `invalid_grant`; a failed renewal gets a 503 naming why. The placeholder's refresh token is now the unit's key, and its JWT carries a placeholder user, so codex keeps its network policy after the reload (core#997). Every codex container seat also switches off its non-model calls with codex's own config keys: analytics, Statsig metrics (ab.chatgpt.com), the apps MCP server, the plugin system (seats install no codex plugins; their skills come from `CODEX_HOME/skills`), and the ChatGPT backend base (a closed loopback port). A seat's session no longer makes refused CONNECTs to chatgpt.com or ab.chatgpt.com (core#1478). Host seats are unchanged. (#1788)
+
+  - A steering rule whose evidence spans the parts of a large change (the code in one part, its test in another) no longer holds on every re-check. When every part was read and none broke the rule, and the parts named the files they needed, the rule is judged again on the whole diff of those files together in one call. A rule whose pages were not all shown or answered still holds. (core#1278 item 4) (#1787)
+
+  - ToolActivity frames carry the launch's seat key as cli (core#1786) (#1790)
+
+  - Hand every seat push to the nopush helper; state what a repository's own rewrite can still do (#1793)
+
+  - Run-cost refuses an unarmed launch; behavioural re-entry claim test; Windows flake (core#1343, core#1780, core#1730) (#1798)
+
+  - A lost PA review result and a first-try managed-hooks refusal get their gates (core#1748, core#1740) (#1797)
+
+  - Estate 0.35.10; AnyStore forwards the semantics restore so a re-extract keeps requirements (core#1668) (#1796)
+
+  - A scoped KEPT names each file listed as not shown, or it does not count (core#1791) (#1802)
+
+  - Stderr redaction, k8s NUL arg refusal, 0700 facts dir, push-URL filter gaps, gw test flake (#1804)
+
 - **core-ts 0.15.48** — 2026-11-22 — patch release on the train-11 cut 7c8ef169, carrying 59 PRs since 0.15.47: #1644, #1645, #1646, #1647, #1648, #1649, #1650, #1651, #1652, #1654, #1655, #1656, #1658, #1659, #1660, #1661, #1664, #1665, #1666, #1669, #1670, #1671, #1672, #1675, #1676, #1677, #1678, #1679, #1680, #1684, #1685, #1686, #1687, #1691, #1692, #1693, #1694, #1695, #1696, #1697, #1704, #1705, #1706, #1707, #1710, #1711, #1712, #1713, #1723, #1725, #1726, #1727, #1728, #1729, #1732, #1733, #1741, #1745, #1749.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 
