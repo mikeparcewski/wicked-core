@@ -71,7 +71,13 @@ struct Seen {
     seat: Option<String>,
     invocation: Option<String>,
     labels: Vec<String>,
+    texts: Vec<String>,
 }
+
+/// A marker only the first review's output carries: an earlier verdict a stand-in must not see.
+const PRIOR_VERDICT_MARKER: &str = "PRIOR-VERDICT-MARKER-7f3a";
+/// A marker only the build's output carries: the work, which every reviewer sees.
+const BUILT_MARKER: &str = "BUILT-OUTPUT-MARKER-1c9e";
 
 /// Records every dispatch; a review answers `VERDICT: PASS`.
 struct Recorder(Arc<Mutex<Vec<Seen>>>);
@@ -82,12 +88,18 @@ impl StepRunner for Recorder {
             seat: i.unit.assigned_cli.clone(),
             invocation: i.unit.assigned_invocation.clone(),
             labels: i.prior_outputs.iter().map(|p| p.label.clone()).collect(),
+            texts: i.prior_outputs.iter().map(|p| p.output.clone()).collect(),
         });
+        let marker = match i.unit.ord {
+            1 => BUILT_MARKER,
+            2 => PRIOR_VERDICT_MARKER,
+            _ => "",
+        };
         StepOutput {
             run_id: i.run_id.clone(),
             unit_ix: i.unit_ix,
             attempt: i.attempt,
-            output: "did the work\nVERDICT: PASS".into(),
+            output: format!("did the work {marker}\nVERDICT: PASS"),
             status: StepStatus::Ok,
             usage: None,
             files: vec![],
@@ -399,6 +411,7 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
     assert!(stale.to_string().starts_with("gate_changed"), "{stale:#}");
     core.grant_stand_ins(sid, "job", Some("operator".into()), now, None)
         .expect("the grant is taken");
+    let built_before = seen.lock().unwrap().iter().filter(|s| s.ord == 1).count();
     let evs = collect_until(
         &ev,
         Duration::from_secs(30),
@@ -424,6 +437,83 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
             .and_then(|s| s.seat.clone())
             .as_deref(),
         Some("claude~1")
+    );
+    // The grant continued exactly the held check: the build ran once, never again.
+    assert_eq!(built_before, 0, "nothing ran before the grant");
+    assert_eq!(seen.iter().filter(|s| s.ord == 1).count(), 1, "{seen:?}");
+    assert_eq!(seen.iter().filter(|s| s.ord == 2).count(), 1, "{seen:?}");
+}
+
+const BUILD_TWO_REVIEWS: &str = r#"{"id":"standin-two-reviews","phases":[
+  {"id":"build","kind":"build","gate":"auto"},
+  {"id":"review","kind":"review","gate":"auto","depends_on":["build"]},
+  {"id":"recheck","kind":"review","gate":"auto","depends_on":["build","review"]}]}"#;
+
+/// The second review's handed context (labels and texts), from a run of [`BUILD_TWO_REVIEWS`].
+fn second_review_context(name: &str, clis: Vec<AgenticCli>, stand_in: LaunchStandIn) -> Seen {
+    let sid = format!("standin-{name}");
+    let (core, seen) = engine(name);
+    core.register_workflow(BUILD_TWO_REVIEWS)
+        .expect("register the two-review def");
+    let ev = core.subscribe();
+    let mut spec = spec(&sid, stand_in);
+    spec.clis = clis;
+    spec.workflow = Some("standin-two-reviews".into());
+    core.launch_run(spec).expect("the launch is admitted");
+    let evs = collect_until(&ev, Duration::from_secs(30), ends(&sid));
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, CoreEvent::SessionCompleted { session } if *session == sid)),
+        "the run completes: {evs:?}"
+    );
+    let seen = seen.lock().unwrap().clone();
+    seen.iter()
+        .find(|s| s.ord == 3)
+        .cloned()
+        .unwrap_or_else(|| panic!("the second review ran: {seen:?}"))
+}
+
+/// T-R6 (codex r1 T1): a stand-in is handed the work and never an earlier verdict, through the
+/// real carrier (`StepInput.prior_outputs`, what the runner renders into the prompt). The control
+/// run proves the marker does reach a real seat by the same route, so the check can fail.
+#[test]
+fn a_stand_in_is_handed_the_work_and_never_an_earlier_verdict() {
+    // Control: two helpers, not aware: the real second review is handed the first review's
+    // verdict as its declared dependency.
+    let real = second_review_context(
+        "fresh-control",
+        vec![cli("claude"), cli("codex")],
+        wicked_core::LaunchStandIn::default(),
+    );
+    assert_ne!(real.seat.as_deref(), Some("claude"), "{real:?}");
+    assert!(
+        real.texts.iter().any(|t| t.contains(PRIOR_VERDICT_MARKER)),
+        "a real reviewer is handed the earlier review: {real:?}"
+    );
+    // One helper, aware, with consent: the second review stands in and is handed the work only.
+    let stand_in = second_review_context("fresh", vec![cli("claude")], aware(Some(consent())));
+    assert!(
+        stand_in
+            .seat
+            .as_deref()
+            .is_some_and(|s| s.starts_with("claude~")),
+        "{stand_in:?}"
+    );
+    assert_eq!(
+        stand_in.labels.first().map(String::as_str),
+        Some("[stand-in reviewer — read this first]"),
+        "{stand_in:?}"
+    );
+    assert!(
+        stand_in.texts.iter().any(|t| t.contains(BUILT_MARKER)),
+        "the stand-in is handed the work: {stand_in:?}"
+    );
+    assert!(
+        !stand_in
+            .texts
+            .iter()
+            .any(|t| t.contains(PRIOR_VERDICT_MARKER)),
+        "the stand-in is never handed an earlier verdict: {stand_in:?}"
     );
 }
 
