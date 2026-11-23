@@ -223,7 +223,7 @@ fn review_receipt(evs: &[CoreEvent], sid: &str) -> serde_json::Value {
             } if session == sid && *ord == 2 => Some(serde_json::to_value(assurance).unwrap()),
             _ => None,
         })
-        .last()
+        .next_back()
         .unwrap_or_else(|| panic!("the review's gateEvaluated: {evs:?}"))
 }
 
