@@ -8843,10 +8843,11 @@ fn compose_skill_prompt(
     // clause reads exactly these units' outputs). Before the VERDICT line, which reads last.
     // (core#1836) …and the reviewer that writes no code records its own check in the same form:
     // POL-2101's record clause is kept on the reviewer's line, so a correct fix whose builder left
-    // none is settled at the reviewer's own gate.
+    // none is settled at the reviewer's own gate. Not QE's isolated acceptance reviewer: it judges
+    // the scenarios and evidence files only, and its output is not the gate's reviewer record.
     if stack_check && writes_code(unit) {
         prompt.push_str(crate::assumptions::STACK_CHECK_CONVENTION);
-    } else if stack_check && is_reviewer(unit) {
+    } else if stack_check && is_reviewer(unit) && unit.qe_review_session.is_none() {
         prompt.push_str(crate::assumptions::REVIEWER_STACK_CHECK_CONVENTION);
     }
     // L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the one
@@ -15667,9 +15668,10 @@ mod tests {
     }
 
     /// (core#1381) A code-writing agent unit (a creator, or an `executes_code` phase) is asked for
-    /// the one-line stack check POL-2101's record clause reads; a neutral or evaluator unit that
-    /// writes no code, a tool step and an engine-internal prompt are not. The evaluator's VERDICT
-    /// line still reads last.
+    /// the builder's one-line stack check POL-2101's record clause reads; a neutral unit, an
+    /// evaluator that writes no code (it is asked for the REVIEWER's line instead, core#1836), a
+    /// tool step and an engine-internal prompt are not. The evaluator's VERDICT line still reads
+    /// last.
     /// (core#1836) The J4 review step (run edb67a40 unit 3, as `GET /runs/:id` shows it: role
     /// evaluator, base skill governed-worker, no phase skill, no tool command, seat codex) is asked
     /// for its own STACK-CHECK line in the exact form the record judge reads (`:: offers`, with
@@ -15718,6 +15720,15 @@ mod tests {
                 assert!(l.contains(words), "{who}: {words}: {l}");
             }
         }
+        // QE's isolated acceptance reviewer judges its evidence files only: VERDICT, no stack line.
+        let mut qe = review.clone();
+        qe.qe_review_session = Some("nonce".into());
+        let p = skill_prompt(&qe, None, SkillForm::ClaudePlugin, None);
+        assert!(!p.contains(line), "{p}");
+        assert!(
+            p.ends_with(crate::assumptions::EVALUATOR_VERDICT_CONVENTION),
+            "{p}"
+        );
         // A tool step or an engine-internal prompt is not a reviewer.
         let mut tool = review.clone();
         tool.tool_cmd = Some(vec!["npm".into(), "test".into()]);

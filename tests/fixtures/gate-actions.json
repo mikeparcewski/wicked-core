@@ -587,7 +587,7 @@
       }
     ],
     "gateKind": "escalation",
-    "ord": 3
+    "ord": 4
   },
   "triage-tool-check": {
     "actions": [

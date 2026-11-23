@@ -35254,24 +35254,39 @@ mod request_changes_tests {
         let rows: Vec<crate::rule_check::RuleVerdict> =
             serde_json::from_value(fixture["rules"].clone()).expect("the wire rows parse");
         let held: Vec<String> = serde_json::from_value(fixture["denialRuleIds"].clone()).unwrap();
+        let reviewed: String = serde_json::from_value(fixture["reviewerOutput"].clone()).unwrap();
+        // J4's shape: the fix (creator, claude) done, the review (evaluator, codex) held by the
+        // rule check, roster claude + codex + pi, the distinct-evaluator contract on.
         let seed = |store: &mut dyn GraphStore, run_id: &str| {
-            seed_rejudge_fix(store, run_id, &["claude", "pi"]);
+            seed_bug_with_deliver(store, run_id);
+            let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+            session.unit_ix = 3;
+            session.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+            session.assurance = crate::assurance::RunAssurance::new(None, false);
+            put_node(store, session.to_node()).unwrap();
             let mut units = crate::domain::session_units(store, run_id).unwrap();
+            units[2].authored_by = vec!["claude".into()];
+            put_node(store, units[2].to_node()).unwrap();
+            let review = &mut units[3];
+            review.assigned_cli = Some("codex".into());
+            review.status = UnitStatus::Rejected;
             let report = crate::rule_check::RuleCheckReport {
                 rows: rows.clone(),
                 ..Default::default()
             };
             let hold = report.hold().expect("the disputed rule holds");
-            units[2].denial_reason = Some(hold.reason.clone());
-            units[2].denial = Some(hold);
-            units[2].rule_check = Some(report);
-            put_node(store, units[2].to_node()).unwrap();
-            open_row(store, run_id, 3, "escalation");
+            review.denial_reason = Some(hold.reason.clone());
+            review.denial = Some(hold);
+            review.rule_check = Some(report);
+            put_node(store, review.to_node()).unwrap();
+            let review = review.clone();
+            persist_rejected_transcript(store, &session, &review, &reviewed);
+            open_row(store, run_id, 4, "escalation");
         };
         let mut store = open_store(Some(":memory:")).unwrap();
         let run_id = format!("core1836-{}", std::process::id());
         seed(&mut store, &run_id);
-        let unit = crate::domain::session_units(&store, &run_id).unwrap()[2].clone();
+        let unit = crate::domain::session_units(&store, &run_id).unwrap()[3].clone();
         let denial = unit.denial.as_ref().unwrap();
         assert_eq!(denial.rule_ids, held, "the hold is the payload's");
         assert!(denial
@@ -35288,6 +35303,33 @@ mod request_changes_tests {
         let err = recheck(&mut store, &run_id, &[("RVWL-1002", "not this change's")])
             .expect_err("a process rule's row is not skipped");
         assert!(err.to_string().contains("RVWL-1002"), "{err}");
+        // The listed skip settles the row from the card, without a send-back: it lands with its
+        // reason on the real row's keys and re-checks the same work.
+        recheck(
+            &mut store,
+            &run_id,
+            &[(
+                "POL-2101",
+                "one-line loop fix; plain JavaScript has no built-in sum",
+            )],
+        )
+        .expect("the listed skip is taken");
+        let review = &crate::domain::session_units(&store, &run_id).unwrap()[3];
+        let pol = rows.iter().find(|r| r.rule_id == "POL-2101").unwrap();
+        assert_eq!(review.rule_skips.len(), 1);
+        assert_eq!(
+            (
+                review.rule_skips[0].rule_id.as_str(),
+                review.rule_skips[0].rule_key.as_str(),
+                Some(review.rule_skips[0].evidence_key.as_str()),
+            ),
+            (
+                "POL-2101",
+                pol.rule_key.as_str(),
+                pol.evidence_key.as_deref()
+            )
+        );
+        assert!(review.requested_rejudge.is_some(), "the re-check is armed");
     }
 
     /// (new issue) A review that ran on the builder's seat under a distinct-evaluator contract:
