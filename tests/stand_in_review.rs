@@ -409,9 +409,11 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
         .grant_stand_ins(sid, "job", Some("operator".into()), first, None)
         .expect_err("a grant for an earlier opening is refused");
     assert!(stale.to_string().starts_with("gate_changed"), "{stale:#}");
+    // Read before the grant: the grant dispatches on the actor, so the build may start before
+    // `grant_stand_ins` returns.
+    let built_before = seen.lock().unwrap().iter().filter(|s| s.ord == 1).count();
     core.grant_stand_ins(sid, "job", Some("operator".into()), now, None)
         .expect("the grant is taken");
-    let built_before = seen.lock().unwrap().iter().filter(|s| s.ord == 1).count();
     let evs = collect_until(
         &ev,
         Duration::from_secs(30),
