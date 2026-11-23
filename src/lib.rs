@@ -67,10 +67,10 @@ mod graph_browser;
 mod headless;
 mod hook_relay;
 mod image_archive;
+mod independence;
 mod index_budget;
 mod install_fence;
 mod interaction;
-mod judge_coverage;
 mod k8s;
 mod knowledge;
 #[cfg(test)]
@@ -291,11 +291,14 @@ pub use gate_hook::{
     GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
 pub use hook_relay::relay_client;
+pub use independence::{
+    judge_coverage, AuthorCoverage, Diversity, IndependencePreflight, Judge, JudgeCoverage,
+    NotJudge, PreflightShape, ProviderSharing, RolePreflight, ShortReason, StandInFrom,
+};
 pub use index_budget::{
     index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
     INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,
 };
-pub use judge_coverage::{judge_coverage, AuthorCoverage, Judge, JudgeCoverage, NotJudge};
 pub use k8s::cli::cluster_main;
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, judge_mcp_call_json, list_mcp_tools_json,
@@ -2104,6 +2107,40 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-STANDIN-001 §3.9; core#1721) Before a launch: which independent roles the job needs
+    /// and how many real seats can fill each on the shape it would take, so a launcher asks once,
+    /// before anything runs, when the roster is short. `clis`: the launch roster (as `launchRun`'s
+    /// `clisJson`); `shape`: the launch options that decide the contract and the shape. The
+    /// contract is resolved by the engine through the launch's own code (an actor command: presets
+    /// and defs live in the store); the roles, over this process's registry and observed providers.
+    /// Diagnostic: every role keeps its own admission at its gate. `Err`: the shape is one the
+    /// launch refuses (malformed plan JSON, a plan beside a preset, a bad QE word, an unknown or
+    /// ballot-only primary); the launch's own plan checks stay the launch's.
+    pub fn independence_preflight(
+        &self,
+        clis: &[AgenticCli],
+        shape: &PreflightShape,
+    ) -> anyhow::Result<IndependencePreflight> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::IndependencePreflight {
+                shape: shape.clone(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        let contract = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        let registry = registry_roster();
+        let skills = crate::skills_snapshot::routing_snapshot();
+        let host = independence::HostFacts {
+            registry: &registry,
+            skills: skills.as_ref(),
+            seen: &crate::observed_provider::last_seen,
+        };
+        independence::independence_preflight_in(clis, &host, shape, contract)
     }
 
     /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit (`POST /api/v1/runs/:id/plan`): the

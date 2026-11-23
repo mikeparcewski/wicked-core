@@ -686,6 +686,23 @@ export declare class Core {
    */
   previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null, repoRef?: string | undefined | null, deliverStepJson?: string | undefined | null): Promise<string>
   /**
+   * (DES-STANDIN-001 §3.9; core#1721) Before a launch: which independent roles the job needs and
+   * how many real seats can fill each on the shape it would take, so a launcher asks once, before
+   * anything runs, when the roster is short. `clisJson`: the launch roster (as `launchRun`'s);
+   * `shapeJson`: `{ workflow?, projectId?, planJson?, power?, reducedAssurance?, primary?, parties?,
+   * excludeSeats?, skipQeAcceptanceReason?, forceQeAcceptance?, repoBound?, councilSize? }`. The
+   * contract is resolved by the engine through the launch's own code. Resolves to JSON `{ short,
+   * primary, roles: [{ role, needed, real, shortBy, canStandIn, standInFrom, conditional, why }],
+   * reason, reasonData, signedIn, benched, judges, diversity: { providers, needed,
+   * neededWithFailover, sharing, outsideHelper, note } }`; `primary` is null when the launch draws
+   * its PA (each role is then its worst case over every work seat). Rejects with the launch's
+   * refusal of the shape (malformed `planJson`, a plan beside a preset, a bad QE word, an unknown or
+   * ballot-only `primary`); the launch's own plan checks stay the launch's.
+   * Diagnostic: every role keeps its own admission at its gate. An addon without this method
+   * predates it; crew keys on its presence.
+   */
+  independencePreflight(clisJson: string, shapeJson: string): Promise<string>
+  /**
    * A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
    * ADD. Held and applied at the run's next step boundary through the engine's revision path
    * (the ratchet and floor fill apply), which publishes `plan.proposed{by:"human", kind:"edit"}`

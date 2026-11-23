@@ -620,6 +620,12 @@ pub(crate) enum Command {
         human_confirm: crate::domain::HumanConfirm,
         reply: Sender<anyhow::Result<crate::plan_gate::PlanPreview>>,
     },
+    /// (DES-STANDIN-001 §3.9) The contract a launch shape would run under, resolved through the
+    /// launch's own code over the store; the caller computes the preflight off the actor.
+    IndependencePreflight {
+        shape: crate::independence::PreflightShape,
+        reply: Sender<anyhow::Result<crate::independence::PreflightContract>>,
+    },
     /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit: held for the run's next step boundary
     /// and applied there through the revision path (§8.7); idempotent by `request_id`.
     ProposePlan {
@@ -808,6 +814,7 @@ impl Command {
             Command::TeamSuperseded { .. } => "TeamSuperseded",
             Command::RunTeam { .. } => "RunTeam",
             Command::PreviewPlan { .. } => "PreviewPlan",
+            Command::IndependencePreflight { .. } => "IndependencePreflight",
             Command::ProposePlan { .. } => "ProposePlan",
             Command::LiveTeamRuns { .. } => "LiveTeamRuns",
             #[cfg(test)]
