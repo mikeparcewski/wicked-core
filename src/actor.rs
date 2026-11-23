@@ -15256,6 +15256,15 @@ fn dispatch_unit_with(
     // waits for the fold through it.
     let team_runner = team_gate::team_runner();
     let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
+    // (DES-STANDIN-001 §3.6) The stand-in this unit's pinned judge may run on, minted HERE on the
+    // actor (slots never repeat); the judge takes it only when no distinct judge is left, and the
+    // fold records it then.
+    let stand_in_judge = crate::standin::judge_offer(
+        &session.assurance,
+        unit,
+        input.attempt,
+        &crate::registry_roster(),
+    );
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -15301,6 +15310,7 @@ fn dispatch_unit_with(
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
             floor_stop,
+            stand_in_judge.as_ref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,

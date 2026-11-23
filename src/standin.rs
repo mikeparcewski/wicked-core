@@ -352,6 +352,9 @@ pub(crate) enum Fill {
     NoUsableBase(Role, String),
 }
 
+/// (§3.8) The denial source and gate class of a check held for want of consent.
+pub(crate) const DENIAL_SOURCE_STAND_IN_NEEDED: &str = "stand_in_needed";
+
 /// Whether stand-ins can apply to this run at all: the launch was `standInAware`. Every fill site
 /// checks this first, so an unaware run never reaches [`fill`].
 pub(crate) fn active(run: &crate::assurance::RunAssurance) -> bool {
@@ -433,6 +436,70 @@ pub(crate) fn fill(req: FillRequest<'_>) -> Fill {
         real: req.real,
         stand_ins: minted,
     }
+}
+
+/// (§3.6) The stand-in a unit's pinned judge may run on when no distinct judge is left: minted on
+/// the actor at dispatch (so slots never repeat), on the work's own seat (its base when that seat
+/// is itself a stand-in), and recorded only if the judge path takes it ([`judge_answered`]).
+/// `None` unless the run is stand-in-aware, consented and not reduced, and the unit pins an
+/// approved validator.
+pub(crate) fn judge_offer(
+    run: &crate::assurance::RunAssurance,
+    unit: &crate::domain::WorkUnit,
+    attempt: u32,
+    roster: &[crate::AgenticCli],
+) -> Option<StandInBinding> {
+    if !active(run) || run.stand_in.is_none() || run.reduced() {
+        return None;
+    }
+    unit.validator.as_ref().filter(|v| v.approved)?;
+    let base = seat_id::credential(unit.assigned_cli.as_deref()?).to_string();
+    let reason = Reason::OnlyOneHelper {
+        cli: display_name(roster, &base),
+    };
+    match fill(FillRequest {
+        role: Role::Judge,
+        need: 1,
+        real: Vec::new(),
+        bases: vec![base],
+        builder_model: None,
+        consent: run.stand_in.as_ref(),
+        reason,
+        scope: BindingScope {
+            ord: Some(unit.ord),
+            attempt: Some(attempt),
+            ..Default::default()
+        },
+        taken: &run.stand_ins,
+    }) {
+        Fill::Seats { stand_ins, .. } => stand_ins.into_iter().next().map(|mut b| {
+            b.display = Some(display_name(roster, &b.base));
+            b
+        }),
+        Fill::NeedConsent(_) | Fill::NoUsableBase(..) => None,
+    }
+}
+
+/// (§3.6) The binding of a stand-in judge that ANSWERED as `key`, for the fold to record: the
+/// unit's own offer under that key, when the key is the offer's base with a slot the run has not
+/// recorded. `None` for any other key (fail closed: a `~` key the run never offered is no
+/// stand-in, and the receipt reads it as an ordinary judge seat).
+pub(crate) fn judge_answered(
+    run: &crate::assurance::RunAssurance,
+    unit: &crate::domain::WorkUnit,
+    attempt: u32,
+    roster: &[crate::AgenticCli],
+    key: &str,
+) -> Option<StandInBinding> {
+    let mut b = judge_offer(run, unit, attempt, roster)?;
+    let (base, slot) = key.rsplit_once(wicked_apps_core::spawn::STAND_IN_SEP)?;
+    if base != b.base || run.stand_ins.iter().any(|x| x.key == key) {
+        return None;
+    }
+    b.slot = slot.parse().ok()?;
+    b.key = key.to_string();
+    b.state = STATE_ANSWERED.to_string();
+    Some(b)
 }
 
 /// (§3.3, rev 3 R6) Whether a recorded binding may be dispatched again (a restart, a retry of the
@@ -736,5 +803,76 @@ mod tests {
         assert_eq!(lens(9), "correctness");
         assert!(preface(Some("security and safety")).ends_with("for security and safety."));
         assert!(!preface(None).contains("Look at it first"));
+    }
+
+    /// T-R5 (offer): a consented aware run offers its pinned judge a stand-in on the work's own
+    /// base, at the next free slot; an unconsented, unaware or unpinned one offers none. The fold
+    /// records only the key the run offered.
+    #[test]
+    fn a_pinned_judge_is_offered_a_stand_in_only_with_consent() {
+        let mut unit = crate::domain::WorkUnit::pending("u1", "r1", 2, "review");
+        unit.assigned_cli = Some("claude~1".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        let aware = LaunchStandIn {
+            aware: true,
+            consent: Some(consent()),
+            ..Default::default()
+        }
+        .apply(crate::assurance::RunAssurance::default());
+        let mut run = aware.clone();
+        run.stand_ins.push(StandInBinding {
+            key: "claude~1".into(),
+            base: "claude".into(),
+            role: Role::Evaluator,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: Some(2),
+            attempt: None,
+            subject: None,
+            evidence: None,
+            invocation: "i".into(),
+            reason: Reason::OnlyOneHelper {
+                cli: "claude".into(),
+            },
+            state: STATE_SEATED.into(),
+            display: None,
+        });
+        let offer = judge_offer(&run, &unit, 1, &[]).expect("consented aware run");
+        assert_eq!(
+            (offer.key.as_str(), offer.base.as_str()),
+            ("claude~2", "claude")
+        );
+        assert_eq!(
+            (offer.role, offer.ord, offer.attempt),
+            (Role::Judge, Some(2), Some(1))
+        );
+        let answered = judge_answered(&run, &unit, 1, &[], "claude~2").expect("its own offer");
+        assert_eq!(answered.state, STATE_ANSWERED);
+        assert!(
+            judge_answered(&run, &unit, 1, &[], "claude~1").is_none(),
+            "taken"
+        );
+        assert!(
+            judge_answered(&run, &unit, 1, &[], "codex~2").is_none(),
+            "another base"
+        );
+        assert!(
+            judge_answered(&run, &unit, 1, &[], "claude").is_none(),
+            "a real seat"
+        );
+
+        let mut no_consent = run.clone();
+        no_consent.stand_in = None;
+        assert!(judge_offer(&no_consent, &unit, 1, &[]).is_none());
+        assert!(judge_offer(&crate::assurance::RunAssurance::default(), &unit, 1, &[]).is_none());
+        let mut unpinned = unit.clone();
+        unpinned.validator = None;
+        assert!(judge_offer(&run, &unpinned, 1, &[]).is_none());
     }
 }

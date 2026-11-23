@@ -3169,6 +3169,7 @@ pub(crate) fn run_unit_and_judge(
     team: Option<&crate::team::runner::TeamRunner>,
     rule_council: Option<&CouncilCtx<'_>>,
     stop: Option<crate::repo_checks::FloorStop>,
+    stand_in_judge: Option<&crate::standin::StandInBinding>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -3204,6 +3205,7 @@ pub(crate) fn run_unit_and_judge(
             // (PRODUCT-WORKS J4) Re-probe the run's due quota benches before the judge reads them.
             reprobe: !run_roster.is_empty(),
             rule_council,
+            stand_in_judge,
         },
         exec_bus,
         team,
@@ -3658,6 +3660,7 @@ fn run_unit_and_judge_with_launches(
             author_binaries,
             reprobe: false,
             rule_council: None,
+            stand_in_judge: None,
         },
         None,
         None,
@@ -3697,6 +3700,7 @@ fn run_unit_and_judge_reprobing(
             author_binaries: Some(&[]),
             reprobe: true,
             rule_council: None,
+            stand_in_judge: None,
         },
         None,
         None,
@@ -4206,6 +4210,10 @@ pub(crate) struct JudgeFallbackCtx<'a> {
     /// (DES-RULE-CHECK-001 rev 2) The rule council a disputed rule goes to; `None` (the bus path,
     /// tests): a dispute holds.
     pub rule_council: Option<&'a CouncilCtx<'a>>,
+    /// (DES-STANDIN-001 §3.6) The stand-in the run's actor offered this unit's pinned judge
+    /// ([`crate::standin::judge_offer`]): taken only when no distinct judge is left. `None` on an
+    /// unaware or unconsented run, the bus path and tests.
+    pub stand_in_judge: Option<&'a crate::standin::StandInBinding>,
 }
 
 /// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
@@ -6456,6 +6464,29 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 ));
             }
             if !crate::validator::distinct_judge_available(&excluded, roster) {
+                // (DES-STANDIN-001 §3.6) No distinct judge, on a run that consented: the stand-in
+                // the actor offered judges instead of a skip. Its own path: no identity or provider
+                // fence, stamped not distinct; the fold records its binding. A base with no record
+                // falls through to the skip (fail closed: no invocation, no judge).
+                if let Some((b, invocation)) = fallback.stand_in_judge.and_then(|b| {
+                    crate::standin::resolve(&[], registry, &b.key).map(|inv| (b, inv))
+                }) {
+                    let (verdict, refused) =
+                        with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                            crate::validator::judge_on_stand_in(
+                                b,
+                                &invocation,
+                                &judge_criterion,
+                                work_for_agent,
+                                &**runner,
+                                Some(&input.run_id),
+                            )
+                        });
+                    note_refusals(&refused);
+                    break 'pinned Some(verdict.unwrap_or_else(|e| {
+                        crate::validator::AgentVerdict::from_judge_error("stand-in judge", e)
+                    }));
+                }
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
                 let validator_id = crate::validator::excluded_identity(
                     crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
@@ -7852,6 +7883,9 @@ fn run_cli_runner(
                     // The floor stops on this task's launch identity, read from the actor's maps
                     // exactly as an in-process worker's floor is (core#1533).
                     crate::actor::launch_stop(&lifecycle_maps, &task.run_id, task.launch_seq),
+                    // (DES-STANDIN-001 §3.6) No run facts on the wire: no stand-in judge here (a
+                    // missing judge holds, fail-closed).
+                    None,
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -11659,6 +11693,7 @@ mod tests {
                 author_binaries: Some(&[]),
                 reprobe: false,
                 rule_council: None,
+                stand_in_judge: None,
             },
             &runner,
             &noop_refusals,

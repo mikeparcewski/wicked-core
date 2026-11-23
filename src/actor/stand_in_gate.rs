@@ -22,7 +22,8 @@ use crate::domain::{AgentSession, SessionStatus, WorkUnit};
 use crate::event::CoreEvent;
 
 /// The denial source (and gate class) of a check held for want of consent.
-pub(crate) const DENIAL_SOURCE_STAND_IN_NEEDED: &str = "stand_in_needed";
+pub(crate) const DENIAL_SOURCE_STAND_IN_NEEDED: &str =
+    crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED;
 
 /// Whether the run's open gate is a `stand_in_needed` hold on its cursor.
 pub(crate) fn gate_open(cursor: Option<&WorkUnit>) -> bool {

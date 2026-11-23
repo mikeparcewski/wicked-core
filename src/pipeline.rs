@@ -1651,15 +1651,55 @@ pub(crate) fn apply_and_finish_unit(
     // convene (no seat distinct from the work's author) is a HOLD when the contract requires the
     // judge: the gate denies under `judge_unavailable` (approve = the operator judges, core#969),
     // never a deterministic-only approve. A `reduced` run keeps the disclosed skip.
-    let assurance = run_session
+    let mut assurance = run_session
         .as_ref()
         .map(|s| s.assurance.clone())
         .unwrap_or_default();
+    // (DES-STANDIN-001 §3.6) A stand-in judge answered: its binding joins the run's record here, on
+    // the single writer, before the receipt reads it, and is announced. Only the key the actor
+    // offered this unit is recorded (`standin::judge_answered`).
+    if let Some(key) = agent_verdict
+        .and_then(|v| v.judge_cli.as_deref())
+        .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
+    {
+        let roster = crate::registry_roster();
+        if let Some(mut s) = crate::domain::get_session(&*store, session_id)? {
+            if let Some(b) =
+                crate::standin::judge_answered(&s.assurance, unit, attempt, &roster, key)
+            {
+                let display = b.display().to_string();
+                s.assurance.stand_ins.push(b.clone());
+                crate::standin::note_label(&mut s.assurance, &b, &display);
+                put_node(store, s.to_node())?;
+                emit(CoreEvent::StandInSeated {
+                    session: session_id.to_string(),
+                    ord: Some(unit.ord),
+                    label: crate::standin::label(&b, &display),
+                    binding: b,
+                });
+                assurance = s.assurance;
+            }
+        }
+    }
+    // (DES-STANDIN-001 §3.6, §3.8) On a stand-in-aware run with no consent, the missing judge is
+    // the `stand_in_needed` hold (grant a stand-in, sign a helper in and retry, or reject), never
+    // the reduced offer.
+    let stand_in_hold = crate::standin::active(&assurance) && assurance.stand_in.is_none();
     let judge_hold = evidence
         .judge_skipped
         .as_ref()
         .filter(|_| agent_verdict.is_none() && assurance.enforces(crate::assurance::JUDGE))
         .map(|why| {
+            if stand_in_hold {
+                return crate::domain::UnitDenial::new(
+                    crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
+                    format!(
+                        "the run requires a judge ({}) and no helper that did not build the work \
+                         can be it: {why}",
+                        crate::assurance::JUDGE
+                    ),
+                );
+            }
             crate::domain::UnitDenial::new(
                 crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
                 format!(
@@ -4011,6 +4051,24 @@ fn gate_receipt(
     match (f.judge, f.judge_skipped) {
         // A judge RAN only when a seat answered: the bus path's transport failure and an
         // unanswered request carry no `judge_cli` and are a skip, not a verdict (codex r1).
+        // (DES-STANDIN-001 §3.6, §5.1) A stand-in judge's answer: the legacy projection (no judge
+        // seat, the skip says `stand_in`, never `ran`), and the canonical role says who.
+        (Some(v), _)
+            if v.seat_failure.is_none()
+                && crate::standin::binding_for(run, v.judge_cli.as_deref()).is_some() =>
+        {
+            let b = crate::standin::binding_for(run, v.judge_cli.as_deref()).expect("guarded");
+            let mut answered = b.clone();
+            answered.state = crate::standin::STATE_ANSWERED.to_string();
+            r.skip(
+                a::JUDGE,
+                a::SKIP_STAND_IN,
+                Some(crate::standin::label(&answered, answered.display())),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+            }
+        }
         (Some(v), _) if v.seat_failure.is_none() && v.judge_cli.is_some() => {
             r.ran(a::JUDGE);
             r.judge = v.judge_cli.clone();
@@ -7468,6 +7526,84 @@ mod guarded_read_step_tests {
             .denial(&recorded, None)
             .reason
             .contains("reassign it to a distinct signed-in seat"));
+    }
+
+    /// T-R5 (the receipt, DES-STANDIN-001 §5.1): a stand-in judge's PASS is never `ran` for the
+    /// judge; the legacy projection has no judge seat and a `stand_in` skip, and the canonical role
+    /// says a stand-in filled it. A `~` key the run never recorded is read as an ordinary seat.
+    #[test]
+    fn a_stand_in_judge_is_projected_conservatively_on_the_receipt() {
+        use wicked_apps_core::ToNode;
+        let build = unit(1, StageKind::Build, PhaseRole::Creator, "sj-claude");
+        let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "sj-codex");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_nodes(&mut store, &[build.to_node(), review.to_node()]).unwrap();
+        let mut run = crate::standin::LaunchStandIn {
+            aware: true,
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(crate::assurance::RunAssurance::default());
+        let mut review_pinned = review.clone();
+        review_pinned.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        review_pinned.assigned_cli = Some("sj-claude".into());
+        let b = crate::standin::judge_answered(&run, &review_pinned, 1, &[], "sj-claude~1")
+            .expect("the run's own offer");
+        run.stand_ins.push(b);
+        let verdict = crate::validator::AgentVerdict {
+            pass: true,
+            reasoning: "ok".into(),
+            judge_cli: Some("sj-claude~1".into()),
+            judge_distinct: Some(false),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        let facts = |judge| super::GateFacts {
+            own_observed: Some(&[]),
+            pinned: None,
+            checks: None,
+            checks_waived: None,
+            judge,
+            judge_skipped: None,
+            judge_not_due: (crate::assurance::SKIP_NOT_APPLICABLE, String::new()),
+            rules: None,
+            eval_ran: false,
+            eval_error: None,
+            tree: None,
+        };
+        let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&verdict)));
+        assert_eq!(receipt.judge, None);
+        assert!(!receipt.ran.iter().any(|i| i == crate::assurance::JUDGE));
+        let skip = receipt
+            .skipped
+            .iter()
+            .find(|s| s.instrument == crate::assurance::JUDGE)
+            .expect("the judge's skip");
+        assert_eq!(skip.reason, crate::assurance::SKIP_STAND_IN);
+        let roles = receipt.roles.expect("an aware run's receipt is canonical");
+        assert!(roles
+            .iter()
+            .any(|r| r.role == "judge" && r.filled == crate::assurance::FILLED_STAND_IN));
+        assert_eq!(
+            receipt.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENCE_MIXED),
+            "a real evaluator and a stand-in judge"
+        );
+        // A key the run never recorded: an ordinary judge seat on the legacy fields.
+        let mut forged = verdict.clone();
+        forged.judge_cli = Some("sj-claude~9".into());
+        let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&forged)));
+        assert_eq!(receipt.judge.as_deref(), Some("sj-claude~9"));
+        assert!(receipt.ran.iter().any(|i| i == crate::assurance::JUDGE));
     }
 
     #[test]
