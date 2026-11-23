@@ -2037,10 +2037,18 @@ pub(crate) fn container_seat_config(
 static CONFIG_IN_USE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 #[derive(Debug)]
-pub(crate) struct ConfigHomeGuard(PathBuf);
+pub(crate) struct ConfigHomeGuard(PathBuf, bool);
 
 impl Drop for ConfigHomeGuard {
     fn drop(&mut self) {
+        // wicked-garden#1365: a claude seat's record holds the operator's token for the unit's
+        // life only. Blanked (as an API-key seat's is) before the home is released to the next
+        // unit, on every path out of the unit, a refusal or a panic included.
+        if self.1 && self.0.join(CLAUDE_RECORD).exists() {
+            if let Err(why) = write_private_file(&self.0.join(CLAUDE_RECORD), b"{}") {
+                eprintln!("wicked-core: claude's seat credential record was not blanked: {why}");
+            }
+        }
         CONFIG_IN_USE
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2057,7 +2065,7 @@ pub(crate) fn claim_config_home(cli: &str, home: &Path) -> Result<Option<ConfigH
         return Err(format!("concurrent {cli} unit refused: shared run config home is already in use (fixed credential path)"));
     }
     live.push(home.to_path_buf());
-    Ok(Some(ConfigHomeGuard(home.to_path_buf())))
+    Ok(Some(ConfigHomeGuard(home.to_path_buf(), cli == "claude")))
 }
 
 pub(crate) fn write_unit_seat_files(
@@ -2331,6 +2339,45 @@ fn placeholder_handoff(
     let env = crate::seat_gateway::seat_env_for_sign_in(cli, &sign_in, &key.bearer);
     (key, env, files)
 }
+
+/// The credential a seat is armed with: [`placeholder_handoff`], and for a claude OAuth seat the
+/// operator's `claude setup-token` token (`setup_token`, read from the broker). core#1024 passes the
+/// token through: it reaches the pod only in the unit env file, over exec stdin (never an argv), as
+/// `CLAUDE_CODE_OAUTH_TOKEN`. claude deletes that variable from every tool child's env, so the
+/// same token also goes in the seat's `.credentials.json`, in claude's own env-token record shape
+/// ([`crate::seat_credentials::claude_oauth_token_record`]). A `claude -p` the seat starts from its
+/// Bash tool (a harness's rule model) signs in with it (wicked-garden#1365). The unit's config-home
+/// claim blanks the record when the unit ends ([`ConfigHomeGuard`]). The seat-secret guard learns
+/// the token. `Err` = the broker holds no token (claude is signed out).
+fn armed_credential(
+    cli: &str,
+    sign_in: impl Into<crate::seat_credentials::SeatSignIn>,
+    run: &str,
+    unit: &str,
+    setup_token: impl FnOnce() -> Result<String, String>,
+) -> Result<SeatCredential, String> {
+    let sign_in = sign_in.into();
+    let oauth = cli == "claude"
+        && sign_in.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
+    let (key, mut env, mut files) = placeholder_handoff(cli, sign_in, run, unit);
+    if oauth {
+        let token = setup_token()?;
+        crate::seat_secret_guard::register(
+            crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+            &token,
+        );
+        files.retain(|(path, _)| path != Path::new(CLAUDE_RECORD));
+        files.push((
+            PathBuf::from(CLAUDE_RECORD),
+            crate::seat_credentials::claude_oauth_token_record(&token),
+        ));
+        env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
+    }
+    Ok((key, env, files))
+}
+
+/// claude's credential record, relative to its config home (`CLAUDE_CONFIG_DIR`).
+const CLAUDE_RECORD: &str = ".credentials.json";
 
 /// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
 /// exec any single argument over `MAX_ARG_STRLEN` (32 pages, 128 KiB): docker-init then fails
@@ -2767,20 +2814,10 @@ pub(crate) fn arm_noting(
                         .subscriptions
                         .contains(&crate::seat_credentials::Subscription::Copilot))
                 .then(|| crate::seat_gateway::copilot_account(dir));
-                let oauth = cli == "claude"
-                    && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
-                let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
-                if oauth {
-                    // core#1024: the operator's own setup-token, passed through; it reaches the pod
-                    // only in the unit env file, over exec stdin (never an argv).
-                    let token = crate::k8s::gw::claude_seat_token(&gw)
-                        .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
-                    crate::seat_secret_guard::register(
-                        crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
-                        &token,
-                    );
-                    env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
-                }
+                let (key, env, files) = armed_credential(cli, kind, run_id, &unit, || {
+                    crate::k8s::gw::claude_seat_token(&gw)
+                })
+                .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -4961,6 +4998,39 @@ esac
         dir
     }
 
+    /// wicked-garden#1365: a claude seat's config home holds the operator's token only for the
+    /// unit's life. Releasing the claim (the unit's end, a refusal, a panic) blanks the record,
+    /// and another CLI's files are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn releasing_a_claude_config_home_blanks_its_credential_record() {
+        let home = c4_temp();
+        let record = home.join(CLAUDE_RECORD);
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token = format!("sk-ant-oat01-{}", "B".repeat(40));
+        std::fs::write(
+            &record,
+            crate::seat_credentials::claude_oauth_token_record(&token),
+        )
+        .unwrap();
+        drop(claim_config_home("claude", &home).unwrap());
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "{}");
+        std::fs::write(&record, "codex-owned").unwrap();
+        drop(claim_config_home("codex", &home).unwrap());
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "codex-owned");
+        std::fs::write(
+            &record,
+            crate::seat_credentials::claude_oauth_token_record(&token),
+        )
+        .unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _held = claim_config_home("claude", &home).unwrap();
+            panic!("the unit panics while it holds the home");
+        });
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "{}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn fixed_auth_homes_refuse_concurrency_and_guard_releases_on_every_exit() {
         let home = c4_temp();
@@ -5143,6 +5213,71 @@ esac
         assert!(gateway_route_defined("copilot", false).is_ok());
         for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
             assert!(gateway_route_defined(cli, true).is_ok(), "{cli}");
+        }
+    }
+
+    /// wicked-garden#1365: an armed claude OAuth seat gives a `claude -p` started from its Bash
+    /// tool a way to sign in. claude deletes `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's env,
+    /// so the token is also the seat's `.credentials.json`, in claude's own env-token record shape
+    /// (no refresh token, no expiry: claude never refreshes it). The outer claude keeps the env
+    /// token core#1024 proved. Red on the reverted arm: its record is `{}`, so a nested claude is
+    /// "Not logged in". A signed-out broker refuses the arm, and no other kind reads the token.
+    #[test]
+    fn an_armed_claude_oauth_seat_gives_its_tool_children_a_signed_in_record() {
+        use crate::seat_credentials::CredentialKind;
+        use crate::seat_secret_guard::injected;
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token = format!("sk-ant-oat01-{}", "R".repeat(40));
+        // The test registry is this thread's own.
+        let before = injected().len();
+        let (_, env, files) = armed_credential(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "test-run",
+            "test-unit",
+            || Ok(token.clone()),
+        )
+        .unwrap();
+        let records: Vec<_> = files
+            .iter()
+            .filter(|(p, _)| p == Path::new(".credentials.json"))
+            .collect();
+        assert_eq!(records.len(), 1, "{files:?}");
+        let record: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+        let oauth = &record["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], token.as_str());
+        assert!(oauth["refreshToken"].is_null(), "nothing to refresh with");
+        assert!(
+            oauth["expiresAt"].is_null(),
+            "never expires, never refreshed"
+        );
+        assert_eq!(
+            oauth["scopes"],
+            serde_json::json!(["user:inference", "user:ccr_inference", "user:file_upload"])
+        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == &token));
+        let registered = injected();
+        assert_eq!(registered.len(), before + 1, "the guard learns the token");
+        assert!(format!("{:?}", registered.last().unwrap()).contains("ClaudeSetupToken"));
+        assert!(armed_credential(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "test-run",
+            "test-unit",
+            || Err("claude is not signed in".into()),
+        )
+        .is_err());
+        for (cli, kind) in [
+            ("claude", CredentialKind::ClaudeApiKey),
+            ("codex", CredentialKind::CodexChatgpt),
+        ] {
+            let (_, env, files) = armed_credential(cli, kind, "test-run", "test-unit", || {
+                panic!("only a claude OAuth seat reads the broker's claude token")
+            })
+            .unwrap();
+            assert!(!format!("{env:?}{files:?}").contains("sk-ant-oat"), "{cli}");
         }
     }
 

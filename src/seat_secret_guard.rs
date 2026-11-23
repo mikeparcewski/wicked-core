@@ -5,8 +5,9 @@
 //!
 //! core#1024 moved the claude seat to pass-through auth: the seat's own claude sends the operator's
 //! long-lived `claude setup-token` token, which reaches the seat container as
-//! `CLAUDE_CODE_OAUTH_TOKEN`. That is inherent to pass-through: the unit's own code can read its
-//! environment, and a token it writes into the worktree (a debug dump, a `.env`, a test fixture, a
+//! `CLAUDE_CODE_OAUTH_TOKEN` and, for the claude its tools start, in its config home's
+//! `.credentials.json` (wicked-garden#1365). That is inherent to pass-through: the unit's own code
+//! can read its environment and that file, and a token it writes into the worktree (a debug dump, a `.env`, a test fixture, a
 //! commit message) would ride the run branch to the remote at delivery.
 //!
 //! ## What the guard does

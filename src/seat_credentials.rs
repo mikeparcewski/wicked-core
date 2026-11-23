@@ -1,7 +1,8 @@
 //! Pure, per-unit CLI credential files. Only placeholders enter a seat; the gateway owns
 //! upstream credentials (a claude OAuth seat is the one exception: it passes the operator's own
-//! `claude setup-token` token through, from its environment, core#1024). Paths are relative to
-//! the runner's isolated CLI home.
+//! `claude setup-token` token through, from its environment, core#1024, and from its config home
+//! for the claude its tools start, wicked-garden#1365). Paths are relative to the runner's
+//! isolated CLI home.
 
 use std::path::{Path, PathBuf};
 
@@ -305,6 +306,32 @@ pub(crate) fn sent_bearer(cli: &str, kind: CredentialKind, unit_key: &str) -> St
     }
 }
 
+/// The scopes claude 2.1.296 gives a `CLAUDE_CODE_OAUTH_TOKEN` token when `CLAUDE_CODE_OAUTH_SCOPES`
+/// is unset (its own default list for an env-supplied token).
+pub(crate) const CLAUDE_ENV_TOKEN_SCOPES: &[&str] =
+    &["user:inference", "user:ccr_inference", "user:file_upload"];
+
+/// The record a claude OAuth seat's `.credentials.json` holds (wicked-garden#1365): the operator's
+/// `claude setup-token` token, in exactly the shape claude builds for itself from
+/// `CLAUDE_CODE_OAUTH_TOKEN`. That is no refresh token and no expiry, so claude never tries a
+/// refresh, and the default env-token scopes, so it makes the same upstream calls as with the env
+/// variable. claude deletes `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's env, so this file is
+/// how a `claude -p` the seat starts from its Bash tool (a harness's rule model) signs in. A
+/// placeholder in its place cannot work: claude sends its own non-inference API calls
+/// (`/api/oauth/profile`, `/api/claude_cli/bootstrap`) straight to api.anthropic.com, past the
+/// gateway, and a refused one ends in a refresh that fails (core#1832).
+pub(crate) fn claude_oauth_token_record(token: &str) -> String {
+    json!({"claudeAiOauth": {
+        "accessToken": token,
+        "refreshToken": null,
+        "expiresAt": null,
+        "scopes": CLAUDE_ENV_TOKEN_SCOPES,
+        "subscriptionType": null,
+        "rateLimitTier": null
+    }})
+    .to_string()
+}
+
 /// Render the spike's credential shapes. `gateway_url` is the selected route's origin
 /// (`http://agw:<port>`); provider clients append their own API paths.
 pub(crate) fn placeholder_files(
@@ -314,12 +341,13 @@ pub(crate) fn placeholder_files(
     gateway_url: &str,
 ) -> Vec<(PathBuf, String)> {
     let (path, value) = match (cli, kind) {
-        // Neither claude mode keeps an OAuth record in the seat. OAuth (core#1024): the seat's
-        // claude passes the operator's `claude setup-token` token through, from its env
+        // No placeholder record for either claude mode. OAuth (core#1024): the seat's claude
+        // passes the operator's `claude setup-token` token through, from its env
         // (`CLAUDE_CODE_OAUTH_TOKEN`), and the unit's key rides `x-wicked-unit`
-        // ([`crate::seat_gateway::seat_env_for`]). API key: selected by ANTHROPIC_API_KEY. The
-        // file is still written, empty, so a seat home an earlier unit used keeps no stale
-        // record there (agy c6-r1).
+        // ([`crate::seat_gateway::seat_env_for`]); arming replaces this empty file with the
+        // token's record (`claude_oauth_token_record`, wicked-garden#1365). API key: selected
+        // by ANTHROPIC_API_KEY. The file is still written, empty, so a seat home an earlier unit
+        // used keeps no stale record there (agy c6-r1).
         ("claude", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
             (".credentials.json", json!({}))
         }
@@ -514,6 +542,26 @@ mod tests {
             json!({})
         );
         assert_eq!(sent_bearer("claude", CredentialKind::ClaudeOauth, KEY), KEY);
+    }
+
+    /// wicked-garden#1365: the record is claude 2.1.296's own shape for an env-supplied token
+    /// (its `CLAUDE_CODE_OAUTH_TOKEN` branch: no refresh token, no expiry, the default scopes, no
+    /// subscription or tier), so claude in file mode behaves as it does with the env variable.
+    #[test]
+    fn claudes_token_record_is_claudes_own_env_token_shape() {
+        let token = format!("sk-ant-oat01-{}", "S".repeat(40));
+        let record: Value = serde_json::from_str(&claude_oauth_token_record(&token)).unwrap();
+        assert_eq!(
+            record,
+            json!({"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": null,
+                "expiresAt": null,
+                "scopes": ["user:inference", "user:ccr_inference", "user:file_upload"],
+                "subscriptionType": null,
+                "rateLimitTier": null
+            }})
+        );
     }
 
     #[test]
