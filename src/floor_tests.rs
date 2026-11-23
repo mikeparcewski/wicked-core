@@ -1173,7 +1173,15 @@ fn each_outcome_rides_the_wire_as_a_typed_decision() {
         .iter()
         .map(|r| r["attempt"].as_str().unwrap())
         .collect();
-    for a in ["head", "base", "toc-base", "toc-head", "excluded"] {
+    // (core#1767) `results-head`: the head's results run (the TS `FloorLogRefJson.attempt` union).
+    for a in [
+        "head",
+        "base",
+        "toc-base",
+        "toc-head",
+        "results-head",
+        "excluded",
+    ] {
         assert!(attempts.contains(&a), "{a} in {attempts:?}");
     }
     for r in w["logRefs"].as_array().unwrap() {

@@ -544,6 +544,9 @@ pub(super) fn decide(
     }
     // The base is red and finished: separate its failures from the head's, if it can be precise.
     let red_base = base_run.filter(|b| !b.passed() && !b.timed_out && b.spawn_error.is_none());
+    // (core#1767) The head's results run, when the plan took one: its cost, and an environment
+    // refusal it met (terminal for the check, core#1627; its exit code is never the verdict).
+    let mut results_head: Option<CheckRun> = None;
     let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
     if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
@@ -663,11 +666,19 @@ pub(super) fn decide(
                 // nothing itself (the excluded run below does, by its exit code).
                 let (r, text) = head_results(worktree, held, check, g, sandbox, scratch);
                 logs.extend(r.logs.iter().cloned());
+                results_head = Some(r);
                 g.completeness(&text?, &head_toc.ids)
                     .map_err(|e| format!("the head's list does not cover its run: {e}"))?;
             }
             Ok(names)
         })();
+    }
+    if let Some(r) = &results_head {
+        head.earlier_passes
+            .push(("head results".to_string(), r.duration_ms));
+        if r.environment_failure() {
+            head.spawn_error = r.spawn_error.clone();
+        }
     }
     // The deciding run: the excluded head run when exclusion is precise and has something to
     // deselect, else the unchanged head run itself.
