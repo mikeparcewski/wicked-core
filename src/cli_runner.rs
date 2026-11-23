@@ -11315,7 +11315,13 @@ mod tests {
                     .unwrap_or_else(|p| p.into_inner());
                 let prev = std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV);
                 std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
-                let cov = crate::judge_coverage::judge_coverage_in(&clis, &registry, false);
+                let cov = crate::independence::judge_coverage_in(
+                    &clis,
+                    &registry,
+                    false,
+                    true,
+                    &crate::observed_provider::last_seen,
+                );
                 match prev {
                     Some(v) => std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, v),
                     None => std::env::remove_var(crate::container_floor::SEAT_FLOOR_ENV),

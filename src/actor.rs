@@ -4797,6 +4797,14 @@ pub(crate) fn run(
                     &human_confirm,
                 ));
             }
+            Command::IndependencePreflight { shape, reply } => {
+                let contract = crate::independence::preflight_contract(&store, &registry, &shape)
+                    .map(|c| crate::independence::PreflightContract {
+                        contained: in_process_governance().is_some(),
+                        ..c
+                    });
+                let _ = reply.send(contract);
+            }
             Command::ProposePlan {
                 run_id,
                 plan,
