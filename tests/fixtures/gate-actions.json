@@ -18,6 +18,7 @@
       }
     ],
     "gateKind": "review_adjudication",
+    "gateSeq": 1,
     "ord": 4
   },
   "adj-qe": {
@@ -39,6 +40,7 @@
       }
     ],
     "gateKind": "review_adjudication",
+    "gateSeq": 1,
     "ord": 4
   },
   "adj-rules": {
@@ -77,6 +79,7 @@
       }
     ],
     "gateKind": "review_adjudication",
+    "gateSeq": 1,
     "ord": 4
   },
   "adj-rules-settled": {
@@ -98,6 +101,7 @@
       }
     ],
     "gateKind": "review_adjudication",
+    "gateSeq": 1,
     "ord": 4
   },
   "def": {

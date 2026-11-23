@@ -917,6 +917,33 @@ fn read_seat_facts(path: &Path, id: &str) -> Option<ImageFacts> {
     (facts.id == id).then_some(facts)
 }
 
+/// (core#1805) Set the facts directories above `path` to 0700: its own directory and, when that
+/// sits in `seat-image-facts/`, the `seat-image-facts` root as well (never anything above it). A
+/// recursive `DirBuilder` leaves an existing directory's mode alone, so an install upgraded from a
+/// release before core#1715 keeps the umask's 0755 until this runs; it runs on every facts read
+/// and write, as `k8s::images::archive_dir` re-applies its mode. A missing directory is left alone.
+fn make_facts_dirs_private(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = path.parent();
+        let root = dir
+            .and_then(Path::parent)
+            .filter(|r| r.file_name().is_some_and(|n| n == "seat-image-facts"));
+        for d in [dir, root].into_iter().flatten() {
+            match std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("cannot make {} private: {e}", d.display()));
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     let dir = path.parent().ok_or("seat image facts path has no parent")?;
     // (core#1715) Private like the image exports: every directory this creates is 0700.
@@ -925,6 +952,7 @@ fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir).map_err(|e| e.to_string())?;
+    make_facts_dirs_private(path)?;
     let bytes = serde_json::to_vec(facts).map_err(|e| e.to_string())?;
     // Shared writer creates a unique 0600 file, syncs it, and renames it over the destination.
     crate::acp_runner::write_atomic(dir, path, &bytes).map_err(|e| e.to_string())
@@ -963,6 +991,12 @@ fn inspect_seat_image_cached(
         return Ok(f);
     }
     let facts_path = seat_facts_path(id);
+    // (core#1805) A facts store an earlier release left at 0755 is made private on the read path
+    // too: an upgrade whose images are unchanged reads every fact from its cache and never writes.
+    // A failure here costs nothing the read needs, so it does not refuse the seat.
+    if let Some(path) = facts_path.as_deref() {
+        let _ = make_facts_dirs_private(path);
+    }
     if let Some(facts) = facts_path
         .as_deref()
         .and_then(|path| read_seat_facts(path, id))
@@ -2140,7 +2174,7 @@ pub(crate) fn write_seat_files(
 
 /// A seat armed as a pod: the wrapper (`kubectl exec` into the seat pod), the argv to run after
 /// it, and the tool that runs it (`kubectl`). Its `Debug` names the env's
-/// variables, never their values (a unit key).
+/// variables, never their values (a unit key, a claude seat's pass-through token).
 pub(crate) struct ArmedContainer {
     pub(crate) wrapper: Vec<String>,
     pub(crate) argv: Vec<String>,
@@ -2330,32 +2364,6 @@ fn placeholder_handoff(
     }
     let env = crate::seat_gateway::seat_env_for_sign_in(cli, &sign_in, &key.bearer);
     (key, env, files)
-}
-
-/// The credential a seat is armed with: placeholders only, for every kind (wicked-garden#1365). A
-/// claude OAuth seat's real token (`setup_token`, read from the broker) never enters the seat: the
-/// gateway sends it upstream in place of the placeholder record's bearer. claude scrubs
-/// `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's env, so a seat signed in by that variable left
-/// a nested `claude -p` signed out. The seat-secret guard still learns the token, so every unit's
-/// diff is checked for it. `Err` = the broker holds no token (claude is signed out).
-fn armed_credential(
-    cli: &str,
-    sign_in: impl Into<crate::seat_credentials::SeatSignIn>,
-    run: &str,
-    unit: &str,
-    setup_token: impl FnOnce() -> Result<String, String>,
-) -> Result<SeatCredential, String> {
-    let sign_in = sign_in.into();
-    let oauth = cli == "claude"
-        && sign_in.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
-    let credential = placeholder_handoff(cli, sign_in, run, unit);
-    if oauth {
-        crate::seat_secret_guard::register(
-            crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
-            &setup_token()?,
-        );
-    }
-    Ok(credential)
 }
 
 /// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
@@ -2793,10 +2801,20 @@ pub(crate) fn arm_noting(
                         .subscriptions
                         .contains(&crate::seat_credentials::Subscription::Copilot))
                 .then(|| crate::seat_gateway::copilot_account(dir));
-                let (key, env, files) = armed_credential(cli, kind, run_id, &unit, || {
-                    crate::k8s::gw::claude_seat_token(&gw)
-                })
-                .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                let oauth = cli == "claude"
+                    && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
+                let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+                if oauth {
+                    // core#1024: the operator's own setup-token, passed through; it reaches the pod
+                    // only in the unit env file, over exec stdin (never an argv).
+                    let token = crate::k8s::gw::claude_seat_token(&gw)
+                        .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                    crate::seat_secret_guard::register(
+                        crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+                        &token,
+                    );
+                    env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
+                }
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -3893,6 +3911,17 @@ mod tests {
         let _restore = Restore(prior);
         let (dir, rt, id, log) = archived_seat(vec![image_tar(&[])], false, false);
         crate::k8s::note_engine_home(&dir.0);
+        // core#1805: an install upgraded from a release before core#1715 already has both facts
+        // directories at the umask's 0755; writing facts makes them private (red on main).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let version_dir = dir.0.join("seat-image-facts").join("v1");
+            std::fs::create_dir_all(&version_dir).unwrap();
+            for d in [&version_dir, &dir.0.join("seat-image-facts")] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
         let first = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
         let path = dir
             .0
@@ -3907,7 +3936,7 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            // core#1715: the facts directories are 0700 (red on main: the umask's 0755).
+            // core#1715 / core#1805: the facts directories are 0700, new or pre-existing.
             for d in [
                 path.parent().unwrap(),
                 path.parent().unwrap().parent().unwrap(),
@@ -3919,7 +3948,41 @@ mod tests {
                     d.display()
                 );
             }
+            // core#1805: a cached read repairs a 0755 store as well, with no export and no write
+            // (an upgrade whose images are unchanged never writes a fact). Nothing above the
+            // `seat-image-facts` root changes mode.
+            let home_mode = std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+            for d in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::write(&log, "").unwrap();
+            let cached = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+            assert_eq!(cached, first);
+            assert!(!std::fs::read_to_string(&log).unwrap().contains("save "));
+            for d in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(d).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "cached read: {}",
+                    d.display()
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+                home_mode
+            );
         }
+        #[cfg(unix)]
+        let home_before = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&dir.0).unwrap().permissions().mode()
+        };
         for version in ["v0", ""] {
             let stale_path = dir
                 .0
@@ -3933,6 +3996,16 @@ mod tests {
             assert_eq!(facts, first);
             assert!(std::fs::read_to_string(&log).unwrap().contains("save "));
             assert_eq!(read_seat_facts(&path, &id), Some(first.clone()));
+        }
+        // core#1805: the version-less stale path's directory IS the facts root; the repair never
+        // reaches the engine home above it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir.0).unwrap().permissions().mode(),
+                home_before
+            );
         }
         std::fs::write(&log, "").unwrap();
         let next = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
@@ -5162,69 +5235,21 @@ esac
         }
     }
 
-    /// wicked-garden#1365: the credential a claude OAuth seat is ARMED with (the final step, after
-    /// the handoff) holds no real token in its env or files, while the seat-secret guard still
-    /// learns the broker's token. A signed-out broker refuses the arm, and no other kind asks the
-    /// broker for a claude token.
-    #[test]
-    fn an_armed_claude_oauth_seat_holds_only_placeholders_and_the_guard_learns_the_token() {
-        use crate::seat_credentials::CredentialKind;
-        use crate::seat_secret_guard::injected;
-        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
-        let token = format!("sk-ant-oat01-{}", "R".repeat(40));
-        // The test registry is this thread's own.
-        let before = injected().len();
-        let (key, env, files) = armed_credential(
-            "claude",
-            CredentialKind::ClaudeOauth,
-            "test-run",
-            "test-unit",
-            || Ok(token.clone()),
-        )
-        .unwrap();
-        let armed = format!("{env:?}{files:?}");
-        assert!(!armed.contains(&token), "the token never enters the seat");
-        assert!(!env.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"));
-        let record: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
-        assert_eq!(record["claudeAiOauth"]["accessToken"], key.key.as_str());
-        let registered = injected();
-        assert_eq!(registered.len(), before + 1, "the guard learns the token");
-        assert!(format!("{:?}", registered.last().unwrap()).contains("ClaudeSetupToken"));
-        let signed_out = armed_credential(
-            "claude",
-            CredentialKind::ClaudeOauth,
-            "test-run",
-            "test-unit",
-            || Err("claude is not signed in".into()),
-        );
-        assert!(signed_out.is_err());
-        armed_credential(
-            "codex",
-            CredentialKind::CodexChatgpt,
-            "test-run",
-            "test-unit",
-            || panic!("only a claude OAuth seat reads the broker's claude token"),
-        )
-        .unwrap();
-    }
-
     #[test]
     fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
         use crate::seat_credentials::CredentialKind;
-        // wicked-garden#1365: a claude OAuth seat holds a placeholder record whose access token
-        // is the unit's key (a nested `claude -p` reads the same file), and its unit also rides a
-        // header of its own. No credential is in its env.
+        // core#1024: a claude OAuth seat keeps no record; its unit rides a header of its own and
+        // its Authorization is the operator's own token (added at arming, never here).
         let (key, env, files) = placeholder_handoff(
             "claude",
             CredentialKind::ClaudeOauth,
             "test-run",
             "test-unit",
         );
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, PathBuf::from(".credentials.json"));
-        let record: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
-        assert_eq!(record["claudeAiOauth"]["accessToken"], key.key.as_str());
-        assert_eq!(key.bearer, key.key);
+        assert_eq!(
+            files,
+            vec![(PathBuf::from(".credentials.json"), "{}".to_string())]
+        );
         assert!(env.iter().any(|(k, v)| k == "ANTHROPIC_CUSTOM_HEADERS"
             && v == &format!("{}: {}", crate::seat_gateway::UNIT_HEADER, key.key)));
         assert!(env
@@ -5310,147 +5335,6 @@ esac
         assert!(env
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == &key.key));
-    }
-
-    /// LIVE (`WICKED_CONTAINER_LIVE=1`, wicked-garden#1365): the seat shape a claude OAuth seat is
-    /// armed with signs in a nested `claude -p` that the seat starts from its Bash tool, which is how
-    /// a harness's rule model runs. claude scrubs `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's
-    /// env, so a seat signed in only by that variable left the nested call "Not logged in". This
-    /// test runs the real seat image with no network. A loopback stub stands in for the gateway and
-    /// logs what each request carries. Set `WICKED_SEAT_IMAGE_CLAUDE` to an image that is already
-    /// present so nothing is built.
-    #[cfg(unix)]
-    #[test]
-    fn live_a_claude_oauth_seats_nested_claude_signs_in_with_the_placeholder() {
-        use crate::seat_credentials::CredentialKind;
-        let _env = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        let rt = runtime().expect("a container runtime answers");
-        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
-        let token = format!("sk-ant-oat01-{}", "N".repeat(40));
-        let (key, env, files) = armed_credential(
-            "claude",
-            CredentialKind::ClaudeOauth,
-            "nested-run",
-            "u1",
-            || Ok(token.clone()),
-        )
-        .unwrap();
-        assert!(
-            !format!("{env:?}{files:?}").contains(&token),
-            "the operator's token never enters the seat"
-        );
-        let dir = tmp("nested-claude");
-        std::fs::create_dir_all(dir.join("cfg")).unwrap();
-        for (rel, body) in &files {
-            std::fs::write(dir.join("cfg").join(rel), body).unwrap();
-        }
-        std::fs::write(
-            dir.join("stub.py"),
-            include_str!("../tests/fixtures/gateway/nested_claude_stub.py"),
-        )
-        .unwrap();
-        // The seat's own env, with the gateway's URL pointed at the stub. The config home is
-        // copied in, so the seat's claude may write beside its record.
-        let run = "python3 -I /probe/stub.py 8089 /tmp/requests.jsonl & sleep 1; \
-                   mkdir -p /tmp/cfg && cp -R /probe/cfg/. /tmp/cfg/; \
-                   timeout 60 claude -p PROBE-OUTER --dangerously-skip-permissions \
-                   --output-format stream-json --verbose > /tmp/out.jsonl 2>&1; \
-                   echo '--- out'; cat /tmp/out.jsonl; echo '--- requests'; cat /tmp/requests.jsonl";
-        let mount = format!("type=bind,src={},dst=/probe,readonly", dir.display());
-        let mut argv: Vec<String> = [
-            "run",
-            "--rm",
-            "--pull=never",
-            "--network",
-            "none",
-            "--mount",
-            &mount,
-            "--entrypoint",
-            "sh",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        for (k, v) in &env {
-            let v = if k == "ANTHROPIC_BASE_URL" {
-                "http://127.0.0.1:8089"
-            } else {
-                v.as_str()
-            };
-            argv.extend(["-e".to_string(), format!("{k}={v}")]);
-        }
-        for kv in [
-            "CLAUDE_CONFIG_DIR=/tmp/cfg",
-            "IS_SANDBOX=1",
-            "DISABLE_TELEMETRY=1",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-        ] {
-            argv.extend(["-e".to_string(), kv.to_string()]);
-        }
-        argv.extend([image, "-c".to_string(), run.to_string()]);
-        let mut c = rt.cmd();
-        c.args(&argv);
-        let out = output_within(c, Duration::from_secs(80)).expect("the seat ran");
-        let _ = std::fs::remove_dir_all(&dir);
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
-        let (claude_out, requests) = text
-            .split_once("--- requests")
-            .unwrap_or_else(|| panic!("no request log: {text}"));
-        let tool_result = claude_out
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v["type"] == "user")
-            .flat_map(|v| {
-                v["message"]["content"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .find(|c| c["type"] == "tool_result")
-            .map(|c| c["content"].to_string())
-            .unwrap_or_else(|| panic!("the outer claude never ran its Bash tool: {text}"));
-        assert!(
-            !tool_result.contains("Not logged in"),
-            "the nested claude -p is not signed in: {tool_result}"
-        );
-        assert!(tool_result.contains("INNER-OK"), "{tool_result}");
-        assert!(
-            claude_out.contains("OUTER-DONE"),
-            "the outer turn ends: {claude_out}"
-        );
-        assert!(
-            !requests.contains(&token),
-            "the operator's token never leaves the seat"
-        );
-        let requests: Vec<serde_json::Value> = requests
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .filter(|r: &serde_json::Value| {
-                r["path"].as_str().unwrap_or("").starts_with("/v1/messages")
-            })
-            .collect();
-        // Two outer turns and the nested one, each with the unit's placeholder bearer (which the
-        // gateway replaces) and the unit header, in claude's OAuth mode.
-        assert!(requests.len() >= 3, "{requests:?}");
-        for r in &requests {
-            assert_eq!(r["authorization"], format!("Bearer {}", key.key), "{r}");
-            assert_eq!(r["unit"], key.key.as_str(), "{r}");
-            assert_eq!(r["x-api-key"], "", "{r}");
-            assert!(
-                r["beta"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("oauth-2025-04-20"),
-                "claude stays in OAuth mode: {r}"
-            );
-        }
     }
 
     fn tmp(tag: &str) -> PathBuf {

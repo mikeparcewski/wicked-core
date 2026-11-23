@@ -7492,9 +7492,16 @@ fn apply_step_result(
             }
         }
         put_node(store, unit.to_node())?;
+        // (core#1801) A timed-out PA review of a member's step is the timeout twin of a lost one
+        // (core#1748): the unit's one output record holds the MEMBER's output, which the re-run
+        // review reads and which counts if it is accepted. The review's partial text never
+        // replaces it; its gate re-runs the review on the PA's seat, or stops the run.
+        let pa_review = team_gate::is_review(unit);
         // The partial transcript survives the rejection (usability review #1) — it is what the
         // operator reads to decide between retry, reassign and stop.
-        persist_rejected_transcript(store, &session, unit, &output.output);
+        if !pa_review {
+            persist_rejected_transcript(store, &session, unit, &output.output);
+        }
         emit(
             subscribers,
             CoreEvent::StepFailed {
@@ -7519,13 +7526,24 @@ fn apply_step_result(
                 ord,
             ));
         }
-        let prompt = format!(
-            "{why} Approve to re-dispatch the unit as attempt {} on the same tree (optionally \
-             amend with a narrower instruction, e.g. which checks to skip); reassign it to \
-             another seat first if this one was the slow part; or reject to stop the run — the \
-             worktree is kept either way.",
-            output.attempt + 2
-        );
+        // (core#1801) A PA review is never re-seated (`parked_reseat_refusal`), so its prompt
+        // offers only what its gate takes: approve re-runs the review, reject stops.
+        let prompt = if pa_review {
+            format!(
+                "{why} This was the PA's review of a member's step: approve to run the review \
+                 again on the PA's seat as attempt {}, or reject to stop the run — the worktree \
+                 is kept either way.",
+                output.attempt + 2
+            )
+        } else {
+            format!(
+                "{why} Approve to re-dispatch the unit as attempt {} on the same tree (optionally \
+                 amend with a narrower instruction, e.g. which checks to skip); reassign it to \
+                 another seat first if this one was the slow part; or reject to stop the run — \
+                 the worktree is kept either way.",
+                output.attempt + 2
+            )
+        };
         pause_for_human(
             store,
             subscribers,
@@ -11762,7 +11780,7 @@ fn pause_for_human_keyed(
     // DES-PROJECT-001 §5.3: the prompt is DURABLE STATE, not just an event — the session's
     // AwaitingHuman write and the open interaction_request commit in ONE batch, so a skin that
     // was not connected when this fired (or a daemon restarted after it) still finds the prompt.
-    let request = crate::interaction::open_gate_keyed(
+    let mut request = crate::interaction::open_gate_keyed(
         &session.id,
         ord,
         reviewing_ord,
@@ -11771,6 +11789,9 @@ fn pause_for_human_keyed(
         gate_key,
         crate::interaction::now_millis(),
     );
+    // (core#1808) This opening's number: an answer sent for an earlier opening at the same ord is
+    // refused `gate_changed` ([`confirm_gate_expecting`]).
+    request.gate_seq = crate::interaction::next_gate_seq(&*store, &session.id)?;
     crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
     emit(
         subscribers,
@@ -11803,6 +11824,7 @@ fn pause_for_human_keyed(
                 })
                 .flatten()
                 .map(Box::new),
+            gate_seq: request.gate_seq,
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -16481,6 +16503,10 @@ pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
     run_editor_conformance_with(request_json, &crate::validator::serve_jail)
 }
 
+/// (core#1708) The refused record's reason for an install call the host shut down.
+const SHUTTING_DOWN: &str =
+    "the conformance run was stopped: the engine is shutting down (no install conformance runs now)";
+
 fn run_editor_conformance_with(
     request_json: &str,
     jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
@@ -16497,12 +16523,6 @@ fn run_editor_conformance_with(
     let pack_root = std::path::Path::new(&request.pack_root);
     if !pack_root.is_absolute() {
         return Err("packRoot must be an absolute path to an existing directory".into());
-    }
-    let pack_root = pack_root
-        .canonicalize()
-        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
-    if !pack_root.is_dir() {
-        return Err("packRoot must be an existing directory".into());
     }
     let deadline = match request.timeout_s {
         Some(s) if !(1..=900).contains(&s) => {
@@ -16524,6 +16544,19 @@ fn run_editor_conformance_with(
             None,
         ))
     };
+    // (core#1708) Registered once the request is well-formed and before any host work (the pack's
+    // resolution included), so a host's shutdown (`ec::shut_down_install_harnesses`) reaches the
+    // call wherever it is: the review-time harness is a run's Tool child, stopped by the run's
+    // cancel path, and this call has no run.
+    let Some(call) = ec::InstallCall::begin() else {
+        return refused(SHUTTING_DOWN.into());
+    };
+    let pack_root = pack_root
+        .canonicalize()
+        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
+    if !pack_root.is_dir() {
+        return Err("packRoot must be an existing directory".into());
+    }
     // Match the review step's ladder when the run has no admitted skills generation.
     let garden_root = match crate::skills_snapshot::resolve_ladder() {
         Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
@@ -16562,10 +16595,15 @@ fn run_editor_conformance_with(
         0,
         deadline,
         jail,
-        &|| None,
+        // `shutdown`: nothing else signals the group, so the loop that holds the unreaped leader
+        // kills it at once (`actor_kill_grace`), as for a run's Tool child when its engine stops.
+        &|| call.stopped().then_some(STOP_SHUTDOWN),
         &|_| {},
         &|_| {},
     );
+    if call.stopped() {
+        return refused(SHUTTING_DOWN.into());
+    }
     Ok(result(record, raw))
 }
 
@@ -16577,6 +16615,10 @@ mod editor_install_conformance_tests {
 
     #[test]
     fn invalid_requests_are_errors_before_any_host_work() {
+        // Serialized with the shutdown test, whose flag would refuse a well-formed request first.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
         let file = tmp.path().join("file");
         std::fs::write(&file, "not a directory").unwrap();
@@ -16683,6 +16725,97 @@ mod editor_install_conformance_tests {
                     assert!(response["report"].is_null());
                 }
             }
+        });
+    }
+
+    /// core#1708: a host's shutdown kills an install-time harness's jailed process group and the
+    /// call resolves to a refused record; a later call is refused before any host work. Red on
+    /// main: the install call passed no-op hooks, so nothing reached the group and it ran on to
+    /// its deadline. The "jail" ignores TERM and loops, standing in for a hung browser.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_shutdown_kills_the_install_harness_group() {
+        with_host_inputs(|root| {
+            struct Reopen;
+            impl Drop for Reopen {
+                fn drop(&mut self) {
+                    ec::reopen_install_harnesses_for_test();
+                }
+            }
+            let _reopen = Reopen;
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let marker = root.join("harness-pid");
+            // Bounded on its own (about 30 s): a failing assertion leaves nothing behind for long,
+            // and the test never signals a group id it does not own.
+            let script = format!(
+                "trap '' TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 600 ]; do sleep 0.05; \
+                 i=$((i+1)); done",
+                marker.display()
+            );
+            let jail = move |_: &[&Path], _: u16| crate::validator::SandboxLauncher {
+                wrapper: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.clone(),
+                    "jail".to_string(),
+                ],
+                level: crate::validator::SandboxLevel::Sandboxed,
+            };
+            let request = serde_json::json!({ "packRoot": pack, "timeoutS": 900 }).to_string();
+            let call = std::thread::spawn(move || run_editor_conformance_with(&request, &jail));
+            let started = std::time::Instant::now();
+            let pid: i32 = loop {
+                if let Some(pid) = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(20),
+                    "the harness never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            extern "C" {
+                fn killpg(pgrp: i32, sig: i32) -> i32;
+            }
+            let stopping = std::time::Instant::now();
+            // The call registered before its harness spawned, so it is in flight now.
+            assert_eq!(ec::shut_down_install_harnesses(), 1);
+            assert!(ec::install_harnesses_settled(
+                std::time::Instant::now() + std::time::Duration::from_secs(10)
+            ));
+            let raw = call.join().unwrap().unwrap();
+            assert!(
+                stopping.elapsed() < std::time::Duration::from_secs(5),
+                "the shutdown must end the call within a poll and a kill, not at the deadline"
+            );
+            // The leader is reaped and nothing is left in its group: a killed descendant may stay
+            // a zombie until its new parent reaps it, so the check is a bounded poll.
+            let gone = std::time::Instant::now();
+            while unsafe { killpg(pid, 0) } == 0 {
+                assert!(
+                    gone.elapsed() < std::time::Duration::from_secs(5),
+                    "the harness's process group survived the shutdown"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["outcome"], "refused");
+            assert_eq!(response["record"]["cause"], "engine_refused");
+            assert_eq!(response["record"]["reason"], SHUTTING_DOWN);
+            assert!(response["report"].is_null());
+            // After the shutdown a call is refused before any host work: the jail is never built.
+            let request = serde_json::json!({ "packRoot": pack }).to_string();
+            let never = |_: &[&Path], _: u16| -> crate::validator::SandboxLauncher {
+                panic!("a call after the shutdown must not reach the jail")
+            };
+            let raw = run_editor_conformance_with(&request, &never).unwrap();
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["reason"], SHUTTING_DOWN);
+            assert_eq!(ec::shut_down_install_harnesses(), 0);
         });
     }
 
@@ -19568,6 +19701,27 @@ pub(crate) fn confirm_gate_expecting(
             session.status
         );
     }
+    // (core#1808) An answer that names the opening it was sent for answers only that opening: a
+    // gate that closed and re-opened since (a retry that landed on a new gate at the same ord, a
+    // re-held plan) is another opening, whatever its ord, kind or plan revision.
+    if let Some(want) = expect.and_then(|e| e.gate_seq) {
+        let open = crate::interaction::list_interactions(
+            &*store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )?
+        .into_iter()
+        .find(|r| r.kind == crate::interaction::InteractionKind::Gate)
+        .map(|r| r.gate_seq);
+        if open != Some(want) {
+            anyhow::bail!(
+                "{}: run {run_id}'s open gate is {}, not the one this answer was sent for \
+                 (opening {want}) — read the gate again",
+                crate::workflow::GATE_CHANGED,
+                open.map_or_else(|| "not open".to_string(), |n| format!("opening {n}")),
+            );
+        }
+    }
     // (DES-TEAMING-002 P1) A team fact still in flight, or a `team_transport` pause answered with
     // anything but its three answers, is refused here — before the gate row resolves.
     team_gate::refuse_answer(&session, &decision)?;
@@ -21388,9 +21542,11 @@ pub(crate) fn refuse_before_resolving(
                 .is_some_and(|m| m.reviewing.is_some())
         })
     {
+        // (core#1801) The gate is a lost review's or a timed-out one's: the words cover both.
         anyhow::bail!(
-            "unit {cursor_ord} is the PA's review of a member's step, and the engine lost its \
-             result: approve to run the review again, or reject to stop the run"
+            "unit {cursor_ord} is the PA's review of a member's step, and that review did not \
+             finish (it ran out of time, or the engine lost its result): approve to run the \
+             review again, or reject to stop the run"
         );
     }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
@@ -22291,8 +22447,27 @@ fn judge_by_operator(
         .as_ref()
         .map(|f| f.label.clone())
         .unwrap_or_else(|| crate::assurance::FLOOR_OVERRIDE_LABEL.to_string());
+    let fresh = u.assurance.is_none();
     let mut receipt = u.assurance.clone().unwrap_or_else(|| {
         crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
+    });
+    // (xreview r1, r2 on #1827) Every receipt the judgment saves accounts for the run's required
+    // judge: a step that never reached its gate's receipt (a failed tool the operator overrides at
+    // triage) says why, as its gate would have; a receipt from before core#1799 that never said it
+    // is missing evidence, and says that.
+    receipt.account_required_judge(|| {
+        if fresh {
+            crate::pipeline::judge_not_due(&u, true, None)
+        } else {
+            (
+                crate::assurance::SKIP_ERROR,
+                format!(
+                    "unit {}'s gate receipt does not say whether a judge ran (a record from \
+                     before the engine said so): whether one was due is not known",
+                    u.ord
+                ),
+            )
+        }
     });
     receipt.ran(crate::assurance::OPERATOR_JUDGE);
     // A floor override judges the FLOOR, not the work: the gate's own judge (the seat that ruled,
@@ -23629,6 +23804,108 @@ pub(crate) mod sessions_detail_fold_tests {
             power: None,
             run_context: None,
         }
+    }
+
+    /// core#1799: a gate where no judge was due records `judge` skipped `not_applicable`. On the
+    /// delivery that skip speaks only when no gate ran a judge and none skipped one for another
+    /// reason: a judged build beside a read-only review keeps its label ("independent"), a run no
+    /// judge ever ran on says so, and a real skip (no distinct seat) is never hidden behind it.
+    #[test]
+    fn a_not_due_judge_speaks_on_the_delivery_only_when_no_gate_ran_one() {
+        use crate::assurance as a;
+        let s = session("judge-not-due-1799");
+        let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("judge-not-due-1799:{ord}"),
+                "judge-not-due-1799",
+                ord,
+                "step",
+            );
+            let mut r = a::AssuranceReceipt::for_run(&s.assurance, 0);
+            f(&mut r);
+            u.assurance = Some(r);
+            u
+        };
+        let not_due = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::DISTINCT_EVALUATOR);
+            r.skip(
+                a::JUDGE,
+                a::SKIP_NOT_APPLICABLE,
+                Some("unit 2 is a review that changes no files".into()),
+            )
+        };
+        let judged = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::JUDGE);
+            r.judge = Some("claude".into());
+        };
+        let judge_skips = |d: &a::AssuranceReceipt| {
+            d.skipped
+                .iter()
+                .filter(|k| k.instrument == a::JUDGE)
+                .map(|k| k.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        // The review first, the judged build after it: the judge ran, so no skip.
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due), gate(1, &judged)]);
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
+        // No gate ran a judge: the delivery says so.
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due)]);
+        assert_eq!(judge_skips(&d), [a::SKIP_NOT_APPLICABLE]);
+        // A real skip after a not-due one is the delivery's word, never hidden behind it.
+        let no_seat = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NO_DISTINCT_SEAT, Some("no seat".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due), gate(3, &no_seat)]);
+        assert_eq!(judge_skips(&d), [a::SKIP_NO_DISTINCT_SEAT]);
+        // (xreview r1 on #1827) The run's first step delivers: no gate came before it, and its own
+        // step is scripted, so the delivery says no judge was due.
+        let mut deliver = crate::domain::WorkUnit::pending(
+            "judge-not-due-1799:1",
+            "judge-not-due-1799",
+            1,
+            "deliver",
+        );
+        deliver.tool_cmd = Some(vec!["deliver".into()]);
+        let d = crate::deliver_lift::delivery_receipt(&s, std::slice::from_ref(&deliver));
+        assert_eq!(judge_skips(&d), [a::SKIP_NOT_APPLICABLE]);
+        let why = d.skipped.iter().find(|k| k.instrument == a::JUDGE).unwrap();
+        assert!(
+            why.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("no step finished before this delivery"),
+            "{why:?}"
+        );
+        // (xreview r2) A gate receipt from before core#1799 that never said the judge is missing
+        // evidence, not a judge that was not due: the delivery says it is not known — alone, and
+        // beside a newer gate's not-due skip, which never speaks for the whole run then.
+        let legacy = |r: &mut a::AssuranceReceipt| r.ran(a::DISTINCT_EVALUATOR);
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &legacy), deliver.clone()]);
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[gate(1, &legacy), gate(2, &not_due), deliver.clone()],
+        );
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        // (xreview delta) …and beside a gate that ran a judge, the unknown is still said.
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[
+                gate(1, &legacy),
+                gate(2, &judged),
+                gate(3, &not_due),
+                deliver.clone(),
+            ],
+        );
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        // A step that finished with no receipt at all is not a first-step delivery.
+        let mut finished =
+            crate::domain::WorkUnit::pending("judge-not-due-1799:0", "judge-not-due-1799", 0, "x");
+        finished.status = crate::domain::UnitStatus::Done;
+        let d = crate::deliver_lift::delivery_receipt(&s, &[finished, deliver]);
+        assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored
@@ -33930,6 +34207,76 @@ mod request_changes_tests {
             .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
     }
 
+    /// (xreview r1 on #1827, core#1799) A failed check the operator overrides at triage never
+    /// reached its gate's receipt: the receipt the judgment cuts says why the run's required judge
+    /// was not due there (a scripted step), on the unit and on the delivery — never silently absent.
+    #[test]
+    fn a_triage_tool_override_says_why_the_required_judge_was_not_due() {
+        use crate::assurance as a;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "triage-judge-1799";
+        seed_triage_check(&mut store, run_id);
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        assert!(s.assurance.required.iter().any(|i| i == a::JUDGE));
+        assert!(crate::domain::session_units(&store, run_id).unwrap()[3]
+            .assurance
+            .is_none());
+        let (r, _events) = operator_judgment(
+            &mut store,
+            run_id,
+            "known flaky check; inspected the output",
+        );
+        r.unwrap();
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let receipt = units[3].assurance.as_ref().unwrap();
+        assert!(receipt.ran.iter().any(|i| i == a::OPERATOR_JUDGE));
+        let judge = |r: &a::AssuranceReceipt| {
+            r.skipped
+                .iter()
+                .find(|k| k.instrument == a::JUDGE)
+                .map(|k| (k.reason.clone(), k.detail.clone().unwrap_or_default()))
+        };
+        let (reason, detail) = judge(receipt).expect("the required judge is on the receipt");
+        assert_eq!(reason, a::SKIP_NOT_APPLICABLE);
+        assert!(detail.contains("unit 4 is a scripted step"), "{detail}");
+        let d = crate::deliver_lift::delivery_receipt(&s, &units);
+        assert_eq!(
+            judge(&d).map(|j| j.0).as_deref(),
+            Some(a::SKIP_NOT_APPLICABLE)
+        );
+    }
+
+    /// (xreview r2 on #1827) A judgment saved over a receipt from before core#1799 that never
+    /// said the judge accounts for it too: as not known, never as an exemption.
+    #[test]
+    fn an_operator_judgment_over_a_legacy_receipt_says_the_judge_is_not_known() {
+        use crate::assurance as a;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "triage-legacy-1799";
+        seed_triage_check(&mut store, run_id);
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let mut units = crate::domain::session_units(&store, run_id).unwrap();
+        let mut legacy = a::AssuranceReceipt::for_run(&s.assurance, 7);
+        legacy.ran(a::DISTINCT_EVALUATOR);
+        units[3].assurance = Some(legacy);
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let (r, _events) = operator_judgment(&mut store, run_id, "inspected the output by hand");
+        r.unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let receipt = units[3].assurance.as_ref().unwrap();
+        let k = receipt
+            .skipped
+            .iter()
+            .find(|k| k.instrument == a::JUDGE)
+            .expect("the required judge is on the receipt");
+        assert_eq!(k.reason, a::SKIP_ERROR);
+        assert!(
+            k.detail.as_deref().unwrap_or("").contains("not known"),
+            "{k:?}"
+        );
+    }
+
     /// (core#1318) Rationale, gate, stage and ownership restrictions leave refusals re-answerable.
     #[test]
     fn triage_tool_judgment_refuses_blank_notes_and_non_checks() {
@@ -34060,6 +34407,7 @@ mod request_changes_tests {
             Some(crate::workflow::GateExpect {
                 ord: Some(1),
                 plan_rev: None,
+                gate_seq: None,
             }),
         );
         let why = result.unwrap_err().to_string();
@@ -44836,6 +45184,7 @@ mod plan_gate_confirm_tests {
                     Some(GateExpect {
                         ord: Some(2),
                         plan_rev: Some(1),
+                        gate_seq: None,
                     }),
                     &None,
                     &None,
@@ -44874,6 +45223,7 @@ mod plan_gate_confirm_tests {
                     Some(GateExpect {
                         ord: Some(2),
                         plan_rev: Some(1),
+                        gate_seq: None,
                     }),
                     &None,
                     &None,
@@ -44907,6 +45257,7 @@ mod plan_gate_confirm_tests {
             Some(GateExpect {
                 ord: Some(2),
                 plan_rev: Some(2),
+                gate_seq: None,
             }),
             &None,
             &None,

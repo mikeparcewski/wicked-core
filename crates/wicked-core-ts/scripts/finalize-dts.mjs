@@ -179,6 +179,9 @@ const HAND_AUTHORED = `${BEGIN}
  * are given later in Plugins. With no plan it carries only
  * \`writeTargetsMissing\` (why nothing is listed). Answer with \`action: 'consent:<id>'\`, approve
  * (= the default) or reject.
+ * core#1808 (additive): every awaitingHuman carries \`gateSeq\` (a number): which opening of a gate
+ * this is, one more than any gate of the run opened before. Send it back as \`confirmGate\`'s
+ * \`expectGateSeq\`: an answer for an earlier opening is refused \`gate_changed:\`, even at the same ord.
  * core#762 / core#418 (additive, new events): \`acpTurnSettled\` {session, ord, attempt, cliKey,
  * quietSecs, outputBytes} — the bridge sent no stopReason for quietSecs after the worker's final
  * message with no tool call open, so the ENGINE ended the turn and kept its output as the

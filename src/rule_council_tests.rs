@@ -474,6 +474,216 @@ fn a_dispute_over_a_binary_change_carries_no_nul_and_keeps_the_hunk() {
     );
 }
 
+/// A big change: `src/add.rs` (DIFF), optionally `src/b.rs`, and 200 KB of `gen/big.json`.
+fn big_change(with_b: bool) -> Change {
+    let b = "diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n\
+             -fn b() {}\n+fn b(x: f64) {}\n";
+    let diff = format!(
+        "{DIFF}{}diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n\
+         +++ b/gen/big.json\n@@ -0,0 +1 @@\n{}",
+        if with_b { b } else { "" },
+        "+\"BIG-ROW\"\n".repeat(20 * 1024)
+    );
+    let mut paths = vec!["src/add.rs", "gen/big.json"];
+    if with_b {
+        paths.insert(1, "src/b.rs");
+    }
+    change_of(&diff, &paths)
+}
+
+/// The judge's reading `judge` against the reviewer's `reviewer` (status, cite).
+fn split(
+    judge: (RuleStatus, &str),
+    reviewer: (RuleStatus, &str),
+) -> (RuleVerdict, Vec<RulePosition>) {
+    let row = judged("R1", judge.0, judge.1);
+    let pos = positions_of(
+        &row,
+        "codex",
+        &Answer {
+            status: reviewer.0,
+            cite: reviewer.1.into(),
+        },
+    );
+    (row, pos)
+}
+
+/// (core#1789) A dispute on a change too big for one ballot (a paged change), where the reviewer
+/// claims the break the judge did not find, goes to the council on the files the reviewer named:
+/// their whole diff, every other changed file listed as not shown, and a KEPT vote counted only
+/// when it names a file shown.
+#[test]
+fn core_1789_a_paged_dispute_reaches_a_council_on_the_files_the_reviewer_named() {
+    let r = rule("R1", "add() takes typed numbers");
+    let c = big_change(false);
+    let (row, pos) = split(
+        (
+            RuleStatus::Kept,
+            "part 1 of 3: src/add.rs:1 types both numbers",
+        ),
+        (RuleStatus::Broken, "src/add.rs:1 returns i32 for floats"),
+    );
+    let whole = Evidence::of_change(&row, &c, None);
+    assert!(
+        dispute_request("s", 2, &r, "", &whole, None, &pos).is_none(),
+        "the whole change does not fit a ballot"
+    );
+    let (scoped, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
+    assert_eq!(shown, vec!["src/add.rs".to_string()]);
+    let req = dispute_request("s", 2, &r, "", &scoped, None, &pos).expect("a ballot");
+    assert!(req.evidence.contains(DIFF), "the named file's diff, whole");
+    assert!(
+        !req.evidence.contains("BIG-ROW"),
+        "the other file is not shown"
+    );
+    assert!(req.evidence.contains("THE CHANGE, IN PART"));
+    let listed = req
+        .evidence
+        .split("NOTSHOWN-")
+        .nth(1)
+        .expect("the not-shown list");
+    assert!(listed.contains("gen/big.json"), "{listed}");
+    // A KEPT vote counts only on a file shown: one naming only the file not shown is not counted.
+    let paths: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let bars = VoteBars {
+        paths: &paths,
+        ..bars(false, None)
+    };
+    let v = verdict(&[
+        ("agy", Some(1), "gen/big.json is generated, nothing to type"),
+        ("opencode", Some(1), "src/add.rs:1 types both numbers"),
+        ("copilot", Some(1), "src/add.rs:1 is typed"),
+    ]);
+    let settled = settle(&row, pos.clone(), &v, &bars);
+    let c0 = settled.council.as_ref().unwrap();
+    assert!(!c0.votes[0].counted, "{c0:?}");
+    assert!(c0.votes[1].counted && c0.votes[2].counted, "{c0:?}");
+}
+
+/// (core#1789, codex r1 and r2) No scope, so the dispute holds as before: when the JUDGE claims
+/// the break with no claims the engine checked as it ruled (a row read back from the store; the
+/// cite alone, even with its `part N of M` label and a changed file named `part`, is never read
+/// for them), when its checked claims name a file git does not list, and when any BROKEN line of
+/// the reviewer's names no changed file. Checked claims, and every reviewer line that names a
+/// file, are shown.
+#[test]
+fn core_1789_a_scope_is_drawn_only_on_checked_claims_each_naming_a_file() {
+    let c = big_change(true);
+    let (mut row, pos) = split(
+        (RuleStatus::Broken, "part 2 of 3: src/add.rs:1 untyped"),
+        (RuleStatus::Kept, "src/add.rs:1 typed"),
+    );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    row.claim_files = Some(vec!["src/add.rs".into()]);
+    let (_, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("checked claims");
+    assert_eq!(shown, vec!["src/add.rs".to_string()]);
+    row.claim_files = Some(vec!["src/gone.rs".into()]);
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    let mut with_part = big_change(true);
+    with_part.paths.push(("part".into(), true));
+    let (row, pos) = split(
+        (RuleStatus::Broken, "part 2 of 3: the rows lack validation"),
+        (RuleStatus::Kept, "src/add.rs:1 typed"),
+    );
+    assert!(Evidence::of_named_files(&row, &with_part, None, &pos).is_none());
+    let (row, pos) = split(
+        (RuleStatus::NotApplicable, "part 1 of 3: no API here"),
+        (
+            RuleStatus::Broken,
+            &format!("src/add.rs:1 untyped{CLAIM_SEP}the rows lack validation"),
+        ),
+    );
+    assert!(
+        Evidence::of_named_files(&row, &c, None, &pos).is_none(),
+        "a claim naming no changed file gives no scope"
+    );
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 3: src/add.rs:1 typed"),
+        (
+            RuleStatus::Broken,
+            &format!("src/add.rs:1 untyped{CLAIM_SEP}src/b.rs:1 takes floats"),
+        ),
+    );
+    let (_, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
+    assert_eq!(
+        shown,
+        vec!["src/add.rs".to_string(), "src/b.rs".to_string()]
+    );
+}
+
+/// (core#1789, codex r1 and r2) A rename's section shows both its sides, so a vote naming the new
+/// name counts and neither side is listed as not shown; a header that only ENDS with a changed
+/// path (a new name holding ` b/`) never marks that other file shown.
+#[test]
+fn core_1789_a_scoped_rename_shows_both_sides_and_only_them() {
+    let big = "+\"BIG-ROW\"\n".repeat(20 * 1024);
+    let renamed = format!(
+        "diff --git a/src/old.rs b/src/new.rs\nsimilarity index 90%\nrename from src/old.rs\n\
+         rename to src/new.rs\n@@ -1 +1 @@\n-fn o() {{}}\n+fn o(x: i32) {{}}\n\
+         diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{big}"
+    );
+    let c = change_of(&renamed, &["src/old.rs", "src/new.rs", "gen/big.json"]);
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 2: src/new.rs:1 typed"),
+        (RuleStatus::Broken, "src/old.rs:1 untyped"),
+    );
+    let (ev, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
+    assert_eq!(
+        shown,
+        vec!["src/new.rs".to_string(), "src/old.rs".to_string()]
+    );
+    assert_eq!(ev.not_shown, Some(vec!["gen/big.json".to_string()]));
+    let decoy = format!(
+        "diff --git a/src/old.rs b/decoy b/src/a.rs\nsimilarity index 90%\n\
+         rename from src/old.rs\nrename to decoy b/src/a.rs\n@@ -1 +1 @@\n-fn o() {{}}\n\
+         +fn o(x: i32) {{}}\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+         @@ -1 +1 @@\n-fn a() {{}}\n+fn a(x: i32) {{}}\n\
+         diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{big}"
+    );
+    let c = change_of(
+        &decoy,
+        &["src/old.rs", "decoy b/src/a.rs", "src/a.rs", "gen/big.json"],
+    );
+    // (codex r4) A header holding ` b/` twice cannot be read as one pair: no scope at all.
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    // (codex r4) A plain section followed by a file whose header git quoted: no scope (the
+    // quoted section would otherwise ride along, and its file be called not shown).
+    let after =
+        format!("{DIFF}diff --git \"a/z/big\\\".json\" \"b/z/big\\\".json\"\n@@ -0,0 +1 @@\n{big}");
+    let c = change_of(&after, &["src/add.rs", "z/big\".json"]);
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 2: src/add.rs:1 typed"),
+        (RuleStatus::Broken, "src/add.rs:1 untyped"),
+    );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    // (codex r3) A file whose own header git quoted (a rename to an unusual name) and a decoy
+    // whose name ends in ` b/src/a.rs`: the decoy never stands in for it, so there is no scope.
+    let quoted = format!(
+        "diff --git a/src/a.rs \"b/src/a\\\"new.rs\"\nsimilarity index 90%\n@@ -1 +1 @@\n\
+         -fn a() {{}}\n+fn a(x: i32) {{}}\n\
+         diff --git a/decoy b/src/a.rs b/decoy b/src/a.rs\n--- a/decoy b/src/a.rs\n\
+         +++ b/decoy b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+         diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{big}"
+    );
+    let c = change_of(
+        &quoted,
+        &[
+            "src/a.rs",
+            "src/a\"new.rs",
+            "decoy b/src/a.rs",
+            "gen/big.json",
+        ],
+    );
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 2: decoy b/src/a.rs:1 fine"),
+        (RuleStatus::Broken, "src/a.rs:1 untyped"),
+    );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+}
+
 // ── A.5 reuse ───────────────────────────────────────────────────────────────────────────────────
 
 #[test]

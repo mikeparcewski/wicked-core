@@ -82,6 +82,17 @@ fn margin_of(budget: Duration) -> Duration {
     (budget / 5).clamp(Duration::from_millis(50), Duration::from_secs(30))
 }
 
+/// (core#1822) The most of the final pass's working window kept for its councils.
+pub const COUNCIL_RESERVE: Duration = Duration::from_secs(90);
+
+/// (core#1822) The tail of the working window `work` only councils may spend: the members' final
+/// batches, the hold round and a member's answer to a rejected step stop before it, so a council
+/// convened after them is never left the seconds they did not use. A third of the window, at most
+/// [`COUNCIL_RESERVE`].
+fn council_reserve_of(work: Duration) -> Duration {
+    (work / 3).min(COUNCIL_RESERVE)
+}
+
 fn now_ms() -> i64 {
     crate::interaction::now_millis()
 }
@@ -893,6 +904,7 @@ impl UnitTeam {
             checkpoint_seq: self.last_seq,
             repo: self.ctx.repo.clone(),
             budget,
+            until: None,
             diff_cap: cap,
             step_id: self.ctx.step_id.clone(),
             output: None,
@@ -1126,6 +1138,9 @@ pub struct BatchJob {
     checkpoint_seq: u64,
     repo: Option<Repo>,
     budget: Duration,
+    /// (core#1822, codex r3) A final batch's turn ends by this instant, whatever its preparation
+    /// took: its budget is cut to what is left right before the turn starts.
+    until: Option<Instant>,
     diff_cap: usize,
     step_id: String,
     /// (ASK-K3b, §4.6) `Some` = the OUTPUT target: the step changed no tree (or has none), so
@@ -1183,6 +1198,19 @@ const TITLES_PER_BATCH: usize = 20;
 /// Run one batch: snapshot once and skip when the tree is unchanged; else open the session if
 /// this is its first reviewed batch (members open lazily), prompt the member with the incremental
 /// diff, and put every `FINDING` through parse → bar → confirm → anchor.
+impl BatchJob {
+    /// The turn's budget as it starts: its own, cut to what is left before `until`.
+    fn turn_budget(&self) -> Duration {
+        match self.until {
+            Some(u) => self.budget.min(u.saturating_duration_since(Instant::now())),
+            None => self.budget,
+        }
+    }
+}
+
+/// (core#1822) What a turn with no budget left answers: it is not started.
+const NO_TIME_LEFT: &str = "no time left in the final pass for this turn";
+
 pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
     let done = |opened, outcome| BatchDone {
         key: job.key.clone(),
@@ -1258,10 +1286,20 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
         repo: repo.clone(),
         tree: tree.clone(),
     };
-    let reply = match host.turn(&job.pool_key, &prompt, job.budget, Some(&view)) {
+    let budget = job.turn_budget();
+    if budget.is_zero() {
+        return done(
+            opened,
+            BatchOutcome::TurnFailed {
+                error: NO_TIME_LEFT.into(),
+                timed_out: true,
+            },
+        );
+    }
+    let reply = match host.turn(&job.pool_key, &prompt, budget, Some(&view)) {
         Ok(r) => r,
         Err(error) => {
-            let timed_out = started.elapsed() >= job.budget;
+            let timed_out = started.elapsed() >= budget;
             return done(opened, BatchOutcome::TurnFailed { error, timed_out });
         }
     };
@@ -1381,10 +1419,20 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
             repo: repo.clone(),
             tree: tree.clone(),
         });
-    let reply = match host.turn(&job.pool_key, &prompt, job.budget, view.as_ref()) {
+    let budget = job.turn_budget();
+    if budget.is_zero() {
+        return done(
+            opened,
+            BatchOutcome::TurnFailed {
+                error: NO_TIME_LEFT.into(),
+                timed_out: true,
+            },
+        );
+    }
+    let reply = match host.turn(&job.pool_key, &prompt, budget, view.as_ref()) {
         Ok(r) => r,
         Err(error) => {
-            let timed_out = started.elapsed() >= job.budget;
+            let timed_out = started.elapsed() >= budget;
             return done(opened, BatchOutcome::TurnFailed { error, timed_out });
         }
     };
@@ -2415,11 +2463,29 @@ impl FinalPassJob {
 
 /// Whether the pass still has time, against a wall-clock deadline.
 struct Clock {
+    /// (core#1822) Members' turns (final batches, the hold round, a rejected step's answer) stop
+    /// here; councils run on to `work_until`.
+    review_until: i64,
     work_until: i64,
     publish_until: i64,
 }
 
 impl Clock {
+    fn review_left(&self) -> Duration {
+        Duration::from_millis((self.review_until - now_ms()).max(0) as u64)
+    }
+    /// (core#1822, codex r2) No member turn may start: none would have a budget left once its
+    /// cancel drain is kept.
+    fn review_expired(&self) -> bool {
+        self.turn_budget().is_zero()
+    }
+    /// (core#1822, codex r1) A member turn's budget: what is left of the review window less the
+    /// time a timed-out turn's seat is given to stop, so the whole call ends inside the window.
+    fn turn_budget(&self) -> Duration {
+        // The host's own drain (codex r3): a smaller allowance would let a cut turn run on.
+        self.review_left()
+            .saturating_sub(super::MEMBER_CANCEL_DRAIN)
+    }
     fn left(&self) -> Duration {
         Duration::from_millis((self.work_until - now_ms()).max(0) as u64)
     }
@@ -2434,7 +2500,9 @@ impl Clock {
 /// (core#959, codex r1) What a final-pass vault record may spend: the pass's time left, less a
 /// margin to publish the hold after it — the hold is never late for the gate because of the vault.
 fn vault_budget(clock: &Clock) -> Duration {
-    clock.left().saturating_sub(Duration::from_secs(2))
+    // (core#1822, codex r1) Vault records are written before the councils: they spend the review
+    // window, never the councils' share.
+    clock.review_left().saturating_sub(Duration::from_secs(2))
 }
 
 /// The attempt's rows, from its `step.claimed` on.
@@ -2534,8 +2602,11 @@ fn worker_position(
 /// deadline). Every S fact it publishes goes through the one wrapper.
 pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn Council) {
     let margin = margin_of(job.budget);
+    let work = job.budget.saturating_sub(margin);
+    let review = work.saturating_sub(council_reserve_of(work));
     let clock = Clock {
-        work_until: job.completed_at + (job.budget.saturating_sub(margin)).as_millis() as i64,
+        review_until: job.completed_at + review.as_millis() as i64,
+        work_until: job.completed_at + work.as_millis() as i64,
         publish_until: job.completed_at + job.budget.as_millis() as i64,
     };
     let key = job.key();
@@ -2632,15 +2703,27 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
         };
         if let Some((repo, t_final, answer, jobs)) = prepared {
             for mut b in jobs {
-                if clock.expired() {
+                if clock.review_expired() {
                     timed_out = true;
                     let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
                     u.monitors[b.slot].in_flight = false;
                     u.monitors[b.slot].timed_out = true;
                     continue;
                 }
-                b.budget = b.budget.min(clock.left());
+                b.budget = b.budget.min(clock.turn_budget());
+                b.until = Some(Instant::now() + clock.turn_budget());
                 let done = run_job(&b, host);
+                // (core#1822, codex r1) A final batch the deadline cut is a timed-out pass, even
+                // with nothing after it to notice.
+                if matches!(
+                    done.outcome,
+                    BatchOutcome::TurnFailed {
+                        timed_out: true,
+                        ..
+                    }
+                ) {
+                    timed_out = true;
+                }
                 job.unit
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2761,6 +2844,23 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             let ledger = tev::fold(&rows);
             let deliveries = delivery_outcomes(&rows);
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
+            // (core#1822, codex r1) Each member answers the PA's rejection of its step in the
+            // review window, before any council runs: a council that runs long never costs a
+            // member its answer.
+            let mut rejected: Vec<RejectedStep<'_>> = Vec::new();
+            for r in &ledger.step_reviews {
+                if r.verdict != StepVerdict::Rejected {
+                    continue;
+                }
+                let Some(member) = job.members.get(&r.reviewed_attempt).cloned() else {
+                    continue;
+                };
+                if member == job.pa {
+                    continue;
+                }
+                let answer = member_answer(&u, host, &member, r, &clock, &mut timed_out);
+                rejected.push((r, member, answer));
+            }
             for f in tev::unresolved_highs(&ledger) {
                 // (core#959) A finding awaiting the operator gets no council: none may clear it.
                 if f.dispute.is_some() || tev::awaits_operator(f) {
@@ -2831,17 +2931,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                 );
             }
             // Member steps the PA rejected in this attempt: the member may HOLD (§8.8).
-            for r in &ledger.step_reviews {
-                if r.verdict != StepVerdict::Rejected {
-                    continue;
-                }
-                let Some(member) = job.members.get(&r.reviewed_attempt).cloned() else {
-                    continue;
-                };
-                if member == job.pa {
-                    continue;
-                }
-                let answer = member_answer(&u, host, &member, r, &clock);
+            for (r, member, answer) in rejected {
                 let Some((held, why)) = answer else {
                     continue;
                 };
@@ -3073,7 +3163,7 @@ fn hold_round(
     for (member_id, items) in by_member {
         let slot = u.monitors.iter().position(|m| m.id == member_id);
         let replies = match slot {
-            Some(i) if u.monitors[i].state != SlotState::Failed && !clock.expired() => {
+            Some(i) if u.monitors[i].state != SlotState::Failed && !clock.review_expired() => {
                 let m = u.monitors[i].clone();
                 let mut prompt = String::from(
                     "[wicked-core · team member · hold round]\nThe worker's turn has ended. For \
@@ -3113,23 +3203,44 @@ fn hold_round(
                     true
                 };
                 if opened {
-                    let budget = clock.left().min(super::MONITOR_TURN_BUDGET);
                     // (§8.8) The settled tree the findings are re-confirmed against.
                     let view = if u.repo_view {
                         RepoView::now(u.ctx.repo.as_ref())
                     } else {
                         None
                     };
-                    host.turn(&m.pool_key, &prompt, budget, view.as_ref())
-                        .map(|r| super::parse_hold_lines(&r))
-                        .unwrap_or_default()
+                    // (core#1822, codex r3) The budget is read after the setup, as the turn
+                    // starts: none left is no turn (silence, HOLD) and a timed-out pass.
+                    let budget = clock.turn_budget().min(super::MONITOR_TURN_BUDGET);
+                    let started = Instant::now();
+                    let turn = if budget.is_zero() {
+                        Err(String::new())
+                    } else {
+                        host.turn(&m.pool_key, &prompt, budget, view.as_ref())
+                    };
+                    match turn {
+                        Ok(r) => super::parse_hold_lines(&r),
+                        // (core#1822, codex r2) A hold turn the deadline cut: silence is HOLD,
+                        // and the pass and the member are timed out.
+                        Err(_) => {
+                            if started.elapsed() >= budget {
+                                *timed_out = true;
+                                u.monitors[i].timed_out = true;
+                            }
+                            BTreeMap::new()
+                        }
+                    }
                 } else {
                     BTreeMap::new()
                 }
             }
             _ => {
-                if clock.expired() {
+                if clock.review_expired() {
                     *timed_out = true;
+                    // (codex r3) The member skipped for want of time is timed out too.
+                    if let Some(i) = slot {
+                        u.monitors[i].timed_out = true;
+                    }
                 }
                 BTreeMap::new()
             }
@@ -3321,6 +3432,10 @@ fn convene_one(
     u.publish(&ev);
 }
 
+/// (core#1822) A step the PA rejected, its member, and the member's answer (gathered before any
+/// council runs).
+type RejectedStep<'a> = (&'a super::StepReviewRecord, String, Option<(bool, String)>);
+
 /// The no-verdict reasons, spelled once.
 mod tev_reason {
     use super::super::NoVerdictReason;
@@ -3340,8 +3455,14 @@ fn member_answer(
     member: &str,
     r: &super::StepReviewRecord,
     clock: &Clock,
+    timed_out: &mut bool,
 ) -> Option<(bool, String)> {
-    if clock.expired() || host.admitted(member).is_err() {
+    if host.admitted(member).is_err() {
+        return None;
+    }
+    // (core#1822, codex r3) A member not asked for want of time times the pass out.
+    if clock.review_expired() {
+        *timed_out = true;
         return None;
     }
     let key = u.key();
@@ -3377,12 +3498,17 @@ fn member_answer(
         att = r.reviewed_attempt,
         reason = r.reason
     );
-    let reply = host.turn(
-        &pool_key,
-        &prompt,
-        clock.left().min(Duration::from_secs(240)),
-        view.as_ref(),
-    );
+    // (core#1822, codex r3) The budget is read after the setup, as the turn starts.
+    let budget = clock.turn_budget().min(Duration::from_secs(240));
+    let started = Instant::now();
+    let reply = if budget.is_zero() {
+        Err(String::new())
+    } else {
+        host.turn(&pool_key, &prompt, budget, view.as_ref())
+    };
+    if reply.is_err() && started.elapsed() >= budget {
+        *timed_out = true;
+    }
     host.close(&pool_key);
     super::parse_member_step_answer(&reply.ok()?, &r.step_id)
 }
