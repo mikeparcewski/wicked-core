@@ -1515,6 +1515,17 @@ pub(crate) fn delivery_receipt(
             r.skip(&k.instrument, &k.reason, k.detail);
         }
     }
+    // (xreview r1 on #1827) A delivery no gate came before (the run's first step delivers) has no
+    // gate receipt to speak for it: its own step is scripted, so no judge was due. A run whose
+    // gates cut receipts that never said the judge (a record from before core#1799) stays as it
+    // was: missing evidence is not a judge that was not due.
+    if units.iter().all(|u| u.assurance.is_none()) {
+        r.account_required_judge(|| {
+            "no step reached a gate before this delivery: the delivery is a scripted step, no \
+             seat's work for a judge to review"
+                .to_string()
+        });
+    }
     r.tree = session.verified_tree.clone();
     r
 }

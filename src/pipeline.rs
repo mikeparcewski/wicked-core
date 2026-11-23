@@ -3773,7 +3773,7 @@ struct GateFacts<'a> {
 /// (core#1799) Why the engine's judge was not due at `unit`'s gate, in the words the receipt
 /// carries: the judge reviews a seat's change to the tree (or a report under a cited-findings
 /// rubric), so a gate without one says which of those it lacked.
-fn judge_not_due(
+pub(crate) fn judge_not_due(
     unit: &crate::domain::WorkUnit,
     has_workdir: bool,
     tree_changed: Option<bool>,
@@ -3783,13 +3783,15 @@ fn judge_not_due(
         format!("unit {ord} is a scripted step: no seat's work for a judge to review")
     } else if crate::execute_wrapped::is_engine_internal(unit) {
         format!("unit {ord} is the engine's own step: no seat's work for a judge to review")
-    } else if unit.role == crate::workflow::PhaseRole::Evaluator
-        || crate::worktree_guard::applies_to(unit)
-    {
+    } else if unit.role == crate::workflow::PhaseRole::Evaluator {
         format!(
             "unit {ord} is a review that changes no files: its evaluator's own verdict decides \
              this gate (a judge reviews a changed tree, or a report under a cited-findings rubric)"
         )
+    } else if crate::worktree_guard::applies_to(unit) {
+        // (xreview r1 on #1827) A guarded read-only step that is not a review (recon, gathering)
+        // has no evaluator verdict either: it changes no files, so nothing is for a judge.
+        format!("unit {ord} is a read-only step: it changes no files, so no change for a judge to review")
     } else if !has_workdir {
         format!("unit {ord} ran without a worktree: no change for a judge to review")
     } else if tree_changed == Some(false) {
@@ -3907,10 +3909,7 @@ fn gate_receipt(
         // (core#1799) The run's contract lists the judge, but none was due at this gate (a review
         // that changes no files, a step that changed none, a scripted step): said on the receipt,
         // never a required instrument that silently did not run. Not a hold — nothing wanted one.
-        (None, None) if run.required.iter().any(|i| i == a::JUDGE) => {
-            r.skip(a::JUDGE, a::SKIP_NOT_APPLICABLE, Some(f.judge_not_due))
-        }
-        (None, None) => {}
+        (None, None) => r.account_required_judge(|| f.judge_not_due),
     }
     // (operator ruling 2026-10-14) A fallback judge is labelled on the receipt whatever it came
     // to — a verdict, or an answer without one (codex r1).
@@ -6994,6 +6993,28 @@ mod guarded_read_step_tests {
             taken_at_ms: 0,
             git_dir: None,
         }
+    }
+
+    /// (xreview r1 on #1827) Why a required judge was not due names what the step was: a review's
+    /// own verdict decides its gate; a guarded read-only step that is no review (recon) claims no
+    /// verdict it never had; a scripted step has no seat's work at all.
+    #[test]
+    fn a_not_due_judge_says_what_the_step_was() {
+        let review = unit(3, StageKind::Review, PhaseRole::Evaluator, "codex");
+        let mut recon = unit(2, StageKind::Recon, PhaseRole::Neutral, "codex");
+        recon.worktree_guarded = true;
+        let mut tool = unit(4, StageKind::Test, PhaseRole::Neutral, "codex");
+        tool.tool_cmd = Some(vec!["npm".into(), "test".into()]);
+        let r = super::judge_not_due(&review, true, Some(false));
+        assert!(
+            r.contains("unit 3 is a review") && r.contains("verdict"),
+            "{r}"
+        );
+        let n = super::judge_not_due(&recon, true, Some(false));
+        assert!(n.contains("unit 2 is a read-only step"), "{n}");
+        assert!(!n.contains("verdict") && !n.contains("review that"), "{n}");
+        let t = super::judge_not_due(&tool, true, None);
+        assert!(t.contains("unit 4 is a scripted step"), "{t}");
     }
 
     /// PRODUCT-WORKS J6 (run 9bd0f728): claude built (unit 6), the floor-added `architecture`

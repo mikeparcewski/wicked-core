@@ -22295,9 +22295,16 @@ fn judge_by_operator(
         .as_ref()
         .map(|f| f.label.clone())
         .unwrap_or_else(|| crate::assurance::FLOOR_OVERRIDE_LABEL.to_string());
+    let fresh = u.assurance.is_none();
     let mut receipt = u.assurance.clone().unwrap_or_else(|| {
         crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
     });
+    // (xreview r1 on #1827) A step that never reached its gate's receipt (a failed tool the
+    // operator overrides at triage) says why the run's required judge was not due there, as its
+    // gate would have: the operator judged the failed check, not a seat's work.
+    if fresh {
+        receipt.account_required_judge(|| crate::pipeline::judge_not_due(&u, true, None));
+    }
     receipt.ran(crate::assurance::OPERATOR_JUDGE);
     // A floor override judges the FLOOR, not the work: the gate's own judge (the seat that ruled,
     // when one did) stays its judge. A judge-unavailable judgment stands in for the judge — and so
@@ -23687,6 +23694,30 @@ pub(crate) mod sessions_detail_fold_tests {
         };
         let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &not_due), gate(3, &no_seat)]);
         assert_eq!(judge_skips(&d), [a::SKIP_NO_DISTINCT_SEAT]);
+        // (xreview r1 on #1827) The run's first step delivers: no gate came before it, and its own
+        // step is scripted, so the delivery says no judge was due.
+        let mut deliver = crate::domain::WorkUnit::pending(
+            "judge-not-due-1799:1",
+            "judge-not-due-1799",
+            1,
+            "deliver",
+        );
+        deliver.tool_cmd = Some(vec!["deliver".into()]);
+        let d = crate::deliver_lift::delivery_receipt(&s, std::slice::from_ref(&deliver));
+        assert_eq!(judge_skips(&d), [a::SKIP_NOT_APPLICABLE]);
+        let why = d.skipped.iter().find(|k| k.instrument == a::JUDGE).unwrap();
+        assert!(
+            why.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("no step reached a gate before this delivery"),
+            "{why:?}"
+        );
+        // A gate receipt from before core#1799 that never said the judge is missing evidence, not a
+        // judge that was not due: the delivery leaves it as it was.
+        let legacy = |r: &mut a::AssuranceReceipt| r.ran(a::DISTINCT_EVALUATOR);
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(2, &legacy), deliver]);
+        assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored
@@ -33986,6 +34017,46 @@ mod request_changes_tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
+    }
+
+    /// (xreview r1 on #1827, core#1799) A failed check the operator overrides at triage never
+    /// reached its gate's receipt: the receipt the judgment cuts says why the run's required judge
+    /// was not due there (a scripted step), on the unit and on the delivery — never silently absent.
+    #[test]
+    fn a_triage_tool_override_says_why_the_required_judge_was_not_due() {
+        use crate::assurance as a;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "triage-judge-1799";
+        seed_triage_check(&mut store, run_id);
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        assert!(s.assurance.required.iter().any(|i| i == a::JUDGE));
+        assert!(crate::domain::session_units(&store, run_id).unwrap()[3]
+            .assurance
+            .is_none());
+        let (r, _events) = operator_judgment(
+            &mut store,
+            run_id,
+            "known flaky check; inspected the output",
+        );
+        r.unwrap();
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let receipt = units[3].assurance.as_ref().unwrap();
+        assert!(receipt.ran.iter().any(|i| i == a::OPERATOR_JUDGE));
+        let judge = |r: &a::AssuranceReceipt| {
+            r.skipped
+                .iter()
+                .find(|k| k.instrument == a::JUDGE)
+                .map(|k| (k.reason.clone(), k.detail.clone().unwrap_or_default()))
+        };
+        let (reason, detail) = judge(receipt).expect("the required judge is on the receipt");
+        assert_eq!(reason, a::SKIP_NOT_APPLICABLE);
+        assert!(detail.contains("unit 4 is a scripted step"), "{detail}");
+        let d = crate::deliver_lift::delivery_receipt(&s, &units);
+        assert_eq!(
+            judge(&d).map(|j| j.0).as_deref(),
+            Some(a::SKIP_NOT_APPLICABLE)
+        );
     }
 
     /// (core#1318) Rationale, gate, stage and ownership restrictions leave refusals re-answerable.
