@@ -913,6 +913,14 @@ export declare class Core {
    */
   static runEditorConformance(requestJson: string): Promise<string>
   /**
+   * (core#1708) Stop every `runEditorConformance` call in flight in this process: each resolves
+   * to a refused record, and each jailed harness's process group gets SIGTERM, a bounded wait
+   * (about 500 ms), then SIGKILL. Resolves to JSON `{ "stopped": number }` (the process groups
+   * signalled). A host calls it on its way down: the harness runs in its own process group, so
+   * it would otherwise outlive the host until its deadline.
+   */
+  static stopEditorConformance(): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

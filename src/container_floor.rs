@@ -925,6 +925,14 @@ fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir).map_err(|e| e.to_string())?;
+    // (core#1805) A directory an earlier release created keeps its umask mode through the builder,
+    // so both levels are set private every time, as `k8s::images::archive_dir` does.
+    #[cfg(unix)]
+    for d in [Some(dir), dir.parent()].into_iter().flatten() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot make {} private: {e}", d.display()))?;
+    }
     let bytes = serde_json::to_vec(facts).map_err(|e| e.to_string())?;
     // Shared writer creates a unique 0600 file, syncs it, and renames it over the destination.
     crate::acp_runner::write_atomic(dir, path, &bytes).map_err(|e| e.to_string())
@@ -3877,6 +3885,17 @@ mod tests {
         let _restore = Restore(prior);
         let (dir, rt, id, log) = archived_seat(vec![image_tar(&[])], false, false);
         crate::k8s::note_engine_home(&dir.0);
+        // core#1805: an install upgraded from a release before core#1715 already has both facts
+        // directories at the umask's 0755; writing facts makes them private (red on main).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let version_dir = dir.0.join("seat-image-facts").join("v1");
+            std::fs::create_dir_all(&version_dir).unwrap();
+            for d in [&version_dir, &dir.0.join("seat-image-facts")] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
         let first = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
         let path = dir
             .0
@@ -3891,7 +3910,7 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            // core#1715: the facts directories are 0700 (red on main: the umask's 0755).
+            // core#1715 / core#1805: the facts directories are 0700, new or pre-existing.
             for d in [
                 path.parent().unwrap(),
                 path.parent().unwrap().parent().unwrap(),

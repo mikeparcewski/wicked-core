@@ -16552,6 +16552,9 @@ fn run_editor_conformance_with(
         }
     };
     let cmd: Vec<String> = ec::CONFORMANCE_CMD.iter().map(|a| a.to_string()).collect();
+    // (core#1708) Registered so a host's stop (`ec::stop_install_harnesses`) kills the jailed
+    // group: the review-time harness is a run's Tool child, killed by the run's cancel path.
+    let call = ec::InstallCall::begin();
     let (_, _, _, record, raw) = run_conformance_harness(
         &cmd,
         &pack_root,
@@ -16562,10 +16565,15 @@ fn run_editor_conformance_with(
         0,
         deadline,
         jail,
-        &|| None,
-        &|_| {},
-        &|_| {},
+        // `cancelled`: the stopper drives the group's SIGTERM-then-SIGKILL, so the harness's own
+        // loop gives it that window rather than force-killing first (`actor_kill_grace`).
+        &|| call.stopped().then_some(STOP_CANCELLED),
+        &|pgid| call.spawned(pgid),
+        &|pgid| call.done(pgid),
     );
+    if call.stopped() {
+        return refused("the conformance run was stopped: the engine is shutting down".into());
+    }
     Ok(result(record, raw))
 }
 
@@ -16683,6 +16691,83 @@ mod editor_install_conformance_tests {
                     assert!(response["report"].is_null());
                 }
             }
+        });
+    }
+
+    /// core#1708: a host's stop kills an install-time harness's jailed process group within the
+    /// SIGTERM-then-SIGKILL window, and the call resolves to a refused record. Red on main: the
+    /// install call passed no-op hooks, so nothing could reach the group and it ran on to its
+    /// deadline. The "jail" ignores TERM and sleeps, standing in for a hung conformance browser.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_stop_kills_the_install_harness_group() {
+        with_host_inputs(|root| {
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let marker = root.join("harness-pid");
+            let script = format!(
+                "trap '' TERM; echo $$ > \"{}\"; while : ; do sleep 0.05; done",
+                marker.display()
+            );
+            let jail = move |_: &[&Path], _: u16| crate::validator::SandboxLauncher {
+                wrapper: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.clone(),
+                    "jail".to_string(),
+                ],
+                level: crate::validator::SandboxLevel::Sandboxed,
+            };
+            let request = serde_json::json!({ "packRoot": pack, "timeoutS": 900 }).to_string();
+            let call = std::thread::spawn(move || run_editor_conformance_with(&request, &jail));
+            let started = std::time::Instant::now();
+            let pid: i32 = loop {
+                if let Some(pid) = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(20),
+                    "the harness never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            extern "C" {
+                fn killpg(pgrp: i32, sig: i32) -> i32;
+            }
+            // A failing assertion must not leave the TERM-proof loop behind for the deadline.
+            struct Reap(i32);
+            impl Drop for Reap {
+                fn drop(&mut self) {
+                    unsafe { killpg(self.0, 9) };
+                }
+            }
+            let reap = Reap(pid);
+            let stopping = std::time::Instant::now();
+            assert_eq!(ec::stop_install_harnesses(), 1);
+            let raw = call.join().unwrap().unwrap();
+            assert!(
+                stopping.elapsed() < std::time::Duration::from_secs(5),
+                "the stop must end the call within its kill window, not at the deadline"
+            );
+            // The leader is reaped and nothing is left in its group.
+            assert_eq!(
+                unsafe { killpg(pid, 0) },
+                -1,
+                "the harness's process group survived the stop"
+            );
+            // Gone: never signal its id again (the kernel may hand it out).
+            std::mem::forget(reap);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["record"]["outcome"], "refused");
+            assert_eq!(response["record"]["cause"], "engine_refused");
+            let why = response["record"]["reason"].as_str().unwrap();
+            assert!(why.contains("stopped"), "{why}");
+            assert!(response["report"].is_null());
+            // A stop with nothing in flight signals nothing.
+            assert_eq!(ec::stop_install_harnesses(), 0);
         });
     }
 

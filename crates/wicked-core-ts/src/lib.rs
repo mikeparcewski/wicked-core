@@ -2646,6 +2646,18 @@ impl Core {
         task(move || wicked_core::run_editor_conformance(&request_json).map_err(err))
     }
 
+    /// (core#1708) Stop every `runEditorConformance` call in flight in this process: each resolves
+    /// to a refused record, and each jailed harness's process group gets SIGTERM, a bounded wait
+    /// (about 500 ms), then SIGKILL. Resolves to JSON `{ "stopped": number }` (the process groups
+    /// signalled). A host calls it on its way down: the harness runs in its own process group, so
+    /// it would otherwise outlive the host until its deadline.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn stop_editor_conformance() -> AsyncTask<CoreTask> {
+        task(|| {
+            Ok(serde_json::json!({ "stopped": wicked_core::stop_install_harnesses() }).to_string())
+        })
+    }
+
     /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
     /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
     /// `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

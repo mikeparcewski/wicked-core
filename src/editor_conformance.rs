@@ -627,6 +627,103 @@ pub(crate) fn brief_block(
     head + &body
 }
 
+/// (core#1708) The install-time harnesses in flight in this process (`Core.runEditorConformance`,
+/// crew's install gate), so a stop can kill their jailed process groups. The review-time harness
+/// is a run's Tool child and goes through the run's own cancel path; this is the install call's
+/// counterpart, which has no run. `epoch` moves on every [`stop_install_harnesses`]: a call that
+/// began before the move is stopped.
+struct InstallHarnesses {
+    epoch: u64,
+    next: u64,
+    /// `(call id, process group)` for every spawned harness not yet done.
+    live: Vec<(u64, u32)>,
+}
+
+static INSTALL_HARNESSES: std::sync::Mutex<InstallHarnesses> =
+    std::sync::Mutex::new(InstallHarnesses {
+        epoch: 0,
+        next: 0,
+        live: Vec::new(),
+    });
+
+fn install_harnesses() -> std::sync::MutexGuard<'static, InstallHarnesses> {
+    INSTALL_HARNESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One install-time conformance call's registration (core#1708). Its hooks are the harness's
+/// `stop`, `on_spawn` and `on_done`; dropping it forgets any group it still holds.
+pub(crate) struct InstallCall {
+    id: u64,
+    epoch: u64,
+}
+
+impl InstallCall {
+    pub(crate) fn begin() -> Self {
+        let mut reg = install_harnesses();
+        reg.next += 1;
+        Self {
+            id: reg.next,
+            epoch: reg.epoch,
+        }
+    }
+
+    /// Whether a stop came after this call began.
+    pub(crate) fn stopped(&self) -> bool {
+        install_harnesses().epoch != self.epoch
+    }
+
+    pub(crate) fn spawned(&self, pgid: u32) {
+        install_harnesses().live.push((self.id, pgid));
+    }
+
+    pub(crate) fn done(&self, pgid: u32) {
+        install_harnesses()
+            .live
+            .retain(|&(id, g)| !(id == self.id && g == pgid));
+    }
+}
+
+impl Drop for InstallCall {
+    fn drop(&mut self) {
+        install_harnesses().live.retain(|&(id, _)| id != self.id);
+    }
+}
+
+/// (core#1708) Stop every install-time conformance harness running in this process: each call
+/// in flight ends as a refused record, and each spawned harness's process group gets SIGTERM, a
+/// bounded wait (about 500 ms) and then SIGKILL, the same escalation a run's cancel gives its Tool
+/// children. Returns how many groups were signalled. Blocks for at most that window. A host
+/// shutting down calls it before it exits: the harness runs in its own process group, so it
+/// would otherwise outlive the host until its deadline.
+///
+/// As with the run tool-child registry, a group id is held until the harness's reaped leader is
+/// reported done, so a stop racing that report may signal a group id the kernel has just freed.
+pub fn stop_install_harnesses() -> usize {
+    let groups: Vec<u32> = {
+        let mut reg = install_harnesses();
+        reg.epoch += 1;
+        reg.live.iter().map(|&(_, g)| g).collect()
+    };
+    #[cfg(unix)]
+    {
+        let signalled: Vec<i32> = groups
+            .iter()
+            .filter_map(|&g| crate::validator::signal_pgroup_term(g))
+            .collect();
+        if !signalled.is_empty() {
+            crate::validator::escalate_groups_after_term(&signalled);
+        }
+        signalled.len()
+    }
+    #[cfg(not(unix))]
+    {
+        // No group kill here: the harness's own loop sees the stop and kills its child tree.
+        groups.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

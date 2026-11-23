@@ -628,6 +628,7 @@ pub fn check_run_tree(
 }
 
 pub use actor::run_editor_conformance;
+pub use editor_conformance::stop_install_harnesses;
 
 /// (core#1122) What the repo-checks floor holds on disk — the build cache at
 /// `<worker home>/repo-checks` (by repository, largest first, with its caps) and the floor log
