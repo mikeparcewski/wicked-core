@@ -82,6 +82,17 @@ fn margin_of(budget: Duration) -> Duration {
     (budget / 5).clamp(Duration::from_millis(50), Duration::from_secs(30))
 }
 
+/// (core#1822) The most of the final pass's working window kept for its councils.
+pub const COUNCIL_RESERVE: Duration = Duration::from_secs(90);
+
+/// (core#1822) The tail of the working window `work` only councils may spend: the members' final
+/// batches, the hold round and a member's answer to a rejected step stop before it, so a council
+/// convened after them is never left the seconds they did not use. A third of the window, at most
+/// [`COUNCIL_RESERVE`].
+fn council_reserve_of(work: Duration) -> Duration {
+    (work / 3).min(COUNCIL_RESERVE)
+}
+
 fn now_ms() -> i64 {
     crate::interaction::now_millis()
 }
@@ -2415,11 +2426,20 @@ impl FinalPassJob {
 
 /// Whether the pass still has time, against a wall-clock deadline.
 struct Clock {
+    /// (core#1822) Members' turns (final batches, the hold round, a rejected step's answer) stop
+    /// here; councils run on to `work_until`.
+    review_until: i64,
     work_until: i64,
     publish_until: i64,
 }
 
 impl Clock {
+    fn review_left(&self) -> Duration {
+        Duration::from_millis((self.review_until - now_ms()).max(0) as u64)
+    }
+    fn review_expired(&self) -> bool {
+        now_ms() >= self.review_until
+    }
     fn left(&self) -> Duration {
         Duration::from_millis((self.work_until - now_ms()).max(0) as u64)
     }
@@ -2534,8 +2554,11 @@ fn worker_position(
 /// deadline). Every S fact it publishes goes through the one wrapper.
 pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn Council) {
     let margin = margin_of(job.budget);
+    let work = job.budget.saturating_sub(margin);
     let clock = Clock {
-        work_until: job.completed_at + (job.budget.saturating_sub(margin)).as_millis() as i64,
+        review_until: job.completed_at
+            + work.saturating_sub(council_reserve_of(work)).as_millis() as i64,
+        work_until: job.completed_at + work.as_millis() as i64,
         publish_until: job.completed_at + job.budget.as_millis() as i64,
     };
     let key = job.key();
@@ -2632,14 +2655,14 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
         };
         if let Some((repo, t_final, answer, jobs)) = prepared {
             for mut b in jobs {
-                if clock.expired() {
+                if clock.review_expired() {
                     timed_out = true;
                     let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
                     u.monitors[b.slot].in_flight = false;
                     u.monitors[b.slot].timed_out = true;
                     continue;
                 }
-                b.budget = b.budget.min(clock.left());
+                b.budget = b.budget.min(clock.review_left());
                 let done = run_job(&b, host);
                 job.unit
                     .lock()
@@ -3073,7 +3096,7 @@ fn hold_round(
     for (member_id, items) in by_member {
         let slot = u.monitors.iter().position(|m| m.id == member_id);
         let replies = match slot {
-            Some(i) if u.monitors[i].state != SlotState::Failed && !clock.expired() => {
+            Some(i) if u.monitors[i].state != SlotState::Failed && !clock.review_expired() => {
                 let m = u.monitors[i].clone();
                 let mut prompt = String::from(
                     "[wicked-core · team member · hold round]\nThe worker's turn has ended. For \
@@ -3113,7 +3136,7 @@ fn hold_round(
                     true
                 };
                 if opened {
-                    let budget = clock.left().min(super::MONITOR_TURN_BUDGET);
+                    let budget = clock.review_left().min(super::MONITOR_TURN_BUDGET);
                     // (§8.8) The settled tree the findings are re-confirmed against.
                     let view = if u.repo_view {
                         RepoView::now(u.ctx.repo.as_ref())
@@ -3128,7 +3151,7 @@ fn hold_round(
                 }
             }
             _ => {
-                if clock.expired() {
+                if clock.review_expired() {
                     *timed_out = true;
                 }
                 BTreeMap::new()
@@ -3341,7 +3364,7 @@ fn member_answer(
     r: &super::StepReviewRecord,
     clock: &Clock,
 ) -> Option<(bool, String)> {
-    if clock.expired() || host.admitted(member).is_err() {
+    if clock.review_expired() || host.admitted(member).is_err() {
         return None;
     }
     let key = u.key();
@@ -3380,7 +3403,7 @@ fn member_answer(
     let reply = host.turn(
         &pool_key,
         &prompt,
-        clock.left().min(Duration::from_secs(240)),
+        clock.review_left().min(Duration::from_secs(240)),
         view.as_ref(),
     );
     host.close(&pool_key);
