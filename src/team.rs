@@ -63,6 +63,9 @@ pub const DIFF_CAP: usize = 48 * 1024;
 pub const MONITOR_TURN_BUDGET: Duration = Duration::from_secs(240);
 /// The final pass's wall budget: the gate never waits unboundedly on advice.
 pub const FINAL_PASS_BUDGET: Duration = Duration::from_secs(300);
+/// How long a timed-out member turn's seat is given to stop after it is cancelled (the ACP host);
+/// the final pass counts it inside a member turn's budget (core#1822).
+pub const MEMBER_CANCEL_DRAIN: Duration = Duration::from_secs(10);
 
 const TITLE_CAP: usize = 256;
 const EVIDENCE_CAP: usize = 512;

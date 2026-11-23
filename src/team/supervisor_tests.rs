@@ -98,6 +98,14 @@ pub(crate) struct FakeHost {
     pub closed: Mutex<Vec<String>>,
     /// Every run `close_run` was called with.
     pub closed_runs: Mutex<Vec<String>>,
+    /// (core#1822) A turn whose prompt holds the needle takes this long, honouring its budget as
+    /// the real host does: past the budget it fails after the budget.
+    pub slow: Mutex<Option<(String, Duration)>>,
+    /// (core#1822, codex r3) How long a turn past its budget takes to stop after it, as the ACP
+    /// host's cancel drain does (zero by default).
+    pub drain: Mutex<Duration>,
+    /// The budget each turn was handed, beside its prompt.
+    pub budgets: Mutex<Vec<(String, Duration)>>,
 }
 
 impl FakeHost {
@@ -115,6 +123,9 @@ impl FakeHost {
             views: Mutex::default(),
             closed: Mutex::default(),
             closed_runs: Mutex::default(),
+            slow: Mutex::default(),
+            drain: Mutex::default(),
+            budgets: Mutex::default(),
         }
     }
 
@@ -166,7 +177,7 @@ impl MonitorHost for FakeHost {
         &self,
         pool_key: &str,
         prompt: &str,
-        _budget: Duration,
+        budget: Duration,
         view: Option<&super::RepoView>,
     ) -> Result<String, String> {
         self.views
@@ -179,6 +190,19 @@ impl MonitorHost for FakeHost {
             .push((pool_key.to_string(), prompt.to_string()));
         if !self.open_keys.lock().unwrap().contains(pool_key) {
             return Err(format!("member '{pool_key}' is not open"));
+        }
+        self.budgets
+            .lock()
+            .unwrap()
+            .push((prompt.to_string(), budget));
+        let slow = self.slow.lock().unwrap().clone();
+        if let Some((_, d)) = slow.filter(|(needle, _)| prompt.contains(needle.as_str())) {
+            std::thread::sleep(d.min(budget));
+            if d > budget {
+                std::thread::sleep(*self.drain.lock().unwrap());
+                self.open_keys.lock().unwrap().remove(pool_key);
+                return Err(format!("the turn exceeded its {budget:?} budget"));
+            }
         }
         let r = (self.reply.lock().unwrap())(pool_key, prompt);
         if r.is_err() {
@@ -1933,6 +1957,140 @@ fn t6_d16_j_a_council_past_the_budget_times_out_and_pauses() {
         f.dispute.as_ref().unwrap().reason,
         Some(super::super::NoVerdictReason::Timeout)
     );
+}
+
+/// (core#1822) A member's final batch that runs long never eats the councils' share of the final
+/// pass: the batch stops at the review deadline, and the council convened after it still has time
+/// to rule, so its vote reaches the ledger the gate reads (field: the batch took the window, the
+/// council got the last seconds and its vote landed 10 ms after the gate). (codex r1) The turn's
+/// budget leaves room for the seat's cancel drain inside the review window.
+#[test]
+fn core_1822_a_long_final_batch_leaves_the_council_its_share_of_the_final_pass() {
+    let budget = Duration::from_secs(30);
+    let mut h = Harness::with(
+        "c1822",
+        move |rig| {
+            let mut c = sup_cfg(rig);
+            c.final_pass_budget = budget;
+            c
+        },
+        FakeCouncil::slow(Duration::from_millis(1500)),
+    );
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            Ok("DONE".into())
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    // The tree moves on after the last checkpoint, so the member gets a final batch, and that
+    // batch would run the whole final pass (a turn up to its own budget).
+    h.fx.write("src/other.rs", "fn c() {}\n");
+    *h.host.slow.lock().unwrap() = Some(("final pass".into(), Duration::from_secs(120)));
+    // The cut turn's seat takes the host's whole cancel drain to stop.
+    *h.host.drain.lock().unwrap() = super::super::MEMBER_CANCEL_DRAIN;
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert_eq!(
+        h.host.prompts_matching("final pass").len(),
+        1,
+        "the member got its final batch"
+    );
+    let work = budget - margin_of(budget);
+    let review = work - council_reserve_of(work);
+    let batch = h
+        .host
+        .budgets
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, _)| p.contains("final pass"))
+        .map(|(_, b)| *b)
+        .expect("the final batch's budget");
+    assert!(
+        batch + super::super::MEMBER_CANCEL_DRAIN <= review,
+        "the turn and its cancel drain end inside the review window: {batch:?} of {review:?}"
+    );
+    assert_eq!(
+        h.council.calls.lock().unwrap().len(),
+        1,
+        "the council is convened"
+    );
+    let ruled = h.rows(tev::COUNCIL_RULED);
+    assert_eq!(ruled[0]["verdict"], "yes", "{ruled:#?}");
+    let l = h.folded(3, 1);
+    let d = l.findings[0].dispute.as_ref().unwrap();
+    assert_eq!(d.verdict, Verdict::Yes, "{l:?}");
+    assert!(!d.seats.is_empty(), "the ruling names who sat: {d:?}");
+}
+
+/// (core#1822, codex r1) A final batch the review deadline cut is a timed-out pass even with no
+/// finding, hold round or council after it to notice: the ledger never says `completed`.
+#[test]
+fn core_1822_a_final_batch_cut_by_the_deadline_times_the_pass_out() {
+    let mut h = Harness::with(
+        "c1822-cut",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.final_pass_budget = Duration::from_secs(30);
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    h.host.set_reply(|_, _| Ok("DONE".into()));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    h.fx.write("src/other.rs", "fn c() {}\n");
+    *h.host.slow.lock().unwrap() = Some(("final pass".into(), Duration::from_secs(120)));
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert_eq!(h.host.prompts_matching("final pass").len(), 1);
+    let l = h.folded(3, 1);
+    assert!(l.findings.is_empty(), "{l:?}");
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
+}
+
+/// (core#1822, codex r2) A hold-round turn its budget cut is silence (HOLD) and a timed-out pass,
+/// even when the council after it rules within its share: never `completed`.
+#[test]
+fn core_1822_a_hold_turn_cut_by_its_budget_times_the_pass_out() {
+    let mut h = Harness::with(
+        "c1822-hold",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.final_pass_budget = Duration::from_secs(30);
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, _| Ok(format!("{hit}\nDONE")));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    *h.host.slow.lock().unwrap() = Some(("hold round".into(), Duration::from_secs(120)));
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert_eq!(h.host.prompts_matching("hold round").len(), 1);
+    assert_eq!(h.council.calls.lock().unwrap().len(), 1);
+    let l = h.folded(3, 1);
+    assert_eq!(
+        l.findings[0].dispute.as_ref().unwrap().verdict,
+        Verdict::Yes,
+        "{l:?}"
+    );
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
 }
 
 /// §4.1 / §8.11: a finding whose `finding.raised` the bus refused is spooled, and the final pass
