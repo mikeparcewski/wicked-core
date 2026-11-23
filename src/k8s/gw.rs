@@ -721,6 +721,9 @@ impl RecordSpool {
         cmd.args([
             "logs",
             "-f",
+            // (core#1716) Each line carries the kubelet's stamp, so release can prove the follower
+            // reached the gateway's latest line by its position, not its text.
+            "--timestamps",
             "-c",
             "gateway",
             &pod.pod,
@@ -786,60 +789,73 @@ impl RecordSpool {
         Ok((follower, offset))
     }
 
-    /// (core#1716) Whether every pod of lease `id` whose follower is still live has spooled the
-    /// gateway's latest log line: one bounded `kubectl logs --tail=1` snapshot per such pod, then a
-    /// bounded wait ([`CATCH_UP_WAIT`]) for the line to reach the spool. A record still in flight
-    /// through `kubectl logs -f` at release would otherwise be missing while the lease reads
-    /// complete. A pod whose follower reached EOF has spooled all it will; a failed snapshot or a
-    /// wait that runs out is not proof, so the caller reports the records incomplete. Residual: a
-    /// line identical to an earlier one would pass early (access-log records carry their own
-    /// request fields, so a repeat is not expected).
-    fn caught_up(&self, id: &str) -> bool {
-        let live: Vec<(String, PathBuf)> = {
+    /// (core#1716) The pods (by UID) of lease `id` whose live follower is PROVEN to have spooled the
+    /// gateway's latest log line at release. A record still in flight through `kubectl logs -f`
+    /// would otherwise be missing while the lease reads complete. First one bounded
+    /// `kubectl logs --timestamps --tail=1` snapshot per live pod, then one shared bounded wait
+    /// ([`CATCH_UP_WAIT`], started after the snapshots) for each snapshot line to reach its spool.
+    /// The follower stamps its lines the same way, so the match is the line's own position in the
+    /// stream (the kubelet's nanosecond stamp), never an earlier line with the same text. An empty
+    /// snapshot proves catch-up only for a spool that holds nothing either (a rotated log can leave
+    /// the current file empty while the follower drains the old one). [`Self::records`] treats a
+    /// live follower missing from the set (a failed snapshot, a wait that ran out, or a pod that
+    /// joined the lease meanwhile) as incomplete. Never under the state lock.
+    fn caught_up(&self, id: &str) -> HashSet<String> {
+        let live: Vec<(String, String, PathBuf)> = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             Self::reap(&mut state);
             let Some(lease) = state.leases.get(id) else {
-                return false;
+                return HashSet::new();
             };
             lease
                 .uids
                 .iter()
-                .filter_map(|uid| state.pods.get(uid))
-                .filter(|pod| pod.follower.is_some() && !pod.finished)
-                .map(|pod| (pod.name.clone(), pod.path.clone()))
+                .filter_map(|uid| state.pods.get(uid).map(|pod| (uid, pod)))
+                .filter(|(_, pod)| pod.follower.is_some() && !pod.finished)
+                .map(|(uid, pod)| (uid.clone(), pod.name.clone(), pod.path.clone()))
                 .collect()
         };
-        // Never under the state lock: the snapshot and the wait are bounded but slow.
-        let deadline = Instant::now() + CATCH_UP_WAIT;
-        live.iter().all(|(pod, path)| match self.latest_line(pod) {
-            Ok(None) => true,
-            Ok(Some(line)) => {
-                let held = spool_holds_line(path, line.as_bytes(), deadline);
-                if !held {
+        let snapshots: Vec<(String, String, PathBuf, Option<String>)> = live
+            .into_iter()
+            .filter_map(|(uid, pod, path)| match self.latest_line(&pod) {
+                Ok(line) => Some((uid, pod, path, line)),
+                Err(e) => {
                     eprintln!(
-                        "wicked-core: gateway {pod}'s follower had not reached its latest log line \
-                         in {} s; the launch's records are incomplete (core#1716)",
-                        CATCH_UP_WAIT.as_secs()
+                        "wicked-core: could not read gateway {pod}'s latest log line ({e}); the \
+                         launch's records are incomplete (core#1716)"
                     );
+                    None
                 }
-                held
-            }
-            Err(e) => {
+            })
+            .collect();
+        let deadline = Instant::now() + CATCH_UP_WAIT;
+        let mut proven = HashSet::new();
+        for (uid, pod, path, line) in snapshots {
+            let held = match line {
+                None => std::fs::metadata(&path).is_ok_and(|m| m.len() == 0),
+                Some(line) => spool_holds_line(&path, line.as_bytes(), deadline),
+            };
+            if held {
+                proven.insert(uid);
+            } else {
                 eprintln!(
-                    "wicked-core: could not read gateway {pod}'s latest log line ({e}); the \
-                     launch's records are incomplete (core#1716)"
+                    "wicked-core: gateway {pod}'s follower had not reached its latest log line in \
+                     {} s; the launch's records are incomplete (core#1716)",
+                    CATCH_UP_WAIT.as_secs()
                 );
-                false
             }
-        })
+        }
+        proven
     }
 
-    /// The gateway container's latest log line, `None` when it has logged nothing.
+    /// The gateway container's latest log line as the follower spools it (kubelet-stamped), `None`
+    /// when its current log is empty.
     fn latest_line(&self, pod: &str) -> Result<Option<String>, String> {
         let out = self.gw.kube.call_capped(
             Some(&self.gw.ns),
             &[
                 "logs",
+                "--timestamps",
                 "-c",
                 "gateway",
                 pod,
@@ -861,7 +877,7 @@ impl RecordSpool {
     }
 
     fn records(&self, id: &str, unit: &str) -> (Vec<GatewayRecord>, bool) {
-        let caught_up = self.caught_up(id);
+        let proven = self.caught_up(id);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         Self::reap(&mut state);
         let watching = state
@@ -871,7 +887,7 @@ impl RecordSpool {
         let Some(lease) = state.leases.get(id) else {
             return (Vec::new(), false);
         };
-        let mut complete = lease.complete && state.covered && watching && caught_up;
+        let mut complete = lease.complete && state.covered && watching;
         let mut records = Vec::new();
         for uid in &lease.uids {
             let Some(pod) = state.pods.get(uid) else {
@@ -879,12 +895,18 @@ impl RecordSpool {
                 continue;
             };
             complete &= !pod.failed && (!pod.gone || pod.finished);
+            // (core#1716) A live follower must have been proven caught up; one that joined the
+            // lease while the proof ran never was.
+            complete &= pod.follower.is_none() || pod.finished || proven.contains(uid);
             match std::fs::read_to_string(&pod.path) {
                 Ok(log) => {
                     // An empty, still-pending stream has not demonstrated attachment yet.
                     complete &= (log.len() as u64 > pod.attached_after || pod.finished)
                         && (log.is_empty() || log.ends_with('\n'));
-                    records.extend(crate::seat_gateway::parse_records(&log, unit));
+                    records.extend(crate::seat_gateway::parse_records(
+                        &strip_log_stamps(&log),
+                        unit,
+                    ));
                     complete &= !pod
                         .follower
                         .as_ref()
@@ -929,6 +951,25 @@ fn spool_holds_line(path: &Path, line: &[u8], deadline: Instant) -> bool {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// (core#1716) The spool's lines without the kubelet stamp the follower adds
+/// (`<RFC3339 stamp> <line>`): the access-log records start at `{`. A line with no stamp is kept.
+fn strip_log_stamps(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    for line in log.split_inclusive('\n') {
+        let stamped = line
+            .split_once(' ')
+            .filter(|(stamp, _)| {
+                stamp.len() >= 20
+                    && stamp.as_bytes()[0].is_ascii_digit()
+                    && stamp.ends_with('Z')
+                    && stamp.contains('T')
+            })
+            .map(|(_, rest)| rest);
+        out.push_str(stamped.unwrap_or(line));
+    }
+    out
 }
 
 /// Percent-encode an opaque resourceVersion or label selector as one query component.
@@ -2040,17 +2081,23 @@ case "$1:$2" in
         printf '{"type":"ERROR"}\n'
         wait;;
     logs:*)
-        # core#1716: the release snapshot (no -f) answers the gateway's latest line and exits.
-        case " $* " in *' -f '*) ;; *)
-            if [ -f latest ]; then cat latest; else tail -n 1 record; fi
-            exit 0;;
-        esac
+        # The gateway's own log (core#1716): `record`, then every `burst`, whatever the
+        # follower has streamed. The release snapshot (no -f) answers its latest line.
+        [ -f gateway.log ] || cp record gateway.log
+        case " $* " in *' -f '*) ;; *) tail -n 1 gateway.log; exit 0;; esac
         echo "$$" >> followers
         sleep 300 &
         echo "$!" > follower-descendant
-        cat record
+        # A fresh follower replays the gateway's log from its start: `record` as it is now.
+        cp record gateway.log
+        sent=0
         while :; do
-            if [ -f burst ]; then cat burst; rm burst; fi
+            if [ -f burst ]; then cat burst >> gateway.log; rm burst; fi
+            # `hold`: the follower lags the gateway (a record in flight through logs -f).
+            if [ ! -f hold ]; then
+                size=$(wc -c < gateway.log)
+                if [ "$size" -gt "$sent" ]; then tail -c +$((sent + 1)) gateway.log; sent=$size; fi
+            fi
             sleep 0.02
         done;;
 esac
@@ -2308,8 +2355,16 @@ esac
             std::fs::write(&tmp, body).unwrap();
             std::fs::rename(tmp, dir.path().join(name)).unwrap();
         };
-        // The gateway logged the launch's record; the follower has not streamed it.
-        emit("latest", &late("launch@late"));
+        let gateway_holds = |unit: &str| {
+            wait_until("the gateway did not log the record", || {
+                std::fs::read_to_string(dir.path().join("gateway.log"))
+                    .is_ok_and(|l| l.contains(unit))
+            });
+        };
+        // The gateway logs the launch's record; the follower lags it.
+        std::fs::write(dir.path().join("hold"), b"").unwrap();
+        emit("burst", &late("launch@late"));
+        gateway_holds("launch@late");
         let started = Instant::now();
         let (records, complete) = gw.records("0", "launch@late", Some(&arm));
         assert!(records.is_empty());
@@ -2319,52 +2374,100 @@ esac
             "release waited for the follower first"
         );
         // The follower catches up: the record is there, and the records are complete.
-        emit("burst", &late("launch@late"));
+        std::fs::remove_file(dir.path().join("hold")).unwrap();
         wait_until("the follower did not catch up", || {
             gw.records("0", "launch@late", Some(&arm)).1
         });
         assert_eq!(gw.records("0", "launch@late", Some(&arm)).0.len(), 1);
         // A follower that catches up DURING the bounded wait completes the same read.
-        emit("latest", &late("launch@soon"));
-        let flush = {
-            let dir = dir.path().to_path_buf();
-            let body = late("launch@soon");
+        std::fs::write(dir.path().join("hold"), b"").unwrap();
+        emit("burst", &late("launch@soon"));
+        gateway_holds("launch@soon");
+        let release = {
+            let hold = dir.path().join("hold");
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(300));
-                std::fs::write(dir.join("burst.tmp"), body).unwrap();
-                std::fs::rename(dir.join("burst.tmp"), dir.join("burst")).unwrap();
+                std::fs::remove_file(hold).unwrap();
             })
         };
         let (records, complete) = gw.records("0", "launch@soon", Some(&arm));
-        flush.join().unwrap();
+        release.join().unwrap();
         assert_eq!(records.len(), 1);
         assert!(complete);
     }
 
-    /// core#1716: the catch-up check matches whole lines only, reads what was appended, and gives
-    /// up at its deadline.
+    /// core#1716 (codex r1 on #1819): the follower's lines are kubelet-stamped, so a snapshot of
+    /// the gateway's latest line matches its own position in the stream. For gateway output
+    /// `A, B, A`, a spool holding only the first `A` is not caught up. The stamps are stripped
+    /// before the records are parsed.
+    #[test]
+    fn a_stamped_snapshot_matches_its_own_position_and_records_parse_unstamped() {
+        let a = r#"{"scope":"request","wicked_unit":"u","wicked_run":"r","http.status":200}"#;
+        let b = r#"{"scope":"request","wicked_unit":"u","wicked_run":"r","http.status":500}"#;
+        let first = format!("2026-11-23T00:00:01.000000001Z {a}");
+        let last = format!("2026-11-23T00:00:03.000000003Z {a}");
+        let dir = std::env::temp_dir().join(format!("wc-1716-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spool.log");
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        assert!(!spool_holds_line(&path, last.as_bytes(), Instant::now()));
+        std::fs::write(
+            &path,
+            format!("{first}\n2026-11-23T00:00:02.000000002Z {b}\n{last}\n"),
+        )
+        .unwrap();
+        assert!(spool_holds_line(&path, last.as_bytes(), Instant::now()));
+        let log = std::fs::read_to_string(&path).unwrap();
+        let parsed = crate::seat_gateway::parse_records(&strip_log_stamps(&log), "u");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(strip_log_stamps("{\"x\":1}\nplain\n"), "{\"x\":1}\nplain\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#1716 (codex r1 on #1819): the catch-up check assembles a line appended in fragments
+    /// across polls, matches whole lines only, and gives up at a future deadline.
     #[cfg(unix)]
     #[test]
-    fn spool_holds_line_matches_whole_lines_until_the_deadline() {
+    fn spool_holds_line_waits_for_a_line_appended_in_fragments() {
+        use std::io::Write as _;
         let dir = TestDir::new();
         let path = dir.path().join("spool.log");
-        std::fs::write(&path, "alpha\nbeta-long\npartial").unwrap();
+        std::fs::write(&path, "alpha\nbeta-long\npar").unwrap();
         let now = Instant::now;
         assert!(spool_holds_line(&path, b"alpha", now()));
-        assert!(spool_holds_line(&path, b"beta-long", now()));
         assert!(
             !spool_holds_line(&path, b"beta", now()),
             "a prefix is not the line"
-        );
-        assert!(
-            !spool_holds_line(&path, b"partial", now()),
-            "an unterminated line is in flight"
         );
         assert!(!spool_holds_line(
             &dir.path().join("none.log"),
             b"alpha",
             now()
         ));
+        let started = now();
+        assert!(!spool_holds_line(
+            &path,
+            b"partial",
+            now() + Duration::from_millis(200)
+        ));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200) && waited < Duration::from_secs(2));
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                f.write_all(b"ti").unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                f.write_all(b"al\n").unwrap();
+            })
+        };
+        assert!(spool_holds_line(
+            &path,
+            b"partial",
+            now() + Duration::from_secs(2)
+        ));
+        writer.join().unwrap();
     }
 
     #[cfg(unix)]
@@ -2398,11 +2501,16 @@ get)
     esac; fi;;
 logs)
     case " $* " in *' pod-1 '*) pod=1;; *) pod=2;; esac
-    case " $* " in *' -f '*) ;; *) tail -n 1 "record-$pod"; exit 0;; esac
+    # Each pod's own log (core#1716): its record, then every `more`; the snapshot is its tail.
+    log="gateway-$pod.log"
+    [ -f "$log" ] || cp "record-$pod" "$log"
+    case " $* " in *' -f '*) ;; *) tail -n 1 "$log"; exit 0;; esac
     printf '%s\n' "$pod" >> followers
-    case " $* " in *' --tail=0 '*) :;; *) cat "record-$pod";; esac
+    case " $* " in *' --tail=0 '*) sent=$(wc -c < "$log");; *) sent=0;; esac
     while [ ! -f "end-$pod" ]; do
-        if [ -f "more-$pod" ]; then cat "more-$pod"; rm "more-$pod"; fi
+        if [ -f "more-$pod" ]; then cat "more-$pod" >> "$log"; rm "more-$pod"; fi
+        size=$(wc -c < "$log")
+        if [ "$size" -gt "$sent" ]; then tail -c +$((sent + 1)) "$log"; sent=$size; fi
         sleep 0.02
     done;;
 esac
