@@ -839,6 +839,14 @@ pub(crate) fn independence_preflight_in(
     })
 }
 
+/// What one work seat reaches: the providers it was seen calling (`seen`), else its CLI as its
+/// own provider (`reached`).
+struct Reach<'a> {
+    seat: &'a str,
+    seen: Option<Vec<String>>,
+    reached: Vec<String>,
+}
+
 /// (core#1721) How many independent providers the signed-in work seats reach, which of them were
 /// seen calling one provider, and who could add one.
 fn diversity(
@@ -849,29 +857,33 @@ fn diversity(
 ) -> Diversity {
     let identity = crate::validator::seat_identity;
     // What each seat reaches: the providers it was seen calling, else its CLI (never observed).
-    let reach: Vec<(&str, Option<Vec<String>>, Vec<String>)> = workers
+    let reach: Vec<Reach<'_>> = workers
         .iter()
         .map(|c| {
             let seen = (host.seen)(&c.key).filter(|p| !p.is_empty());
             let reached = seen
                 .clone()
                 .unwrap_or_else(|| vec![format!("cli:{}", identity(c))]);
-            (c.key.as_str(), seen, reached)
+            Reach {
+                seat: c.key.as_str(),
+                seen,
+                reached,
+            }
         })
         .collect();
     // Independent providers: seats picked in roster order, each sharing nothing with one picked
     // before it, so overlap never counts twice (`{X,Y}` and `{X,Y}` are one, not two).
     let mut taken: Vec<&String> = Vec::new();
     let mut independent = 0;
-    for (_, _, reached) in &reach {
-        if !reached.iter().any(|p| taken.contains(&p)) {
+    for r in &reach {
+        if !r.reached.iter().any(|p| taken.contains(&p)) {
             independent += 1;
-            taken.extend(reached);
+            taken.extend(&r.reached);
         }
     }
     // Sharing: only what was observed, per provider, in roster order.
     let mut observed: Vec<&String> = Vec::new();
-    for p in reach.iter().filter_map(|(_, s, _)| s.as_ref()).flatten() {
+    for p in reach.iter().filter_map(|r| r.seen.as_ref()).flatten() {
         if !observed.contains(&p) {
             observed.push(p);
         }
@@ -881,8 +893,8 @@ fn diversity(
         .filter_map(|p| {
             let seats: Vec<String> = reach
                 .iter()
-                .filter(|(_, s, _)| s.as_ref().is_some_and(|s| s.contains(p)))
-                .map(|(k, _, _)| k.to_string())
+                .filter(|r| r.seen.as_ref().is_some_and(|s| s.contains(p)))
+                .map(|r| r.seat.to_string())
                 .collect();
             (seats.len() > 1).then(|| ProviderSharing {
                 seats,
