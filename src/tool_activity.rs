@@ -714,7 +714,7 @@ pub fn refusals_of(output: &str, script: &str) -> Vec<SeatRefusal> {
             };
             named.trim_matches(quote).to_string()
         };
-        if path.trim().is_empty() || (changes_dir && !Path::new(&path).is_absolute()) {
+        if path.trim().is_empty() || (changes_dir && !seat_absolute(&path)) {
             continue;
         }
         let r = SeatRefusal { path, why };
@@ -972,26 +972,34 @@ impl ToolActivitySink {
     }
 }
 
+/// (core#1674) Whether a seat's path is absolute. Seats print POSIX paths (a codex seat runs in a
+/// Linux container) whatever the host, so `/work/a` is absolute on a Windows host too.
+fn seat_absolute(path: &str) -> bool {
+    path.starts_with('/') || Path::new(path).is_absolute()
+}
+
 /// (core#1674) `path` (as a seat named it: relative to its work tree, or absolute) as the tree's
 /// own relative path (`..` resolved by its words), when it is under `root` and not in its `.git`;
-/// `None` otherwise.
+/// `None` otherwise. Read as `/`-separated words, as the seat printed it.
 fn in_tree(root: &Path, path: &str) -> Option<String> {
-    let p = Path::new(path);
-    let rel = if p.is_absolute() {
-        p.strip_prefix(root).ok()?
+    let path = path.replace('\\', "/");
+    let rel = if seat_absolute(&path) {
+        let root = root.to_string_lossy().replace('\\', "/");
+        path.strip_prefix(root.trim_end_matches('/'))?
+            .strip_prefix('/')?
+            .to_string()
     } else {
-        p
+        path
     };
     let mut parts: Vec<&str> = Vec::new();
-    for c in rel.components() {
-        match c {
-            std::path::Component::Normal(n) => parts.push(n.to_str()?),
-            std::path::Component::CurDir => {}
+    for w in rel.split('/') {
+        match w {
+            "" | "." => {}
             // `src/../src/a.rs` is `src/a.rs`; a `..` above the tree leaves it.
-            std::path::Component::ParentDir => {
+            ".." => {
                 parts.pop()?;
             }
-            _ => return None,
+            w => parts.push(w),
         }
     }
     if parts.is_empty() || parts.contains(&".git") {
