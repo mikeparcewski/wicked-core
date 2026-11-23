@@ -435,7 +435,10 @@ pub struct RunAssurance {
     /// exists. Durable: the fold and the receipts read a stand-in only from here.
     #[serde(default, rename = "standIns", skip_serializing_if = "Vec::is_empty")]
     pub stand_ins: Vec<crate::standin::StandInBinding>,
-    /// (§5.1) The run's canonical role records; `None` on a run recorded before stand-ins.
+    /// (§5.1) Whether the run's receipts are canonical: `Some` (empty) from a stand-in-aware launch,
+    /// `None` on every other run and every run recorded before stand-ins. The records themselves
+    /// live on each gate receipt and on the delivery receipt (their keyed union); this field holds
+    /// none (codex r1 B19: a second copy here would be a second writer to keep in step).
     #[serde(default, rename = "roles", skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<RoleRecord>>,
     /// (§3.7) The run's stand-in label: the first reason, and "and later: …" once.
