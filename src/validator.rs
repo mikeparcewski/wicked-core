@@ -6710,11 +6710,14 @@ mod tests {
     #[test]
     fn a_validators_backgrounded_writer_ends_with_its_verdict_1810() {
         let dir = crate::repo_checks::PrivateTmp::create().unwrap();
-        // Both loops are bounded (about 10 s), so a failing run leaves nothing behind for long.
+        // Both loops are bounded, so a failing run leaves nothing behind for long.
+        // A loop that runs out (about 10 s) says so (`expired`, or the leader's exit 3), so a
+        // stalled run fails instead of passing vacuously.
         let script = "(: > ready; i=0; while [ ! -e go ] && [ $i -lt 500 ]; do sleep 0.02; \
-                      i=$((i+1)); done; [ -e go ] && : > late) >/dev/null 2>&1 </dev/null & \
+                      i=$((i+1)); done; if [ -e go ]; then : > late; else : > expired; fi) \
+                      >/dev/null 2>&1 </dev/null & \
                       i=0; while [ ! -e ready ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; \
-                      exit 0";
+                      [ -e ready ] || exit 3; exit 0";
         let mut launches: Vec<(&str, Command)> = Vec::new();
         // spawn-audit: test-only — process-tree fixture, on the same minimal env as the validator.
         let mut plain = Command::new("sh");
@@ -6732,7 +6735,7 @@ mod tests {
             eprintln!("core#1810: sandbox-exec cannot arm here; the jailed launch is skipped");
         }
         for (name, mut cmd) in launches {
-            for f in ["ready", "go", "late"] {
+            for f in ["ready", "go", "late", "expired"] {
                 let _ = std::fs::remove_file(dir.path().join(f));
             }
             cmd.current_dir(dir.path());
@@ -6752,6 +6755,10 @@ mod tests {
             assert!(
                 !dir.path().join("late").exists(),
                 "{name}: a descendant the validator backgrounded wrote after its verdict"
+            );
+            assert!(
+                !dir.path().join("expired").exists(),
+                "{name}: the fixture stalled past its bound, so this run proves nothing"
             );
         }
     }
