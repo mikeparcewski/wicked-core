@@ -145,6 +145,24 @@ export interface LaunchOptions {
    */
   reducedAssurance?: boolean
   /**
+   * (DES-STANDIN-001 §3.8, §8) The launcher implements the stand-in choice. Omit (or `false`)
+   * and the run behaves exactly as before, reduced assurance included; `true` with
+   * `reducedAssurance` REJECTS the launch.
+   */
+  standInAware?: boolean
+  /**
+   * (DES-STANDIN-001 §3.8) Seats that authored the work under review: never seated for real in
+   * an independent role, still on the roster so a stand-in can be based on them. Only with
+   * `standInAware`.
+   */
+  parties?: Array<string>
+  /**
+   * (DES-STANDIN-001 §3.8) A human's consent to stand-ins, as JSON:
+   * `{"scope":"job"|"always","by":"<actor>","at":<ms>,"via":"launch"|…}`. `by`/`at` are the
+   * launcher server's, never a request body's. Only with `standInAware`.
+   */
+  standInJson?: string
+  /**
    * (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
    * step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
    * session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.

@@ -122,6 +122,7 @@ impl RunSpec {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),

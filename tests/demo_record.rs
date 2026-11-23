@@ -254,6 +254,7 @@ fn run_with(name: &str, mode: &str, plant: bool, gated: bool) -> Run {
         evidence_root: Some(root.to_string_lossy().into_owned()),
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

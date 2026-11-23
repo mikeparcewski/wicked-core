@@ -423,44 +423,9 @@ pub struct StandInFrom {
     pub models: Vec<Option<String>>,
 }
 
-/// Why a job is short, as data (DES §3.7): never parsed from the words.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ShortReason {
-    OnlyOneHelper {
-        cli: String,
-    },
-    AllParties {
-        seats: Vec<String>,
-    },
-    HelpersShort {
-        signed_in: usize,
-        need: usize,
-        have: usize,
-    },
-}
-
-impl ShortReason {
-    /// The reason in a person's words (display names from the roster).
-    pub fn words(&self) -> String {
-        match self {
-            ShortReason::OnlyOneHelper { cli } => format!("only {cli} was signed in"),
-            ShortReason::AllParties { seats } => format!(
-                "every signed-in helper ({}) built or reviewed this work",
-                seats.join(", ")
-            ),
-            ShortReason::HelpersShort {
-                signed_in,
-                need,
-                have,
-            } => format!(
-                "{signed_in} helper{} signed in: {have} can check this job independently and it \
-                 needs {need}",
-                if *signed_in == 1 { " is" } else { "s are" }
-            ),
-        }
-    }
-}
+/// Why a job is short, as data (DES §3.7): never parsed from the words. The stand-in reason
+/// ([`crate::standin::Reason`]); a preflight produces only its first three kinds.
+pub type ShortReason = crate::standin::Reason;
 
 /// (core#1721) Provider diversity among the signed-in work seats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

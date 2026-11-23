@@ -445,6 +445,7 @@ fn spec(run_id: &str, workflow: &str, repo: &str, clis: &[&str]) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

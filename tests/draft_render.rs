@@ -303,6 +303,7 @@ fn run(name: &str, texts: &[&str]) -> Run {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: vec![draft.to_string_lossy().into_owned()],

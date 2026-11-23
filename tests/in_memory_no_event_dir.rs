@@ -35,6 +35,7 @@ fn an_in_memory_core_creates_no_event_log_directory() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

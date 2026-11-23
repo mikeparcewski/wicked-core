@@ -1499,6 +1499,7 @@ pub(crate) fn run(
                     power: _,
                     // …and no orchestrator to hear a voice (core#1216).
                     voice: _,
+                    stand_in,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1528,6 +1529,14 @@ pub(crate) fn run(
                     )),
                     // (core#850) The reduced-assurance opt-in is recorded on the governed
                     // dispatch's session: refused here rather than silently dropped.
+                    // (DES-STANDIN-001 §3.8) Stand-in facts live on the run's contract, which
+                    // only the governed dispatch records: refused here, never dropped.
+                    Ok(None) if stand_in != crate::standin::LaunchStandIn::default() => {
+                        Err(anyhow::anyhow!(
+                            "a standInAware launch must use launch_run: the straight-through \
+                             path does not record the run's assurance contract"
+                        ))
+                    }
                     Ok(None) if reduced_assurance => Err(anyhow::anyhow!(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
@@ -1655,6 +1664,12 @@ pub(crate) fn run(
                     // (core#1216) The orchestrator's voice block: bounded, refused with NO
                     // session persisted.
                     crate::power::validate_voice(spec.voice.as_deref())?;
+                    // (DES-STANDIN-001 §3.8, rev 3 N4) Stand-in facts that cannot hold together
+                    // (aware + reduced, consent on an unaware launch, a malformed consent) are
+                    // refused with NO session persisted.
+                    spec.stand_in
+                        .validate(spec.reduced_assurance)
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     // core#411 / wicked-crew#497: the state-home INTAKE fence. An entry under the
                     // handed snapshot's state home that the registry cannot classify would refuse
                     // EVERY worker launch of this run — surfaced, until now, at the first worker
@@ -1928,19 +1943,25 @@ pub(crate) fn run(
                         // (QE acceptance) The operator's explicit skip or force, refused before
                         // anything persists when it is malformed or has nothing to apply to; an
                         // Apps run's contract carries its preset, and a publish's QE is forced.
-                        assurance: crate::apps::contract(
-                            crate::assurance::RunAssurance::new(
-                                selected_def
-                                    .as_ref()
-                                    .and_then(|d| d.required_instruments.as_deref()),
-                                spec.reduced_assurance,
-                            ),
-                            apps.clone(),
-                            &spec.qe_acceptance,
-                        )
-                        // Typed, so the bus bridge drops a request that will never launch
-                        // instead of retrying it forever.
-                        .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
+                        // (DES-STANDIN-001 §3.3, rev 3 N3) …and the launch's stand-in facts,
+                        // persisted here and read from here afterwards.
+                        assurance: spec.stand_in.apply(
+                            crate::apps::contract(
+                                crate::assurance::RunAssurance::new(
+                                    selected_def
+                                        .as_ref()
+                                        .and_then(|d| d.required_instruments.as_deref()),
+                                    spec.reduced_assurance,
+                                ),
+                                apps.clone(),
+                                &spec.qe_acceptance,
+                            )
+                            // Typed, so the bus bridge drops a request that will never launch
+                            // instead of retrying it forever.
+                            .map_err(|e| {
+                                anyhow::Error::new(crate::assurance::QeOverrideRefused(e))
+                            })?,
+                        ),
                         run_context: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
@@ -5721,11 +5742,11 @@ fn team_plan_at_launch(
         {
             stub.assurance
         }
-        _ => launch_plan_assurance(
+        _ => spec.stand_in.apply(launch_plan_assurance(
             instruments.as_deref(),
             spec.reduced_assurance,
             &spec.qe_acceptance,
-        ),
+        )),
     };
     let prior = crate::plan_gate::TeamPlanState {
         roster: spec

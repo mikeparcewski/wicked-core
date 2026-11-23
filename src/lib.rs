@@ -132,6 +132,7 @@ pub mod run_context;
 mod run_mirror;
 mod runtime_wait;
 mod skill_use;
+mod standin;
 pub mod tool_activity;
 // S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
 #[allow(dead_code)]
@@ -465,6 +466,10 @@ pub use workflow::{
     StepInput, StepOutput, StepOwner, StepRunner, StepStatus, StubStepRunner, UnitEvidence, Usage,
     WorkflowDef, WorkflowDefError, WorkflowRegistry, GATE_CHANGED,
 };
+pub use standin::{
+    refuse_forged_stand_ins, LaunchStandIn, Reason as StandInReason, Role as StandInRole,
+    StandInBinding, StandInConsent,
+};
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 
 /// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
@@ -605,6 +610,10 @@ pub struct LaunchSpec {
     /// [`power::VOICE_MAX_BYTES`] (a longer one refuses the launch, nothing persisted). Ignored
     /// on a phased run (there is no orchestrator). `None` ⇒ no voice section.
     pub voice: Option<String>,
+    /// (DES-STANDIN-001 §3.8) The launch's stand-in facts: `standInAware` (the activation switch;
+    /// `false`, the default, keeps today's behaviour), the parties and any human consent.
+    /// Persisted on the run's contract, never re-read from here.
+    pub stand_in: crate::standin::LaunchStandIn,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):

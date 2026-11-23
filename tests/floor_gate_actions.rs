@@ -280,6 +280,7 @@ fn launch(core: &Core, name: &str, repo: &Path, sid: &str) -> std::sync::mpsc::R
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

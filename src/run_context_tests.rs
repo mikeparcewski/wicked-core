@@ -1403,6 +1403,7 @@ fn the_engine_keeps_the_block_on_the_session_stamps_each_unit_and_survives_a_res
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

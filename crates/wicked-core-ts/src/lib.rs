@@ -826,6 +826,18 @@ pub struct LaunchOptions {
     /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
     /// whose required judge was skipped holds (`judge_unavailable`).
     pub reduced_assurance: Option<bool>,
+    /// (DES-STANDIN-001 §3.8, §8) The launcher implements the stand-in choice. Omit (or `false`)
+    /// and the run behaves exactly as before, reduced assurance included; `true` with
+    /// `reducedAssurance` REJECTS the launch.
+    pub stand_in_aware: Option<bool>,
+    /// (DES-STANDIN-001 §3.8) Seats that authored the work under review: never seated for real in
+    /// an independent role, still on the roster so a stand-in can be based on them. Only with
+    /// `standInAware`.
+    pub parties: Option<Vec<String>>,
+    /// (DES-STANDIN-001 §3.8) A human's consent to stand-ins, as JSON:
+    /// `{"scope":"job"|"always","by":"<actor>","at":<ms>,"via":"launch"|…}`. `by`/`at` are the
+    /// launcher server's, never a request body's. Only with `standInAware`.
+    pub stand_in_json: Option<String>,
     /// (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
     /// step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
     /// session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
@@ -904,8 +916,23 @@ fn consider_rules_at(db_path: &str, query_json: &str) -> Result<String, String> 
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
+    // (DES-STANDIN-001 §3.3, T-R14) A roster never hands in a stand-in: refused before typing,
+    // which would drop an unknown `standIn` field silently.
+    let raw: Vec<serde_json::Value> = serde_json::from_str(&o.clis_json)
+        .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+    wicked_core::refuse_forged_stand_ins(&raw).map_err(err)?;
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+    let stand_in = wicked_core::LaunchStandIn {
+        aware: o.stand_in_aware.unwrap_or(false),
+        parties: o.parties.unwrap_or_default(),
+        consent: o
+            .stand_in_json
+            .as_deref()
+            .map(serde_json::from_str::<wicked_core::StandInConsent>)
+            .transpose()
+            .map_err(|e| err(format!("standInJson is not a stand-in consent: {e}")))?,
+    };
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
     let qe_acceptance = wicked_core::assurance::QeOverride::from_wire(
         o.skip_qe_acceptance_reason,
@@ -947,6 +974,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         evidence_root: o.evidence_root,
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
+        stand_in,
         power: o.power.unwrap_or(false),
         voice: o.voice,
         deliverables: o.deliverables.unwrap_or_default(),

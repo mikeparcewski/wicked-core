@@ -162,6 +162,7 @@ fn launch_with(f: &Fixture, run: &str, human_confirm: crate::HumanConfirm) {
             evidence_root: None,
             primary: None,
             reduced_assurance: true,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),
