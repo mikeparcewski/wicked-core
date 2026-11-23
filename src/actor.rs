@@ -14106,9 +14106,18 @@ fn dispatch_unit_with(
     // and dropping (1) is the bug. Declared-dependency membership is by PHASE ID, the token the def
     // uses; `phase_id()` returns None for prose-planned units, which correctly matches nothing.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
-    // (DES-STANDIN-001 §3.4) A stand-in's packet is ALLOW-LISTED: of the earlier units it gets only
-    // a builder's final output (the work product), never an earlier review's verdict.
+    // (DES-STANDIN-001 §3.4) A stand-in's packet is ALLOW-LISTED: of the earlier units it gets the
+    // work (every unit that is no review: a `creator` or an unroled build, a tool's facts), never an
+    // earlier review's or test's verdict. Keyed on the stage too, since a def's phases need not
+    // name a role (an unroled `build` is the work; an unroled `review` is a verdict).
     let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
+    let is_verdict = |u: &crate::domain::WorkUnit| {
+        u.role == crate::workflow::PhaseRole::Evaluator
+            || matches!(
+                u.stage,
+                crate::domain::StageKind::Review | crate::domain::StageKind::Test
+            )
+    };
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
     let (mut prior_outputs, mut context_items): (
@@ -14116,7 +14125,7 @@ fn dispatch_unit_with(
         Vec<crate::event::InjectedContext>,
     ) = units
         .iter()
-        .filter(|u| !stand_in || u.role == crate::workflow::PhaseRole::Creator)
+        .filter(|u| !stand_in || !is_verdict(u))
         .filter_map(|u| {
             let label = prior_context_label(unit, u, current_cli)?;
             let output = crate::domain::get_work_output(store, &u.id)?;

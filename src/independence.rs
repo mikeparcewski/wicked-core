@@ -767,6 +767,12 @@ pub(crate) fn independence_preflight_in(
                 .map(crate::cli_runner::record_identities)
                 .unwrap_or_default();
             let rule_reviewer = reviewer.clone().or_else(|| rule_judges.first().cloned());
+            // The reviewer's launch as the gate reads it (its unit's `assigned_invocation`): its
+            // record's own template, so a launch-roster record is never looked up in the registry.
+            let rule_reviewer_inv: Option<String> = rule_reviewer
+                .as_deref()
+                .and_then(|k| records.iter().find(|c| c.key == k))
+                .map(|c| c.headless_invocation.clone());
             let rule_council: Vec<String> = crate::cli_runner::rule_council_candidates(
                 &author_keys,
                 author_bins.as_deref(),
@@ -775,7 +781,7 @@ pub(crate) fn independence_preflight_in(
                 &[],
                 &[],
                 (rule_judges.first().map(String::as_str), &rule_judge_ids),
-                (rule_reviewer.as_deref(), None),
+                (rule_reviewer.as_deref(), rule_reviewer_inv.as_deref()),
                 None,
                 &records,
                 false,
