@@ -9,8 +9,10 @@
 //! `{session, ord, attempt, cli, at, id, state, kind, tool, target, ok, durationMs}` (`cli`, the
 //! launch's seat key, since core#1786).
 //!
-//! A target is a repo-relative path or a redacted command, at most 160 characters. Nothing here
-//! decides anything: a frame that cannot be sent is dropped.
+//! A target is a repo-relative path or a redacted command, at most 160 characters. A frame decides
+//! nothing: one that cannot be sent is dropped. The one thing the stream leaves for a gate is the
+//! writes the seat's own layer refused inside its work tree (core#1674, [`seat_refusals`]): the
+//! creator's gate reads them, so a change to how a completion is read changes that gate too.
 //!
 //! Every seat's own stream feeds it (coordinator 2026-10-30, rig run 1d372696: a codex QE step read
 //! "Codex Working on Check…" with no activity for 20+ s): claude's `stream-json` blocks, codex's
@@ -555,26 +557,44 @@ pub fn codex_item(v: &Value) -> Option<CodexCall> {
         ),
         _ => return None,
     };
-    // (core#1674) What the seat's own layer refused this call: a command's output, or a file
-    // change codex itself could not apply.
-    let refused = match item.get("type").and_then(Value::as_str) {
-        _ if started => Vec::new(),
-        Some("command_execution") => refusals_of(
-            item.get("aggregated_output")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        ),
-        Some("file_change") if failed => item
-            .get("changes")
+    // (core#1674) What the seat's own layer refused this call (a write a command's output shows
+    // refused, or a file change codex could not apply), and what a file change that went through
+    // wrote: every path it changed.
+    let changed = || {
+        item.get("changes")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(|c| c.get("path").and_then(Value::as_str))
-            .map(|p| SeatRefusal {
-                path: p.to_string(),
+            .map(str::to_string)
+    };
+    let kind = item.get("type").and_then(Value::as_str);
+    let refused = match kind {
+        _ if started => Vec::new(),
+        Some("command_execution") => {
+            let script = input.get("command").and_then(Value::as_str).unwrap_or("");
+            if TEST_WORDS.iter().any(|w| script.contains(w)) {
+                // A test run's output prints its fixtures' failures, not the seat's.
+                Vec::new()
+            } else {
+                refusals_of(
+                    item.get("aggregated_output")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    script,
+                )
+            }
+        }
+        Some("file_change") if failed => changed()
+            .map(|path| SeatRefusal {
+                path,
                 why: "the edit was not applied",
             })
             .collect(),
+        _ => Vec::new(),
+    };
+    let wrote = match kind {
+        Some("file_change") if !started && !failed => changed().collect(),
         _ => Vec::new(),
     };
     Some(CodexCall {
@@ -584,6 +604,7 @@ pub fn codex_item(v: &Value) -> Option<CodexCall> {
         input,
         ok,
         refused,
+        wrote,
     })
 }
 
@@ -597,6 +618,9 @@ pub struct CodexCall {
     /// (core#1674) What the seat's own layer refused this call, as the completed item showed it
     /// ([`refusals_of`]). Empty for a start and for every stream that shows no command output (pi).
     pub refused: Vec<SeatRefusal>,
+    /// (core#1674) Every path a completed file change that went through wrote (codex's
+    /// `changes`; the frame's `file_path` is only the first). Empty otherwise.
+    pub wrote: Vec<String>,
 }
 
 /// (core#1674) One refusal the seat's own layer (its CLI sandbox, a read-only mount, file
@@ -616,57 +640,103 @@ const REFUSAL_WORDS: [&str; 3] = [
     "Read-only file system",
 ];
 
-/// What a refusal line may put before the path it names (`cannot create <path>`, …).
-const REFUSAL_VERBS: [&str; 7] = [
+/// What a program other than the shell prints before the path it could not WRITE (coreutils:
+/// `cp`/`install` `cannot create regular file`, `mkdir` `cannot create directory`, `ln`, `touch`,
+/// `rm`, `mv`), longest first. A read (`cat`, `ls`' `cannot open directory`), an exec or a
+/// language runtime's error (Python's `PermissionError` names a read and a write alike) is not a
+/// refused write and is never read as one.
+const WRITE_VERBS: [&str; 7] = [
     "cannot create regular file ",
+    "cannot create symbolic link ",
+    "failed to create symbolic link ",
     "cannot create directory ",
-    "cannot create ",
     "cannot touch ",
     "cannot remove ",
-    "cannot open directory ",
-    "cannot open ",
+    "cannot move ",
 ];
 
-/// (core#1674) The refusals a command's output shows: every line naming a path the system refused
-/// (`bash: line 1: <path>: Permission denied`, `/bin/sh: 1: cannot create <path>: Read-only file
-/// system`, `touch: cannot touch '<path>': Operation not permitted`, Python's `PermissionError:
-/// [Errno 1] Operation not permitted: '<path>'`). A line naming no path is not one.
-pub fn refusals_of(output: &str) -> Vec<SeatRefusal> {
+/// (core#1674) The writes a command's output shows refused, given the script it ran (`script`):
+/// - the shell's own redirect (`bash: line 1: <path>: Permission denied`, `/bin/sh: 1: cannot
+///   create <path>: Read-only file system`), the first form only where the script redirects
+///   (`>`/`>>`) to that path (the same words follow an exec of a file with no execute bit);
+/// - a coreutils write ([`WRITE_VERBS`]: `touch: cannot touch '<path>': Operation not permitted`;
+///   `mv` names the path it could not create, the last), or `tee: <path>: …`.
+///
+/// A line must END with the system's words ([`REFUSAL_WORDS`]). A relative path from a script that
+/// changes directory (`cd`) is left out: which directory it named is not known. A line in any other
+/// form, or naming no path, is not one: a missed refusal leaves the gate as it was, a wrong one
+/// would hold a step's finished work.
+pub fn refusals_of(output: &str, script: &str) -> Vec<SeatRefusal> {
     let quote = |c: char| matches!(c, '\'' | '"' | '`' | '\u{2018}' | '\u{2019}');
+    let changes_dir = script
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | '{'))
+        .any(|w| w == "cd" || w == "pushd");
     let mut out: Vec<SeatRefusal> = Vec::new();
     for line in output.lines().map(str::trim) {
-        let Some((at, why)) = REFUSAL_WORDS
-            .iter()
-            .find_map(|w| line.find(w).map(|at| (at, *w)))
-        else {
+        let Some(why) = REFUSAL_WORDS.iter().copied().find(|w| line.ends_with(w)) else {
             continue;
         };
-        let before = line[..at].trim_end();
-        // `<…>: <path>: <words>` (shells, coreutils), or `<words>: '<path>'` (Python).
-        let named = match before.strip_suffix(':') {
-            Some(head) => head.rsplit(": ").next().unwrap_or(head),
-            None => line[at + why.len()..].trim_start_matches(':'),
+        let Some(before) = line[..line.len() - why.len()].trim_end().strip_suffix(':') else {
+            continue;
         };
-        let mut path = named.trim();
-        for v in REFUSAL_VERBS {
-            if let Some(rest) = path.strip_prefix(v) {
-                path = rest;
-                break;
+        let Some((prog, rest)) = before.split_once(": ") else {
+            continue;
+        };
+        let prog = prog.rsplit('/').next().unwrap_or(prog);
+        let path = if matches!(prog, "sh" | "bash" | "zsh" | "dash") {
+            // `line 1: ` (bash), `1: ` (dash).
+            let rest = rest
+                .strip_prefix("line ")
+                .unwrap_or(rest)
+                .split_once(": ")
+                .filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .map_or(rest, |(_, r)| r);
+            match rest.strip_prefix("cannot create ") {
+                Some(p) => p.trim_matches(quote).to_string(),
+                None => {
+                    let p = rest.trim_matches(quote);
+                    if !redirected_to(script, p) {
+                        continue;
+                    }
+                    p.to_string()
+                }
             }
-        }
-        let path = path.trim_matches(quote);
-        if path.is_empty() || path.contains(char::is_whitespace) {
+        } else if prog == "tee" {
+            rest.trim_matches(quote).to_string()
+        } else {
+            let Some(named) = WRITE_VERBS.iter().find_map(|v| rest.strip_prefix(v)) else {
+                continue;
+            };
+            // `cannot move 'a' to 'b'`: the one it could not create is the last.
+            let named = match named.rsplit_once(" to ") {
+                Some((_, to)) if rest.starts_with("cannot move ") => to,
+                _ => named,
+            };
+            named.trim_matches(quote).to_string()
+        };
+        if path.trim().is_empty() || (changes_dir && !Path::new(&path).is_absolute()) {
             continue;
         }
-        let r = SeatRefusal {
-            path: path.to_string(),
-            why,
-        };
+        let r = SeatRefusal { path, why };
         if !out.contains(&r) {
             out.push(r);
         }
     }
     out
+}
+
+/// Whether `script` redirects output (`>`, `>>`, `>|`, `&>`) to `path`, quoted or not.
+fn redirected_to(script: &str, path: &str) -> bool {
+    !path.is_empty()
+        && script.match_indices(path).any(|(at, _)| {
+            let head = script[..at].trim_end_matches(['\'', '"']).trim_end();
+            let ends = script[at + path.len()..]
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'));
+            ends && head.trim_end_matches('|').ends_with('>')
+        })
 }
 
 /// codex runs every command as `bash -lc '<script>'` (formatted with `shlex::try_join`, so the
@@ -823,6 +893,7 @@ pub fn pi_event(v: &Value) -> Option<CodexCall> {
         input,
         ok,
         refused: Vec::new(),
+        wrote: Vec::new(),
     })
 }
 
@@ -846,16 +917,47 @@ impl ToolActivitySink {
 
 impl ToolActivitySink {
     /// (core#1674) Keep what the seat was refused inside its work tree (a path under the tree,
-    /// never its `.git`), as the tree's own relative path; a later edit of that path that went
-    /// through answers it.
+    /// never its `.git`), as the tree's own relative path. A later call that went through answers
+    /// it: a file change that wrote it (any of its paths), a command redirecting to it, or one
+    /// naming it that is not a plain read (`cat`, `ls`, …): the seat wrote it another way, say
+    /// after a `chmod`. A clear by a command that only named it leaves the gate as it was before
+    /// this check; a refusal kept past a write would hold finished work.
     fn note_refusals(&self, c: &CodexCall) {
         let key = (self.run_id.clone(), self.ord, self.attempt);
         let mut all = attempt_refusals().lock().unwrap_or_else(|p| p.into_inner());
-        if c.ok && c.tool == "Edit" {
-            if let Some(p) = c.input.get("file_path").and_then(Value::as_str) {
-                if let (Some(done), Some(list)) = (in_tree(&self.root, p), all.get_mut(&key)) {
-                    list.retain(|r| r.path != done);
-                }
+        if c.ok {
+            if let Some(list) = all.get_mut(&key) {
+                let done: Vec<String> = c
+                    .wrote
+                    .iter()
+                    .filter_map(|p| in_tree(&self.root, p))
+                    .collect();
+                let script = (c.tool == "Bash")
+                    .then(|| c.input.get("command").and_then(Value::as_str))
+                    .flatten()
+                    .unwrap_or("");
+                let root = self.root.to_string_lossy();
+                let first = script.split_whitespace().next().unwrap_or("");
+                let reads = matches!(
+                    first.rsplit('/').next().unwrap_or(first),
+                    "cat"
+                        | "ls"
+                        | "head"
+                        | "tail"
+                        | "stat"
+                        | "wc"
+                        | "grep"
+                        | "rg"
+                        | "file"
+                        | "test"
+                );
+                list.retain(|r| {
+                    let abs = format!("{}/{}", root.trim_end_matches('/'), r.path);
+                    let named = [r.path.as_str(), abs.as_str()]
+                        .into_iter()
+                        .any(|p| redirected_to(script, p) || (!reads && script.contains(p)));
+                    !done.contains(&r.path) && !named
+                });
             }
         }
         for r in &c.refused {
@@ -871,7 +973,8 @@ impl ToolActivitySink {
 }
 
 /// (core#1674) `path` (as a seat named it: relative to its work tree, or absolute) as the tree's
-/// own relative path, when it is under `root` and not in its `.git`; `None` otherwise.
+/// own relative path (`..` resolved by its words), when it is under `root` and not in its `.git`;
+/// `None` otherwise.
 fn in_tree(root: &Path, path: &str) -> Option<String> {
     let p = Path::new(path);
     let rel = if p.is_absolute() {
@@ -884,6 +987,10 @@ fn in_tree(root: &Path, path: &str) -> Option<String> {
         match c {
             std::path::Component::Normal(n) => parts.push(n.to_str()?),
             std::path::Component::CurDir => {}
+            // `src/../src/a.rs` is `src/a.rs`; a `..` above the tree leaves it.
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
             _ => return None,
         }
     }
@@ -1510,9 +1617,9 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
-    /// (core#1674) The refusals a codex command's output shows, read off the container capture
-    /// `tests/fixtures/headless/codex-gw.ndjson` (a codex seat's own transcript): each refused path
-    /// with the system's words, a write or a read alike, and nothing from a line that names none.
+    /// (core#1674) The refused WRITES a codex command's output shows, read off the container
+    /// capture `tests/fixtures/headless/codex-gw.ndjson` (a codex seat's own transcript): each
+    /// refused path with the system's words. Its refused reads (`cat`, `ls`) are not writes.
     #[test]
     fn core1674_refusals_are_read_off_a_real_codex_transcript() {
         let fixture = include_str!("../tests/fixtures/headless/codex-gw.ndjson");
@@ -1528,30 +1635,113 @@ mod tests {
             ("/tmp/outside/shell-outside.txt", "Permission denied"),
             ("/opt/rootfs-outside.txt", "Read-only file system"),
             ("/tmp/outside/child-sh-outside.txt", "Permission denied"),
+            ("/tmp/outside/child-bash-outside.txt", "Permission denied"),
             ("/work/held/link.txt", "Permission denied"),
-            ("/tmp/outside", "Permission denied"),
-            ("/run/fake-secret/.ssh/id_rsa", "Permission denied"),
         ] {
             assert!(
                 refused.iter().any(|(p, w)| p == want.0 && *w == want.1),
                 "{want:?} in {refused:?}"
             );
         }
-        // Python's form names its path after the words.
-        let py = refusals_of(
-            "PermissionError: [Errno 1] Operation not permitted: '/w/src/add.py'\nrc=1",
+        for read in ["/tmp/outside", "/run/fake-secret/.ssh/id_rsa"] {
+            assert!(!refused.iter().any(|(p, _)| p == read), "{read} is a read");
+        }
+    }
+
+    /// (core#1674, review on #1850) Only a refused write is one: no read, exec, test run or
+    /// pathless line; a path with spaces survives; a relative path after a `cd` is not placed.
+    #[test]
+    fn core1674_only_refused_writes_are_read_and_each_names_its_path() {
+        let paths = |out: &str, script: &str| -> Vec<String> {
+            refusals_of(out, script)
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        // Writes, in the forms coreutils and the shells print them.
+        assert_eq!(
+            paths(
+                "touch: cannot touch 'src/new.rs': Operation not permitted",
+                "touch src/new.rs"
+            ),
+            ["src/new.rs"]
         );
-        assert_eq!(py.len(), 1);
-        assert_eq!(py[0].path, "/w/src/add.py");
-        // coreutils' quoted form, and a line with no path at all.
-        let cu = refusals_of(
-            "touch: cannot touch 'src/new.rs': Operation not permitted\n\
-             execvp() of '/bin/ps' failed: Operation not permitted now",
+        assert_eq!(
+            paths(
+                "mv: cannot move 'src/old.rs' to 'src/new.rs': Permission denied",
+                "mv src/old.rs src/new.rs"
+            ),
+            ["src/new.rs"]
         );
-        assert_eq!(cu.len(), 1, "{cu:?}");
-        assert_eq!(cu[0].path, "src/new.rs");
-        // A start shows no output; a clean run refuses nothing.
-        assert!(refusals_of("rc=0\n").is_empty());
+        assert_eq!(
+            paths(
+                "cp: cannot create symbolic link 'src/link': Permission denied",
+                "cp -s a src/link"
+            ),
+            ["src/link"]
+        );
+        assert_eq!(
+            paths(
+                "bash: line 1: src/my module.rs: Permission denied",
+                "echo x > 'src/my module.rs'"
+            ),
+            ["src/my module.rs"]
+        );
+        assert_eq!(
+            paths(
+                "tee: out/a.txt: Read-only file system",
+                "echo x | tee out/a.txt"
+            ),
+            ["out/a.txt"]
+        );
+        // Not writes: a read, a listing, an exec of a file with no execute bit, a runtime's error,
+        // a line naming no path, a shell line number, words mid-line.
+        for (out, script) in [
+            (
+                "cat: src/private.txt: Permission denied",
+                "cat src/private.txt",
+            ),
+            (
+                "ls: cannot open directory 'src': Permission denied",
+                "ls src",
+            ),
+            (
+                "bash: line 1: ./scripts/run.sh: Permission denied",
+                "./scripts/run.sh",
+            ),
+            (
+                "PermissionError: [Errno 13] Permission denied: 'src/a.py'",
+                "python3 x.py",
+            ),
+            ("Error: Operation not permitted", "node x.js"),
+            ("/bin/sh: 1: Permission denied", "sh -c x"),
+            ("bash: Permission denied", "x"),
+            ("ping: sendto: Operation not permitted", "ping h"),
+            ("Operation not permitted here", "x"),
+        ] {
+            assert!(paths(out, script).is_empty(), "{out}");
+        }
+        // A test run prints its fixtures' failures, not the seat's.
+        let test_run = codex_item(&json!({"type": "item.completed", "item": {"id": "t",
+            "type": "command_execution", "command": "bash -lc 'cargo test'",
+            "aggregated_output": "touch: cannot touch 'src/x': Permission denied",
+            "exit_code": 101, "status": "failed"}}))
+        .unwrap();
+        assert!(test_run.refused.is_empty());
+        // After a `cd`, a relative path names a directory the line does not say.
+        assert!(paths(
+            "bash: line 1: a.rs: Permission denied",
+            "cd src && echo x > a.rs"
+        )
+        .is_empty());
+        assert_eq!(
+            paths(
+                "bash: line 1: /work/src/a.rs: Permission denied",
+                "cd src && echo x > /work/src/a.rs"
+            ),
+            ["/work/src/a.rs"]
+        );
+        assert!(paths("rc=0\n", "true").is_empty());
     }
 
     /// (core#1674) Driven through the codex adapter as a seat's live stream is, with the work tree
@@ -1589,7 +1779,8 @@ mod tests {
         sink.call(
             &codex_item(
                 &json!({"type": "item.completed", "item": {"id": "g", "type":
-                "command_execution", "command": "git commit -m x", "aggregated_output":
+                "command_execution", "command": "echo x > /work/.git/index.lock",
+                "aggregated_output":
                 "/bin/bash: line 1: /work/.git/index.lock: Permission denied",
                 "exit_code": 255, "status": "failed"}}),
             )
@@ -1605,6 +1796,46 @@ mod tests {
         );
         sink.call(&item("completed", "/work/src/math.js"));
         assert!(seat_refusals(run, 3, 0).is_empty());
+
+        // (review on #1850) A failed two-file patch is answered by a patch that wrote both, and a
+        // refused redirect by a later write of the same path in another form (`src/../`); a
+        // command that only reads it answers nothing.
+        let mut sink = ToolActivitySink::new(run, 4, 0, Path::new("/work"), Box::new(|_| {}));
+        let patch = |status: &str| {
+            codex_item(
+                &json!({"type": "item.completed", "item": {"id": format!("p-{status}"),
+                "type": "file_change", "status": status, "changes": [
+                {"path": "/work/src/a.rs", "kind": "update"},
+                {"path": "/work/src/b.rs", "kind": "update"}]}}),
+            )
+            .unwrap()
+        };
+        let cmd = |id: &str, script: &str, out: &str| {
+            codex_item(&json!({"type": "item.completed", "item": {"id": id,
+                "type": "command_execution", "command": format!("/bin/bash -lc '{script}'"),
+                "aggregated_output": out, "exit_code": 0, "status": "completed"}}))
+            .unwrap()
+        };
+        sink.call(&patch("failed"));
+        sink.call(&cmd(
+            "c1",
+            "echo x > src/../src/c.rs; echo rc=$?",
+            "bash: line 1: src/../src/c.rs: Permission denied\nrc=1",
+        ));
+        let paths = || -> Vec<String> {
+            seat_refusals(run, 4, 0)
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        assert_eq!(paths(), ["src/a.rs", "src/b.rs", "src/c.rs"]);
+        sink.call(&patch("completed"));
+        assert_eq!(paths(), ["src/c.rs"]);
+        sink.call(&cmd("c2", "cat src/c.rs", ""));
+        assert_eq!(paths(), ["src/c.rs"], "a read answers nothing");
+        sink.call(&cmd("c3", "chmod u+w src && printf y > /work/src/c.rs", ""));
+        assert!(paths().is_empty());
+
         forget_run(run);
         assert!(seat_refusals(run, 2, 0).is_empty());
     }

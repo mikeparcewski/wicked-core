@@ -3942,16 +3942,18 @@ fn run_pol_2101(
     records: &[CreatorRecord],
     reviewer: Option<&str>,
 ) -> RuleCheckReport {
-    run_pol_2101_after(c, judge, records, reviewer, &[])
+    run_pol_2101_after(c, judge, records, reviewer, None, &[])
 }
 
-/// [`run_pol_2101`] at a later gate, with the rows of the run's other gates that read this change.
+/// [`run_pol_2101`] at a later gate, under the person's `instructions`, with the rows of the run's
+/// earlier gates (each with what its check read).
 fn run_pol_2101_after(
     c: &Change,
     judge: &dyn RuleJudge,
     records: &[CreatorRecord],
     reviewer: Option<&str>,
-    same_change: &[RuleVerdict],
+    instructions: Option<&str>,
+    same_change: &[(String, RuleVerdict)],
 ) -> RuleCheckReport {
     let rules = [pack("POL-2101")];
     let f = job_facts(&mcp_steps(), None, None, c);
@@ -3969,7 +3971,7 @@ fn run_pol_2101_after(
             seats: &seats,
             no_seat: None,
             base: "b0",
-            instructions: None,
+            instructions,
             engine_record: Some(ENGINE),
             creator_records: Some(records),
             reviewer_record: reviewer,
@@ -4042,12 +4044,12 @@ fn core1842_a_later_step_on_the_same_change_reuses_the_reviews_pol_2101_verdict(
             }
             self.0.ask(seat, prompt)
         }
-        fn approval_failure(&self, _seat: &str) -> Option<String> {
-            Some(
+        fn approval_failure(&self, seat: &str) -> Option<String> {
+            (seat != "codex").then(|| {
                 "observed calling the work's provider: observed calling \
                  `api.anthropic.com:443`, a provider of the work"
-                    .into(),
-            )
+                    .into()
+            })
         }
     }
     let sub_k = "KEPT — src/add.rs uses the language's own + operator";
@@ -4083,8 +4085,21 @@ fn core1842_a_later_step_on_the_same_change_reuses_the_reviews_pol_2101_verdict(
     assert_eq!(row_of(&held, "POL-2101").status, RuleStatus::Unchecked);
     assert!(held.hold().is_some(), "{held:?}");
 
-    // Every review-stage check records the change it read.
-    assert_eq!(held.change_key, Some(change_key(&c)));
+    // Every unit-gate check records what it read; the review's check read the same.
+    let key = held.change_key.clone().expect("a unit-gate check's key");
+    let at = |rows: &[RuleVerdict]| -> Vec<(String, RuleVerdict)> {
+        rows.iter().map(|r| (key.clone(), r.clone())).collect()
+    };
+    let later = |rows: &[(String, RuleVerdict)]| {
+        run_pol_2101_after(
+            &c,
+            &qe(),
+            &record(REC_NO_CHECK),
+            Some(REVIEWER_CHECKED),
+            None,
+            rows,
+        )
+    };
 
     // The review's KEPT on this same change answers it: no judge is asked, the gate does not hold.
     let judge = qe();
@@ -4093,7 +4108,8 @@ fn core1842_a_later_step_on_the_same_change_reuses_the_reviews_pol_2101_verdict(
         &judge,
         &record(REC_NO_CHECK),
         Some(REVIEWER_CHECKED),
-        std::slice::from_ref(&reviewed),
+        None,
+        &at(std::slice::from_ref(&reviewed)),
     );
     let row = row_of(&r, "POL-2101");
     assert_eq!(row.status, RuleStatus::Kept, "{row:?}");
@@ -4102,37 +4118,68 @@ fn core1842_a_later_step_on_the_same_change_reuses_the_reviews_pol_2101_verdict(
     assert!(row.reason.starts_with(SAME_CHANGE_REUSED), "{}", row.reason);
     assert!(r.hold().is_none() && r.denial().is_none(), "{r:?}");
     assert!(judge.0.prompts.lock().unwrap().is_empty());
+    assert_eq!(r.change_key.as_deref(), Some(key.as_str()));
 
-    // Only a KEPT or N/A is reused: a BROKEN (or anything else) is asked again.
+    // Only a KEPT or N/A is reused: a BROKEN is asked again, and so is a KEPT a later gate on
+    // the same change overruled with a BROKEN (the latest row decides).
     let mut broken = reviewed.clone();
     broken.status = RuleStatus::Broken;
-    let r = run_pol_2101_after(
-        &c,
-        &qe(),
-        &record(REC_NO_CHECK),
-        Some(REVIEWER_CHECKED),
-        &[broken],
-    );
-    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+    let unchecked = |r: &RuleCheckReport| row_of(r, "POL-2101").status == RuleStatus::Unchecked;
+    assert!(unchecked(&later(&at(std::slice::from_ref(&broken)))));
+    assert!(unchecked(&later(&at(&[reviewed.clone(), broken]))));
 
     // Another rule text (the rule changed since) is asked again.
     let mut other_rule = reviewed.clone();
     other_rule.rule_key = "an older text".into();
-    let r = run_pol_2101_after(
-        &c,
-        &qe(),
-        &record(REC_NO_CHECK),
-        Some(REVIEWER_CHECKED),
-        &[other_rule],
-    );
-    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+    assert!(unchecked(&later(&at(&[other_rule]))));
 
-    // A different change has a different key: the caller hands over no row from it.
+    // A judge that may not approve this work (seen calling its provider) is not reused.
+    let mut by_pi = reviewed.clone();
+    by_pi.judge = Some("pi".into());
+    by_pi.judge_ids = vec!["pi".into()];
+    assert!(unchecked(&later(&at(&[by_pi]))));
+
+    // What the check read differs (review on #1850): another change, other creator records, or
+    // other instructions from the person each make another key, and the row is not reused.
     let other = change_of(
         "diff --git a/src/b.rs b/src/b.rs\n+fn b() {}\n",
         &["src/b.rs"],
     );
-    assert_ne!(change_key(&other), change_key(&c));
+    let kept = at(std::slice::from_ref(&reviewed));
+    let on_other = run_pol_2101_after(
+        &other,
+        &qe(),
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+        None,
+        &kept,
+    );
+    let with_records = run_pol_2101_after(
+        &c,
+        &qe(),
+        &record(REC_GOOD),
+        Some(REVIEWER_CHECKED),
+        None,
+        &kept,
+    );
+    let told = run_pol_2101_after(
+        &c,
+        &qe(),
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+        Some("use the pinned toolchain's std only"),
+        &kept,
+    );
+    for r in [&on_other, &with_records, &told] {
+        assert_ne!(r.change_key.as_deref(), Some(key.as_str()));
+        assert!(
+            !row_of(r, "POL-2101").reason.starts_with(SAME_CHANGE_REUSED),
+            "{r:?}"
+        );
+    }
+    // The reviewer's own record is not part of it: it can only add a check.
+    let no_reviewer = run_pol_2101_after(&c, &qe(), &record(REC_NO_CHECK), None, None, &kept);
+    assert_eq!(no_reviewer.change_key.as_deref(), Some(key.as_str()));
 }
 
 /// Deny-dominates holds: a substance BROKEN (a duplicated built-in) breaks the rule whatever the

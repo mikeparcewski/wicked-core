@@ -2988,8 +2988,6 @@ impl FoldRefresh {
     }
 }
 
-/// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
-/// supplies no invented denials; the fold record separately preserves its unknown state.
 /// (core#1674) The words of a [`crate::domain::DENIAL_SOURCE_SEAT_REFUSED`] denial: what was
 /// refused (the first few paths, each with the system's words), and what the person can do.
 fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String {
@@ -3011,6 +3009,8 @@ fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String 
     )
 }
 
+/// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
+/// supplies no invented denials; the fold record separately preserves its unknown state.
 fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::UnitDenial> {
     if !now.same_tree_as(prior) {
         return Vec::new();
