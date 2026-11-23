@@ -20,8 +20,9 @@
 //! - **opencode**: `opencode auth import` of its own export, `opencode models` (loading its
 //!   providers resolves the active ChatGPT sign-in, which opencode renews within five minutes of
 //!   its expiry), then `opencode auth export`. All three on a private `--standalone` server.
-//! - **claude** seats pass the operator's own long-lived `claude setup-token` token through
-//!   (the gateway relays the client's Authorization unchanged), so there is nothing to renew. A
+//! - **claude** runs on the operator's own long-lived `claude setup-token` token, which the
+//!   gateway sends upstream in place of the seat's placeholder (wicked-garden#1365), so there is
+//!   nothing to renew. A
 //!   record from an earlier `claude auth login` sign-in is never renewed: when it falls due, the
 //!   refresh fails with a plain reason, and the operator signs in again.
 //! - **copilot**: its GitHub token does not expire; the pass re-reads the account's Copilot API
@@ -61,7 +62,7 @@ pub(crate) const REFRESH_IMAGE: &str = "curlimages/curl:8.11.1";
 /// models it re-reads with the GitHub token.
 pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode", "copilot"];
 
-/// Why a claude record is never renewed: its seats pass a `claude setup-token` token through.
+/// Why a claude record is never renewed: claude now runs on a `claude setup-token` token.
 pub(crate) const CLAUDE_SIGN_IN_AGAIN: &str = "claude seats now sign in with a long-lived token \
      from `claude setup-token`, which the broker does not renew; sign claude in again";
 
