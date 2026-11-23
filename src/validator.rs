@@ -2704,9 +2704,13 @@ pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
     // (core#937, codex r2) An instance key (`pi#2`) is its CLI's seat: the judge pool maps it to
     // that seat, so the exclusion must resolve it the same way or `pi` would judge `pi#2`'s work.
     let cli = wicked_apps_core::spawn::seat_cli_key(key);
+    // (DES-STANDIN-001 §3.3) A stand-in key `codex#2~1` is its credential record's (`codex#2`)
+    // before its CLI's; a key without `~` is its own credential, so nothing else changes.
+    let credential = wicked_apps_core::spawn::seat_id::credential(key);
     roster
         .iter()
         .find(|c| c.key == key)
+        .or_else(|| roster.iter().find(|c| c.key == credential))
         .or_else(|| roster.iter().find(|c| c.key == cli))
         .map(seat_identity)
         .unwrap_or_else(|| normalize_identity(key))
@@ -7006,6 +7010,19 @@ mod tests {
         )];
         assert_eq!(seat_identity(&roster[0]), "claude-wrapper");
         assert_eq!(excluded_identity("claude", &roster), "claude-wrapper");
+    }
+
+    /// T-R18 / codex r1 B14: a stand-in key is its credential record's identity, never its CLI's.
+    #[test]
+    fn a_stand_in_key_is_excluded_by_its_credential_records_binary() {
+        let roster = vec![
+            seat("codex", "codex exec {PROMPT}"),
+            seat("codex#2", "codex-work exec {PROMPT}"),
+        ];
+        assert_eq!(excluded_identity("codex#2~1", &roster), "codex-work");
+        assert_eq!(excluded_identity("codex#2", &roster), "codex-work");
+        // An instance with no record of its own is still its CLI's, as before.
+        assert_eq!(excluded_identity("codex#3", &roster), "codex");
     }
 
     #[test]
