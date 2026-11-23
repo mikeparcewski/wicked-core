@@ -5513,17 +5513,32 @@ mod council_tail_tests {
             !stopped.load(Ordering::SeqCst),
             "the verdict waited for a seat still stopping"
         );
+        // (core#1794) A probe that takes the slot proves the order only when the seat had already
+        // stopped: the seat may stop, be reaped and free the slot between the loop's read of
+        // `stopped` and the probe, and that is the right order, not a freed-early slot.
         while !stopped.load(Ordering::SeqCst) {
-            assert_eq!(
-                HostCouncilLock::acquire_until(&path, Instant::now()).err(),
-                Some(SlotRefused::Busy),
-                "the slot was freed while a carried seat was still stopping"
-            );
+            match HostCouncilLock::acquire_until(&path, Instant::now()) {
+                Err(e) => assert_eq!(e, SlotRefused::Busy),
+                Ok(_free) => {
+                    assert!(
+                        stopped.load(Ordering::SeqCst),
+                        "the slot was freed while a carried seat was still stopping"
+                    );
+                    break;
+                }
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         tail.join().expect("the council tail");
+        // (core#1794) The slot is a `flock` on an open file: a child another test spawns while the
+        // council holds it keeps a duplicate of that descriptor until its exec completes, so for
+        // that moment the slot still reads as held after the tail let it go. Under endpoint
+        // security an exec can wait seconds, so the probe waits on the release, bounded by the
+        // suite's failure guard (`test_env::PATIENT`); a slot the tail never released stays held
+        // past it and still fails.
         assert!(
-            HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+            HostCouncilLock::acquire_until(&path, Instant::now() + crate::test_env::PATIENT)
+                .is_ok(),
             "the slot is free once the seat is reaped"
         );
         let _ = std::fs::remove_file(&path);
