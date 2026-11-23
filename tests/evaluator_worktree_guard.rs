@@ -371,7 +371,7 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "t@example.invalid"]);
@@ -845,7 +845,7 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
         discarded.2.is_none(),
         "HEAD had not moved, so none was reset"
     );
-    let wt = repo.join("wicked-worktrees").join("r-rewrite");
+    let wt = run_tree(&repo, "r-rewrite");
     assert_eq!(
         std::fs::read_to_string(wt.join("src/app.ts")).unwrap(),
         "fixed\n",
@@ -902,7 +902,7 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
             "a guarded phase that writes nothing passes (ord {ord})"
         );
     }
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// A well-behaved evaluator over a repo with a PASSING check: the run completes, and the verify
@@ -938,7 +938,7 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
             verify.denial_reason
         );
         assert_fail_closed_without_boundary(&evs, &verify, 4);
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
         return;
     }
     let evs = drain(&events);
@@ -1001,7 +1001,7 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
             .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
         "a clean evaluator produces no mutation event"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// Codex review on #414: a "passing" check script that EDITS a tracked file. The repo checks exit
@@ -1070,7 +1070,7 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
                 .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
             "nothing ran, so nothing mutated"
         );
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
         return;
     }
     // (core#417, core#1144) A guarded floor runs on a clean checkout of the tree, so the mutating
@@ -1097,7 +1097,7 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
     );
     let live = std::fs::read_to_string(repo.join("src/app.ts")).unwrap();
     assert!(!live.contains("touched by the test script"), "{live}");
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// The `repoChecksEvaluated` record for `ord`: `(floor, outcome, passed, checks)`.
@@ -1166,7 +1166,7 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
             verify.denial_reason
         );
         assert_fail_closed_without_boundary(&evs, &verify, 4);
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
         return;
     }
     // The creator's floor denied: the run paused at the ESCALATION gate on the fix unit
@@ -1277,7 +1277,7 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
             .any(|ev| matches!(ev, CoreEvent::GateEvaluated { ord: 4, .. })),
         "no verify gate — the run stopped at the creator"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// core#464, the run-loss shape itself (runs e20a3ffb / dd5b8f54): the read-only `reproduce` rung
@@ -1374,7 +1374,7 @@ fn a_recon_phase_that_writes_a_note_into_the_tree_pauses_at_a_gate_and_the_appro
         )),
         "the mutation event names the recon phase and the restore"
     );
-    let wt = repo.join("wicked-worktrees").join("r-recon-note");
+    let wt = run_tree(&repo, "r-recon-note");
     assert!(
         !wt.join("evidence/repro.md").exists(),
         "the restore discarded the note from the tree"
@@ -1433,7 +1433,7 @@ fn a_recon_phase_that_writes_a_note_into_the_tree_pauses_at_a_gate_and_the_appro
         ran.iter().any(|p| p == "fix"),
         "the run continued to the creator after the retry: {ran:?}"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// core#464 / core#463 item 3 (F-RC1-046): a governance Deny recorded for a recon rung AFTER its
@@ -1501,7 +1501,7 @@ fn a_boundary_deny_on_a_recon_phase_whose_output_was_captured_pauses_at_a_gate()
         gate_for(&evs, 2).denial_source.as_deref(),
         Some("input_governance")
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     let _ = std::fs::remove_dir_all(gov_run_dir("r-recon-boundary"));
 }
 
@@ -1547,13 +1547,13 @@ fn rejecting_the_denial_gate_cancels_the_run_and_keeps_the_dirty_worktree() {
         |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r-reject-dirty")
     ));
     assert!(!session_failed(&before) && !session_failed(&evs));
-    let wt = repo.join("wicked-worktrees").join("r-reject-dirty");
+    let wt = run_tree(&repo, "r-reject-dirty");
     assert_eq!(
         std::fs::read_to_string(wt.join("src/fix.ts")).unwrap(),
         "the fix\n",
         "the retained tree is the creator's restored fix"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// The reject arm on a CLEAN tree (the reproduce gate: nothing but the base commit under it):
@@ -1593,7 +1593,7 @@ fn rejecting_the_denial_gate_on_a_clean_recon_tree_cancels_without_failing() {
         |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r-reject-clean")
     ));
     assert!(!session_failed(&before) && !session_failed(&evs));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// wicked-crew#951: the run's QE unit (`verify`, the `verified_evidence` phase after the
@@ -1651,7 +1651,7 @@ fn the_qe_unit_records_its_verdict_under_the_run_qe_ledger_root_without_tripping
         expected.as_path(),
         "<evidence root>/.wicked-qe"
     );
-    let wt = repo.join("wicked-worktrees").join("r-qe-ledger-root");
+    let wt = run_tree(&repo, "r-qe-ledger-root");
     assert!(
         !Path::new(root).starts_with(&wt) && !Path::new(root).starts_with(&repo),
         "the QE ledger root is outside the worktree and the clone: {root}"
@@ -1682,7 +1682,7 @@ fn the_qe_unit_records_its_verdict_under_the_run_qe_ledger_root_without_tripping
             other.unit.phase_id()
         );
     }
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     let _ = std::fs::remove_dir_all(&evidence);
     if let Some(notes) = verify.unit.notes_root.as_deref() {
         if let Some(run_dir) = Path::new(notes).parent() {
@@ -1807,7 +1807,7 @@ fn qe_acceptance_on_a_seat_without_a_sub_agent_is_reviewed_by_the_engine_in_isol
     assert_eq!(review.attempts[0].seat, reviewer_seat);
     assert_eq!(review.attempts[0].basis, "distinct");
     let _ = core.cancel_run("r-qe-every-seat");
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     let _ = std::fs::remove_dir_all(&evidence);
 }
 
@@ -1861,7 +1861,7 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
         .notes_root
         .as_deref()
         .expect("a bound read-only unit carries a notes root");
-    let wt = repo.join("wicked-worktrees").join("r-notes-root");
+    let wt = run_tree(&repo, "r-notes-root");
     assert!(
         !Path::new(root).starts_with(&wt) && !Path::new(root).starts_with(&repo),
         "the notes root is outside the worktree and the clone: {root}"
@@ -1904,7 +1904,7 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
         !wt.join("repro.md").exists() && !wt.join("evidence").exists(),
         "the worktree holds no note"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     if let Some(run_dir) = Path::new(root).parent() {
         let _ = std::fs::remove_dir_all(run_dir);
     }
@@ -1945,7 +1945,7 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
             verify.denial_reason
         );
         assert_fail_closed_without_boundary(&evs, &verify, 4);
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
         return;
     }
     let evs = drain(&events);
@@ -1987,7 +1987,7 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         let base = c.base.as_deref().expect("the base run rides the check");
         assert!(base.run.as_ref().is_some_and(|b| !b.passed()));
     }
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// A catalog-plan run (DES-TEAMING-002) bound to `repo_ref`, with a docs-only touch set so the
@@ -2054,7 +2054,7 @@ fn a_produce_step_that_writes_docs_into_the_tree_keeps_them() {
         "{:?}",
         produce.denial_reason
     );
-    let wt = repo.join("wicked-worktrees").join("r-produce-docs");
+    let wt = run_tree(&repo, "r-produce-docs");
     assert_eq!(
         std::fs::read_to_string(wt.join("docs/design/spec.md")).unwrap(),
         "# spec\n",
@@ -2077,7 +2077,7 @@ fn a_produce_step_that_writes_docs_into_the_tree_keeps_them() {
             "still there at the end"
         );
     }
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// D14, the other half: a read-only catalog step (`understand`, role neutral, `executes_code:
@@ -2130,12 +2130,12 @@ fn a_read_only_understand_step_that_changes_the_tree_is_still_discarded() {
         )),
         "the mutation event names the read-only step and the restore"
     );
-    let wt = repo.join("wicked-worktrees").join("r-understand-note");
+    let wt = run_tree(&repo, "r-understand-note");
     assert!(
         !wt.join("NOTES.md").exists(),
         "the read-only step's write was DISCARDED"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
 }
 
 /// (core#1484) The QE run the engine made for this attempt, read off the reviewer's brief
@@ -2149,4 +2149,23 @@ fn reviewed_run(input: &StepInput) -> String {
         .and_then(|(dir, _)| std::path::Path::new(dir).file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .expect("the reviewer brief names the evidence dir")
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo`:
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+/// Remove a test checkout and the folder beside it that holds its run trees.
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }
