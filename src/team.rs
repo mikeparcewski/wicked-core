@@ -449,8 +449,13 @@ wire_enum! {
         NoQuorum = "no_quorum",
         SeatsBenched = "seats_benched",
         Error = "error",
+        /// A council whose ballots STARTED (`council.convened`) ran out of time while voting.
         Timeout = "timeout",
         Cap = "cap",
+        /// (core#1822) No ballot ever started: the step ended before the council's turn, the host
+        /// council slot stayed busy, or the final pass's budget was spent first. Never `timeout`,
+        /// which says a council was voting (DES-STANDIN-001 §3.11).
+        NotConvened = "not_convened",
     }
 }
 
@@ -573,6 +578,10 @@ pub struct Dispute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     pub reason: Option<NoVerdictReason>,
+    /// (core#1822) Why, in words, when the reason alone does not say it (`not_convened`: "the
+    /// step ended before its turn"). Absent on every row recorded before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// One finding in the ledger (DES §7 `teamLedger.findings[]`). S2 fills everything it owns;

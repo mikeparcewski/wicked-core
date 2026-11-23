@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::events::{
-    self as tev, AttachStatus, ChangeRequested, CouncilCalled, CouncilPosition, CouncilRuled,
-    CouncilTrigger, Envelope, FindingRaised, FindingSettled, HelpAnswered, LedgerFolded,
-    MemberJoined, MemberLeft, MemberRole, SettledStatus, StepCompletion, StepVerdict, TeamBody,
-    TeamEvent, TeamRow, Transport,
+    self as tev, AttachStatus, ChangeRequested, CouncilCalled, CouncilConvened, CouncilPosition,
+    CouncilRuled, CouncilTrigger, Envelope, FindingRaised, FindingSettled, HelpAnswered,
+    LedgerFolded, MemberJoined, MemberLeft, MemberRole, SettledStatus, StepCompletion, StepVerdict,
+    TeamBody, TeamEvent, TeamRow, Transport,
 };
 use super::publish::{LiveTeamRun, PublishOutcome, TeamBus, TeamConfig};
 use super::{
@@ -49,6 +49,7 @@ use super::{
     TeamLimits, TeamPlan, UnitKey, Verdict,
 };
 use crate::bus::BusDb;
+use crate::command::CouncilReply;
 use crate::decision::{DecisionRequest, DecisionVerdict};
 
 /// The bus filter the supervisor's cursor reads (§4.2).
@@ -125,19 +126,37 @@ pub enum CouncilOutcome {
     NoSeats(String),
     /// The call failed (`error`).
     Failed(String),
-    /// No answer within the budget (`timeout`).
+    /// The council's ballots started (it called `on_convened`) and no answer came within the
+    /// budget (`timeout`).
     TimedOut,
+    /// (core#1822) No ballot ever started (`not_convened`), with why: the host council slot stayed
+    /// busy, freed only as the budget ran out, or the engine never started the ballots in time.
+    NotConvened(String),
+}
+
+/// (core#1822) The `not_convened` details, spelled once.
+pub(crate) mod not_convened {
+    pub const SLOT_BUSY: &str = "another council held the host slot";
+    pub const SLOT_LATE: &str = "the host council slot freed after the budget ran out";
+    pub const NOT_STARTED: &str = "the council's ballots did not start before the budget ran out";
+    pub const BUDGET_SPENT: &str = "the final pass ran out of time before this council's turn";
 }
 
 /// The council the supervisor convenes: production sends `Command::ConveneDecision` to the actor
 /// ([`ActorCouncil`]); tests inject verdicts. `excluded` are the parties (the creator and every
 /// author/corroborator): no seat whose instance or cli key is among them votes.
+///
+/// (core#1822) `on_convened` is called once, with the seats, when the council's ballots START (the
+/// council worker polled its drawn voters), before any ballot returns: the caller publishes
+/// `council.convened` from it. A council that never calls it never voted, so its outcome is never
+/// [`CouncilOutcome::TimedOut`].
 pub trait Council: Send + Sync {
     fn convene(
         &self,
         req: DecisionRequest,
         excluded: &[String],
         budget: Duration,
+        on_convened: &mut dyn FnMut(&[String]),
     ) -> CouncilOutcome;
 }
 
@@ -161,8 +180,9 @@ impl Council for ActorCouncil {
         req: DecisionRequest,
         excluded: &[String],
         budget: Duration,
+        on_convened: &mut dyn FnMut(&[String]),
     ) -> CouncilOutcome {
-        self.convene_from(crate::registry_roster(), req, excluded, budget)
+        self.convene_from(crate::registry_roster(), req, excluded, budget, on_convened)
     }
 }
 
@@ -174,6 +194,7 @@ impl ActorCouncil {
         req: DecisionRequest,
         excluded: &[String],
         budget: Duration,
+        on_convened: &mut dyn FnMut(&[String]),
     ) -> CouncilOutcome {
         let clis = match team_council_seats(roster, excluded) {
             Ok(clis) => clis,
@@ -190,10 +211,14 @@ impl ActorCouncil {
             match crate::cli_runner::HostCouncilLock::acquire_until(&self.lock_path, deadline) {
                 // (codex r2 on #1771) Taken only as the budget ran out: the caller can no longer
                 // wait for a ruling, so no council starts (the slot is released at once).
-                Ok(_late) if Instant::now() >= deadline => return CouncilOutcome::TimedOut,
+                Ok(_late) if Instant::now() >= deadline => {
+                    return CouncilOutcome::NotConvened(not_convened::SLOT_LATE.into())
+                }
                 Ok(lock) => lock,
                 // Another council held the host slot for the whole budget.
-                Err(crate::cli_runner::SlotRefused::Busy) => return CouncilOutcome::TimedOut,
+                Err(crate::cli_runner::SlotRefused::Busy) => {
+                    return CouncilOutcome::NotConvened(not_convened::SLOT_BUSY.into())
+                }
                 Err(crate::cli_runner::SlotRefused::Unavailable(why)) => {
                     return CouncilOutcome::Failed(format!(
                         "the host council slot is unavailable: {why}"
@@ -213,12 +238,25 @@ impl ActorCouncil {
         {
             return CouncilOutcome::Failed("the engine stopped".into());
         }
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(v)) => CouncilOutcome::Ruled(v),
-            Ok(Err(e)) => CouncilOutcome::Failed(format!("{e:#}")),
-            Err(RecvTimeoutError::Timeout) => CouncilOutcome::TimedOut,
-            Err(RecvTimeoutError::Disconnected) => {
-                CouncilOutcome::Failed("the engine dropped the council reply".into())
+        // (core#1822) The engine reports the ballots starting before it reports the ruling.
+        let mut convened = false;
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(CouncilReply::Convened(seats)) => {
+                    if !convened {
+                        convened = true;
+                        on_convened(&seats);
+                    }
+                }
+                Ok(CouncilReply::Ruled(Ok(v))) => return CouncilOutcome::Ruled(v),
+                Ok(CouncilReply::Ruled(Err(e))) => return CouncilOutcome::Failed(format!("{e:#}")),
+                Err(RecvTimeoutError::Timeout) if convened => return CouncilOutcome::TimedOut,
+                Err(RecvTimeoutError::Timeout) => {
+                    return CouncilOutcome::NotConvened(not_convened::NOT_STARTED.into())
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return CouncilOutcome::Failed("the engine dropped the council reply".into())
+                }
             }
         }
     }
@@ -3009,7 +3047,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     l.final_pass = FinalPass::StreamGap;
                     l.refresh_pause();
                 } else if timed_out {
-                    l = tev::synthesize_timeout(l);
+                    l = tev::synthesize_timeout(l, &tev::convened_findings(&rows));
                 }
                 (
                     l,
@@ -3359,7 +3397,8 @@ fn convene_one(
         }),
     };
     u.publish(&called);
-    let no = |reason: tev_reason::R| CouncilRuled {
+    let no = |reason: tev_reason::R, detail: Option<&str>| CouncilRuled {
+        detail: detail.map(str::to_string),
         subject: c.subject.clone(),
         verdict: Verdict::NoVerdict,
         reason: Some(reason.0),
@@ -3375,10 +3414,14 @@ fn convene_one(
         ballots_in: None,
     };
     let (by, ruled) = if c.over_cap {
-        ("engine".to_string(), no(tev_reason::CAP))
+        ("engine".to_string(), no(tev_reason::CAP, None))
     } else if clock.expired() {
+        // (core#1822) The budget was spent before this council's turn: it never convened.
         *timed_out = true;
-        ("engine".to_string(), no(tev_reason::TIMEOUT))
+        (
+            "engine".to_string(),
+            no(tev_reason::NOT_CONVENED, Some(not_convened::BUDGET_SPENT)),
+        )
     } else {
         let req = DecisionRequest {
             session_id: key.0.clone(),
@@ -3391,7 +3434,24 @@ fn convene_one(
                 .collect(),
             evidence: c.evidence.clone(),
         };
-        match council.convene(req, &excluded, clock.left()) {
+        // (core#1822) `council.convened` goes on the stream when the ballots start, before any
+        // ballot returns: a council still voting when the unit ends reads `timeout`, and one that
+        // never started reads `not_convened`.
+        let mut on_convened = |seats: &[String]| {
+            u.publish(&TeamEvent {
+                env: env_of(
+                    &key,
+                    "engine",
+                    Some(format!("council.called#{}", c.subject)),
+                ),
+                body: TeamBody::CouncilConvened(CouncilConvened {
+                    subject: c.subject.clone(),
+                    finding_id: c.finding_id.clone(),
+                    seats: seats.to_vec(),
+                }),
+            });
+        };
+        match council.convene(req, &excluded, clock.left(), &mut on_convened) {
             CouncilOutcome::Ruled(v) => {
                 let verdict = match v.winner {
                     Some(0) => Verdict::Yes,
@@ -3414,14 +3474,21 @@ fn convene_one(
                         seed: Some(v.seed),
                         eligible: v.eligible.clone(),
                         ballots_in: v.ballots_in.clone(),
+                        detail: None,
                     },
                 )
             }
-            CouncilOutcome::NoSeats(_) => ("engine".into(), no(tev_reason::SEATS_BENCHED)),
-            CouncilOutcome::Failed(_) => ("engine".into(), no(tev_reason::ERROR)),
+            CouncilOutcome::NoSeats(_) => ("engine".into(), no(tev_reason::SEATS_BENCHED, None)),
+            CouncilOutcome::Failed(_) => ("engine".into(), no(tev_reason::ERROR, None)),
             CouncilOutcome::TimedOut => {
                 *timed_out = true;
-                ("engine".into(), no(tev_reason::TIMEOUT))
+                ("engine".into(), no(tev_reason::TIMEOUT, None))
+            }
+            // The budget ran out with no ballot started: `finalPass` reads `timed_out` as before;
+            // only the council's reason says what happened.
+            CouncilOutcome::NotConvened(why) => {
+                *timed_out = true;
+                ("engine".into(), no(tev_reason::NOT_CONVENED, Some(&why)))
             }
         }
     };
@@ -3445,6 +3512,7 @@ mod tev_reason {
     pub const NO_QUORUM: R = R(NoVerdictReason::NoQuorum);
     pub const SEATS_BENCHED: R = R(NoVerdictReason::SeatsBenched);
     pub const ERROR: R = R(NoVerdictReason::Error);
+    pub const NOT_CONVENED: R = R(NoVerdictReason::NotConvened);
 }
 
 /// The member's answer to the PA's rejection of its step: a turn on a fresh read-only session on

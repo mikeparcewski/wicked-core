@@ -272,11 +272,21 @@ impl Council for FakeCouncil {
         req: DecisionRequest,
         excluded: &[String],
         _budget: Duration,
+        on_convened: &mut dyn FnMut(&[String]),
     ) -> CouncilOutcome {
         self.calls
             .lock()
             .unwrap()
             .push((req.clone(), excluded.to_vec()));
+        let out = (self.verdict.lock().unwrap())(&req);
+        // (core#1822) A council that rules, or runs out of time while voting, started its
+        // ballots; one that seated nobody, failed or never started did not.
+        if !matches!(
+            out,
+            CouncilOutcome::NoSeats(_) | CouncilOutcome::Failed(_) | CouncilOutcome::NotConvened(_)
+        ) {
+            on_convened(&["s1".to_string(), "s2".to_string(), "s3".to_string()]);
+        }
         if let Some(d) = self.delay {
             if d > _budget {
                 std::thread::sleep(_budget);
@@ -284,7 +294,7 @@ impl Council for FakeCouncil {
             }
             std::thread::sleep(d);
         }
-        (self.verdict.lock().unwrap())(&req)
+        out
     }
 }
 
@@ -3540,6 +3550,7 @@ fn a_team_council_refuses_a_party_whose_launch_cannot_be_verified() {
         council_request(),
         &["wrapped-worker#1".to_string()],
         Duration::from_secs(5),
+        &mut |_: &[String]| {},
     );
     assert!(
         matches!(&out, CouncilOutcome::NoSeats(w) if w.starts_with("identity_unknown")),
@@ -3566,8 +3577,13 @@ fn a_team_council_waits_for_the_host_slot_and_never_reaches_the_engine_while_hel
         council_request(),
         &["claude#1".to_string()],
         Duration::from_millis(600),
+        &mut |_: &[String]| {},
     );
-    assert_eq!(out, CouncilOutcome::TimedOut);
+    assert_eq!(
+        out,
+        CouncilOutcome::NotConvened("another council held the host slot".into()),
+        "(core#1822) a council that never started is not a timeout"
+    );
     assert!(started.elapsed() >= Duration::from_millis(500));
     assert!(
         rx.try_recv().is_err(),
@@ -3599,9 +3615,14 @@ fn a_slot_freed_after_the_budget_starts_no_council() {
         council_request(),
         &["claude#1".to_string()],
         Duration::from_millis(50),
+        &mut |_: &[String]| {},
     );
     release.join().unwrap();
-    assert_eq!(out, CouncilOutcome::TimedOut);
+    assert_eq!(
+        out,
+        CouncilOutcome::NotConvened("the host council slot freed after the budget ran out".into()),
+        "(core#1822) a council that never started is not a timeout"
+    );
     assert!(
         rx.try_recv().is_err(),
         "a council started after its budget ran out"
@@ -3640,7 +3661,9 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
                     Instant::now() + Duration::from_secs(5),
                 )
                 .is_ok();
-                let _ = reply.send(Err(anyhow::anyhow!("stub engine")));
+                let _ = reply.send(crate::command::CouncilReply::Ruled(Err(anyhow::anyhow!(
+                    "stub engine"
+                ))));
                 let keys: Vec<String> = clis.into_iter().map(|c| c.key).collect();
                 (keys, busy, free)
             }
@@ -3656,6 +3679,7 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
         council_request(),
         &["claude#1".to_string()],
         Duration::from_secs(30),
+        &mut |_: &[String]| {},
     );
     assert!(
         matches!(&out, CouncilOutcome::Failed(e) if e.contains("stub engine")),
@@ -3666,4 +3690,163 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     assert!(busy, "the slot was free while the council held it");
     assert!(free, "the slot stayed held after the council dropped it");
     let _ = std::fs::remove_file(&path);
+}
+
+/// core#1822 (T-R16): the engine reports the ballots starting before the ruling. A council whose
+/// ballots started and then ran past the budget is `TimedOut`, after `on_convened` heard its seats;
+/// one the engine never started within the budget is `NotConvened`, and `on_convened` never ran.
+#[test]
+fn core_1822_a_council_times_out_only_after_its_ballots_started() {
+    for started in [true, false] {
+        let path = slot_path(if started { "started" } else { "unstarted" });
+        let (tx, rx) = channel();
+        let council = ActorCouncil {
+            tx,
+            lock_path: path.clone(),
+        };
+        // The stub engine takes the command, reports the ballots starting (or not), then never
+        // rules; it keeps the reply sender until the convener has given up.
+        let engine = std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(crate::command::Command::ConveneDecision { reply, lock, .. }) => {
+                if started {
+                    let _ = reply.send(crate::command::CouncilReply::Convened(vec![
+                        "codex".into(),
+                        "pi".into(),
+                    ]));
+                }
+                std::thread::sleep(Duration::from_millis(900));
+                drop((reply, lock));
+            }
+            _ => panic!("no ConveneDecision reached the engine"),
+        });
+        let mut heard: Vec<Vec<String>> = Vec::new();
+        let out = council.convene_from(
+            vec![
+                builtin_seat("claude"),
+                builtin_seat("codex"),
+                builtin_seat("pi"),
+            ],
+            council_request(),
+            &["claude#1".to_string()],
+            Duration::from_millis(400),
+            &mut |seats: &[String]| heard.push(seats.to_vec()),
+        );
+        engine.join().unwrap();
+        if started {
+            assert_eq!(out, CouncilOutcome::TimedOut);
+            assert_eq!(heard, vec![vec!["codex".to_string(), "pi".to_string()]]);
+        } else {
+            assert_eq!(
+                out,
+                CouncilOutcome::NotConvened(
+                    "the council's ballots did not start before the budget ran out".into()
+                ),
+                "a council that never started is not a timeout"
+            );
+            assert!(heard.is_empty());
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// core#1822: a council that starts puts `council.convened` on the stream (its subject, finding
+/// and seats) beside its `council.called` and `council.ruled`; one that never starts does not, and
+/// its ruling reads `not_convened` with why, never `timeout`. `finalPass` still reads `timed_out`.
+#[test]
+fn core_1822_the_stream_says_whether_a_council_convened() {
+    let h = one_unresolved_high("c1822a", FakeCouncil::yes(), Some("declined"));
+    let called = h.rows(tev::COUNCIL_CALLED);
+    let convened = h.rows(tev::COUNCIL_CONVENED);
+    assert_eq!(convened.len(), 1, "{convened:#?}");
+    // On the stream in order: called, then convened (ballots started), then ruled.
+    let id_of = |t: &str| -> i64 {
+        BusDb::shared(&h.rig.bus)
+            .unwrap()
+            .poll(t, 0, 10_000)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.payload["run_id"] == RUN)
+            .unwrap_or_else(|| panic!("no {t}"))
+            .event_id
+    };
+    assert!(id_of(tev::COUNCIL_CALLED) < id_of(tev::COUNCIL_CONVENED));
+    assert!(id_of(tev::COUNCIL_CONVENED) < id_of(tev::COUNCIL_RULED));
+    assert_eq!(convened[0]["subject"], called[0]["subject"]);
+    assert_eq!(convened[0]["finding_id"], called[0]["finding_id"]);
+    assert_eq!(convened[0]["seats"], json!(["s1", "s2", "s3"]));
+    assert_eq!(h.rows(tev::COUNCIL_RULED)[0]["verdict"], "yes");
+
+    let busy =
+        FakeCouncil::new(|_| CouncilOutcome::NotConvened(super::not_convened::SLOT_BUSY.into()));
+    let h = one_unresolved_high("c1822b", busy, Some("declined"));
+    assert!(h.rows(tev::COUNCIL_CONVENED).is_empty());
+    let ruled = h.rows(tev::COUNCIL_RULED);
+    assert_eq!(ruled[0]["verdict"], "no_verdict");
+    assert_eq!(ruled[0]["reason"], "not_convened");
+    assert_eq!(ruled[0]["detail"], "another council held the host slot");
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
+    let d = l.findings[0].dispute.as_ref().unwrap();
+    assert_eq!(d.reason, Some(super::super::NoVerdictReason::NotConvened));
+    assert_eq!(
+        d.detail.as_deref(),
+        Some("another council held the host slot")
+    );
+    assert!(l.team_pause);
+}
+
+/// core#1822: a council whose turn comes after the final pass's budget is spent never convenes:
+/// the first HIGH's council runs past the budget (`timeout`, it was voting), so the second HIGH's
+/// is never called on the council (`not_convened`, "the final pass ran out of time before this
+/// council's turn"). `finalPass` is `timed_out` and the run pauses, as before.
+#[test]
+fn core_1822_a_council_whose_turn_comes_after_the_budget_is_not_convened() {
+    let council = FakeCouncil::slow(Duration::from_secs(60));
+    let mut h = Harness::with(
+        "c1822c",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.final_pass_budget = Duration::from_secs(8);
+            c
+        },
+        council,
+    );
+    let first = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    let second = finding_line("high", "src/lib.rs", 1, "fn a() {}", "a is unused");
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            Ok("DONE".into())
+        } else {
+            Ok(format!("{first}\n{second}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let ruled = h.rows(tev::COUNCIL_RULED);
+    assert_eq!(ruled.len(), 2, "{ruled:#?}");
+    let reasons: Vec<(&str, Option<&str>)> = ruled
+        .iter()
+        .map(|r| (r["reason"].as_str().unwrap(), r["detail"].as_str()))
+        .collect();
+    assert!(reasons.contains(&("timeout", None)), "{reasons:?}");
+    assert!(
+        reasons.contains(&(
+            "not_convened",
+            Some("the final pass ran out of time before this council's turn")
+        )),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        h.rows(tev::COUNCIL_CONVENED).len(),
+        1,
+        "only the first convened"
+    );
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
+    assert!(l.team_pause, "{l:?}");
 }

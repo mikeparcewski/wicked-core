@@ -69,9 +69,13 @@ pub const PATH_ENDED: &str = "wicked.team.path.ended";
 /// (DES-ASK-TEAM-CHAT-001 §4.1, §6 #26) The PA changed mid-path: a seat-caused failure of a PA
 /// step on a roster with another eligible seat re-pins the creator seat.
 pub const PATH_REPICKED: &str = "wicked.team.path.repicked";
+/// (core#1822, DES-STANDIN-001 §3.11) A council's ballots STARTED: the council worker polled its
+/// drawn voters. A `council.called` with no `council.convened` never voted.
+pub const COUNCIL_CONVENED: &str = "wicked.team.council.convened";
 
-/// The 26 types, in DES-002 §6 table order (#26 `path.repicked`, DES-ASK-TEAM-CHAT-001 §6).
-pub const ALL_TYPES: [&str; 26] = [
+/// The 27 types, in DES-002 §6 table order (#26 `path.repicked`, DES-ASK-TEAM-CHAT-001 §6; #27
+/// `council.convened`, DES-STANDIN-001 §3.11).
+pub const ALL_TYPES: [&str; 27] = [
     PATH_STARTED,
     PATH_SCORED,
     PLAN_PROPOSED,
@@ -98,6 +102,7 @@ pub const ALL_TYPES: [&str; 26] = [
     GATE_DECIDED,
     PATH_ENDED,
     PATH_REPICKED,
+    COUNCIL_CONVENED,
 ];
 
 /// The one component that publishes a type (DES-002 §7).
@@ -118,7 +123,7 @@ pub fn owner(event_type: &str) -> Option<Owner> {
         PATH_STARTED | PATH_SCORED | PLAN_PROPOSED | PLAN_REVISED | PLAN_ACCEPTED
         | PLAN_REFUSED | GATE_OPENED | GATE_DECIDED | PATH_ENDED | PATH_REPICKED => E,
         MEMBER_JOINED | MEMBER_LEFT | FINDING_RAISED | HELP_ANSWERED | CHANGE_REQUESTED
-        | FINDING_SETTLED | COUNCIL_CALLED | COUNCIL_RULED | LEDGER_FOLDED => S,
+        | FINDING_SETTLED | COUNCIL_CALLED | COUNCIL_CONVENED | COUNCIL_RULED | LEDGER_FOLDED => S,
         STEP_CLAIMED | CHECKPOINT_REACHED | ADVICE_DELIVERED | ADVICE_ANSWERED | HELP_REQUESTED
         | STEP_COMPLETED | STEP_REVIEWED => R,
         _ => return None,
@@ -244,6 +249,12 @@ pub fn key_finding_settled(run_id: &str, ord: u32, attempt: u32, raise_seq: u32)
 pub fn key_council_called(run_id: &str, ord: u32, attempt: u32, subject: &str) -> String {
     let (o, a) = (ord.to_string(), attempt.to_string());
     team_key(COUNCIL_CALLED, run_id, &[&o, &a, subject])
+}
+
+/// One `council.convened` per council of an attempt: keyed like the `council.called` it answers.
+pub fn key_council_convened(run_id: &str, ord: u32, attempt: u32, subject: &str) -> String {
+    let (o, a) = (ord.to_string(), attempt.to_string());
+    team_key(COUNCIL_CONVENED, run_id, &[&o, &a, subject])
 }
 
 pub fn key_council_ruled(run_id: &str, ord: u32, attempt: u32, subject: &str) -> String {
@@ -1093,6 +1104,19 @@ pub struct CouncilCalled {
     pub transcript: Vec<i64>,
 }
 
+/// 27 — `council.convened` (S; core#1822, DES-STANDIN-001 §3.11): the council's ballots started.
+/// Published by the supervisor when the engine reports the council worker polling its drawn
+/// voters, so it is on the stream before any ballot returns. The envelope's `(ord, attempt)` is the
+/// unit's; a finding's council is matched by `finding_id` (the ledger drops `raise_seq`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouncilConvened {
+    /// The `council.called` subject: [`subject_finding`] | [`subject_step`].
+    pub subject: String,
+    pub finding_id: Option<String>,
+    /// The seats whose ballots started.
+    pub seats: Vec<String>,
+}
+
 /// 21 — `council.ruled` (S): `convene_decision`'s `DecisionVerdict`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CouncilRuled {
@@ -1122,6 +1146,10 @@ pub struct CouncilRuled {
     /// field, and when nothing was convened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ballots_in: Option<String>,
+    /// (core#1822) Why, in words, on a `not_convened` no-verdict ("another council held the host
+    /// slot"). Absent otherwise and on every row recorded before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1443,6 +1471,7 @@ bodies! {
     GateDecided(GateDecided) = GATE_DECIDED,
     PathEnded(PathEnded) = PATH_ENDED,
     PathRepicked(PathRepicked) = PATH_REPICKED,
+    CouncilConvened(CouncilConvened) = COUNCIL_CONVENED,
 }
 
 /// One team event: the envelope plus its body.
@@ -1558,6 +1587,7 @@ fn key_parts_of(ev: &TeamEvent) -> Result<String> {
         TeamBody::FindingSettled(b) => key_finding_settled(run, ord()?, attempt()?, b.raise_seq),
         TeamBody::CouncilCalled(b) => key_council_called(run, ord()?, attempt()?, &b.subject),
         TeamBody::CouncilRuled(b) => key_council_ruled(run, ord()?, attempt()?, &b.subject),
+        TeamBody::CouncilConvened(b) => key_council_convened(run, ord()?, attempt()?, &b.subject),
         TeamBody::LedgerFolded(_) => key_ledger_folded(run, ord()?, attempt()?),
         TeamBody::GateOpened(b) => key_gate_opened(run, &b.gate_id),
         TeamBody::GateDecided(b) => key_gate_decided(run, &b.gate_id),
@@ -1938,21 +1968,49 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
             seats: r.seats.clone(),
             seed: r.seed,
             reason: r.reason,
+            detail: None,
         },
         // A council that was drawn but reached no verdict still names who sat (codex r1).
         Verdict::NoVerdict => Dispute {
             seats: r.seats.clone(),
             seed: r.seed,
+            detail: r.detail.clone(),
             ..no_verdict(r.reason.unwrap_or(NoVerdictReason::Error))
         },
     }
 }
 
+/// The `finding_id`s whose council STARTED voting in `rows` (`council.convened`, core#1822), in
+/// the attempt the rows' terminal `step.completed` names (every row when none names one, as the
+/// fold reads them). [`synthesize_timeout`] reads it: a council that never convened did not time
+/// out.
+pub fn convened_findings(rows: &[TeamRow]) -> HashSet<String> {
+    let terminal = rows.iter().find_map(|r| match r.event.body {
+        TeamBody::StepCompleted(_) => Some((r.event.env.ord, r.event.env.attempt)),
+        _ => None,
+    });
+    rows.iter()
+        .filter(|r| terminal.is_none_or(|at| (r.event.env.ord, r.event.env.attempt) == at))
+        .filter_map(|r| match &r.event.body {
+            // A finding's council only (`finding:<raise_seq>`); a member step's has no finding.
+            TeamBody::CouncilConvened(b) if b.subject.starts_with("finding:") => {
+                b.finding_id.clone()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The words on a finding's `not_convened` dispute when the final pass ended first.
+pub const NOT_CONVENED_STEP_ENDED: &str = "the step ended before its turn";
+
 /// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every HIGH settling now
 /// missing a hold-round reply or a council verdict gets `{kind:"hold", reason:"no reply (final
-/// pass timed out)"}` / `{verdict:"no_verdict", reason:"timeout"}`. Recorded results are kept;
+/// pass timed out)"}` and a no-verdict dispute. (core#1822) The dispute says `timeout` only when
+/// the finding's council STARTED voting (`convened`, from [`convened_findings`]); a council that
+/// never convened is `not_convened` with [`NOT_CONVENED_STEP_ENDED`]. Recorded results are kept;
 /// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. `teamPause` is recomputed.
-pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
+pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &HashSet<String>) -> TeamLedger {
     ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
         if f.finding.severity != Severity::High || !settles_now(f) {
@@ -1969,7 +2027,14 @@ pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
             });
         }
         if f.dispute.is_none() {
-            f.dispute = Some(no_verdict(NoVerdictReason::Timeout));
+            f.dispute = Some(if convened.contains(&f.finding.finding_id) {
+                no_verdict(NoVerdictReason::Timeout)
+            } else {
+                Dispute {
+                    detail: Some(NOT_CONVENED_STEP_ENDED.to_string()),
+                    ..no_verdict(NoVerdictReason::NotConvened)
+                }
+            });
         }
     }
     ledger.refresh_pause();
@@ -1984,6 +2049,7 @@ pub(crate) fn no_verdict(reason: NoVerdictReason) -> Dispute {
         seats: Vec::new(),
         seed: None,
         reason: Some(reason),
+        detail: None,
     }
 }
 
