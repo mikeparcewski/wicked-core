@@ -20375,6 +20375,16 @@ pub(crate) fn confirm_gate_expecting(
                 grant,
                 actor.as_deref(),
             )? {
+                // (T-R12) A check held after its seat ran (a missing judge): only the judge runs
+                // again, on the reviewed attempt's output and tree; no seat is re-dispatched.
+                stand_in_gate::Answered::Run
+                    if crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .is_some_and(|u| u.last_attempt.is_some()) =>
+                {
+                    armed_rejudge = Some(rejudge_basis(&*store, run_id, Vec::new())?);
+                    crate::workflow::HumanDecision::Rejudge
+                }
                 stand_in_gate::Answered::Run => crate::workflow::HumanDecision::Approve {
                     amend: None,
                     amend_scope: crate::workflow::AmendScope::Cursor,
@@ -21310,6 +21320,17 @@ fn rejudge_request(
             }
         );
     }
+    rejudge_basis(store, run_id, r.eligible)
+}
+
+/// (rejudge) The re-judge of `run_id`'s cursor unit as it stands: the reviewed attempt's captured
+/// output (the seat does not run again), its attempt and monitors. `seats` names the judges
+/// eligible when it was armed (the record's; a stand-in grant names none).
+pub(crate) fn rejudge_basis(
+    store: &dyn GraphStore,
+    run_id: &str,
+    seats: Vec<String>,
+) -> anyhow::Result<crate::domain::RequestedRejudge> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -21330,7 +21351,7 @@ fn rejudge_request(
     Ok(crate::domain::RequestedRejudge {
         output,
         attempt,
-        seats: r.eligible,
+        seats,
         monitors: crate::cli_runner::unit_team_monitors(cursor),
         team: cursor.team.clone().map(Box::new),
         consumed: false,
@@ -24140,6 +24161,99 @@ pub(crate) mod sessions_detail_fold_tests {
         finished.status = crate::domain::UnitStatus::Done;
         let d = crate::deliver_lift::delivery_receipt(&s, &[finished, deliver]);
         assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
+    }
+
+    /// T-R15 / T-R20 (DES-STANDIN-001 §5.1): on a stand-in-aware run, gate 1's real judge and
+    /// gate 2's stand-in judge make the delivery's judge role `stand_in` and its independence
+    /// `mixed`, and the legacy projection is conservative (the judge never `ran`). A judge missing
+    /// at a third gate stays unsatisfied: the stand-in never hides that skip. A gate with no judge
+    /// due beside a real judge stays `independent`.
+    #[test]
+    fn a_stand_in_judge_at_one_gate_makes_the_delivery_mixed_and_never_ran() {
+        use crate::assurance as a;
+        let mut s = session("stand-in-delivery");
+        s.assurance.roles = Some(Vec::new());
+        s.assurance.stand_in_aware = true;
+        s.assurance.stand_in_label = Some("Checked by a stand-in".into());
+        let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("stand-in-delivery:{ord}"),
+                "stand-in-delivery",
+                ord,
+                "step",
+            );
+            let mut r = a::AssuranceReceipt::for_run(&s.assurance, 0);
+            f(&mut r);
+            u.assurance = Some(r);
+            u
+        };
+        let real = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::JUDGE);
+            r.judge = Some("codex".into());
+            r.roles = Some(vec![a::RoleRecord::real(
+                crate::standin::Role::Judge,
+                "codex",
+                1,
+                0,
+            )]);
+        };
+        let stood = |r: &mut a::AssuranceReceipt| {
+            let b = crate::standin::StandInBinding {
+                key: "claude~1".into(),
+                base: "claude".into(),
+                role: crate::standin::Role::Judge,
+                slot: 1,
+                model: None,
+                builder_model: None,
+                lens: None,
+                ord: Some(2),
+                attempt: Some(0),
+                subject: None,
+                evidence: None,
+                invocation: "i".into(),
+                reason: crate::standin::Reason::OnlyOneHelper {
+                    cli: "Claude Code".into(),
+                },
+                state: crate::standin::STATE_ANSWERED.into(),
+                display: None,
+            };
+            r.skip(a::JUDGE, a::SKIP_STAND_IN, Some("by a stand-in".into()));
+            r.roles = Some(vec![a::RoleRecord::stand_in(&b, "Claude Code")]);
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &stood)]);
+        assert!(!d.ran.iter().any(|i| i == a::JUDGE), "{:?}", d.ran);
+        assert!(d
+            .skipped
+            .iter()
+            .any(|k| k.instrument == a::JUDGE && k.reason == a::SKIP_STAND_IN));
+        let roles = d.roles.as_ref().expect("canonical");
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].filled, a::FILLED_STAND_IN);
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENCE_MIXED));
+        assert_eq!(d.stand_in_label.as_deref(), Some("Checked by a stand-in"));
+        // A required judge missing at gate 3 is the delivery's word.
+        let missing = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NO_DISTINCT_SEAT, Some("no seat".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[gate(1, &real), gate(2, &stood), gate(3, &missing)],
+        );
+        let judge_skips: Vec<&str> = d
+            .skipped
+            .iter()
+            .filter(|k| k.instrument == a::JUDGE)
+            .map(|k| k.reason.as_str())
+            .collect();
+        assert_eq!(judge_skips, [a::SKIP_NO_DISTINCT_SEAT]);
+        // No judge due at gate 2, a real one at gate 1: independent.
+        let not_due = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NOT_APPLICABLE, Some("no files".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &not_due)]);
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENT));
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert_eq!(d.stand_in_label, None);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored
