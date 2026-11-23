@@ -3572,21 +3572,24 @@ impl WrappedCliStepRunner {
                 "{}\n\n{DELIVERABLE_ROOTS_INSTRUCTION}",
                 unit_prompt(input, form, handed)
             )
-        } else if write_posture == crate::write_posture::WritePosture::Full {
-            // (core#1758) The full posture's scratch, named: a seat that fans work out needs
-            // somewhere to stage it, and without a name it tried `/tmp` (refused) and then the
-            // tree (refused at hand-off, outside the write set).
-            let scratch = unit_scratch_dir(
-                input.workdir.as_deref().unwrap_or(&sandbox),
-                uses_container_seat(
+        } else if let Some(scratch) = names_scratch(write_posture, input.unit.pre_build_scope)
+            .then(|| {
+                // (core#1758) The full posture's scratch, named: a seat that fans work out needs
+                // somewhere to stage it, and without a name it tried `/tmp` (refused) and then
+                // the tree (refused at hand-off, outside the write set).
+                let in_container = uses_container_seat(
                     runs_in_seat(input),
                     crate::container_floor::container_mode(),
-                ),
-            );
+                );
+                prepared_unit_scratch(input.workdir.as_deref().unwrap_or(&sandbox), in_container)
+                    .map(|dir| (dir, in_container))
+            })
+            .flatten()
+        {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
-                scratch_instruction(&scratch)
+                scratch_instruction(&scratch.0, !scratch.1)
             )
         } else {
             unit_prompt(input, form, handed)
@@ -5635,27 +5638,46 @@ pub(crate) fn hook_write_extras(
         .collect()
 }
 
-/// (core#1758) The scratch directory a full-posture unit is told to use, outside its change: in a
-/// seat container (`in_container`, both the container and the k8s floor) the container's own
-/// `/tmp` ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]: rwx under every container floor, per
-/// container, never written back); on the host the engine scratch `<cwd>/tmp`
-/// ([`crate::worktree_guard::ENGINE_SCRATCH_DIR`], the `TMPDIR` [`redirect_scratch_into_boundary`]
-/// sets), which is inside the unit's write root and excluded from its write set. Never `/tmp` on
-/// the host: that is outside the unit's boundary.
-pub(crate) fn unit_scratch_dir(cwd: &Path, in_container: bool) -> PathBuf {
-    if in_container {
-        PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP)
-    } else {
-        cwd.join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-    }
+/// (core#1758) Whether a unit's brief names its scratch: the full posture, except a pre-build
+/// rung, whose phase fence admits documentation writes only (`gate_hook::phase_scope_denial`), so
+/// scratch files would be refused there anyway. The fenced postures carry their own instruction.
+pub(crate) fn names_scratch(
+    posture: crate::write_posture::WritePosture,
+    pre_build_scope: bool,
+) -> bool {
+    posture == crate::write_posture::WritePosture::Full && !pre_build_scope
 }
 
-/// (core#1758) The brief's line naming the unit's scratch directory ([`unit_scratch_dir`]).
-pub(crate) fn scratch_instruction(scratch: &Path) -> String {
+/// (core#1758) The scratch directory a full-posture unit is told to use, outside its change, or
+/// `None` when it cannot be had (never name a directory the seat cannot write). In a seat
+/// container (`in_container`, both the container and the k8s floor) it is the container's own
+/// `/tmp` ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]: rwx under every container floor, per
+/// container, never written back). On the host it is the engine scratch `<cwd>/tmp`
+/// ([`crate::worktree_guard::ENGINE_SCRATCH_DIR`], the `TMPDIR` [`redirect_scratch_into_boundary`]
+/// sets), inside the unit's write root and excluded from its write set, and made here as that
+/// does: a tree whose `tmp` is a file has none. Never `/tmp` on the host: that is outside the
+/// unit's boundary.
+pub(crate) fn prepared_unit_scratch(cwd: &Path, in_container: bool) -> Option<PathBuf> {
+    if in_container {
+        return Some(PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP));
+    }
+    let dir = cwd.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+    (std::fs::create_dir_all(&dir).is_ok() && dir.is_dir()).then_some(dir)
+}
+
+/// (core#1758) The brief's line naming the unit's scratch directory ([`prepared_unit_scratch`]).
+/// `shared`: the host's `<cwd>/tmp`, which every step of the run in that tree uses and which goes
+/// with the run's worktree; a container's `/tmp` is the step's own and goes with the container.
+pub(crate) fn scratch_instruction(scratch: &Path, shared: bool) -> String {
+    let lifetime = if shared {
+        "it is not part of your change, other steps of this run use it too (keep your files in a \
+         subdirectory named for this step), and it is removed with the run's worktree"
+    } else {
+        "it is yours for this step, it is not part of your change, and it is discarded afterwards"
+    };
     format!(
-        "Scratch space: put temporary files (chunks, intermediate data, helper scripts) in {} \
-         — it is yours for this unit, it is not part of your change, and it is discarded \
-         afterwards. Never stage them anywhere else in the repository, and use no other temp \
+        "Scratch space: put temporary files (chunks, intermediate data, helper scripts) in {} — \
+         {lifetime}. Never stage them anywhere else in the repository, and use no other temp \
          directory.",
         scratch.display()
     )
@@ -7804,9 +7826,20 @@ fn system_managed_settings_dir() -> Option<std::path::PathBuf> {
 pub(crate) fn managed_hooks_only_source(
     candidates: &[std::path::PathBuf],
 ) -> Option<std::path::PathBuf> {
-    candidates
+    managed_hooks_only_source_in(candidates, system_managed_settings_dir().as_deref())
+}
+
+/// [`managed_hooks_only_source`] with the system managed-settings directory handed in. A silencing
+/// file there wins over an earlier one elsewhere (codex r1 on #1818): it binds claude on either
+/// floor, so the refusal's remedy must come from it ([`managed_hooks_remedy`]), never the
+/// container floor that a sign-in policy alone would allow.
+pub(crate) fn managed_hooks_only_source_in(
+    candidates: &[std::path::PathBuf],
+    system: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let silencing: Vec<&std::path::PathBuf> = candidates
         .iter()
-        .find(|p| {
+        .filter(|p| {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -7817,7 +7850,12 @@ pub(crate) fn managed_hooks_only_source(
                         || v.get("disableAllHooks") == Some(&serde_json::Value::Bool(true))
                 })
         })
-        .cloned()
+        .collect();
+    silencing
+        .iter()
+        .find(|p| system.is_some_and(|s| p.starts_with(s)))
+        .or(silencing.first())
+        .map(|p| (*p).clone())
 }
 
 /// Stable prefix of the #653 spawn refusal — the escalation an operator and crew read.
@@ -13077,6 +13115,36 @@ mod tests {
         assert!(bench[0].reason.starts_with(MANAGED_HOOKS_ONLY_REFUSAL));
     }
 
+    /// core#1744 (codex r1 on #1818): with both a sign-in policy and a system policy silencing the
+    /// hook, the system one is the source, so the refusal never suggests the container floor,
+    /// where the system policy is still read.
+    #[test]
+    fn core_1744_a_system_silencer_wins_over_a_sign_in_one() {
+        let dir = std::env::temp_dir().join(format!("wc-1744-both-{}", std::process::id()));
+        let system = dir.join("system");
+        std::fs::create_dir_all(&system).unwrap();
+        let remote = dir.join("remote-settings.json");
+        std::fs::write(&remote, r#"{"allowManagedHooksOnly": true}"#).unwrap();
+        let sys = system.join("managed-settings.json");
+        std::fs::write(&sys, r#"{"disableAllHooks": true}"#).unwrap();
+        let both = [remote.clone(), sys.clone()];
+        assert_eq!(
+            managed_hooks_only_source_in(&both, Some(&system)),
+            Some(sys)
+        );
+        assert_eq!(
+            managed_hooks_only_source_in(&both, None),
+            Some(remote.clone())
+        );
+        let kept = system.join("kept.json");
+        std::fs::write(&kept, r#"{"disableAllHooks": false}"#).unwrap();
+        assert_eq!(
+            managed_hooks_only_source_in(&[remote.clone(), kept], Some(&system)),
+            Some(remote)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// core#1744: a system-managed setting binds every claude this host launches, on either floor,
     /// so its remedy is another seat or the machine's administrator, never the container floor.
     #[test]
@@ -15387,19 +15455,49 @@ mod tests {
     /// the write root, excluded from the write set) — and never the host's `/tmp`.
     #[test]
     fn core_1758_the_brief_names_the_units_scratch_on_every_floor() {
-        let wt = Path::new("/w/tree");
-        assert_eq!(unit_scratch_dir(wt, true), PathBuf::from("/tmp"));
+        use crate::write_posture::WritePosture;
+        let base = std::env::temp_dir().join(format!("wc-1758-scratch-{}", std::process::id()));
+        let wt = base.join("tree");
+        std::fs::create_dir_all(&wt).unwrap();
         assert_eq!(
-            unit_scratch_dir(wt, false),
-            wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+            prepared_unit_scratch(&wt, true),
+            Some(PathBuf::from("/tmp"))
         );
-        let line = scratch_instruction(&unit_scratch_dir(wt, false));
-        assert!(line.contains("/w/tree/tmp"), "{line}");
-        assert!(line.contains("not part of your change"), "{line}");
+        assert_eq!(
+            prepared_unit_scratch(&wt, false),
+            Some(wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR))
+        );
+        assert!(wt.join("tmp").is_dir(), "made as the launch makes it");
+        // (codex r1 on #1818) A tree whose `tmp` is a file has no scratch to name.
+        let odd = base.join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("tmp"), b"a file").unwrap();
+        assert_eq!(prepared_unit_scratch(&odd, false), None);
+        // The host's is shared by the run's steps; a container's is the step's own.
+        let host = scratch_instruction(&wt.join("tmp"), true);
+        assert!(
+            host.contains(&wt.join("tmp").display().to_string()),
+            "{host}"
+        );
+        assert!(host.contains("not part of your change") && host.contains("other steps"));
+        let pod = scratch_instruction(Path::new("/tmp"), false);
+        assert!(pod.contains("yours for this step") && !pod.contains("other steps"));
+        // Only the full posture names it, and never a pre-build rung (its phase fence admits
+        // documentation writes only).
+        assert!(names_scratch(WritePosture::Full, false));
+        assert!(!names_scratch(WritePosture::Full, true));
+        for fenced in [
+            WritePosture::ReadOnly,
+            WritePosture::DeliverableRoots,
+            WritePosture::ToolLess,
+        ] {
+            assert!(!names_scratch(fenced, false));
+        }
+        let _ = std::fs::remove_dir_all(&base);
         let src = include_str!("execute_wrapped.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();
         assert!(
-            production.contains("scratch_instruction(&scratch)"),
+            production.contains("scratch_instruction(&scratch.0, !scratch.1)"),
             "the full-posture brief no longer names the unit's scratch"
         );
     }
