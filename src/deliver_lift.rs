@@ -1435,7 +1435,20 @@ pub(crate) fn delivery_receipt(
     units: &[crate::domain::WorkUnit],
 ) -> crate::assurance::AssuranceReceipt {
     let mut r = crate::assurance::AssuranceReceipt::for_run(&session.assurance, 0);
-    for g in units.iter().filter_map(|u| u.assurance.as_ref()) {
+    // (core#1799) A gate where no judge was due (`not_applicable`) speaks for the delivery only
+    // when no gate of the run ran a judge and none skipped one for another reason: a review that
+    // changed no files beside a judged build is not a skipped judge. A gate receipt that never
+    // said the judge (a record from before core#1799) is missing evidence, and outranks a not-due
+    // gate: the delivery says it is not known (xreview r2 on #1827).
+    let mut judge_not_due: Option<crate::assurance::SkippedInstrument> = None;
+    let mut judge_unknown: Option<u32> = None;
+    for (ord, g) in units
+        .iter()
+        .filter_map(|u| u.assurance.as_ref().map(|g| (u.ord, g)))
+    {
+        if g.judge_unaccounted() {
+            judge_unknown.get_or_insert(ord);
+        }
         for i in &g.ran {
             r.ran(i);
         }
@@ -1446,6 +1459,12 @@ pub(crate) fn delivery_receipt(
             .iter()
             .filter(|k| k.instrument != crate::assurance::QE_ACCEPTANCE)
         {
+            if k.instrument == crate::assurance::JUDGE
+                && k.reason == crate::assurance::SKIP_NOT_APPLICABLE
+            {
+                judge_not_due.get_or_insert_with(|| k.clone());
+                continue;
+            }
             r.skip(&k.instrument, &k.reason, k.detail.clone());
         }
         // Every council the run's gates recorded: who decided its disputes.
@@ -1499,6 +1518,40 @@ pub(crate) fn delivery_receipt(
             r.operator_judges.push(j.clone());
         }
         r.ran(crate::assurance::OPERATOR_JUDGE);
+    }
+    // `skip` keeps the first per instrument: a real skip a gate recorded (above) stands. Missing
+    // evidence is said whether or not another gate ran a judge, as an `error` skip a gate recorded
+    // would be (xreview delta on #1827); a not-due skip speaks only when no gate ran one.
+    if let Some(ord) = judge_unknown {
+        r.skip(
+            crate::assurance::JUDGE,
+            crate::assurance::SKIP_ERROR,
+            Some(format!(
+                "unit {ord}'s gate receipt does not say whether a judge ran (a record from \
+                 before the engine said so): whether one was due is not known"
+            )),
+        );
+    }
+    if !r.ran.iter().any(|i| i == crate::assurance::JUDGE) {
+        if let Some(k) = judge_not_due {
+            r.skip(&k.instrument, &k.reason, k.detail);
+        }
+    }
+    // (xreview r1, r2 on #1827) The run's first step delivers: no step has finished and none cut
+    // a gate receipt, and the delivery's own step is scripted, so no judge was due. Read from the
+    // run's state, never from receipts alone: finished steps with no receipt stay as they were.
+    if units
+        .iter()
+        .all(|u| u.assurance.is_none() && u.status != crate::domain::UnitStatus::Done)
+    {
+        r.account_required_judge(|| {
+            (
+                crate::assurance::SKIP_NOT_APPLICABLE,
+                "no step finished before this delivery: the delivery is a scripted step, no \
+                 seat's work for a judge to review"
+                    .to_string(),
+            )
+        });
     }
     r.tree = session.verified_tree.clone();
     r

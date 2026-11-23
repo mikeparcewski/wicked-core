@@ -600,6 +600,24 @@ impl AssuranceReceipt {
         r
     }
 
+    /// (core#1799) Whether the run requires the judge and this receipt neither ran nor skipped it.
+    pub fn judge_unaccounted(&self) -> bool {
+        self.required.iter().any(|i| i == JUDGE)
+            && !self.ran.iter().any(|i| i == JUDGE)
+            && !self.skipped.iter().any(|s| s.instrument == JUDGE)
+    }
+
+    /// (core#1799) A required judge this receipt neither ran nor skipped is said on it — the skip
+    /// reason and words `why` gives (`not_applicable` when it was not due, `error` when that is not
+    /// known) — never a required instrument that is silently absent. A no-op when the run does not
+    /// require the judge, or the receipt already accounts for it.
+    pub fn account_required_judge(&mut self, why: impl FnOnce() -> (&'static str, String)) {
+        if self.judge_unaccounted() {
+            let (reason, words) = why();
+            self.skip(JUDGE, reason, Some(words));
+        }
+    }
+
     pub fn ran(&mut self, instrument: &str) {
         if !self.ran.iter().any(|r| r == instrument) {
             self.ran.push(instrument.to_string());

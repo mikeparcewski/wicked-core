@@ -2355,6 +2355,7 @@ pub(crate) fn apply_and_finish_unit(
                 .and_then(operator_waiver),
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
+            judge_not_due: judge_not_due(unit, workdir.is_some(), evidence.tree_changed),
             rules: evidence.rule_check.as_ref(),
             eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
             eval_error: eval_error.as_deref(),
@@ -3759,11 +3760,108 @@ struct GateFacts<'a> {
     checks_waived: Option<String>,
     judge: Option<&'a crate::validator::AgentVerdict>,
     judge_skipped: Option<&'a str>,
+    /// (core#1799) Why no judge was due at this gate ([`judge_not_due`]): recorded as a skip when
+    /// the run's contract lists `judge` and no judge ran or was skipped.
+    judge_not_due: (&'static str, String),
     /// (DES-RULE-CHECK-001 S2) The review step's rule check, when it ran.
     rules: Option<&'a crate::rule_check::RuleCheckReport>,
     eval_ran: bool,
     eval_error: Option<&'a str>,
     tree: Option<String>,
+}
+
+/// (core#1799) Why the engine's judge did not run at `unit`'s gate, as the receipt says it: the
+/// skip reason and its words. The judge reviews a bound seat's change to the tree (or a report
+/// under a cited-findings rubric), so a gate without one says which of those it lacked —
+/// `not_applicable`. When the unit's facts say a judge WAS due and its completion carries neither
+/// a verdict nor a reason (an older completion, a lost result), that is missing evidence, never an
+/// exemption: `error`, saying so (xreview r2 on #1827). Mirrors the runner's own selection
+/// (`cli_runner`: `bound_agent`, `default_floor_applies`, `report_judge`).
+pub(crate) fn judge_not_due(
+    unit: &crate::domain::WorkUnit,
+    has_workdir: bool,
+    tree_changed: Option<bool>,
+) -> (&'static str, String) {
+    use crate::assurance::{SKIP_ERROR, SKIP_NOT_APPLICABLE};
+    let ord = unit.ord;
+    let guarded = crate::worktree_guard::applies_to(unit);
+    let report_judge = unit.role == crate::workflow::PhaseRole::Evaluator
+        && has_workdir
+        && unit
+            .rubric
+            .as_deref()
+            .and_then(crate::rubric::rubric)
+            .is_some_and(|r| r.recheck_excludes_gatherers);
+    let not_due = |words: String| (SKIP_NOT_APPLICABLE, words);
+    if unit.tool_cmd.is_some() {
+        not_due(format!(
+            "unit {ord} is a scripted step: no seat's work for a judge to review"
+        ))
+    } else if crate::execute_wrapped::is_engine_internal(unit) {
+        not_due(format!(
+            "unit {ord} is the engine's own step: no seat's work for a judge to review"
+        ))
+    } else if unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some())
+    {
+        not_due(format!(
+            "unit {ord} is the PA's review of a member's step: the PA's verdict decides it, no judge"
+        ))
+    } else if has_workdir && unit.validator.as_ref().is_some_and(|v| v.approved) {
+        // (xreview delta on #1827) A pinned validator's judge runs whatever the guard or the
+        // default floor say (`cli_runner`: the pinned path).
+        (
+            SKIP_ERROR,
+            format!(
+                "unit {ord} has a pinned judge, and its completion carries no verdict and no \
+                 reason: whether it ran is not known"
+            ),
+        )
+    } else if report_judge {
+        (
+            SKIP_ERROR,
+            format!(
+                "unit {ord} is a report under a cited-findings rubric, which takes a judge, and its \
+                 completion carries no verdict and no reason: whether a judge ran is not known"
+            ),
+        )
+    } else if guarded && unit.role == crate::workflow::PhaseRole::Evaluator {
+        not_due(format!(
+            "unit {ord} is a review its phase declares read-only: its evaluator's own verdict \
+             decides this gate (a judge reviews a changed tree, or a report under a cited-findings \
+             rubric)"
+        ))
+    } else if guarded {
+        // (xreview r1 on #1827) A guarded read-only step that is no review (recon, gathering)
+        // has no evaluator verdict either; its phase declares it changes no files (the guard
+        // denies the gate if it did), so the judge does not take it.
+        not_due(format!(
+            "unit {ord} is a step its phase declares read-only: the judge reviews a changed tree, \
+             and this step's phase may not change one"
+        ))
+    } else if !has_workdir {
+        not_due(format!(
+            "unit {ord} ran without a worktree: no change for a judge to review"
+        ))
+    } else if !unit.default_floor {
+        not_due(format!(
+            "unit {ord}'s step takes no default floor, so the engine's judge does not review it"
+        ))
+    } else if tree_changed == Some(false) {
+        not_due(format!(
+            "unit {ord} changed no files: no change for a judge to review"
+        ))
+    } else {
+        (
+            SKIP_ERROR,
+            format!(
+                "unit {ord} may have changed the tree, which takes a judge, and its completion \
+                 carries no verdict and no reason: whether a judge ran is not known"
+            ),
+        )
+    }
 }
 
 /// (core#850) A gate's assurance receipt: the run's contract, the instruments that ran and the
@@ -3871,7 +3969,10 @@ fn gate_receipt(
             },
             Some(why.to_string()),
         ),
-        (None, None) => {}
+        // (core#1799) The run's contract lists the judge, but none was due at this gate (a review
+        // that changes no files, a step that changed none, a scripted step): said on the receipt,
+        // never a required instrument that silently did not run. Not a hold — nothing wanted one.
+        (None, None) => r.account_required_judge(|| f.judge_not_due),
     }
     // (operator ruling 2026-10-14) A fallback judge is labelled on the receipt whatever it came
     // to — a verdict, or an answer without one (codex r1).
@@ -6957,6 +7058,83 @@ mod guarded_read_step_tests {
         }
     }
 
+    /// (xreview r1 on #1827) Why a required judge was not due names what the step was: a review's
+    /// own verdict decides its gate; a guarded read-only step that is no review (recon) claims no
+    /// verdict it never had; a scripted step has no seat's work at all.
+    #[test]
+    fn a_not_due_judge_says_what_the_step_was() {
+        use crate::assurance::{SKIP_ERROR, SKIP_NOT_APPLICABLE};
+        let mut review = unit(3, StageKind::Review, PhaseRole::Evaluator, "codex");
+        review.worktree_guarded = true;
+        let mut recon = unit(2, StageKind::Recon, PhaseRole::Neutral, "codex");
+        recon.worktree_guarded = true;
+        let mut tool = unit(4, StageKind::Test, PhaseRole::Neutral, "codex");
+        tool.tool_cmd = Some(vec!["npm".into(), "test".into()]);
+        let (k, r) = super::judge_not_due(&review, true, None);
+        assert_eq!(k, SKIP_NOT_APPLICABLE);
+        assert!(
+            r.contains("unit 3 is a review") && r.contains("verdict"),
+            "{r}"
+        );
+        let (k, n) = super::judge_not_due(&recon, true, None);
+        assert_eq!(k, SKIP_NOT_APPLICABLE);
+        assert!(
+            n.contains("unit 2 is a step its phase declares read-only"),
+            "{n}"
+        );
+        // It claims no verdict, and no observed tree (the guard's outcome is not its to say).
+        assert!(
+            !n.contains("verdict") && !n.contains("changes no files"),
+            "{n}"
+        );
+        let (k, t) = super::judge_not_due(&tool, true, None);
+        assert_eq!(k, SKIP_NOT_APPLICABLE);
+        assert!(t.contains("unit 4 is a scripted step"), "{t}");
+        // (xreview r2 on #1827) A bound creator whose completion carries no tree comparison, no
+        // verdict and no reason (an older payload): a judge was due, so that is not known — never
+        // an exemption. The same step with an unchanged tree, or without a default floor, is not due.
+        let mut build = unit(5, StageKind::Build, PhaseRole::Creator, "claude");
+        build.default_floor = true;
+        let (k, m) = super::judge_not_due(&build, true, None);
+        assert_eq!(k, SKIP_ERROR);
+        assert!(m.contains("unit 5") && m.contains("not known"), "{m}");
+        assert_eq!(
+            super::judge_not_due(&build, true, Some(false)).0,
+            SKIP_NOT_APPLICABLE
+        );
+        build.default_floor = false;
+        assert_eq!(
+            super::judge_not_due(&build, true, None).0,
+            SKIP_NOT_APPLICABLE
+        );
+        // An unguarded review that may have changed the tree under a default floor takes a judge.
+        let mut open_review = unit(6, StageKind::Review, PhaseRole::Evaluator, "codex");
+        open_review.default_floor = true;
+        assert_eq!(
+            super::judge_not_due(&open_review, true, Some(true)).0,
+            SKIP_ERROR
+        );
+        // (xreview delta) A pinned judge runs whatever the guard or the default floor say: a
+        // guarded review and a no-floor step with one, and no verdict, are not known.
+        let pinned = crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        };
+        let mut pinned_review = review.clone();
+        pinned_review.validator = Some(pinned.clone());
+        assert_eq!(
+            super::judge_not_due(&pinned_review, true, None).0,
+            SKIP_ERROR
+        );
+        let mut pinned_step = build.clone();
+        pinned_step.validator = Some(pinned);
+        assert_eq!(
+            super::judge_not_due(&pinned_step, true, Some(false)).0,
+            SKIP_ERROR
+        );
+    }
+
     /// PRODUCT-WORKS J6 (run 9bd0f728): claude built (unit 6), the floor-added `architecture`
     /// recon ran read-only on codex (unit 7), and the test on codex (unit 8) was denied
     /// `same_seat_evaluator` — "codex built this work". A guarded read step that left the tree as
@@ -7262,6 +7440,7 @@ mod guarded_read_step_tests {
                 checks_waived: None,
                 judge: None,
                 judge_skipped: None,
+                judge_not_due: (crate::assurance::SKIP_NOT_APPLICABLE, String::new()),
                 rules: None,
                 eval_ran: false,
                 eval_error: None,
