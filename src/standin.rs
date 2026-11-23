@@ -770,6 +770,36 @@ mod tests {
             .contains("rename the seat"));
     }
 
+    /// T-R18 (rev 3 R7/N1): a binding on `codex#2` runs `codex#2`'s own record, never `codex`'s;
+    /// a family record is the fallback only when the exact one is gone; a real key is never
+    /// resolved here.
+    #[test]
+    fn a_binding_resolves_to_its_exact_credential_record() {
+        let codex = wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "codex")
+            .expect("built-in codex");
+        let mut codex2 = codex.clone();
+        codex2.key = "codex#2".into();
+        codex2.headless_invocation = "codex exec --profile two {PROMPT}".into();
+        let roster = vec![codex.clone(), codex2.clone()];
+        assert_eq!(
+            resolve(&roster, &[], "codex#2~1").as_deref(),
+            Some("codex exec --profile two {PROMPT}")
+        );
+        assert_eq!(
+            resolve(&roster, &[], "codex~1"),
+            Some(codex.headless_invocation.clone())
+        );
+        assert_eq!(
+            resolve(&[], std::slice::from_ref(&codex), "codex#2~1"),
+            Some(codex.headless_invocation.clone()),
+            "the family's record when the exact one is gone"
+        );
+        assert_eq!(resolve(&roster, &[], "codex#2"), None);
+        assert_eq!(seat_id::credential("codex#2~1"), "codex#2");
+    }
+
     #[test]
     fn the_preface_names_a_lens_only_when_given_one() {
         assert!(preface(Some("security and safety")).ends_with("for security and safety."));
