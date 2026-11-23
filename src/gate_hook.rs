@@ -3738,12 +3738,34 @@ fn git_subcommand_reads(args: &[&str]) -> bool {
     let Some((&verb, rest)) = args.split_first() else {
         return true;
     };
-    if rest.iter().any(|a| git_option_writes(verb, a)) {
+    // (crew#1795 review r2) Judged as git receives each word, after the shell's quote removal:
+    // `'-m'` is the option `-m`, `$'--output=f'` is `--output=f`. A word the text cannot settle
+    // (an expansion, ANSI-C quoting) keeps only its literal start ([`GitWord::Lead`]).
+    let words: Vec<GitWord> = rest.iter().map(|a| GitWord::of(a)).collect();
+    let end_of_options = GitWord::Known("--".to_string());
+    if words
+        .iter()
+        .take_while(|w| **w != end_of_options)
+        .any(|w| git_option_writes(verb, w))
+    {
         return false;
     }
     if GIT_READ_VERBS.contains(&verb) {
         return true;
     }
+    // A listing form is admitted only on words it can read in full, and on a glob that can only
+    // name operands (`git tag -l v*`; spelled so it matches no keyword).
+    let Some(rest) = words
+        .iter()
+        .map(|w| match w {
+            GitWord::Known(a) => Some(a.as_str()),
+            GitWord::Pattern(l) if !l.is_empty() && !l.starts_with('-') => Some("\0pattern"),
+            GitWord::Pattern(_) | GitWord::Lead(_) => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return false;
+    };
     let only = |allowed: &[&str]| rest.iter().all(|a| allowed.contains(a));
     match verb {
         // No operand: a name would create a branch. `-l` is left out (old git read it as
@@ -3760,7 +3782,8 @@ fn git_subcommand_reads(args: &[&str]) -> bool {
             "--show-current",
             "--no-color",
         ]),
-        // Bare, or `-l`/`--list` with patterns only: any other option (`-d`, `-a`, `-f`) writes.
+        // Bare, or `-l`/`--list` with patterns only: any other option (`-d`, `-a`, `-f`, `-m`
+        // whose message would be the next word) writes.
         "tag" => {
             rest.is_empty()
                 || (rest.iter().any(|a| matches!(*a, "-l" | "--list"))
@@ -3784,17 +3807,96 @@ fn git_subcommand_reads(args: &[&str]) -> bool {
     }
 }
 
-/// (crew#1795 review) Whether one word of a reading git invocation still writes a file or runs a
-/// program: `--output` (log, diff, show, and the verbs that take their options, `stash show` and
+/// One git argument as the shell hands it to git.
+#[derive(Debug, PartialEq)]
+enum GitWord {
+    /// The exact word, quotes removed and escapes applied.
+    Known(String),
+    /// A glob or a brace list (`v*`, `v{1,2}`): one or more words, each starting with this
+    /// literal text.
+    Pattern(String),
+    /// A word holding something the text cannot settle — an expansion (`"$x"`, `$(…)`) or ANSI-C
+    /// quoting (`$'…'`) — kept as the literal text before it. Unquoted, its value can split
+    /// into more words of any spelling.
+    Lead(String),
+}
+
+impl GitWord {
+    fn of(raw: &str) -> Self {
+        let chars: Vec<char> = raw.chars().collect();
+        let mut out = String::new();
+        let (mut single, mut double) = (false, false);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            i += 1;
+            if single {
+                if c == '\'' {
+                    single = false;
+                } else {
+                    out.push(c);
+                }
+                continue;
+            }
+            match c {
+                // An expansion here, or one the outer shell made of a `-c` word.
+                '$' | '`' | OPAQUE_EXPANSION => return Self::Lead(out),
+                '\\' if !cfg!(windows) => match chars.get(i) {
+                    Some(&n) if !double || matches!(n, '$' | '`' | '"' | '\\') => {
+                        out.push(n);
+                        i += 1;
+                    }
+                    Some('\n') => i += 1,
+                    Some(_) => out.push('\\'),
+                    None => return Self::Lead(out),
+                },
+                '"' => double = !double,
+                '\'' if !double => single = true,
+                '*' | '?' | '[' if !double => return Self::Pattern(out),
+                // A brace LIST (`{a,b}`, `{1..3}`) expands to several words; `stash@{0}` is one.
+                '{' if !double => {
+                    let body: String = chars[i..].iter().take_while(|&&n| n != '}').collect();
+                    if body.contains(',') || body.contains("..") {
+                        return Self::Pattern(out);
+                    }
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        if single || double {
+            return Self::Lead(out);
+        }
+        Self::Known(out)
+    }
+}
+
+/// (crew#1795 review) Whether one word of a reading git invocation may still write a file or run
+/// a program: `--output` (log, diff, show, and the verbs that take their options, `stash show` and
 /// `reflog`) and every abbreviation git accepts for it, `archive -o`, `fsck --lost-found`, `grep
-/// -O` / `--open-files-in-pager`. Judged with quotes and backslashes removed (`'--output=f'`).
-fn git_option_writes(verb: &str, word: &str) -> bool {
-    let a = word.replace(['\'', '"', '\\'], "");
+/// -O` / `--open-files-in-pager`. `--output-indicator-new`/`-old`/`-context` only change patch
+/// characters and read. A [`GitWord::Lead`] writes when the word it starts could still become one
+/// of these (`"$x"`, `--out$x`, `-$x`).
+fn git_option_writes(verb: &str, word: &GitWord) -> bool {
+    let (a, lead) = match word {
+        GitWord::Known(a) => (a.as_str(), false),
+        GitWord::Pattern(l) | GitWord::Lead(l) => (l.as_str(), true),
+    };
+    if lead && matches!(a, "" | "-") {
+        return true;
+    }
+    // The long option `full`, or an abbreviation of it at least `min` long; for a lead with no
+    // `=` yet, any start the rest of the word could complete into one.
+    let long = |full: &str, min: &str| match a.split_once('=') {
+        Some((name, _)) => name.starts_with(min) && full.starts_with(name),
+        None => (a.starts_with(min) || lead) && a.starts_with("--") && full.starts_with(a),
+    };
     let short = a.starts_with('-') && !a.starts_with("--");
-    a.starts_with("--out")
-        || (verb == "archive" && short && a.contains('o'))
-        || (verb == "fsck" && a.starts_with("--lo"))
-        || (verb == "grep" && ((short && a.contains('O')) || a.starts_with("--op")))
+    long("--output", "--out")
+        || (verb == "archive" && short && (lead || a.contains('o')))
+        || (verb == "fsck" && long("--lost-found", "--lo"))
+        || (verb == "grep"
+            && ((short && (lead || a.contains('O'))) || long("--open-files-in-pager", "--op")))
 }
 
 /// Interpreter programs that can write files with unresolvable targets when invoked with inline
@@ -3865,8 +3967,17 @@ fn command_write_capability(command: &str) -> (WriteCapability, bool) {
             // Any -c wrapper may write: its code is a string this scan does not run. What the
             // inner command line shows is classified too, so wrapping a write in `sh -c` never
             // makes it weaker (agy r1 on #1849): `bash -c 'rm -rf src'` writes.
-            Unwrapped::Inline { inner, .. } => {
-                let (nested, complete) = command_write_capability(&inner);
+            // The inner text is classified exactly as the inner shell receives it (codex r2 on
+            // #1849: `bash -c "\"git\" branch x"` runs `"git" branch x`), as the write scan
+            // decodes it; text this decoding cannot settle is judged a write.
+            Unwrapped::Inline {
+                word, argv_tail, ..
+            } => {
+                let Some((mut exact, _)) = lex_shell_word(&word, None, true, !cfg!(windows)) else {
+                    return (WriteCapability::Writes, extended);
+                };
+                exact.push_str(&argv_tail);
+                let (nested, complete) = command_write_capability(&exact);
                 extended &= complete;
                 if nested == WriteCapability::Writes {
                     return (WriteCapability::Writes, extended);
@@ -3905,7 +4016,13 @@ fn command_write_capability(command: &str) -> (WriteCapability, bool) {
                         }
                     }
                 }
-                if matches!(basename, "ln" | "rm" | "truncate" | "patch") {
+                // `cp`/`mv`/`install` write wherever their destination is, and the target scan
+                // can name the wrong word for it (`cp -t . /dev/null` writes `./null`; the scan
+                // takes the sink `/dev/null` and drops it, codex r2 on #1849).
+                if matches!(
+                    basename,
+                    "ln" | "rm" | "truncate" | "patch" | "cp" | "mv" | "install"
+                ) {
                     return (WriteCapability::Writes, extended);
                 }
                 // (PRODUCT-WORKS J6) `sed` writes only in-place, from a script file this scan
@@ -8935,6 +9052,13 @@ mod tests {
             format!("cd {r} && git remote -v 2>&1 | head"),
             format!("cd {r} && git tag 2> /dev/null"),
             format!("git -C {r} branch --show-current 2>/dev/null"),
+            // Codex r2 on #1849: patch-character options only read; a ref with `@{N}`, a quoted
+            // pattern and a pathspec glob after `--` are no options.
+            format!("git -C {r} diff --output-indicator-new=+ HEAD~1"),
+            format!("cd {r} && git log -p --output-indicator-old=- -1"),
+            format!("cd {r} && git stash show stash@{{0}}"),
+            format!("cd {r} && git tag -l \"v1.*\""),
+            format!("git -C {r} log --oneline -- *.rs"),
         ] {
             assert_eq!(check(&read), None, "a read: {read}");
         }
@@ -8998,6 +9122,19 @@ mod tests {
             format!("cd {r} && bash -c 'rm -rf src'"),
             format!("cd {r} && sh -c 'git branch -D main'"),
             format!("cd {r} && echo x > \"$f\""),
+            // Codex r2 on #1849: each word is judged as git receives it. `'-m'` is an option
+            // (its message is `-l`, so this CREATES the tag), ANSI-C quoting and expansions may
+            // spell `--output`, an escaped inner quote still runs git, and `cp -t . /dev/null`
+            // writes `./null` although the scan reads `/dev/null` as the destination.
+            format!("git -C {r} tag '-m' -l injected"),
+            format!("cd {r} && git tag '-m' -l injected"),
+            format!("git -C {r} stash show $'--output={r}/victim'"),
+            format!("cd {r} && git stash show $'--output=victim'"),
+            format!("git -C {r} log \"$out\""),
+            format!("git -C {r} log --out\"put\"={r}/victim"),
+            format!("cd {r} && bash -c \"\\\"git\\\" branch injected\""),
+            format!("cd {r} && python3 --version && cp -t . /dev/null"),
+            format!("cd {r} && cp -t . /dev/null"),
         ] {
             let (reason, fatal) =
                 check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
@@ -9043,6 +9180,16 @@ mod tests {
             &["archive", "--format=tar", "HEAD"],
             &["fsck", "--full"],
             &["log", "-O", "order.txt"],
+            // Codex r2 on #1849.
+            &["diff", "--output-indicator-new=+"],
+            &["log", "--output-indicator-context=."],
+            &["stash", "show", "stash@{0}"],
+            &["tag", "-l", "v1.*"],
+            &["tag", "-l", "\"v1.*\""],
+            &["log", "--", "*.rs", "--output=x"],
+            &["log", "--grep=\"$x\""],
+            &["log", "--format='%h %s'"],
+            &["reflog", "show", "HEAD@{1}"],
             &[],
         ] {
             assert!(git_subcommand_reads(read), "{read:?}");
@@ -9084,6 +9231,21 @@ mod tests {
             &["fsck", "--lost-found"],
             &["grep", "-O", "x"],
             &["grep", "--open-files-in-pager=vi", "x"],
+            // Codex r2 on #1849: judged as git receives each word.
+            &["tag", "'-m'", "-l", "injected"],
+            &["tag", "\"-d\"", "-l", "v1"],
+            &["tag", "-l", "v$x"],
+            &["tag", "-l", "{-d,v1}"],
+            &["tag", "-l", "'-x'*"],
+            &["stash", "show", "$'--output=x'"],
+            &["log", "\"$out\""],
+            &["log", "$out"],
+            &["log", "--out\"put\"=x"],
+            &["log", "--out$x"],
+            &["log", "-$x"],
+            &["archive", "-v$x", "HEAD"],
+            &["log", "--o\\utput=x"],
+            &["branch", "-a", "$x"],
         ] {
             assert!(!git_subcommand_reads(write), "{write:?}");
         }
