@@ -14,8 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut 3 ec105b8a, carrying 53 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed.
+- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut 4 46cf9af4, carrying 55 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - The reviewer is asked for POL-2101's record line; a skip names only the held rules (#1839)
+
+  - A council that never convened reads not_convened, not timeout (#1840)
 
   - A claude seat's tool children get a signed-in record for the unit's life (wicked-garden#1365) (#1834)
 
