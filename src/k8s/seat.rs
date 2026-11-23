@@ -44,34 +44,39 @@ use crate::worker_sandbox::FloorUnarmed;
 /// exec's argv, which is a URL query on the API server), its working directory entered, the
 /// launcher run, its exit code written where [`settle`] reads it.
 ///
-/// A claude OAuth seat's credential record ([`claude_record_vars`], wicked-garden#1365) is
-/// written into its config home right before the launcher runs and blanked to `{}` right after
-/// it exits, whatever its exit code. The temporary name is removed first and created no-clobber,
-/// so a link a seat planted there is never followed. The two carrier variables are unset before
-/// the launcher, and landrun passes no variable it is not named. The record never reaches the
-/// host or the replica codec, and a unit that ends without the wrapper (its pod killed) leaves a
-/// record that the next unit's home re-sync replaces.
+/// A claude seat's credential record ([`claude_record_vars`], wicked-garden#1365) lives in its
+/// config home only while the launcher runs. Before it, the record path and its temporary name
+/// are removed (whatever a seat or an interrupted unit left there, a planted link or directory
+/// included), and an OAuth seat's record is written under the temporary name with no-clobber,
+/// then renamed in place. After the launcher exits, whatever its exit code, both names are
+/// removed again; a removal that fails makes the unit fail (exit 125). An API-key claude seat
+/// is handed the path alone, so its units only clean. The carrier variables are unset before the
+/// launcher (and landrun passes no variable it is not named), so the record never reaches the
+/// host or the replica codec. Residual: a pod killed mid-unit keeps the record in that seat's
+/// replica until its next unit starts.
 pub(crate) const WRAPPER: &str = "set -u; u=/wicked-unit; \
 [ -f $u/env ] || { echo 'wicked-seat: the unit env is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 . $u/env; /floor/busybox rm -f $u/env; \
 [ $# -gt 0 ] || { echo 'wicked-seat: the unit argv is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 cd \"$WICKED_UNIT_CWD\" || { echo 'wicked-seat: the unit directory is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 unset WICKED_UNIT_CWD; \
-c=${WICKED_CLAUDE_RECORD_FILE:-}; \
-put() { /floor/busybox rm -f \"$c.wicked-tmp\" && (umask 077; set -C; /floor/busybox printf '%s' \"$1\" > \"$c.wicked-tmp\") && /floor/busybox mv -f \"$c.wicked-tmp\" \"$c\"; }; \
-[ -z \"$c\" ] || put \"${WICKED_CLAUDE_RECORD:-}\" || { echo 'wicked-seat: the claude credential record could not be written' >&2; echo 125 > $u/rc; exit 125; }; \
-unset WICKED_CLAUDE_RECORD WICKED_CLAUDE_RECORD_FILE; \
+c=${WICKED_CLAUDE_RECORD_FILE:-}; r=${WICKED_CLAUDE_RECORD:-}; unset WICKED_CLAUDE_RECORD WICKED_CLAUDE_RECORD_FILE; \
+drop() { /floor/busybox rm -rf \"$c\" \"$c.wicked-tmp\"; }; \
+[ -z \"$c\" ] || { drop && { [ -z \"$r\" ] || { (umask 077; set -C; /floor/busybox printf '%s' \"$r\" > \"$c.wicked-tmp\") && /floor/busybox mv -f \"$c.wicked-tmp\" \"$c\"; }; }; } || { echo 'wicked-seat: the claude credential record could not be written' >&2; drop; echo 125 > $u/rc; exit 125; }; \
+unset r; \
 \"$@\"; rc=$?; \
-[ -z \"$c\" ] || put '{}' || echo 'wicked-seat: the claude credential record could not be blanked' >&2; \
+[ -z \"$c\" ] || drop || { echo 'wicked-seat: the claude credential record could not be removed' >&2; rc=125; }; \
 echo $rc > $u/rc.tmp && /floor/busybox mv $u/rc.tmp $u/rc; exit $rc";
 
-/// The carrier variables that hand [`WRAPPER`] a claude OAuth seat's credential record
+/// The carrier variables that hand [`WRAPPER`] a claude seat's credential record
 /// (wicked-garden#1365): claude 2.1.296 deletes `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's
 /// env, so a `claude -p` the seat starts from its Bash tool (a harness's rule model) reads its
 /// sign-in from `$CLAUDE_CONFIG_DIR/.credentials.json`. The record is claude's own env-token
-/// shape ([`crate::seat_credentials::claude_oauth_token_record`]). Empty for every other seat. A
-/// gateway placeholder cannot stand in for it: claude's own non-inference calls go straight to
-/// api.anthropic.com, past the gateway (core#1832).
+/// shape ([`crate::seat_credentials::claude_oauth_token_record`]). Every claude seat with a config
+/// home is handed the path, so the wrapper cleans it for every unit; only a seat signed in by a
+/// token is handed a record. Empty for every other CLI. A gateway placeholder cannot stand in for
+/// the record: claude's own non-inference calls go straight to api.anthropic.com, past the
+/// gateway (core#1832).
 pub(crate) fn claude_record_vars(cli: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
     if wicked_apps_core::spawn::SeatCli::from_binary(cli)
         != wicked_apps_core::spawn::SeatCli::Claude
@@ -83,19 +88,20 @@ pub(crate) fn claude_record_vars(cli: &str, vars: &[(String, String)]) -> Vec<(S
             .find(|(k, v)| k == name && !v.is_empty())
             .map(|(_, v)| v.as_str())
     };
-    match (get("CLAUDE_CODE_OAUTH_TOKEN"), get("CLAUDE_CONFIG_DIR")) {
-        (Some(token), Some(home)) => vec![
-            (
-                "WICKED_CLAUDE_RECORD".into(),
-                crate::seat_credentials::claude_oauth_token_record(token),
-            ),
-            (
-                "WICKED_CLAUDE_RECORD_FILE".into(),
-                format!("{}/.credentials.json", home.trim_end_matches('/')),
-            ),
-        ],
-        _ => Vec::new(),
+    let Some(home) = get("CLAUDE_CONFIG_DIR") else {
+        return Vec::new();
+    };
+    let mut out = vec![(
+        "WICKED_CLAUDE_RECORD_FILE".to_string(),
+        format!("{}/.credentials.json", home.trim_end_matches('/')),
+    )];
+    if let Some(token) = get("CLAUDE_CODE_OAUTH_TOKEN") {
+        out.push((
+            "WICKED_CLAUDE_RECORD".into(),
+            crate::seat_credentials::claude_oauth_token_record(token),
+        ));
     }
+    out
 }
 
 /// The marker prefix of a seat's exec (`$0` of [`WRAPPER`]): its id in [`SEATS`].
