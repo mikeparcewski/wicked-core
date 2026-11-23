@@ -3618,10 +3618,16 @@ fn a_slot_freed_after_the_budget_starts_no_council() {
         &mut |_: &[String]| {},
     );
     release.join().unwrap();
-    assert_eq!(
-        out,
-        CouncilOutcome::NotConvened("the host council slot freed after the budget ran out".into()),
-        "(core#1822) a council that never started is not a timeout"
+    // (core#1822) Which slot word it reads is timing: the lock wait never sleeps past the
+    // deadline (cli_runner.rs `acquire_until`), so it is usually still held (busy); taken in the
+    // instant after the deadline, it is late. Either way it never convened, so it is no timeout.
+    assert!(
+        matches!(
+            &out,
+            CouncilOutcome::NotConvened(d)
+                if d == super::not_convened::SLOT_BUSY || d == super::not_convened::SLOT_LATE
+        ),
+        "(core#1822) a council that never started is not a timeout: {out:?}"
     );
     assert!(
         rx.try_recv().is_err(),
