@@ -3594,7 +3594,10 @@ pub(crate) fn run(
                     Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
-                let relay = council_event_relay(self_tx.clone());
+                // (core#1822) The convener hears `Convened` when the ballots start (the council
+                // worker's `requested`, relayed as `CouncilConvened`), before any ballot returns.
+                let relay =
+                    convened_reporting_relay(council_event_relay(self_tx.clone()), reply.clone());
                 std::thread::spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         crate::decision::convene_decision(
@@ -3613,7 +3616,9 @@ pub(crate) fn run(
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
                     end_council(
-                        reply,
+                        move |r| {
+                            let _ = reply.send(crate::command::CouncilReply::Ruled(r));
+                        },
                         result,
                         reaper.as_ref(),
                         (&req.session_id, req.ord),
@@ -3678,7 +3683,9 @@ pub(crate) fn run(
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("rule council thread panicked")));
                     council_context_delivered(context_tx, &req, &result);
                     end_council(
-                        reply,
+                        move |r| {
+                            let _ = reply.send(r);
+                        },
                         result,
                         reaper.as_ref(),
                         (&req.session_id, req.ord),
@@ -5389,13 +5396,13 @@ fn council_context_delivered(
 ///    reported, and the slot is released anyway (a slot held forever would stop every council).
 /// 3. Only then is the host council slot freed, so no next council starts beside a stopping seat.
 fn end_council(
-    reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
+    reply: impl FnOnce(anyhow::Result<crate::decision::DecisionVerdict>),
     result: anyhow::Result<crate::decision::DecisionVerdict>,
     reaper: Option<&crate::decision::BallotReaper>,
     (session, ord): (&str, u32),
     lock: crate::cli_runner::HostCouncilLock,
 ) {
-    let _ = reply.send(result);
+    reply(result);
     if let Some(reaper) = reaper {
         let left = reaper.reap(crate::decision::REAP_BOUND);
         if left > 0 {
@@ -5411,7 +5418,49 @@ fn end_council(
 
 #[cfg(test)]
 mod council_tail_tests {
-    use super::end_council;
+    use super::{convened_reporting_relay, end_council};
+    use crate::command::CouncilReply;
+    use crate::event::CoreEvent;
+
+    /// core#1822: the decision council's relay tells its convener once, with the seats, when the
+    /// ballots start, and still forwards every event to the emit point unchanged.
+    #[test]
+    fn the_convener_hears_the_ballots_start_once_and_every_event_still_reaches_the_emit_point() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<CoreEvent>::new()));
+        let inner: crate::decision::EventRelay = Arc::new({
+            let seen = seen.clone();
+            move |ev| seen.lock().unwrap().push(ev)
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let relay = convened_reporting_relay(inner, tx.clone());
+        let convened = |clis: &[&str]| CoreEvent::CouncilConvened {
+            session: "run-1822".into(),
+            ord: 6,
+            clis: clis.iter().map(|c| c.to_string()).collect(),
+        };
+        relay(CoreEvent::CouncilDeliberated {
+            session: "run-1822".into(),
+            ord: 6,
+            round: 1,
+            agreement_pct: 50,
+            needed_pct: 67,
+            votes: 2,
+        });
+        assert!(rx.try_recv().is_err(), "nothing started yet");
+        relay(convened(&["codex", "pi"]));
+        relay(convened(&["codex", "pi"]));
+        drop(tx);
+        let heard: Vec<Vec<String>> = rx
+            .try_iter()
+            .map(|m| match m {
+                CouncilReply::Convened(s) => s,
+                CouncilReply::Ruled(_) => panic!("the relay never rules"),
+            })
+            .collect();
+        assert_eq!(heard, vec![vec!["codex".to_string(), "pi".to_string()]]);
+        assert_eq!(seen.lock().unwrap().len(), 3, "every event is forwarded");
+    }
+
     use crate::cli_runner::{HostCouncilLock, SlotRefused};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5440,7 +5489,15 @@ mod council_tail_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let tail = std::thread::spawn(move || {
             let verdict = Err(anyhow::anyhow!("the verdict"));
-            end_council(tx, verdict, Some(&reaper), ("run-1290", 1), lock);
+            end_council(
+                move |v| {
+                    let _ = tx.send(v);
+                },
+                verdict,
+                Some(&reaper),
+                ("run-1290", 1),
+                lock,
+            );
         });
         let verdict = rx.recv_timeout(Duration::from_secs(60)).expect("a verdict");
         assert!(verdict.is_err());
@@ -5502,6 +5559,26 @@ fn ballot_dispatcher(
         ),
         None => (dispatcher.clone(), None, None),
     }
+}
+
+/// (core#1822) `relay`, plus [`crate::command::CouncilReply::Convened`] (the drawn seats) to the
+/// council's convener the first time the council reports its ballots starting: the council
+/// worker's `requested`, relayed as `CoreEvent::CouncilConvened`, emitted as it queues the drawn
+/// voters' ballots (`wicked_council::Worker::queue`). The `Mutex` makes the one-shot reply sender
+/// usable from the `Fn + Sync` relay; a convener that stopped waiting just drops the message.
+fn convened_reporting_relay(
+    relay: crate::decision::EventRelay,
+    reply: Sender<crate::command::CouncilReply>,
+) -> crate::decision::EventRelay {
+    let reply = std::sync::Mutex::new(Some(reply));
+    std::sync::Arc::new(move |ev| {
+        if let CoreEvent::CouncilConvened { clis, .. } = &ev {
+            if let Some(tx) = reply.lock().ok().and_then(|mut g| g.take()) {
+                let _ = tx.send(crate::command::CouncilReply::Convened(clis.clone()));
+            }
+        }
+        relay(ev)
+    })
 }
 
 /// Build an [`crate::decision::EventRelay`] that posts council lifecycle events
@@ -21153,8 +21230,12 @@ fn rule_skip(
     }
     // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
     // may waive with a reason; a broken error/critical rule is reworked.
+    // (core#1836) A process rule's row is reported, never open (`RuleVerdict::reported_only`): it
+    // never holds the gate, so it is never skipped either, and the gate's skip names exactly the
+    // rules its hold names ("1 rule needs you" beside "Skip POL-2101", not "Skip 2 rules").
     let Some(row) = rows.iter().find(|r| {
         r.rule_id == id
+            && !r.reported_only()
             && (matches!(
                 r.status,
                 crate::rule_check::RuleStatus::Unchecked
@@ -21165,9 +21246,9 @@ fn rule_skip(
     }) else {
         anyhow::bail!(
             "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
-             of unit {} — only a rule no judge or council ruled on, or a broken rule of \
-             severity warn or info, can be skipped (a broken error or critical rule denies the \
-             gate)",
+             of unit {} that holds its gate — only a rule no judge or council ruled on, or a \
+             broken rule of severity warn or info, can be skipped (a broken error or critical \
+             rule denies the gate; a process rule is reported and never holds it)",
             cursor.ord
         );
     };
@@ -35234,6 +35315,98 @@ mod request_changes_tests {
                 .rules,
             ["R1"]
         );
+    }
+
+    /// (core#1836) The J4 certification gate's own rows (run edb67a40, gateEvaluated seq 208, as
+    /// the engine wrote them: `tests/fixtures/core1836-gate-seq208-rules.json`): POL-2101 disputed
+    /// beside RVWL-1002, a process rule's unchecked row that never holds the gate. The card said
+    /// "1 rule needs you" and its button "Skip 2 rules": the skip names exactly the rules the hold
+    /// names, and a process row is not one the person can skip.
+    #[test]
+    fn core1836_the_skip_names_the_rules_the_hold_names_on_the_real_gate_rows() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/core1836-gate-seq208-rules.json"
+        ))
+        .unwrap();
+        let rows: Vec<crate::rule_check::RuleVerdict> =
+            serde_json::from_value(fixture["rules"].clone()).expect("the wire rows parse");
+        let held: Vec<String> = serde_json::from_value(fixture["denialRuleIds"].clone()).unwrap();
+        let reviewed: String = serde_json::from_value(fixture["reviewerOutput"].clone()).unwrap();
+        // J4's shape: the fix (creator, claude) done, the review (evaluator, codex) held by the
+        // rule check, roster claude + codex + pi, the distinct-evaluator contract on.
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_bug_with_deliver(store, run_id);
+            let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+            session.unit_ix = 3;
+            session.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+            session.assurance = crate::assurance::RunAssurance::new(None, false);
+            put_node(store, session.to_node()).unwrap();
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            units[2].authored_by = vec!["claude".into()];
+            put_node(store, units[2].to_node()).unwrap();
+            let review = &mut units[3];
+            review.assigned_cli = Some("codex".into());
+            review.status = UnitStatus::Rejected;
+            let report = crate::rule_check::RuleCheckReport {
+                rows: rows.clone(),
+                ..Default::default()
+            };
+            let hold = report.hold().expect("the disputed rule holds");
+            review.denial_reason = Some(hold.reason.clone());
+            review.denial = Some(hold);
+            review.rule_check = Some(report);
+            put_node(store, review.to_node()).unwrap();
+            let review = review.clone();
+            persist_rejected_transcript(store, &session, &review, &reviewed);
+            open_row(store, run_id, 4, "escalation");
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core1836-{}", std::process::id());
+        seed(&mut store, &run_id);
+        let unit = crate::domain::session_units(&store, &run_id).unwrap()[3].clone();
+        let denial = unit.denial.as_ref().unwrap();
+        assert_eq!(denial.rule_ids, held, "the hold is the payload's");
+        assert!(denial
+            .reason
+            .starts_with("1 steering rule(s) need you: POL-2101 DISPUTED"));
+        let listed = listed_is_accepted("rules-core1836-j4", &seed);
+        assert_eq!(
+            action(&listed, crate::rule_check::SKIP_ACTION)
+                .unwrap()
+                .rules,
+            held,
+            "{listed:#?}"
+        );
+        let err = recheck(&mut store, &run_id, &[("RVWL-1002", "not this change's")])
+            .expect_err("a process rule's row is not skipped");
+        assert!(err.to_string().contains("RVWL-1002"), "{err}");
+        // The listed skip settles the row from the card, without a send-back: it lands with its
+        // reason on the real row's keys and re-checks the same work.
+        recheck(
+            &mut store,
+            &run_id,
+            &[(
+                "POL-2101",
+                "one-line loop fix; plain JavaScript has no built-in sum",
+            )],
+        )
+        .expect("the listed skip is taken");
+        let review = &crate::domain::session_units(&store, &run_id).unwrap()[3];
+        let pol = rows.iter().find(|r| r.rule_id == "POL-2101").unwrap();
+        assert_eq!(review.rule_skips.len(), 1);
+        assert_eq!(
+            (
+                review.rule_skips[0].rule_id.as_str(),
+                review.rule_skips[0].rule_key.as_str(),
+                Some(review.rule_skips[0].evidence_key.as_str()),
+            ),
+            (
+                "POL-2101",
+                pol.rule_key.as_str(),
+                pol.evidence_key.as_deref()
+            )
+        );
+        assert!(review.requested_rejudge.is_some(), "the re-check is armed");
     }
 
     /// (new issue) A review that ran on the builder's seat under a distinct-evaluator contract:

@@ -8750,6 +8750,15 @@ fn writes_code(unit: &WorkUnit) -> bool {
         && (unit.role == crate::workflow::PhaseRole::Creator || unit.executes_code)
 }
 
+/// An Evaluator agent work unit: the one whose prompt ends with the VERDICT line, and (core#1836)
+/// the reviewer whose own `STACK-CHECK:` line POL-2101's record clause reads at its gate. Never a
+/// tool step or an engine-internal judge/triage prompt.
+fn is_reviewer(unit: &WorkUnit) -> bool {
+    unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.tool_cmd.is_none()
+        && !is_engine_internal(unit)
+}
+
 pub(crate) fn skill_prompt(
     unit: &WorkUnit,
     layout: Option<&str>,
@@ -8832,18 +8841,21 @@ fn compose_skill_prompt(
     );
     // (core#1381) A code-writing agent unit records its stack check on one line (POL-2101's record
     // clause reads exactly these units' outputs). Before the VERDICT line, which reads last.
+    // (core#1836) …and the reviewer that writes no code records its own check in the same form:
+    // POL-2101's record clause is kept on the reviewer's line, so a correct fix whose builder left
+    // none is settled at the reviewer's own gate. Not QE's isolated acceptance reviewer: it judges
+    // the scenarios and evidence files only, and its output is not the gate's reviewer record.
     if stack_check && writes_code(unit) {
         prompt.push_str(crate::assumptions::STACK_CHECK_CONVENTION);
+    } else if stack_check && is_reviewer(unit) && unit.qe_review_session.is_none() {
+        prompt.push_str(crate::assumptions::REVIEWER_STACK_CHECK_CONVENTION);
     }
     // L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the one
     // VERDICT line L1's fold parses — on every `SkillForm`, both carriers (`unit_prompt` is the one
     // composer). NOT a `tool_cmd` unit (a scripted step emits no verdict) and NOT engine-internal
     // (the early return above already excludes validator/triage; the guard is kept explicit so the
     // predicate matches the contract). Creator/Neutral prompts never carry it.
-    if unit.role == crate::workflow::PhaseRole::Evaluator
-        && unit.tool_cmd.is_none()
-        && !is_engine_internal(unit)
-    {
+    if is_reviewer(unit) {
         prompt.push_str(crate::assumptions::EVALUATOR_VERDICT_CONVENTION);
     }
     prompt
@@ -15656,9 +15668,79 @@ mod tests {
     }
 
     /// (core#1381) A code-writing agent unit (a creator, or an `executes_code` phase) is asked for
-    /// the one-line stack check POL-2101's record clause reads; a neutral or evaluator unit that
-    /// writes no code, a tool step and an engine-internal prompt are not. The evaluator's VERDICT
-    /// line still reads last.
+    /// the builder's one-line stack check POL-2101's record clause reads; a neutral unit, an
+    /// evaluator that writes no code (it is asked for the REVIEWER's line instead, core#1836), a
+    /// tool step and an engine-internal prompt are not. The evaluator's VERDICT line still reads
+    /// last.
+    /// (core#1836) The J4 review step (run edb67a40 unit 3, as `GET /runs/:id` shows it: role
+    /// evaluator, base skill governed-worker, no phase skill, no tool command, seat codex) is asked
+    /// for its own STACK-CHECK line in the exact form the record judge reads (`:: offers`, with
+    /// "nothing this change needs" for a one-line fix), in the output it ends with, before its
+    /// VERDICT line. Its builder is asked for the same line in the output IT ends with.
+    #[test]
+    fn core1836_the_reviewer_is_asked_for_the_stack_check_line_the_record_judge_reads() {
+        use crate::workflow::PhaseRole;
+        let line = crate::assumptions::REVIEWER_STACK_CHECK_CONVENTION;
+        assert!(!line.contains('\n'), "single-line by pty contract");
+        let mut review = WorkUnit::pending(
+            "edb67a40-2ff4-51b3-a184-da1158e6b0d9:review",
+            "edb67a40-2ff4-51b3-a184-da1158e6b0d9",
+            3,
+            "review — In tiny-math-t12, sum([1,2,3]) returns 5 instead of 6",
+        );
+        review.role = PhaseRole::Evaluator;
+        review.base_skill_ref = Some("wicked-garden-governed-worker".into());
+        for form in [
+            SkillForm::ClaudePlugin,
+            SkillForm::MirroredName,
+            SkillForm::Unloaded,
+        ] {
+            let p = skill_prompt(&review, None, form, None);
+            assert!(
+                p.ends_with(&format!(
+                    "{line}{}",
+                    crate::assumptions::EVALUATOR_VERDICT_CONVENTION
+                )),
+                "the reviewer's line, then the VERDICT line last: {p}"
+            );
+            assert!(
+                !p.contains(crate::assumptions::STACK_CHECK_CONVENTION),
+                "{p}"
+            );
+        }
+        for (who, l) in [
+            ("reviewer", line),
+            ("builder", crate::assumptions::STACK_CHECK_CONVENTION),
+        ] {
+            for words in [
+                "STACK-CHECK: looked at <docs or source> :: offers <what it provides for this",
+                "or nothing this change needs>",
+                "in the output you end with",
+            ] {
+                assert!(l.contains(words), "{who}: {words}: {l}");
+            }
+        }
+        // QE's isolated acceptance reviewer judges its evidence files only: VERDICT, no stack line.
+        let mut qe = review.clone();
+        qe.qe_review_session = Some("nonce".into());
+        let p = skill_prompt(&qe, None, SkillForm::ClaudePlugin, None);
+        assert!(!p.contains(line), "{p}");
+        assert!(
+            p.ends_with(crate::assumptions::EVALUATOR_VERDICT_CONVENTION),
+            "{p}"
+        );
+        // A tool step or an engine-internal prompt is not a reviewer.
+        let mut tool = review.clone();
+        tool.tool_cmd = Some(vec!["npm".into(), "test".into()]);
+        assert!(!skill_prompt(&tool, None, SkillForm::ClaudePlugin, None).contains(line));
+        let mut judge = WorkUnit::pending("validator-agent", "validator", 1, "judge this");
+        judge.role = PhaseRole::Evaluator;
+        assert_eq!(
+            skill_prompt(&judge, None, SkillForm::ClaudePlugin, None),
+            "judge this"
+        );
+    }
+
     #[test]
     fn a_code_writing_unit_is_asked_for_the_stack_check_line() {
         use crate::workflow::PhaseRole;
@@ -16185,14 +16267,19 @@ mod tests {
             let u = mk(role);
             // An Evaluator work unit's prompt additionally ends with the pinned VERDICT line
             // (L1↔L4 contract); Creator/Neutral do not.
+            // (core#1836) …after the reviewer's stack-check line.
             let verdict = if role == PhaseRole::Evaluator {
-                crate::assumptions::EVALUATOR_VERDICT_CONVENTION
+                format!(
+                    "{}{}",
+                    crate::assumptions::REVIEWER_STACK_CHECK_CONVENTION,
+                    crate::assumptions::EVALUATOR_VERDICT_CONVENTION
+                )
             } else {
-                ""
+                String::new()
             };
             // (core#1381) …and a Creator's with the stack-check line.
             let verdict = if role == PhaseRole::Creator {
-                crate::assumptions::STACK_CHECK_CONVENTION
+                crate::assumptions::STACK_CHECK_CONVENTION.to_string()
             } else {
                 verdict
             };

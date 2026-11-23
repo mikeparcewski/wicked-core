@@ -192,9 +192,13 @@
     "trigger": "S: an unresolved HIGH or a member-step dispute goes to a one-off council",
     "payload": "`subject`, `finding_id`, `trigger`, `question`, `positions`, `evidence`, `excluded_seats`, `transcript`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
+  "wicked.team.council.convened": {
+    "trigger": "S: the council's ballots started (the council worker polled its drawn voters; core#1822)",
+    "payload": "`subject`, `finding_id`, `seats`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
   "wicked.team.council.ruled": {
     "trigger": "S: the verdict of the council it convened",
-    "payload": "`subject`, `verdict`, `reason`, `task_id`, `consensus`, `agreement_pct`, `dissent`, `returned`, `seated`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`subject`, `verdict`, `reason` (`no_quorum`, `seats_benched`, `error`, `timeout`, `cap`, `not_convened`), `detail?`, `task_id`, `consensus`, `agreement_pct`, `dissent`, `returned`, `seated`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.ledger.folded": {
     "trigger": "S: the final pass folded the attempt's stream into its TeamLedger",

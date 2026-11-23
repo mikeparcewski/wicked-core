@@ -2365,8 +2365,16 @@ impl Core {
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+        // (core#1822) The ballots starting is reported first; this caller waits for the ruling.
+        loop {
+            match rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+            {
+                crate::command::CouncilReply::Convened(_) => continue,
+                crate::command::CouncilReply::Ruled(r) => return r,
+            }
+        }
     }
 
     /// (core#677) Vault a deterministic validator the HOST authored — `criterion` (what it checks)
