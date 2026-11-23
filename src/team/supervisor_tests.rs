@@ -2006,8 +2006,9 @@ fn core_1822_a_long_final_batch_leaves_the_council_its_share_of_the_final_pass()
         .find(|(p, _)| p.contains("final pass"))
         .map(|(_, b)| *b)
         .expect("the final batch's budget");
+    let drain = super::super::MEMBER_CANCEL_DRAIN.min(review / 4);
     assert!(
-        batch + super::super::MEMBER_CANCEL_DRAIN <= review,
+        !drain.is_zero() && batch + drain <= review,
         "the turn and its cancel drain end inside the review window: {batch:?} of {review:?}"
     );
     assert_eq!(
@@ -2049,6 +2050,40 @@ fn core_1822_a_final_batch_cut_by_the_deadline_times_the_pass_out() {
     assert_eq!(h.host.prompts_matching("final pass").len(), 1);
     let l = h.folded(3, 1);
     assert!(l.findings.is_empty(), "{l:?}");
+    assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
+}
+
+/// (core#1822, codex r2) A hold-round turn its budget cut is silence (HOLD) and a timed-out pass,
+/// even when the council after it rules within its share: never `completed`.
+#[test]
+fn core_1822_a_hold_turn_cut_by_its_budget_times_the_pass_out() {
+    let mut h = Harness::with(
+        "c1822-hold",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.final_pass_budget = Duration::from_secs(30);
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, _| Ok(format!("{hit}\nDONE")));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    *h.host.slow.lock().unwrap() = Some(("hold round".into(), Duration::from_secs(120)));
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert_eq!(h.host.prompts_matching("hold round").len(), 1);
+    assert_eq!(h.council.calls.lock().unwrap().len(), 1);
+    let l = h.folded(3, 1);
+    assert_eq!(
+        l.findings[0].dispute.as_ref().unwrap().verdict,
+        Verdict::Yes,
+        "{l:?}"
+    );
     assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
 }
 

@@ -2429,6 +2429,9 @@ struct Clock {
     /// (core#1822) Members' turns (final batches, the hold round, a rejected step's answer) stop
     /// here; councils run on to `work_until`.
     review_until: i64,
+    /// (core#1822, codex r1/r2) What a member turn's budget leaves for its seat to stop after a
+    /// timeout: [`super::MEMBER_CANCEL_DRAIN`], at most a quarter of the review window.
+    drain: Duration,
     work_until: i64,
     publish_until: i64,
 }
@@ -2437,14 +2440,15 @@ impl Clock {
     fn review_left(&self) -> Duration {
         Duration::from_millis((self.review_until - now_ms()).max(0) as u64)
     }
+    /// (core#1822, codex r2) No member turn may start: none would have a budget left once its
+    /// cancel drain is kept.
     fn review_expired(&self) -> bool {
-        now_ms() >= self.review_until
+        self.turn_budget().is_zero()
     }
     /// (core#1822, codex r1) A member turn's budget: what is left of the review window less the
     /// time a timed-out turn's seat is given to stop, so the whole call ends inside the window.
     fn turn_budget(&self) -> Duration {
-        self.review_left()
-            .saturating_sub(super::MEMBER_CANCEL_DRAIN)
+        self.review_left().saturating_sub(self.drain)
     }
     fn left(&self) -> Duration {
         Duration::from_millis((self.work_until - now_ms()).max(0) as u64)
@@ -2563,9 +2567,10 @@ fn worker_position(
 pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn Council) {
     let margin = margin_of(job.budget);
     let work = job.budget.saturating_sub(margin);
+    let review = work.saturating_sub(council_reserve_of(work));
     let clock = Clock {
-        review_until: job.completed_at
-            + work.saturating_sub(council_reserve_of(work)).as_millis() as i64,
+        review_until: job.completed_at + review.as_millis() as i64,
+        drain: super::MEMBER_CANCEL_DRAIN.min(review / 4),
         work_until: job.completed_at + work.as_millis() as i64,
         publish_until: job.completed_at + job.budget.as_millis() as i64,
     };
@@ -2806,8 +2811,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             // (core#1822, codex r1) Each member answers the PA's rejection of its step in the
             // review window, before any council runs: a council that runs long never costs a
             // member its answer.
-            let mut rejected: Vec<(&super::StepReviewRecord, String, Option<(bool, String)>)> =
-                Vec::new();
+            let mut rejected: Vec<RejectedStep<'_>> = Vec::new();
             for r in &ledger.step_reviews {
                 if r.verdict != StepVerdict::Rejected {
                     continue;
@@ -3170,9 +3174,19 @@ fn hold_round(
                     } else {
                         None
                     };
-                    host.turn(&m.pool_key, &prompt, budget, view.as_ref())
-                        .map(|r| super::parse_hold_lines(&r))
-                        .unwrap_or_default()
+                    let started = Instant::now();
+                    match host.turn(&m.pool_key, &prompt, budget, view.as_ref()) {
+                        Ok(r) => super::parse_hold_lines(&r),
+                        // (core#1822, codex r2) A hold turn the deadline cut: silence is HOLD,
+                        // and the pass and the member are timed out.
+                        Err(_) => {
+                            if started.elapsed() >= budget {
+                                *timed_out = true;
+                                u.monitors[i].timed_out = true;
+                            }
+                            BTreeMap::new()
+                        }
+                    }
                 } else {
                     BTreeMap::new()
                 }
@@ -3370,6 +3384,10 @@ fn convene_one(
     };
     u.publish(&ev);
 }
+
+/// (core#1822) A step the PA rejected, its member, and the member's answer (gathered before any
+/// council runs).
+type RejectedStep<'a> = (&'a super::StepReviewRecord, String, Option<(bool, String)>);
 
 /// The no-verdict reasons, spelled once.
 mod tev_reason {
