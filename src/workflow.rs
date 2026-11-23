@@ -653,7 +653,17 @@ pub enum HumanDecision {
     /// Refused at every other gate, for a recorded FAIL (a verdict), and when no reviewer seat can
     /// run now.
     RetryQe,
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at a `stand_in_needed` gate, wire token
+    /// [`USE_STAND_INS_ACTION`]: the person's consent (`scope` `job` | `always`) goes on the run's
+    /// contract and exactly the held check continues on a stand-in. Reached through
+    /// [`crate::Core::grant_stand_ins`] (studio's `{approve: true, action: "use_stand_ins",
+    /// scope}`). Refused at every other gate, on a run that is not stand-in-aware, and on a
+    /// reduced one.
+    UseStandIns { scope: String },
 }
+
+/// The wire token of [`HumanDecision::UseStandIns`].
+pub const USE_STAND_INS_ACTION: &str = "use_stand_ins";
 
 /// (DES-CATALOG-002 §4.6, §11 Lane A) What the answer to a gate EXPECTS the open gate to be: the
 /// unit ordinal it showed and, for a `plan_approval` gate, the plan revision it showed. Checked

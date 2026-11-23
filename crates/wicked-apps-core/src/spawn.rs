@@ -1674,6 +1674,9 @@ fn seat_config_in(
     cli: SeatCli,
     seat_key: &str,
 ) -> anyhow::Result<SeatConfig> {
+    // (DES-STANDIN-001 §3.3, rev 3 N1) A stand-in runs on its BASE credential: `codex#2~1`
+    // resolves `codex#2`'s home, never `codex`'s, and no `~n` suffix reaches the instance root.
+    let seat_key = seat_id::credential(seat_key);
     let Some(name) = cli.root_name() else {
         return Ok(SeatConfig::Isolated {
             cli,
@@ -3947,6 +3950,12 @@ rebase.autosquash\0";
             // No separator ⇒ no instance: an operator's own key is the CLI's only instance and
             // keeps the root it has had since core#410 (moving it would be the #578 hazard).
             ("my-claude", "claude"),
+            // (DES-STANDIN-001 T-R18, rev 3 N1) A stand-in resolves its BASE credential's root:
+            // `claude#2~1` is `claude#2`'s home, never `claude`'s, and `2~1` never reaches the
+            // instance-suffix validator (which would refuse it).
+            ("claude~1", "claude"),
+            ("claude#2~1", "claude-2"),
+            ("claude#cheap_2~3", "claude-cheap_2"),
         ] {
             let root = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key)
                 .expect("resolves")

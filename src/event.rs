@@ -240,6 +240,21 @@ pub enum CoreEvent {
         /// and disclosed here, never refused. Additive; emitted unconditionally.
         pool: Option<crate::domain::PoolSeating>,
     },
+    /// (DES-STANDIN-001 §5.1) A stand-in was seated for an independent role, before anything was
+    /// dispatched on it: `binding` is the persisted record, `label` its stamp in words.
+    StandInSeated {
+        session: String,
+        ord: Option<u32>,
+        binding: crate::standin::StandInBinding,
+        label: String,
+    },
+    /// (DES-STANDIN-001 §3.8) A person consented to stand-ins mid-run, at a `stand_in_needed`
+    /// gate: the run's contract now carries the consent.
+    StandInsGranted {
+        session: String,
+        ord: u32,
+        consent: crate::standin::StandInConsent,
+    },
     /// The council was convened to pick a CLI for a unit (distribution vote started).
     CouncilConvened {
         session: String,
@@ -2082,6 +2097,28 @@ impl CoreEvent {
                     })),
                 })
             }
+            CoreEvent::StandInSeated {
+                session,
+                ord,
+                binding,
+                label,
+            } => json!({
+                "type": "standInSeated",
+                "session": session,
+                "ord": ord,
+                "binding": binding,
+                "label": label,
+            }),
+            CoreEvent::StandInsGranted {
+                session,
+                ord,
+                consent,
+            } => json!({
+                "type": "standInsGranted",
+                "session": session,
+                "ord": ord,
+                "consent": consent,
+            }),
             CoreEvent::CouncilConvened { session, ord, clis } => json!({
                 "type": "councilConvened",
                 "session": session,

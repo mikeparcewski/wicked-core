@@ -838,6 +838,22 @@ pub(crate) fn apply_distributions(
     let governed = crate::actor::in_process_governance().is_some();
     let container_mode = crate::container_floor::container_mode();
     for (u, dist) in pre.units.iter_mut().zip(distributions.iter()) {
+        // (DES-STANDIN-001 §3.2) A stand-in is persisted on the run's contract, and announced,
+        // BEFORE its unit can be dispatched: the session write below commits it with the units.
+        if let Some(b) = &dist.stand_in {
+            let bindings = &mut pre.session.assurance.stand_ins;
+            if !bindings.iter().any(|x| x.key == b.key) {
+                bindings.push(b.clone());
+            }
+            let display = crate::standin::display_name(&pre.clis, &b.base);
+            crate::standin::note_label(&mut pre.session.assurance, b, &display);
+            emit(CoreEvent::StandInSeated {
+                session: pre.session_id.clone(),
+                ord: Some(u.ord),
+                binding: b.clone(),
+                label: crate::standin::label(b, &display),
+            });
+        }
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.assigned_invocation = dist.assigned_invocation.clone();
         u.routing = Some(dist.routing.clone());
@@ -873,6 +889,8 @@ pub(crate) fn apply_distributions(
             RoutingInfo::Tool => ("tool".to_string(), None, None, None, None),
             // (core#590 S5) The deterministic pick: no council, so no agreement and no quorum.
             RoutingInfo::Teamed { .. } => ("teamed".to_string(), None, None, None, None),
+            // (DES-STANDIN-001 §5.1) A stand-in: its binding rides `standInSeated`.
+            RoutingInfo::StandIn { .. } => ("stand_in".to_string(), None, None, None, None),
         };
         let degraded_reason = dist
             .degraded_reason
@@ -903,7 +921,9 @@ pub(crate) fn apply_distributions(
         // record without it — the rig's claude ACP seat — runs under the worktree guard and the
         // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
         if !matches!(dist.routing, RoutingInfo::Tool) {
-            if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
+            // A stand-in runs on its base's record (DES-STANDIN-001 §3.3).
+            let seat_key = wicked_apps_core::spawn::seat_id::credential(&dist.assigned_cli);
+            if let Some(seat) = pre.clis.iter().find(|c| c.key == seat_key) {
                 let workdir = pre.session.workdir.as_deref().map(std::path::Path::new);
                 let container_floor = crate::execute_wrapped::uses_container_seat(
                     crate::execute_wrapped::unit_runs_in_seat(u, governed),
@@ -1882,7 +1902,14 @@ pub(crate) fn apply_and_finish_unit(
     // Review/Test unit that ran on a seat that built the work it checks — a dead-seat gate's
     // provisional seating, an operator's reassignment — denies when the run requires a distinct
     // evaluator, under the dead-seat class (reassign it to a distinct seat, or relaunch reduced).
-    let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
+    // (DES-STANDIN-001 §3.2) A review on one of the run's own consented stand-ins is checked by a
+    // stand-in BY DESIGN: it shares its base's identity, and its receipt says so (`roles`, the
+    // conservative legacy projection) instead of this denial.
+    let on_stand_in =
+        crate::standin::binding_for(&assurance, unit.assigned_cli.as_deref()).is_some();
+    let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR)
+        && !on_stand_in
+    {
         let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
         // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
         let rel = evaluator_relation(
@@ -3903,7 +3930,31 @@ fn gate_receipt(
     let seat = unit.assigned_cli.clone();
     // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
     let units = crate::domain::session_units(store, session_id).unwrap_or_default();
+    // (DES-STANDIN-001 §5.1) A stand-in-aware run's receipt is canonical: every independent role
+    // it filled, real or stand-in. `None` for every other run (the legacy path, byte for byte).
+    let mut roles: Option<Vec<a::RoleRecord>> = run.roles.as_ref().map(|_| Vec::new());
+    let stand_in = crate::standin::binding_for(run, seat.as_deref());
     match evaluator_relation(&units, unit, f.own_observed) {
+        // (DES-STANDIN-001 §5.1) The CONSERVATIVE LEGACY PROJECTION: a review a stand-in did is
+        // never `ran` for `distinct_evaluator`, its seat field is null, and the skip says why —
+        // so no reader on main ever reads it as an independent check.
+        Some(rel) if stand_in.is_some() => {
+            let b = stand_in.expect("guarded");
+            r.creator = rel.creator;
+            r.evaluator = None;
+            let mut answered = b.clone();
+            answered.state = crate::standin::STATE_ANSWERED.to_string();
+            answered.ord = Some(unit.ord);
+            answered.attempt = Some(attempt);
+            r.skip(
+                a::DISTINCT_EVALUATOR,
+                a::SKIP_STAND_IN,
+                Some(crate::standin::label(&answered, answered.display())),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+            }
+        }
         Some(rel) => {
             r.creator = rel.creator;
             r.evaluator = seat.clone();
@@ -3920,7 +3971,17 @@ fn gate_receipt(
                         rel.conflict.unwrap_or_default()
                     )),
                 ),
-                (Some(_), false) => r.ran(a::DISTINCT_EVALUATOR),
+                (Some(e), false) => {
+                    r.ran(a::DISTINCT_EVALUATOR);
+                    if let Some(roles) = roles.as_mut() {
+                        roles.push(a::RoleRecord::real(
+                            crate::standin::Role::Evaluator,
+                            e,
+                            unit.ord,
+                            attempt,
+                        ));
+                    }
+                }
                 (None, _) => {}
             }
         }
@@ -3954,6 +4015,14 @@ fn gate_receipt(
         (Some(v), _) if v.seat_failure.is_none() && v.judge_cli.is_some() => {
             r.ran(a::JUDGE);
             r.judge = v.judge_cli.clone();
+            if let (Some(roles), Some(j)) = (roles.as_mut(), v.judge_cli.as_deref()) {
+                roles.push(a::RoleRecord::real(
+                    crate::standin::Role::Judge,
+                    j,
+                    unit.ord,
+                    attempt,
+                ));
+            }
         }
         (Some(v), _) => r.skip(
             a::JUDGE,
@@ -3995,6 +4064,13 @@ fn gate_receipt(
         r.ran(a::EVALUATOR_PASS);
     } else if let Some(e) = f.eval_error {
         r.skip(a::EVALUATOR_PASS, a::SKIP_ERROR, Some(e.to_string()));
+    }
+    if let Some(roles) = roles {
+        r.independence = a::independence_of(&roles);
+        if roles.iter().any(a::RoleRecord::is_stand_in) {
+            r.stand_in_label = run.stand_in_label.clone();
+        }
+        r.roles = Some(roles);
     }
     r
 }

@@ -43,6 +43,7 @@ pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
+mod stand_in_gate;
 mod team_gate;
 mod worktree_cleanup;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
@@ -2616,15 +2617,27 @@ pub(crate) fn run(
                 // 390b273e's launch-time twin). Every other distribution error keeps the fail
                 // contract. `fail_run_by_id` guards the terminal statuses: do not clobber
                 // Cancelled with Failed if the run was cancelled while the council thread ran.
-                let parked = match error.downcast_ref::<NoEligibleSeat>() {
-                    Some(refusal) => park_at_dead_seat_gate(
+                // (DES-STANDIN-001 §3.2) A review a stand-in-aware run cannot seat independently,
+                // with no consent: the run parks at the `stand_in_needed` gate the same way.
+                let parked = match (
+                    error.downcast_ref::<NoEligibleSeat>(),
+                    error.downcast_ref::<crate::distribute::StandInNeeded>(),
+                ) {
+                    (Some(refusal), _) => park_at_dead_seat_gate(
                         &mut store,
                         &mut subscribers,
                         &self_tx,
                         &run_id,
                         refusal,
                     ),
-                    None => Ok(false),
+                    (None, Some(need)) => stand_in_gate::park(
+                        &mut store,
+                        &mut subscribers,
+                        &self_tx,
+                        &run_id,
+                        need,
+                    ),
+                    (None, None) => Ok(false),
                 };
                 match parked {
                     Ok(true) => {}
@@ -10103,6 +10116,11 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // no eligible seat left — a decision about SEATS, not a verdict on the work
         // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
         Some("dead_seat") => "dead_seat",
+        // (DES-STANDIN-001 §3.10) A check no independent helper can take and no one has agreed
+        // to stand in for: a decision about SEATS and consent, never a verdict on the work.
+        Some(stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED) => {
+            stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED
+        }
         // (core#850) A review that ran on a seat that built its work, on a run that requires a
         // distinct evaluator — a decision about SEATS: reassign it, as for a dead seat.
         Some(crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR) => "dead_seat",
@@ -10986,6 +11004,7 @@ fn denial_gate_prompt_body(
         .map(|d| d.source.as_str())
         .unwrap_or("gate");
     match class {
+        stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED => stand_in_gate::prompt(unit, reason, note),
         "evaluator_mutated_worktree" => {
             let phase = unit.phase_id().unwrap_or("read-only");
             let paths = mutation
@@ -14310,7 +14329,9 @@ fn dispatch_unit_with(
     // (program DES-POWER-MODE) OPERATOR MESSAGES queued while no turn could hear them (the
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
-    if unit.tool_cmd.is_none() && review_of.is_none() {
+    // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
+    let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
+    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -14347,6 +14368,39 @@ fn dispatch_unit_with(
     // for this unit's seats BEFORE any of them is built (a restarted engine re-primes here), and
     // named on the unit's context event. The carrier renders it (not a prior output: never clipped,
     // never read as an earlier phase's work).
+    // (DES-STANDIN-001 §3.4) A STAND-IN's context is an allow-listed packet: the step's task and
+    // checklist, the work's final output, the engine's records (floor, requirements, rulings) and
+    // the stand-in preface — never team findings, earlier verdicts, communications or anything
+    // that carries the builder's reasoning ([`crate::standin::packet_keeps`]).
+    if stand_in {
+        let keep: Vec<bool> = prior_outputs
+            .iter()
+            .map(|p| crate::standin::packet_keeps(&p.label))
+            .collect();
+        let mut k = keep.iter();
+        prior_outputs.retain(|_| *k.next().unwrap_or(&false));
+        let mut k = keep.iter();
+        context_items.retain(|_| *k.next().unwrap_or(&false));
+        let lens = session
+            .assurance
+            .stand_ins
+            .iter()
+            .find(|b| Some(b.key.as_str()) == unit.assigned_cli.as_deref())
+            .and_then(|b| b.lens.clone());
+        let preface = crate::standin::preface(lens.as_deref());
+        let label = crate::standin::PREFACE_LABEL.to_string();
+        context_items.insert(
+            0,
+            crate::event::InjectedContext::new(unit.ord, label.clone(), preface.len()),
+        );
+        prior_outputs.insert(
+            0,
+            PriorUnitOutput {
+                label,
+                output: preface,
+            },
+        );
+    }
     crate::run_context::publish(run_id, session.run_context.as_ref());
     let run_context_item = (unit.tool_cmd.is_none())
         .then(|| crate::run_context::current(run_id))
@@ -18444,7 +18498,8 @@ pub(crate) fn plan_answer_refusal(
         | HumanDecision::RetryQe
         | HumanDecision::RecheckRules { .. }
         | HumanDecision::OperatorJudgment { .. }
-        | HumanDecision::SkipQe { .. } => anyhow::bail!(
+        | HumanDecision::SkipQe { .. }
+        | HumanDecision::UseStandIns { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
              amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
              plan, or reject"
@@ -20104,6 +20159,13 @@ pub(crate) fn confirm_gate_expecting(
             "approve": true, "action": choice, "amend": null,
         })
         .to_string(),
+        // (DES-STANDIN-001 §3.8) The consent's scope is the record.
+        crate::workflow::HumanDecision::UseStandIns { scope } => serde_json::json!({
+            "approve": true,
+            "action": crate::workflow::USE_STAND_INS_ACTION,
+            "scope": scope,
+        })
+        .to_string(),
     };
     // (core#1313) Domain helpers batch independently. Suppress those inner boundaries
     // until the row and the state this answer arms are durable together.
@@ -20284,6 +20346,42 @@ pub(crate) fn confirm_gate_expecting(
         }
         d => d,
     };
+    // (DES-STANDIN-001 §3.10) THE STAND-IN GATE: a grant puts the consent on the contract; a grant
+    // or a retry re-routes the units that have not run (real helpers first, a stand-in only with
+    // consent) and the cursor then runs as a plain approve — or, still short, the gate re-opens.
+    let decision = match decision {
+        crate::workflow::HumanDecision::UseStandIns { .. }
+        | crate::workflow::HumanDecision::Approve { amend: None, .. }
+            if stand_in_gate::gate_open(
+                crate::domain::session_units(store, run_id)?.get(session.unit_ix),
+            ) =>
+        {
+            let grant = match &decision {
+                crate::workflow::HumanDecision::UseStandIns { scope } => Some(scope.as_str()),
+                _ => None,
+            };
+            match stand_in_gate::answer(
+                store,
+                &mut answer_events,
+                self_tx,
+                &mut session,
+                run_id,
+                grant,
+                actor.as_deref(),
+            )? {
+                stand_in_gate::Answered::Run => crate::workflow::HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+                stand_in_gate::Answered::Held => {
+                    finish_answer(store, subscribers)?;
+                    in_flight.remove(run_id);
+                    return Ok(SessionStatus::AwaitingHuman);
+                }
+            }
+        }
+        d => d,
+    };
     if let crate::workflow::HumanDecision::OperatorJudgment { rationale } = &decision {
         let units = crate::domain::session_units(store, run_id)?;
         let grant = floor_override_for(
@@ -20448,6 +20546,10 @@ pub(crate) fn confirm_gate_expecting(
         // Answered above (`answer_skip_qe`): it became an approve, a judgment or a re-opened gate.
         crate::workflow::HumanDecision::SkipQe { .. } => {
             anyhow::bail!("run {run_id}: a QE skip is answered before any re-dispatch")
+        }
+        // Answered above (`stand_in_gate::answer`): it became an approve or a re-opened gate.
+        crate::workflow::HumanDecision::UseStandIns { .. } => {
+            anyhow::bail!("run {run_id}: stand-ins are granted before any re-dispatch")
         }
     };
     {
@@ -21637,6 +21739,22 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (DES-STANDIN-001 §3.10) A `stand_in_needed` gate takes three answers: use stand-ins,
+    // approve (retry) and reject; `use_stand_ins` answers nothing else.
+    if let crate::workflow::HumanDecision::UseStandIns { scope } = decision {
+        stand_in_gate::refuse_use_stand_ins(session, cursor, scope)?;
+    } else if stand_in_gate::gate_open(cursor)
+        && !matches!(
+            decision,
+            crate::workflow::HumanDecision::Approve { amend: None, .. }
+                | crate::workflow::HumanDecision::Reject
+        )
+    {
+        anyhow::bail!(
+            "run {run_id} is held for want of an independent helper: use stand-ins, approve to \
+             retry, or reject"
+        );
+    }
     // (core#1748, codex xreview) A lost PA review's `failure` gate re-runs the review (approve) or
     // stops the run (reject). A send-back there would rewind onto the same unit with its review
     // state kept, and re-run the PA's review over the member's unchanged output: sending the

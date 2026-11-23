@@ -3286,6 +3286,14 @@ impl OneShotScratch {
     }
 }
 
+/// (DES-STANDIN-001 §3.4) Whether the unit runs on a stand-in binding (its `assigned_cli` is a
+/// `<base>~<slot>` key): such a unit never resumes a session and is never recorded as one.
+pub(crate) fn is_stand_in_unit(unit: &crate::domain::WorkUnit) -> bool {
+    unit.assigned_cli
+        .as_deref()
+        .is_some_and(wicked_apps_core::spawn::seat_id::is_stand_in)
+}
+
 /// The seat key a wrapped launch of `input` runs as: the unit's assigned seat, else `claude`. Its
 /// `skillUsed` and `toolActivity` frames carry it as `cli` (core#1786).
 pub(crate) fn launch_cli_key(input: &StepInput) -> String {
@@ -4634,8 +4642,11 @@ impl WrappedCliStepRunner {
             let headless = (container && structured).then(|| {
                 // The engine's own sessions (judge, triage, ballot) are one-shot under a run id of
                 // their own: nothing to resume, and no entry to leave behind (codex council-r2).
+                // (DES-STANDIN-001 §3.4) …and a stand-in never resumes or records one either: it
+                // has none of its builder's reasoning, by construction.
                 let turn = (input.unit.qe_review_session.is_none()
-                    && !is_engine_internal(&input.unit))
+                    && !is_engine_internal(&input.unit)
+                    && !is_stand_in_unit(&input.unit))
                 .then(|| {
                     self.sessions.begin(
                         crate::headless::SessionKey {

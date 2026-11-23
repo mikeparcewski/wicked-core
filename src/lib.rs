@@ -1385,6 +1385,29 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at `run_id`'s open `stand_in_needed` gate —
+    /// studio's `{approve: true, action: "use_stand_ins", scope}`: the consent (`scope` `job` |
+    /// `always`, `by` = `actor`, recorded `via: "grant"`) goes on the run's contract and exactly the
+    /// held check continues, on a stand-in where no real helper can take it. Refused at any other
+    /// gate, on a run that is not stand-in-aware or runs reduced, and (through `expect`) for a gate
+    /// that is no longer the open one. Idempotent per gate: the gate it answered is closed.
+    pub fn grant_stand_ins(
+        &self,
+        run_id: &str,
+        scope: &str,
+        actor: Option<String>,
+        expect: Option<crate::workflow::GateExpect>,
+    ) -> anyhow::Result<SessionStatus> {
+        self.confirm_gate_expecting(
+            run_id,
+            HumanDecision::UseStandIns {
+                scope: scope.to_string(),
+            },
+            actor,
+            expect,
+        )
+    }
+
     /// (rejudge) Whether `run_id`'s open gate can RE-RUN ITS JUDGE now
     /// ([`HumanDecision::Rejudge`], wire action `rejudge`): it applies to a unit denied
     /// `judge_unavailable`, and is available when the engine's own judge selection names a seat as

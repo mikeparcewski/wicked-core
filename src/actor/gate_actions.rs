@@ -374,7 +374,15 @@ fn answer_actions(
 
     // The named arms, each by its own token.
     use crate::repo_checks::FloorRerunMode as Mode;
-    let named: [(HumanDecision, &str, NoteRule); 9] = [
+    let named: [(HumanDecision, &str, NoteRule); 10] = [
+        // (DES-STANDIN-001 §3.10, S0 ruling 1) Listed once; a skin draws both scopes from it.
+        (
+            HumanDecision::UseStandIns {
+                scope: crate::standin::SCOPE_JOB.to_string(),
+            },
+            crate::workflow::USE_STAND_INS_ACTION,
+            NoteRule::None,
+        ),
         (
             HumanDecision::RetryQe,
             crate::workflow::RETRY_QE_ACTION,

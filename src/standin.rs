@@ -272,6 +272,30 @@ pub struct StandInBinding {
     pub reason: Reason,
     /// `seated` | `answered` | `failed`.
     pub state: String,
+    /// The base's display name when it was seated (`Claude Code`), for the stamp's words.
+    #[serde(default)]
+    pub display: Option<String>,
+}
+
+impl StandInBinding {
+    /// The base's display name, else its key.
+    pub fn display(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.base)
+    }
+}
+
+/// The binding a unit on seat `seat` runs on, when the run is stand-in-aware, has consent, and
+/// the seat is one of the run's OWN recorded bindings. A `~` key the run never minted is no
+/// stand-in (fail closed: every fence then reads it as its base).
+pub(crate) fn binding_for<'a>(
+    run: &'a crate::assurance::RunAssurance,
+    seat: Option<&str>,
+) -> Option<&'a StandInBinding> {
+    let seat = seat.filter(|s| seat_id::is_stand_in(s))?;
+    if !active(run) || run.stand_in.is_none() {
+        return None;
+    }
+    run.stand_ins.iter().find(|b| b.key == seat)
 }
 
 /// (§3.2) Where a binding applies: the role's unit, attempt, subject and evidence.
@@ -397,6 +421,7 @@ pub(crate) fn fill(req: FillRequest<'_>) -> Fill {
             invocation: uuid::Uuid::new_v4().to_string(),
             reason: req.reason.clone(),
             state: STATE_SEATED.to_string(),
+            display: None,
         });
     }
     Fill::Seats {
@@ -463,6 +488,26 @@ pub(crate) fn preface(lens: Option<&str>) -> String {
     s
 }
 
+/// The label the stand-in preface rides in a unit's context.
+pub(crate) const PREFACE_LABEL: &str = "[stand-in reviewer — read this first]";
+
+/// (§3.4) The context blocks a stand-in may be handed, by label: never team findings, earlier
+/// verdicts of the review, a send-back's findings, a team step's record or operator messages —
+/// everything that carries the builder's (or another reviewer's) reasoning. The step's checklist,
+/// the work's outputs and the engine's own records (floor, requirements, rulings, conformance) are
+/// facts and stay.
+pub(crate) fn packet_keeps(label: &str) -> bool {
+    const DROPPED: [&str; 6] = [
+        "[team findings",
+        "[prior verdicts",
+        "[review — unit",
+        "[team step",
+        "[operator messages",
+        "[team ",
+    ];
+    !DROPPED.iter().any(|d| label.starts_with(d))
+}
+
 /// (§3.5) The lens list, by position inside one council or pool.
 pub(crate) const LENSES: [&str; 9] = [
     "correctness",
@@ -494,6 +539,37 @@ pub(crate) fn label(binding: &StandInBinding, display: &str) -> String {
         binding.role.words(),
         binding.reason.words()
     )
+}
+
+/// A seat's display name from the roster (`Claude Code`), else its key.
+pub(crate) fn display_name(roster: &[crate::AgenticCli], key: &str) -> String {
+    let base = seat_id::credential(key);
+    roster
+        .iter()
+        .find(|c| c.key == base)
+        .or_else(|| roster.iter().find(|c| c.key == seat_id::family(base)))
+        .map(|c| c.display_name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// (§3.7) The run's `standInLabel`: the first stand-in's label; a later stand-in for a different
+/// reason appends "and later: …" once.
+pub(crate) fn note_label(
+    run: &mut crate::assurance::RunAssurance,
+    binding: &StandInBinding,
+    display: &str,
+) {
+    let this = label(binding, display);
+    match run.stand_in_label.as_mut() {
+        None => run.stand_in_label = Some(this),
+        Some(first) => {
+            let reason = binding.reason.words();
+            if !first.contains("and later:") && !first.ends_with(&reason) {
+                first.push_str(&format!("; and later: {reason}"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

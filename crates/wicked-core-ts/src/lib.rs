@@ -1685,6 +1685,37 @@ impl Core {
         })
     }
 
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at the run's open `stand_in_needed` gate (the
+    /// answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
+    /// or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
+    /// on the run's contract and exactly the held check continues. Refused at any other gate, on a
+    /// run that is not stand-in-aware or runs reduced, and — with `expectOrd` / `expectGateSeq` —
+    /// with an error that starts `gate_changed:` when that gate is no longer the open one. Resolves
+    /// to the status token.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn grant_stand_ins(
+        &self,
+        run_id: String,
+        scope: String,
+        actor: Option<String>,
+        expect_ord: Option<u32>,
+        expect_gate_seq: Option<u32>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        let expect = (expect_ord.is_some() || expect_gate_seq.is_some()).then_some(
+            wicked_core::GateExpect {
+                ord: expect_ord,
+                plan_rev: None,
+                gate_seq: expect_gate_seq,
+            },
+        );
+        task(move || {
+            core.grant_stand_ins(&run_id, &scope, actor, expect)
+                .map(status_token)
+                .map_err(err)
+        })
+    }
+
     /// Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
     /// token. Safe whether the run is executing or paused.
     #[napi(ts_return_type = "Promise<string>")]
