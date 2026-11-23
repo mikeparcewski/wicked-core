@@ -2352,7 +2352,7 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
             let dot_git = trees.join(&name).join(".git");
             std::fs::symlink_metadata(&dot_git)
                 .is_ok_and(|m| m.is_file())
-                .then(|| (trees, dot_git))
+                .then_some((trees, dot_git))
         }) else {
             continue;
         };
