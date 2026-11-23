@@ -62,9 +62,15 @@ pub(crate) fn refuse_use_stand_ins(
 
 /// The gate's words: which check is held, why, and the three answers.
 pub(crate) fn prompt(unit: &WorkUnit, reason: &str, note: &str) -> String {
+    // A unit whose seat already ran waits for its check; one that never ran waits to start.
+    let held = if unit.last_attempt.is_some() {
+        "its work is done and waits for its check"
+    } else {
+        "it is held before it runs"
+    };
     format!(
-        "Unit {} is held before it runs: {}. Use a stand-in (for this job, or for every job), \
-         sign another helper in and approve to retry, or reject to stop the run{note}",
+        "Unit {}: {held}. {}. Use a stand-in (for this job, or for every job), sign another \
+         helper in and approve to retry, or reject to stop the run{note}",
         unit.ord,
         super::reason_head(reason)
     )
@@ -191,7 +197,17 @@ pub(crate) fn answer(
             },
         );
     }
-    match reroute(store, events, session) {
+    // A hold whose seat already ran (a missing judge) re-routes nothing: only its judge runs again,
+    // on the reviewed attempt (the caller arms the re-judge). Completed work is never re-seated.
+    let cursor_ran = crate::domain::session_units(store, run_id)?
+        .get(session.unit_ix)
+        .is_some_and(|u| u.last_attempt.is_some());
+    let routed = if cursor_ran {
+        Ok(())
+    } else {
+        reroute(store, events, session)
+    };
+    match routed {
         Ok(()) => {
             session.assurance.pending_stand_in = None;
             crate::domain::put_node(store, session.to_node())?;
@@ -230,14 +246,13 @@ fn reroute(
         .iter()
         .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
         .collect();
-    // A sign-in since the hold may have cleared a bench: re-route over the operator-clearable
-    // bench, as an explicit `{cli:null}` reassign does.
-    let benched = crate::apps::binding_benches(&session.benched_seats);
+    // The run's live benches stand: consent is no evidence that a credential recovered (a bench
+    // lifts through its own re-probe).
     let dists = crate::distribute::distribute_units_on_benched(
         &units,
         &roster,
         &run_id,
-        &benched,
+        &session.benched_seats,
         &session.assurance,
     )?;
     let mut changed = Vec::new();

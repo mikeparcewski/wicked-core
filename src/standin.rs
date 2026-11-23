@@ -362,9 +362,12 @@ pub(crate) fn active(run: &crate::assurance::RunAssurance) -> bool {
 
 /// The next free slot on `base` across the run's bindings (slots never repeat, so two fills never
 /// mint one key).
-pub(crate) fn next_slot(taken: &[StandInBinding], base: &str) -> u32 {
+pub(crate) fn next_slot<'a>(
+    taken: impl IntoIterator<Item = &'a StandInBinding>,
+    base: &str,
+) -> u32 {
     taken
-        .iter()
+        .into_iter()
         .filter(|b| b.base == base)
         .map(|b| b.slot)
         .max()
@@ -411,8 +414,7 @@ pub(crate) fn fill(req: FillRequest<'_>) -> Fill {
     let mut minted: Vec<StandInBinding> = Vec::new();
     for i in 0..(req.need - req.real.len()) {
         let base = bases[i % bases.len()].clone();
-        let all: Vec<StandInBinding> = req.taken.iter().chain(minted.iter()).cloned().collect();
-        let slot = next_slot(&all, &base);
+        let slot = next_slot(req.taken.iter().chain(minted.iter()), &base);
         minted.push(StandInBinding {
             key: binding_key(&base, slot),
             base,
@@ -447,6 +449,7 @@ pub(crate) fn judge_offer(
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     roster: &[crate::AgenticCli],
+    run_seats: &[String],
     benched: &[crate::domain::BenchedSeat],
 ) -> Option<StandInBinding> {
     if !active(run) || run.stand_in.is_none() || run.reduced() {
@@ -458,14 +461,22 @@ pub(crate) fn judge_offer(
     if benched.iter().any(|b| seat_id::credential(&b.cli) == base) {
         return None;
     }
-    // (§3.7) Why, from the run's facts: a helper lost during the run, else only the one.
+    // (§3.7) Why, from the run's facts: a helper lost during the run; else only one helper on the
+    // run; else fewer helpers than the judge needs (every other one built the work or shares it).
+    let credentials: std::collections::BTreeSet<&str> =
+        run_seats.iter().map(|k| seat_id::credential(k)).collect();
     let reason = match benched.first() {
         Some(b) => Reason::LostMidRun {
             seat: display_name(roster, &b.cli),
             cause: b.reason.clone(),
         },
-        None => Reason::OnlyOneHelper {
+        None if credentials.len() <= 1 => Reason::OnlyOneHelper {
             cli: display_name(roster, &base),
+        },
+        None => Reason::HelpersShort {
+            signed_in: credentials.len(),
+            need: 1,
+            have: 0,
         },
     };
     match fill(FillRequest {
@@ -492,24 +503,21 @@ pub(crate) fn judge_offer(
 }
 
 /// (§3.6) The binding of a stand-in judge that ANSWERED as `key`, for the fold to record: the
-/// unit's own offer under that key, when the key is the offer's base with a slot the run has not
-/// recorded. `None` for any other key (fail closed: a `~` key the run never offered is no
+/// unit's own offer, recomputed on the single writer, when `key` is exactly that offer's key. `None` for any other key (fail closed: a `~` key the run never offered is no
 /// stand-in, and the receipt reads it as an ordinary judge seat).
 pub(crate) fn judge_answered(
     run: &crate::assurance::RunAssurance,
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     roster: &[crate::AgenticCli],
+    run_seats: &[String],
     benched: &[crate::domain::BenchedSeat],
     key: &str,
 ) -> Option<StandInBinding> {
-    let mut b = judge_offer(run, unit, attempt, roster, benched)?;
-    let (base, slot) = key.rsplit_once(wicked_apps_core::spawn::STAND_IN_SEP)?;
-    if base != b.base || run.stand_ins.iter().any(|x| x.key == key) {
+    let mut b = judge_offer(run, unit, attempt, roster, run_seats, benched)?;
+    if b.key != key {
         return None;
     }
-    b.slot = slot.parse().ok()?;
-    b.key = key.to_string();
     b.state = STATE_ANSWERED.to_string();
     Some(b)
 }
@@ -844,7 +852,7 @@ mod tests {
             state: STATE_SEATED.into(),
             display: None,
         });
-        let offer = judge_offer(&run, &unit, 1, &[], &[]).expect("consented aware run");
+        let offer = judge_offer(&run, &unit, 1, &[], &[], &[]).expect("consented aware run");
         assert_eq!(
             (offer.key.as_str(), offer.base.as_str()),
             ("claude~2", "claude")
@@ -853,35 +861,37 @@ mod tests {
             (offer.role, offer.ord, offer.attempt),
             (Role::Judge, Some(2), Some(1))
         );
-        let answered = judge_answered(&run, &unit, 1, &[], &[], "claude~2").expect("its own offer");
+        let answered =
+            judge_answered(&run, &unit, 1, &[], &[], &[], "claude~2").expect("its own offer");
         assert_eq!(answered.state, STATE_ANSWERED);
         assert!(
-            judge_answered(&run, &unit, 1, &[], &[], "claude~1").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], &[], "claude~1").is_none(),
             "taken"
         );
         assert!(
-            judge_answered(&run, &unit, 1, &[], &[], "codex~2").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], &[], "codex~2").is_none(),
             "another base"
         );
         assert!(
-            judge_answered(&run, &unit, 1, &[], &[], "claude").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], &[], "claude").is_none(),
             "a real seat"
         );
 
         let mut no_consent = run.clone();
         no_consent.stand_in = None;
-        assert!(judge_offer(&no_consent, &unit, 1, &[], &[]).is_none());
+        assert!(judge_offer(&no_consent, &unit, 1, &[], &[], &[]).is_none());
         assert!(judge_offer(
             &crate::assurance::RunAssurance::default(),
             &unit,
             1,
+            &[],
             &[],
             &[]
         )
         .is_none());
         let mut unpinned = unit.clone();
         unpinned.validator = None;
-        assert!(judge_offer(&run, &unpinned, 1, &[], &[]).is_none());
+        assert!(judge_offer(&run, &unpinned, 1, &[], &[], &[]).is_none());
         // T-R13: a benched base stands nothing in; a helper lost during the run is the reason.
         let bench = |cli: &str| crate::domain::BenchedSeat {
             cli: cli.into(),
@@ -892,8 +902,8 @@ mod tests {
             strikes: 1,
             replaced: None,
         };
-        assert!(judge_offer(&run, &unit, 1, &[], &[bench("claude")]).is_none());
-        let lost = judge_offer(&run, &unit, 1, &[], &[bench("codex")]).expect("claude is up");
+        assert!(judge_offer(&run, &unit, 1, &[], &[], &[bench("claude")]).is_none());
+        let lost = judge_offer(&run, &unit, 1, &[], &[], &[bench("codex")]).expect("claude is up");
         assert_eq!(
             lost.reason,
             Reason::LostMidRun {

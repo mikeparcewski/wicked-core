@@ -1554,32 +1554,25 @@ pub(crate) fn delivery_receipt(
             r.skip(&k.instrument, &k.reason, k.detail);
         }
     }
-    // (DES-STANDIN-001 §5.1, T-R15, T-R20) A stand-in-aware run's delivery is canonical: each role
-    // that took part at any gate, the weakest fill speaking for it (none, then a stand-in, then a
-    // real seat). The independence reads every gate's record: a real judge at one gate and a
-    // stand-in at another is `mixed`.
+    // (DES-STANDIN-001 §5.1, T-R15, T-R20) A stand-in-aware run's delivery is canonical: the keyed
+    // union (role, ord, attempt) of every gate's records, so a role real at one gate and stood in at
+    // another lists both, and an obligation unfilled at one gate stays there. Independence reads
+    // them all: `mixed` once any stand-in took part beside a real helper.
     if session.assurance.roles.is_some() {
-        use crate::assurance::{RoleRecord, FILLED_NONE, FILLED_STAND_IN};
-        let rank = |x: &RoleRecord| match x.filled.as_str() {
-            FILLED_NONE => 0,
-            FILLED_STAND_IN => 1,
-            _ => 2,
-        };
-        let all: Vec<RoleRecord> = units
+        use crate::assurance::RoleRecord;
+        let mut roles: Vec<RoleRecord> = Vec::new();
+        for role in units
             .iter()
             .filter_map(|u| u.assurance.as_ref())
-            .flat_map(|g| g.roles.iter().flatten().cloned())
-            .collect();
-        let mut roles: Vec<RoleRecord> = Vec::new();
-        for role in &all {
-            match roles.iter_mut().find(|x| x.role == role.role) {
-                Some(have) if rank(role) < rank(have) => *have = role.clone(),
-                Some(_) => {}
-                None => roles.push(role.clone()),
+            .flat_map(|g| g.roles.iter().flatten())
+        {
+            let key = |x: &RoleRecord| (x.role.clone(), x.ord, x.attempt);
+            if !roles.iter().any(|x| key(x) == key(role)) {
+                roles.push(role.clone());
             }
         }
-        r.independence = crate::assurance::independence_of(&all);
-        if all.iter().any(RoleRecord::is_stand_in) {
+        r.independence = crate::assurance::independence_of(&roles);
+        if roles.iter().any(RoleRecord::is_stand_in) {
             r.stand_in_label = session.assurance.stand_in_label.clone();
         }
         r.roles = Some(roles);

@@ -11466,6 +11466,8 @@ fn distinct_evaluator_seat(
             && k != seat
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
+            // (DES-STANDIN-001 §3.8) A party never reviews for real: empty on an unaware run.
+            && !crate::distribute::is_party(k, &session.assurance.parties)
     })
 }
 
@@ -12123,7 +12125,9 @@ fn reseat_off_benched_seat(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
-    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == seat) else {
+    // (DES-STANDIN-001 §3.3) A stand-in (`claude~1`) is benched with its credential (`claude`).
+    let credential = wicked_apps_core::spawn::seat_id::credential(&seat);
+    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == credential) else {
         return Ok(Reseat::Unchanged);
     };
     // The template the unit would carry on each seat: the launch roster's own, when another unit
@@ -15264,6 +15268,7 @@ fn dispatch_unit_with(
         unit,
         input.attempt,
         &crate::registry_roster(),
+        &session.clis,
         &session.benched_seats,
     );
     std::thread::spawn(move || {
@@ -24165,8 +24170,8 @@ pub(crate) mod sessions_detail_fold_tests {
     }
 
     /// T-R15 / T-R20 (DES-STANDIN-001 §5.1): on a stand-in-aware run, gate 1's real judge and
-    /// gate 2's stand-in judge make the delivery's judge role `stand_in` and its independence
-    /// `mixed`, and the legacy projection is conservative (the judge never `ran`). A judge missing
+    /// gate 2's stand-in judge both stay in the delivery's roles (the keyed union) and make its
+    /// independence `mixed`, and the legacy projection is conservative (the judge never `ran`). A judge missing
     /// at a third gate stays unsatisfied: the stand-in never hides that skip. A gate with no judge
     /// due beside a real judge stays `independent`.
     #[test]
@@ -24227,9 +24232,14 @@ pub(crate) mod sessions_detail_fold_tests {
             .skipped
             .iter()
             .any(|k| k.instrument == a::JUDGE && k.reason == a::SKIP_STAND_IN));
+        // The keyed union: gate 1's real judge and gate 2's stand-in both stay.
         let roles = d.roles.as_ref().expect("canonical");
-        assert_eq!(roles.len(), 1);
-        assert_eq!(roles[0].filled, a::FILLED_STAND_IN);
+        let filled: Vec<(&str, Option<u32>)> =
+            roles.iter().map(|r| (r.filled.as_str(), r.ord)).collect();
+        assert_eq!(
+            filled,
+            [(a::FILLED_REAL, Some(1)), (a::FILLED_STAND_IN, Some(2))]
+        );
         assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENCE_MIXED));
         assert_eq!(d.stand_in_label.as_deref(), Some("Checked by a stand-in"));
         // A required judge missing at gate 3 is the delivery's word.

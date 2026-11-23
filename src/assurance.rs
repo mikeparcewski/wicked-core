@@ -525,6 +525,21 @@ impl RoleRecord {
         }
     }
 
+    /// (§5.1) An obligation due at this gate that nobody filled: kept, so no other gate's record
+    /// can stand for it.
+    pub fn none(role: crate::standin::Role, ord: u32, attempt: u32) -> Self {
+        Self {
+            role: role.as_str().to_string(),
+            filled: FILLED_NONE.to_string(),
+            state: FILLED_NONE.to_string(),
+            seat: None,
+            stand_in: None,
+            ord: Some(ord),
+            attempt: Some(attempt),
+            subject: None,
+        }
+    }
+
     /// A stand-in, in the binding's state.
     pub fn stand_in(b: &crate::standin::StandInBinding, display: &str) -> Self {
         Self {

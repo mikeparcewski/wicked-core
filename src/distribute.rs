@@ -1234,6 +1234,7 @@ fn seat_runs_claude(key: &str, invocation: Option<String>) -> bool {
 /// Seats are compared by INSTANCE key for the reassignment (two instances of one cli ARE two
 /// seats, and pooling them is the point of core#591) and by CLI key ([`model_of`]) for the
 /// disclosure, because that is the axis the disclosure is about.
+#[allow(clippy::too_many_arguments)]
 fn enforce_evaluator_distinct(
     units: &[WorkUnit],
     dists: &mut [Distribution],

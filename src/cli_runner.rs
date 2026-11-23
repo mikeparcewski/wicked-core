@@ -6278,6 +6278,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
         Some(evidence) => std::borrow::Cow::Owned(format!("{work_owned}{evidence}")),
         None => work_owned,
     };
+    // (DES-STANDIN-001 §3.4) A stand-in judge never reads the team's ledger or comms: its work is
+    // taken here, before the team render. Only when the actor offered one.
+    let stand_in_work: Option<String> = fallback.stand_in_judge.map(|_| work_owned.to_string());
     // T5 / DES-001 §6.2: the judge sees the team's outcomes AND its comms — the rendered ledger
     // and compact transcript ride INSIDE the WORK fence (untrusted data, never instructions).
     let work_owned = match will_judge
@@ -6414,6 +6417,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             // closed: no invocation, no judge).
             let stand_in_verdict = || -> Option<crate::validator::AgentVerdict> {
                 let b = fallback.stand_in_judge?;
+                let work = stand_in_work.as_deref()?;
                 let invocation = crate::standin::resolve(&[], registry, &b.key)?;
                 let (verdict, refused) =
                     with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
@@ -6421,7 +6425,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             b,
                             &invocation,
                             &judge_criterion,
-                            work_for_agent,
+                            work,
                             &**runner,
                             Some(&input.run_id),
                         )
@@ -6615,6 +6619,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     .is_none(),
             };
             if outside_only && all_failed {
+                // (DES-STANDIN-001 §3.6) …a consented stand-in before the skip.
+                if let Some(v) = stand_in_verdict() {
+                    break 'pinned Some(v);
+                }
                 judge_skipped = Some(format!(
                     "no judge seat distinct from creator '{work_author}' and validator author                      '{}'{monitors_note} on the run's own seats, and every other enabled seat                      failed to judge ({})",
                     crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
@@ -6662,22 +6670,36 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 // (core#772) Every judge seat failed as a seat ⇒ a seat-failure denial, not a
                 // REJECT; any other error keeps the fail-closed REJECT shape. (operator ruling
                 // 2026-10-14) Before the hold, a distinct fallback seat judges in their place.
-                Err(e) => judge_error_or_fallback(
-                    "agent validator",
-                    e,
-                    &refused,
-                    &judge_criterion,
-                    work_for_agent,
-                    &fallback_parties(&excluded, fallback.work_authors),
-                    fallback_ids(&author_ids),
-                    roster,
-                    benched,
-                    fallback,
-                    &**runner,
-                    &note_refusals,
-                    emit_delta,
-                    Some(&input.run_id),
-                ),
+                Err(e) => {
+                    let v = judge_error_or_fallback(
+                        "agent validator",
+                        e,
+                        &refused,
+                        &judge_criterion,
+                        work_for_agent,
+                        &fallback_parties(&excluded, fallback.work_authors),
+                        fallback_ids(&author_ids),
+                        roster,
+                        benched,
+                        fallback,
+                        &**runner,
+                        &note_refusals,
+                        emit_delta,
+                        Some(&input.run_id),
+                    );
+                    // (DES-STANDIN-001 §3.6) Every real judge failed as a seat and no fallback
+                    // answered: a consented stand-in judges. A verdict-less answer stays the
+                    // human's.
+                    let lost = v.judge_cli.is_none()
+                        && v.seat_failure
+                            .as_deref()
+                            .is_some_and(|f| !f.contains(crate::validator::JUDGE_NO_VERDICT));
+                    if lost {
+                        stand_in_verdict().unwrap_or(v)
+                    } else {
+                        v
+                    }
+                }
             })
         };
         if pinned.is_some() {

@@ -1669,6 +1669,7 @@ pub(crate) fn apply_and_finish_unit(
                 unit,
                 attempt,
                 &roster,
+                &s.clis,
                 &s.benched_seats,
                 key,
             ) {
@@ -1689,7 +1690,11 @@ pub(crate) fn apply_and_finish_unit(
     // (DES-STANDIN-001 §3.6, §3.8) On a stand-in-aware run with no consent, the missing judge is
     // the `stand_in_needed` hold (grant a stand-in, sign a helper in and retry, or reject), never
     // the reduced offer.
-    let stand_in_hold = crate::standin::active(&assurance) && assurance.stand_in.is_none();
+    // Only a pinned judge can take a stand-in (`standin::judge_offer`): a default judge's hold keeps
+    // today's words, since a grant could not fill it.
+    let stand_in_hold = crate::standin::active(&assurance)
+        && assurance.stand_in.is_none()
+        && unit.validator.as_ref().is_some_and(|v| v.approved);
     // (T-R12) …and so is a judge whose every seat failed as a seat (lost during the run, no
     // fallback): a verdict-less answer stays the human's, as today.
     let agent_denial = agent_denial.map(|(source, why)| {
@@ -2220,7 +2225,15 @@ pub(crate) fn apply_and_finish_unit(
     // (core#431, F-3R2-007) WHO judged: the seat the layer-2 judge ran under and whether it was
     // identity-distinct from the work's author — `None` when no judge ran, so evaluator ≠ creator
     // can be verified from the event stream instead of trusted.
-    let judge_cli = agent_verdict.and_then(|av| av.judge_cli.clone());
+    // (DES-STANDIN-001 §5.1, R9) A stand-in's verdict names its base family on the legacy wire
+    // (`judgeDistinct: false`); the binding lives in the canonical receipt only.
+    let judge_cli = agent_verdict.and_then(|av| av.judge_cli.clone()).map(|k| {
+        if wicked_apps_core::spawn::seat_id::is_stand_in(&k) {
+            wicked_apps_core::spawn::seat_id::family(&k).to_string()
+        } else {
+            k
+        }
+    });
     // (#539) When the judge was skipped for eligibility, force judge_distinct = false so the wire
     // records "no distinct judge" rather than the ambiguous None.
     let judge_distinct = agent_verdict
@@ -4020,18 +4033,27 @@ fn gate_receipt(
             r.creator = rel.creator;
             r.evaluator = seat.clone();
             match (&seat, rel.on_builder_seat) {
-                (Some(e), true) => r.skip(
-                    a::DISTINCT_EVALUATOR,
-                    if run.reduced() {
-                        a::SKIP_REDUCED
-                    } else {
-                        a::SKIP_NO_DISTINCT_SEAT
-                    },
-                    Some(format!(
-                        "evaluated on `{e}`, {}",
-                        rel.conflict.unwrap_or_default()
-                    )),
-                ),
+                (Some(e), true) => {
+                    r.skip(
+                        a::DISTINCT_EVALUATOR,
+                        if run.reduced() {
+                            a::SKIP_REDUCED
+                        } else {
+                            a::SKIP_NO_DISTINCT_SEAT
+                        },
+                        Some(format!(
+                            "evaluated on `{e}`, {}",
+                            rel.conflict.unwrap_or_default()
+                        )),
+                    );
+                    if let Some(roles) = roles.as_mut() {
+                        roles.push(a::RoleRecord::none(
+                            crate::standin::Role::Evaluator,
+                            unit.ord,
+                            attempt,
+                        ));
+                    }
+                }
                 (Some(e), false) => {
                     r.ran(a::DISTINCT_EVALUATOR);
                     if let Some(roles) = roles.as_mut() {
@@ -4091,6 +4113,29 @@ fn gate_receipt(
                 roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
             }
         }
+        // A `~` key this run never recorded is no judge (fail closed): never counted as one.
+        (Some(v), _)
+            if v.seat_failure.is_none()
+                && v.judge_cli
+                    .as_deref()
+                    .is_some_and(wicked_apps_core::spawn::seat_id::is_stand_in) =>
+        {
+            r.skip(
+                a::JUDGE,
+                a::SKIP_ERROR,
+                Some(format!(
+                    "the judge answered as `{}`, a stand-in this run never recorded",
+                    v.judge_cli.as_deref().unwrap_or_default()
+                )),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::none(
+                    crate::standin::Role::Judge,
+                    unit.ord,
+                    attempt,
+                ));
+            }
+        }
         (Some(v), _) if v.seat_failure.is_none() && v.judge_cli.is_some() => {
             r.ran(a::JUDGE);
             r.judge = v.judge_cli.clone();
@@ -4103,20 +4148,38 @@ fn gate_receipt(
                 ));
             }
         }
-        (Some(v), _) => r.skip(
-            a::JUDGE,
-            a::SKIP_ERROR,
-            v.seat_failure.clone().or_else(|| Some(v.reasoning.clone())),
-        ),
-        (None, Some(why)) => r.skip(
-            a::JUDGE,
-            if run.reduced() {
-                a::SKIP_REDUCED
-            } else {
-                a::SKIP_NO_DISTINCT_SEAT
-            },
-            Some(why.to_string()),
-        ),
+        (Some(v), _) => {
+            r.skip(
+                a::JUDGE,
+                a::SKIP_ERROR,
+                v.seat_failure.clone().or_else(|| Some(v.reasoning.clone())),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::none(
+                    crate::standin::Role::Judge,
+                    unit.ord,
+                    attempt,
+                ));
+            }
+        }
+        (None, Some(why)) => {
+            r.skip(
+                a::JUDGE,
+                if run.reduced() {
+                    a::SKIP_REDUCED
+                } else {
+                    a::SKIP_NO_DISTINCT_SEAT
+                },
+                Some(why.to_string()),
+            );
+            if let Some(roles) = roles.as_mut() {
+                roles.push(a::RoleRecord::none(
+                    crate::standin::Role::Judge,
+                    unit.ord,
+                    attempt,
+                ));
+            }
+        }
         // (core#1799) The run's contract lists the judge, but none was due at this gate (a review
         // that changes no files, a step that changed none, a scripted step): said on the receipt,
         // never a required instrument that silently did not run. Not a hold — nothing wanted one.
@@ -4148,6 +4211,23 @@ fn gate_receipt(
         r.independence = a::independence_of(&roles);
         if roles.iter().any(a::RoleRecord::is_stand_in) {
             r.stand_in_label = run.stand_in_label.clone();
+            // (DES-STANDIN-001 §5.1) THE WHOLE-RECEIPT CONSERVATIVE PROJECTION: once any stand-in
+            // took part, no reader on main may read an independent check off this receipt —
+            // neither instrument is `ran`, both seats are null, and a stronger skip a role already
+            // has stands (`skip` keeps the first).
+            let label = run.stand_in_label.clone().unwrap_or_default();
+            for (instrument, role) in [(a::DISTINCT_EVALUATOR, "review"), (a::JUDGE, "judge")] {
+                if r.ran.iter().any(|i| i == instrument) {
+                    r.ran.retain(|i| i != instrument);
+                    r.skip(
+                        instrument,
+                        a::SKIP_STAND_IN,
+                        Some(format!("{label} (the {role} itself was a real helper)")),
+                    );
+                }
+            }
+            r.evaluator = None;
+            r.judge = None;
         }
         r.roles = Some(roles);
     }
@@ -7578,8 +7658,9 @@ mod guarded_read_step_tests {
             approved: true,
         });
         review_pinned.assigned_cli = Some("sj-claude".into());
-        let b = crate::standin::judge_answered(&run, &review_pinned, 1, &[], &[], "sj-claude~1")
-            .expect("the run's own offer");
+        let b =
+            crate::standin::judge_answered(&run, &review_pinned, 1, &[], &[], &[], "sj-claude~1")
+                .expect("the run's own offer");
         run.stand_ins.push(b);
         let verdict = crate::validator::AgentVerdict {
             pass: true,
@@ -7620,12 +7701,32 @@ mod guarded_read_step_tests {
             Some(crate::assurance::INDEPENDENCE_MIXED),
             "a real evaluator and a stand-in judge"
         );
-        // A key the run never recorded: an ordinary judge seat on the legacy fields.
+        // The whole receipt is projected: the real evaluator is not `ran` either, and its seat is
+        // null, so no reader on main reads an independent check off it.
+        assert!(!receipt
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::DISTINCT_EVALUATOR));
+        assert!(receipt.skipped.iter().any(|s| {
+            s.instrument == crate::assurance::DISTINCT_EVALUATOR
+                && s.reason == crate::assurance::SKIP_STAND_IN
+        }));
+        assert_eq!(receipt.evaluator, None);
+        // A key the run never recorded is no judge (fail closed): an error skip and an unfilled
+        // obligation, never `ran`.
         let mut forged = verdict.clone();
         forged.judge_cli = Some("sj-claude~9".into());
         let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&forged)));
-        assert_eq!(receipt.judge.as_deref(), Some("sj-claude~9"));
-        assert!(receipt.ran.iter().any(|i| i == crate::assurance::JUDGE));
+        assert_eq!(receipt.judge, None);
+        assert!(!receipt.ran.iter().any(|i| i == crate::assurance::JUDGE));
+        assert!(receipt.skipped.iter().any(|s| {
+            s.instrument == crate::assurance::JUDGE && s.reason == crate::assurance::SKIP_ERROR
+        }));
+        assert!(receipt
+            .roles
+            .expect("canonical")
+            .iter()
+            .any(|r| r.role == "judge" && r.filled == crate::assurance::FILLED_NONE));
     }
 
     #[test]
