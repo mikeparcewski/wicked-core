@@ -43,13 +43,60 @@ use crate::worker_sandbox::FloorUnarmed;
 /// and `set --` with the launcher and CLI argv, so neither a secret nor the prompt is ever on the
 /// exec's argv, which is a URL query on the API server), its working directory entered, the
 /// launcher run, its exit code written where [`settle`] reads it.
+///
+/// A claude OAuth seat's credential record ([`claude_record_vars`], wicked-garden#1365) is
+/// written into its config home right before the launcher runs and blanked to `{}` right after
+/// it exits, whatever its exit code. The temporary name is removed first and created no-clobber,
+/// so a link a seat planted there is never followed. The two carrier variables are unset before
+/// the launcher, and landrun passes no variable it is not named. The record never reaches the
+/// host or the replica codec, and a unit that ends without the wrapper (its pod killed) leaves a
+/// record that the next unit's home re-sync replaces.
 pub(crate) const WRAPPER: &str = "set -u; u=/wicked-unit; \
 [ -f $u/env ] || { echo 'wicked-seat: the unit env is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 . $u/env; /floor/busybox rm -f $u/env; \
 [ $# -gt 0 ] || { echo 'wicked-seat: the unit argv is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 cd \"$WICKED_UNIT_CWD\" || { echo 'wicked-seat: the unit directory is missing' >&2; echo 125 > $u/rc; exit 125; }; \
-unset WICKED_UNIT_CWD; \"$@\"; rc=$?; \
+unset WICKED_UNIT_CWD; \
+c=${WICKED_CLAUDE_RECORD_FILE:-}; \
+put() { /floor/busybox rm -f \"$c.wicked-tmp\" && (umask 077; set -C; /floor/busybox printf '%s' \"$1\" > \"$c.wicked-tmp\") && /floor/busybox mv -f \"$c.wicked-tmp\" \"$c\"; }; \
+[ -z \"$c\" ] || put \"${WICKED_CLAUDE_RECORD:-}\" || { echo 'wicked-seat: the claude credential record could not be written' >&2; echo 125 > $u/rc; exit 125; }; \
+unset WICKED_CLAUDE_RECORD WICKED_CLAUDE_RECORD_FILE; \
+\"$@\"; rc=$?; \
+[ -z \"$c\" ] || put '{}' || echo 'wicked-seat: the claude credential record could not be blanked' >&2; \
 echo $rc > $u/rc.tmp && /floor/busybox mv $u/rc.tmp $u/rc; exit $rc";
+
+/// The carrier variables that hand [`WRAPPER`] a claude OAuth seat's credential record
+/// (wicked-garden#1365): claude 2.1.296 deletes `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's
+/// env, so a `claude -p` the seat starts from its Bash tool (a harness's rule model) reads its
+/// sign-in from `$CLAUDE_CONFIG_DIR/.credentials.json`. The record is claude's own env-token
+/// shape ([`crate::seat_credentials::claude_oauth_token_record`]). Empty for every other seat. A
+/// gateway placeholder cannot stand in for it: claude's own non-inference calls go straight to
+/// api.anthropic.com, past the gateway (core#1832).
+pub(crate) fn claude_record_vars(cli: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
+    if wicked_apps_core::spawn::SeatCli::from_binary(cli)
+        != wicked_apps_core::spawn::SeatCli::Claude
+    {
+        return Vec::new();
+    }
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| v.as_str())
+    };
+    match (get("CLAUDE_CODE_OAUTH_TOKEN"), get("CLAUDE_CONFIG_DIR")) {
+        (Some(token), Some(home)) => vec![
+            (
+                "WICKED_CLAUDE_RECORD".into(),
+                crate::seat_credentials::claude_oauth_token_record(token),
+            ),
+            (
+                "WICKED_CLAUDE_RECORD_FILE".into(),
+                format!("{}/.credentials.json", home.trim_end_matches('/')),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
 
 /// The marker prefix of a seat's exec (`$0` of [`WRAPPER`]): its id in [`SEATS`].
 pub(crate) const MARKER_PREFIX: &str = "wicked-unit-";
@@ -3629,6 +3676,9 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         ));
         names.push(key);
     }
+    // Read by the wrapper alone (never named to landrun, so never the CLI's env).
+    let record = claude_record_vars(&seat.cli, &vars);
+    vars.extend(record);
     // nopush_git_config_env()'s GIT_CONFIG_COUNT/KEY/VALUE entries also ride this env
     // handoff and landrun's --env entries, so the push fence does not depend on a config file.
     let (git_files, git_reads) =

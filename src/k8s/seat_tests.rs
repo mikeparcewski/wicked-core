@@ -3656,13 +3656,129 @@ fn k8s_one_shot_scopes_never_collide_on_a_label() {
     assert!(seat::one_shot_scope("run-1").is_none());
 }
 
+/// wicked-garden#1365: only a claude seat signed in by a token gets a credential record, in
+/// claude's own env-token shape, at its config home. An API-key claude seat (no token) and every
+/// other CLI get none. Red on the reverted wrapper handoff: no record, so a `claude -p` the seat
+/// starts from its Bash tool is "Not logged in".
+#[test]
+fn k8s_only_a_claude_oauth_seat_is_handed_a_credential_record() {
+    // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+    let token = format!("sk-ant-oat01-{}", "W".repeat(40));
+    let vars = vec![
+        ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone()),
+        ("CLAUDE_CONFIG_DIR".to_string(), "/seat/claude/".to_string()),
+    ];
+    let record = seat::claude_record_vars("claude", &vars);
+    assert_eq!(
+        record.len(),
+        2,
+        "{:?}",
+        record.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+    let body: serde_json::Value = serde_json::from_str(&record[0].1).unwrap();
+    assert_eq!(record[0].0, "WICKED_CLAUDE_RECORD");
+    assert_eq!(body["claudeAiOauth"]["accessToken"], token.as_str());
+    assert!(body["claudeAiOauth"]["refreshToken"].is_null());
+    assert!(body["claudeAiOauth"]["expiresAt"].is_null());
+    assert_eq!(
+        record[1],
+        (
+            "WICKED_CLAUDE_RECORD_FILE".to_string(),
+            "/seat/claude/.credentials.json".to_string()
+        )
+    );
+    assert!(seat::claude_record_vars("codex", &vars).is_empty());
+    assert!(seat::claude_record_vars("claude", &vars[1..]).is_empty());
+    assert!(seat::claude_record_vars("claude", &vars[..1]).is_empty());
+}
+
+/// wicked-garden#1365: the wrapper (run here as the pod runs it) writes the record before the CLI
+/// starts, so the CLI and anything it starts read it from its config home. It never hands the
+/// CLI the carrier variables, never follows a link planted at its temporary name, and blanks the
+/// record to `{}` once the CLI exits, whatever its exit code.
+#[cfg(unix)]
+#[test]
+fn k8s_the_wrapper_writes_the_claude_record_for_the_unit_and_blanks_it_after() {
+    let host = tmp("claude-record");
+    let cfg = host.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join(".credentials.json"), "{}").unwrap();
+    // A link a seat planted at the temporary name, aimed at a file the record must never reach.
+    let target = host.join("planted-target");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, cfg.join(".credentials.json.wicked-tmp")).unwrap();
+    let token = format!("sk-ant-oat01-{}", "X".repeat(40));
+    let mut vars = vec![
+        ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone()),
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            cfg.to_string_lossy().into_owned(),
+        ),
+    ];
+    let record = seat::claude_record_vars("claude", &vars);
+    vars.extend(record);
+    vars.push((
+        "WICKED_UNIT_CWD".into(),
+        host.to_string_lossy().into_owned(),
+    ));
+    std::fs::write(
+        host.join("env"),
+        format!(
+            "{}{}",
+            seat::env_file(&vars).unwrap(),
+            seat::argv_line(&[
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat \"$CLAUDE_CONFIG_DIR/.credentials.json\" > seen; env > seen-env; exit 3"
+                    .into(),
+            ])
+            .unwrap()
+        ),
+    )
+    .unwrap();
+    let wrapper = seat::WRAPPER
+        .replace("/wicked-unit", &host.to_string_lossy())
+        .replace("/floor/busybox", "/usr/bin/env");
+    let out = std::process::Command::new("/bin/sh")
+        .hardened()
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", &host)
+        .args(["-c", &wrapper])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(host.join("seen")).unwrap()).unwrap();
+    assert_eq!(seen["claudeAiOauth"]["accessToken"], token.as_str());
+    let seen_env = std::fs::read_to_string(host.join("seen-env")).unwrap();
+    assert!(
+        !seen_env.contains("WICKED_CLAUDE_RECORD"),
+        "the carriers never reach the CLI"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cfg.join(".credentials.json")).unwrap(),
+        "{}",
+        "blanked once the CLI exits"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert!(!cfg.join(".credentials.json.wicked-tmp").exists());
+    assert_eq!(std::fs::read_to_string(host.join("rc")).unwrap(), "3\n");
+    std::fs::remove_dir_all(host).unwrap();
+}
+
 /// r6 #5: a wrapper setup failure writes its rc, so it is the unit's failure (exit 125), never a
 /// lost stream.
 #[test]
 fn k8s_a_wrapper_setup_failure_is_an_exit_code_not_a_lost_stream() {
     assert_eq!(
         seat::WRAPPER.matches("echo 125 > $u/rc; exit 125").count(),
-        3
+        4
     );
     assert_eq!(seat::exit_code(125, Some("125\n")), Some(125));
 }

@@ -344,8 +344,9 @@ pub(crate) fn placeholder_files(
         // No placeholder record for either claude mode. OAuth (core#1024): the seat's claude
         // passes the operator's `claude setup-token` token through, from its env
         // (`CLAUDE_CODE_OAUTH_TOKEN`), and the unit's key rides `x-wicked-unit`
-        // ([`crate::seat_gateway::seat_env_for`]); arming replaces this empty file with the
-        // token's record (`claude_oauth_token_record`, wicked-garden#1365). API key: selected
+        // ([`crate::seat_gateway::seat_env_for`]); for the unit's life the seat's in-pod wrapper
+        // writes the token's record over this empty file (`claude_oauth_token_record`,
+        // `k8s::seat::WRAPPER`, wicked-garden#1365). API key: selected
         // by ANTHROPIC_API_KEY. The file is still written, empty, so a seat home an earlier unit
         // used keeps no stale record there (agy c6-r1).
         ("claude", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
