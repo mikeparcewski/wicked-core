@@ -3707,7 +3707,8 @@ fn unit_body_from_finalize(dir: &Path, cli: &str, envs: &[(String, String)]) -> 
         context: "t".into(),
         owner: "o".into(),
     };
-    let id = format!("record-{}", uuid::Uuid::new_v4().simple());
+    // Alphanumeric only: `seat_id_of` reads no other marker, and finalize would pass it by.
+    let id = format!("record{}", uuid::Uuid::new_v4().simple());
     let live = seat::register_for_test(&kube, &id, dir, cli);
     // spawn-audit: test-only — never spawned: finalize reads its args and env, and spawns the stub.
     let mut cmd = std::process::Command::new("kubectl");
