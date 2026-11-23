@@ -44,6 +44,30 @@ fn rule_council_and_arbiter_exclude_a_seat_seen_on_the_creators_provider() {
     crate::observed_provider::take_receipts();
 }
 
+/// (core#1789) A judge that answers R1 with `there` in a call whose prompt holds `shows` (the part
+/// showing that change), and with `elsewhere` in every other call; the other rules N/A.
+struct ByPart {
+    shows: &'static str,
+    there: &'static str,
+    elsewhere: &'static str,
+}
+
+impl StepRunner for ByPart {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let word = if input.unit.description.contains(self.shows) {
+            self.there
+        } else {
+            self.elsewhere
+        };
+        Judging {
+            r1: word,
+            rest: "N/A — not a fix",
+            calls: AtomicU32::new(0),
+        }
+        .run_unit(input)
+    }
+}
+
 /// The judge: answers every asked rule with `R1`'s word for R1 (and the others' from `rest`).
 struct Judging {
     r1: &'static str,
@@ -377,7 +401,23 @@ fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
     );
     assert_eq!(r1.status, RuleStatus::Broken, "{r1:?}");
     assert_eq!(r1.origin, Some(RuleOrigin::Council));
-    // The judge claims the break: its paged BROKEN cannot be scoped, so the dispute holds.
+    // The paged judge claims the break in the part that shows src/a.rs, N/A elsewhere: its claim
+    // names a file its part showed, so the council sees that file.
+    let judge = ByPart {
+        shows: "+fn add(a: i32, b: i32)",
+        there: "BROKEN — src/a.rs:2 add() takes i32 for floats",
+        elsewhere: "N/A — this part holds generated rows",
+    };
+    let council = FakeCouncil::new("paged-dispute-claim", kept_3_0);
+    let input = paged("paged-dispute-claim");
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 1, "{r1:?}");
+    let (req, _) = &council.seen.lock().unwrap()[0];
+    assert!(req.evidence.contains("+fn add(a: i32, b: i32)"));
+    assert!(!req.evidence.contains("BIG-ROW"));
+    assert_eq!(r1.status, RuleStatus::Kept, "{r1:?}");
+    // A judge claiming src/a.rs in every part (most of which never showed it) still holds.
     let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
     let council = FakeCouncil::new("paged-dispute-judge", kept_3_0);
     let input = paged("paged-dispute-judge");

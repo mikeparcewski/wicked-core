@@ -331,6 +331,12 @@ pub struct RuleVerdict {
     /// A broken `error` / `critical` rule is reworked. Absent elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waivable: Option<bool>,
+    /// (core#1789) On a fresh judge BROKEN: the changed files its claims named, each checked when
+    /// it ruled (every part that broke the rule named a file that part showed; no part was
+    /// undecided; nothing was cut). A council on a change too big for a ballot is shown these.
+    /// Not recorded: a row read back from the store has none, and its dispute holds as before.
+    #[serde(skip)]
+    pub claim_files: Option<Vec<String>>,
 }
 
 /// A person's skip of an unchecked rule, or of a broken warning (`waivable`; e2e-1105 CJ9) (gate
@@ -1935,8 +1941,18 @@ pub fn parse_rule_answers(
                         broken: *any_broken,
                     });
                 } else if prev.is_ok() {
-                    if let Err(m) = answer {
-                        *prev = Err(m);
+                    match (prev, answer) {
+                        (Ok(p), Ok(a))
+                            if a.status == RuleStatus::Broken
+                                && !p.cite.split(CLAIM_SEP).any(|c| c == a.cite) =>
+                        {
+                            // (core#1789, codex r2) Each BROKEN line is a claim a council
+                            // scoped to the files they name must see.
+                            p.cite.push_str(CLAIM_SEP);
+                            p.cite.push_str(&a.cite);
+                        }
+                        (prev, Err(m)) => *prev = Err(m),
+                        _ => {}
                     }
                 }
             }
@@ -2917,18 +2933,18 @@ impl Evidence {
         }
     }
 
-    /// (core#1789) The evidence of a dispute on a change too big for a ballot whole, when the
-    /// REVIEWER claims the break and the rule judge read every part and found it not broken (KEPT
-    /// or N/A, so no part broke it and none was left undecided): the whole diff of each changed
-    /// file (git's own list) the reviewer's BROKEN lines name by their whole paths, the other
-    /// changed files listed as not shown, and those files as the ones a KEPT vote names. The
-    /// council rules on the reviewer's claims; the judge's reading stands for the rest.
+    /// (core#1789) The evidence of a dispute on a change too big for a ballot whole: the whole diff
+    /// of each changed file the BROKEN side's claims name, the other changed files listed as not
+    /// shown, and the files shown as the ones a KEPT vote names. The council rules on those
+    /// claims; the other reading (KEPT or N/A, on the whole change) stands for the rest.
     ///
-    /// `None` (the dispute holds as before) when the judge claims the break: a paged judge's
-    /// BROKEN is one part's answer, and the row keeps neither the other parts' claims nor the
-    /// files each part showed, so a ruling on the files it names could clear a break it was never
-    /// shown (codex r2). Also `None` unless EVERY BROKEN line of the reviewer's names a changed
-    /// file ([`CLAIM_SEP`]), and when a named file has no section in the diff (git quoted it).
+    /// The claims are the reviewer's BROKEN lines ([`CLAIM_SEP`]), each naming a changed file, or
+    /// the judge's, as the engine checked them when it judged ([`RuleVerdict::claim_files`]):
+    /// every part that broke the rule named a file that part showed, and no part was undecided.
+    /// `None` (the dispute holds as before) otherwise: a judge row read back from the store
+    /// carries no claims, and a ruling on files other than a claim's could clear a break the
+    /// council was never shown (codex r2). Also `None` unless each file named has exactly one
+    /// section in the diff, matched by its exact header ([`exact_sections`]).
     pub fn of_named_files(
         row: &RuleVerdict,
         change: &Change,
@@ -2937,45 +2953,38 @@ impl Evidence {
     ) -> Option<(Evidence, Vec<String>)> {
         let by = |who: &str| positions.iter().find(|p| p.by == who);
         let (judge, reviewer) = (by(BY_RULE_JUDGE)?, by(BY_REVIEWER)?);
-        if reviewer.status != RuleStatus::Broken
-            || !matches!(judge.status, RuleStatus::Kept | RuleStatus::NotApplicable)
-        {
-            return None;
-        }
+        let not_broken = |s: RuleStatus| matches!(s, RuleStatus::Kept | RuleStatus::NotApplicable);
         let all: Vec<&str> = change
             .paths
             .iter()
             .map(|(f, _)| f.as_str())
             .filter(|f| f.len() >= 3)
             .collect();
-        let named_in = |text: &str| -> Vec<&str> {
-            all.iter()
-                .copied()
-                .filter(|f| names_whole_path(text, f))
-                .collect()
-        };
-        let claims: Vec<Vec<&str>> = reviewer.cite.split(CLAIM_SEP).map(named_in).collect();
-        if claims.iter().any(Vec::is_empty) {
-            return None;
-        }
-        let named: BTreeSet<&str> = claims.into_iter().flatten().collect();
+        let named: BTreeSet<&str> =
+            if reviewer.status == RuleStatus::Broken && not_broken(judge.status) {
+                let named_in = |text: &str| -> Vec<&str> {
+                    all.iter()
+                        .copied()
+                        .filter(|f| names_whole_path(text, f))
+                        .collect()
+                };
+                let claims: Vec<Vec<&str>> = reviewer.cite.split(CLAIM_SEP).map(named_in).collect();
+                if claims.iter().any(Vec::is_empty) {
+                    return None;
+                }
+                claims.into_iter().flatten().collect()
+            } else if judge.status == RuleStatus::Broken && not_broken(reviewer.status) {
+                let files = row.claim_files.as_ref().filter(|f| !f.is_empty())?;
+                // The claims were checked against git's own list when the judge ruled.
+                files
+                    .iter()
+                    .map(|f| all.iter().copied().find(|p| p == f))
+                    .collect::<Option<_>>()?
+            } else {
+                return None;
+            };
         let named: Vec<&str> = named.into_iter().collect();
-        let shown = scoped_sections(&change.diff, &named)?;
-        // A rename's section shows both its sides: the other side counts as shown only on a header
-        // that is exactly `a/<one> b/<other>` (codex r2: never a suffix of a longer name).
-        let renamed = |f: &str| {
-            named.iter().any(|n| {
-                shown.lines().any(|l| {
-                    l == format!("diff --git a/{n} b/{f}") || l == format!("diff --git a/{f} b/{n}")
-                })
-            })
-        };
-        let on_view: BTreeSet<&str> = change
-            .paths
-            .iter()
-            .map(|(f, _)| f.as_str())
-            .filter(|f| named.contains(f) || renamed(f))
-            .collect();
+        let (shown, on_view) = exact_sections(change, &named)?;
         let not_shown = change
             .paths
             .iter()
@@ -2991,6 +3000,60 @@ impl Evidence {
             on_view.into_iter().map(str::to_string).collect(),
         ))
     }
+}
+
+/// (core#1789, codex r3) Whether a `diff --git a/` header (`h`, after that prefix, no line end) is
+/// exactly `a/<n> b/<other>` or `a/<other> b/<n>`, the other side a changed path in `listed` (the
+/// same file, or a rename's other side): that other side. A decoy whose own name ends in
+/// ` b/<n>` names a pair that is not in the list, so it never matches.
+fn header_partner<'a>(h: &str, n: &str, listed: &BTreeSet<&'a str>) -> Option<&'a str> {
+    if h == format!("{n} b/{n}") {
+        return listed.get(n).copied();
+    }
+    if let Some(new) = h.strip_prefix(&format!("{n} b/")) {
+        if let Some(p) = listed.get(new) {
+            return Some(*p);
+        }
+    }
+    h.strip_suffix(&format!(" b/{n}"))
+        .and_then(|old| listed.get(old).copied())
+}
+
+/// (core#1789, codex r3) The whole sections of `change`'s diff for the changed files `named`, each
+/// matched by its EXACT header `diff --git a/<old> b/<new>`, where one side is a named file and the
+/// other a changed path in git's own list (the same file, or a rename's other side), with the
+/// changed paths those sections show (both sides of a rename). `None` unless every named file
+/// has exactly one such section: a quoted header (git quotes unusual names) or a decoy whose
+/// name ends in ` b/<path>` never stands in for a file's own section.
+fn exact_sections<'a>(change: &'a Change, named: &[&str]) -> Option<(String, BTreeSet<&'a str>)> {
+    let listed: BTreeSet<&'a str> = change.paths.iter().map(|(f, _)| f.as_str()).collect();
+    let mut found: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut on_view: BTreeSet<&'a str> = BTreeSet::new();
+    let mut out = String::new();
+    let mut keep = false;
+    for line in change.diff.split_inclusive('\n') {
+        if let Some(h) = line
+            .strip_prefix("diff --git a/")
+            .map(|h| h.trim_end_matches(['\n', '\r']))
+        {
+            keep = false;
+            for n in named {
+                if let Some(p) = header_partner(h, n, &listed) {
+                    keep = true;
+                    *found.entry(*n).or_default() += 1;
+                    on_view.extend(listed.get(*n).copied());
+                    on_view.insert(p);
+                }
+            }
+        }
+        if keep {
+            out.push_str(line);
+        }
+    }
+    named
+        .iter()
+        .all(|n| found.get(n) == Some(&1))
+        .then_some((out, on_view))
 }
 
 /// (core#1789) What a scoped dispute ballot says about the change: the files shown are the ones the
@@ -4361,7 +4424,7 @@ fn judge_rows(
     }
     for (i, p) in pending.iter().enumerate() {
         let row = match answered.remove(&i) {
-            Some((a, seat, whole)) => RuleVerdict {
+            Some((a, seat, whole, claim_files)) => RuleVerdict {
                 rule_id: p.rule.id.clone(),
                 status: a.status,
                 how: RuleHow::Judge,
@@ -4372,6 +4435,7 @@ fn judge_rows(
                 evidence_key: Some(p.evidence_key.clone()),
                 origin: Some(RuleOrigin::Judge),
                 evidence_complete: Some(whole),
+                claim_files,
                 ..Default::default()
             },
             None => unchecked(
@@ -4488,7 +4552,7 @@ pub fn judge_reading(r: &RuleVerdict) -> Option<RuleVerdict> {
     })
 }
 
-type Answered = BTreeMap<usize, (Answer, String, bool)>;
+type Answered = BTreeMap<usize, (Answer, String, bool, Option<Vec<String>>)>;
 
 /// (F20, F22) A rule's first ask that did not settle it: the seat (asked last on the retry), what
 /// the retry is told, and whether the miss holds for a person (never re-asked).
@@ -4878,6 +4942,75 @@ fn run_pool(
                         } else {
                             parse_rule_answers(&out, &ids, &nonce, bar, input.instructions)
                         };
+                        // (core#1789) Per BROKEN rule, the changed files its claims name, each
+                        // claim checked against what its call showed: a part's own files, the
+                        // scoped call's files, or the whole change. A part undecided on the rule,
+                        // or a claim naming no file it was shown, leaves the rule without claims.
+                        let claims: BTreeMap<&str, Vec<String>> =
+                            if subject == EvidenceSubject::Change {
+                                let listed: BTreeSet<&str> = paths.iter().copied().collect();
+                                let shown_by = |k: Option<usize>| -> Vec<&str> {
+                                    match (k, &scoped) {
+                                        // The files whose own header the part holds, exactly.
+                                        (Some(k), _) => paths
+                                            .iter()
+                                            .copied()
+                                            .filter(|p| {
+                                                part_files[k].iter().any(|h| {
+                                                    h.trim_end_matches(['\n', '\r'])
+                                                        .strip_prefix("diff --git a/")
+                                                        .is_some_and(|h| {
+                                                            header_partner(h, p, &listed).is_some()
+                                                        })
+                                                })
+                                            })
+                                            .collect(),
+                                        (None, Some((_, shown, _))) => shown.to_vec(),
+                                        (None, None) => paths.to_vec(),
+                                    }
+                                };
+                                let calls: Vec<(Option<usize>, &Parsed)> = if total_parts > 1 {
+                                    each.iter().enumerate().map(|(k, p)| (Some(k), p)).collect()
+                                } else {
+                                    vec![(None, &parsed)]
+                                };
+                                ids.iter()
+                                    .filter_map(|id| {
+                                        if calls.iter().any(|(_, p)| p.misses.contains_key(*id)) {
+                                            return None;
+                                        }
+                                        let mut files: BTreeSet<String> = BTreeSet::new();
+                                        let mut any = false;
+                                        for (k, p) in &calls {
+                                            let Some(a) = p
+                                                .answers
+                                                .get(*id)
+                                                .filter(|a| a.status == RuleStatus::Broken)
+                                            else {
+                                                continue;
+                                            };
+                                            any = true;
+                                            let on = shown_by(*k);
+                                            for claim in a.cite.split(CLAIM_SEP) {
+                                                let hit: Vec<&str> = on
+                                                    .iter()
+                                                    .copied()
+                                                    .filter(|f| {
+                                                        f.len() >= 3 && names_whole_path(claim, f)
+                                                    })
+                                                    .collect();
+                                                if hit.is_empty() {
+                                                    return None;
+                                                }
+                                                files.extend(hit.into_iter().map(str::to_string));
+                                            }
+                                        }
+                                        any.then(|| (*id, files.into_iter().collect()))
+                                    })
+                                    .collect()
+                            } else {
+                                BTreeMap::new()
+                            };
                         if scoped.is_some() {
                             for a in parsed.answers.values_mut() {
                                 a.cite = format!("{SCOPED_CITE}{}", a.cite);
@@ -5030,7 +5163,15 @@ fn run_pool(
                                             ans.cite = q;
                                         }
                                     }
-                                    a.insert(batch[j], (ans, seat.clone(), !cut && !record_cut));
+                                    let files = (subject == EvidenceSubject::Change
+                                        && !cut
+                                        && ans.status == RuleStatus::Broken)
+                                        .then(|| claims.get(*id).cloned())
+                                        .flatten();
+                                    a.insert(
+                                        batch[j],
+                                        (ans, seat.clone(), !cut && !record_cut, files),
+                                    );
                                     continue;
                                 }
                                 None => parsed.misses.get(*id).cloned().unwrap_or(Miss::NoLine),

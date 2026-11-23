@@ -4357,10 +4357,20 @@ fn core_1474_part_answers_combine_broken_first_then_misses_then_kept() {
     assert_eq!(c.answers["N"].status, RuleStatus::NotApplicable);
 }
 
-/// (core#1789, codex r1) A reviewer's two BROKEN lines on one rule both stand in its reading (an
-/// echo is one claim): a council scoped to the files the reviewer names must see each.
+/// (core#1789, codex r1 and r2) Two BROKEN lines on one rule both stand, in a judge's answer and in
+/// the reviewer's reading (an echo is one claim): a council scoped to the files the claims name
+/// must see each.
 #[test]
-fn core_1789_every_broken_line_of_the_reviewer_is_kept_in_its_reading() {
+fn core_1789_every_broken_line_is_kept_in_the_reading() {
+    let ids = ["B"];
+    let text = "BEGIN VERDICTS n\nRULE B: BROKEN — src/a.rs untyped\n\
+                RULE B: BROKEN — src/b.rs untyped\nRULE B: BROKEN — src/a.rs untyped\n\
+                END VERDICTS n\n";
+    let p = parse_rule_lines(text, &ids, "n", &["src/a.rs", "src/b.rs"], None);
+    assert_eq!(
+        p["B"].cite,
+        format!("src/a.rs untyped{CLAIM_SEP}src/b.rs untyped")
+    );
     let r = seat_positions(
         "RULE B: BROKEN — src/a.rs untyped\nRULE B: BROKEN — src/b.rs untyped\n\
          RULE B: BROKEN — src/a.rs untyped\n",

@@ -560,18 +560,24 @@ fn core_1789_a_paged_dispute_reaches_a_council_on_the_files_the_reviewer_named()
     assert!(c0.votes[1].counted && c0.votes[2].counted, "{c0:?}");
 }
 
-/// (core#1789, codex r1 and r2) No scope, so the dispute holds as before: when the paged JUDGE
-/// claims the break (its BROKEN is one part's answer; the row keeps neither the other parts'
-/// claims nor what each part showed, even when its cite carries the engine's `part N of M`
-/// label and a file named `part` changed), and when any BROKEN line of the reviewer's names no
-/// changed file. Every line that does name one is shown.
+/// (core#1789, codex r1 and r2) No scope, so the dispute holds as before: when the JUDGE claims
+/// the break with no claims the engine checked as it ruled (a row read back from the store; the
+/// cite alone, even with its `part N of M` label and a changed file named `part`, is never read
+/// for them), when its checked claims name a file git does not list, and when any BROKEN line of
+/// the reviewer's names no changed file. Checked claims, and every reviewer line that names a
+/// file, are shown.
 #[test]
-fn core_1789_a_scope_is_drawn_only_on_the_reviewers_claims_each_naming_a_file() {
+fn core_1789_a_scope_is_drawn_only_on_checked_claims_each_naming_a_file() {
     let c = big_change(true);
-    let (row, pos) = split(
+    let (mut row, pos) = split(
         (RuleStatus::Broken, "part 2 of 3: src/add.rs:1 untyped"),
         (RuleStatus::Kept, "src/add.rs:1 typed"),
     );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
+    row.claim_files = Some(vec!["src/add.rs".into()]);
+    let (_, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("checked claims");
+    assert_eq!(shown, vec!["src/add.rs".to_string()]);
+    row.claim_files = Some(vec!["src/gone.rs".into()]);
     assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
     let mut with_part = big_change(true);
     with_part.paths.push(("part".into(), true));
@@ -650,6 +656,30 @@ fn core_1789_a_scoped_rename_shows_both_sides_and_only_them() {
         "{:?}",
         ev.not_shown
     );
+    // (codex r3) A file whose own header git quoted (a rename to an unusual name) and a decoy
+    // whose name ends in ` b/src/a.rs`: the decoy never stands in for it, so there is no scope.
+    let quoted = format!(
+        "diff --git a/src/a.rs \"b/src/a\\\"new.rs\"\nsimilarity index 90%\n@@ -1 +1 @@\n\
+         -fn a() {{}}\n+fn a(x: i32) {{}}\n\
+         diff --git a/decoy b/src/a.rs b/decoy b/src/a.rs\n--- a/decoy b/src/a.rs\n\
+         +++ b/decoy b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+         diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{big}"
+    );
+    let c = change_of(
+        &quoted,
+        &[
+            "src/a.rs",
+            "src/a\"new.rs",
+            "decoy b/src/a.rs",
+            "gen/big.json",
+        ],
+    );
+    let (row, pos) = split(
+        (RuleStatus::Kept, "part 1 of 2: decoy b/src/a.rs:1 fine"),
+        (RuleStatus::Broken, "src/a.rs:1 untyped"),
+    );
+    assert!(Evidence::of_named_files(&row, &c, None, &pos).is_none());
 }
 
 // ── A.5 reuse ───────────────────────────────────────────────────────────────────────────────────
