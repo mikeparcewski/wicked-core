@@ -55,10 +55,27 @@ pub const PROMPT_CONVENTION: &str = " ||| CONVENTION (external transformations):
 /// clause reads, `cli_runner::creator_records`), never to an engine-internal or tool unit. Without it
 /// a builder did the check and left no sentence a judge could cite, so the rule broke on the record
 /// alone. SINGLE-LINE by the same pty contract as [`PROMPT_CONVENTION`].
+///
+/// (core#1836) The record is the output the step ENDS with (a power build's last turn), so the line
+/// is asked there: asked only "before writing code", a builder wrote it nowhere in what it ended
+/// with (J4, runs 179bc621 and edb67a40), and the rule held a correct fix on the record alone.
 pub const STACK_CHECK_CONVENTION: &str = " ||| STACK CHECK (rule POL-2101): before writing code, \
-     check what the chosen stack already provides at its pinned version, and record it on one \
-     output line: STACK-CHECK: looked at <docs or source> :: offers <what it provides for this job, \
-     or nothing this change needs>";
+     check what the chosen stack already provides at its pinned version, and record it in the \
+     output you end with, on one line: STACK-CHECK: looked at <docs or source> :: offers <what it \
+     provides for this job, or nothing this change needs>";
+
+/// (core#1836) The same record line, asked of a REVIEWER: an evaluator agent unit that writes no
+/// code (`execute_wrapped::skill_prompt`). POL-2101's record clause is kept when the reviewer at the
+/// rule-check gate states its own check (`rule_check::reviewer_record`), so a correct fix whose
+/// builder left no line is settled at that same gate. Both J4 reviewers wrote a `STACK-CHECK:` line
+/// with no `offers` half ("looked at package.json and src/math.js :: plain JavaScript ESM ..."),
+/// and the record judge broke it: the line is asked in the exact form the judge reads, with the
+/// answer a one-line fix has ("nothing this change needs"). Before the VERDICT line, which reads
+/// last. SINGLE-LINE by the same pty contract as [`PROMPT_CONVENTION`].
+pub const REVIEWER_STACK_CHECK_CONVENTION: &str = " ||| STACK CHECK (rule POL-2101, reviewer): \
+     check yourself what the chosen stack already provides for this change, and record it in the \
+     output you end with, on one line: STACK-CHECK: looked at <docs or source> :: offers <what it \
+     provides for this change, or nothing this change needs>";
 
 /// The evaluator VERDICT contract line (L1↔L4 cross-lane contract; des-adjudicated §4.1). Appended
 /// by `execute_wrapped::skill_prompt` to EVERY Evaluator-role work unit's prompt (all three

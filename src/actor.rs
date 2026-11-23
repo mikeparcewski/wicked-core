@@ -21153,8 +21153,12 @@ fn rule_skip(
     }
     // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
     // may waive with a reason; a broken error/critical rule is reworked.
+    // (core#1836) A process rule's row is reported, never open (`RuleVerdict::reported_only`): it
+    // never holds the gate, so it is never skipped either, and the gate's skip names exactly the
+    // rules its hold names ("1 rule needs you" beside "Skip POL-2101", not "Skip 2 rules").
     let Some(row) = rows.iter().find(|r| {
         r.rule_id == id
+            && !r.reported_only()
             && (matches!(
                 r.status,
                 crate::rule_check::RuleStatus::Unchecked
@@ -21165,9 +21169,9 @@ fn rule_skip(
     }) else {
         anyhow::bail!(
             "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
-             of unit {} — only a rule no judge or council ruled on, or a broken rule of \
-             severity warn or info, can be skipped (a broken error or critical rule denies the \
-             gate)",
+             of unit {} that holds its gate — only a rule no judge or council ruled on, or a \
+             broken rule of severity warn or info, can be skipped (a broken error or critical \
+             rule denies the gate; a process rule is reported and never holds it)",
             cursor.ord
         );
     };
@@ -35234,6 +35238,56 @@ mod request_changes_tests {
                 .rules,
             ["R1"]
         );
+    }
+
+    /// (core#1836) The J4 certification gate's own rows (run edb67a40, gateEvaluated seq 208, as
+    /// the engine wrote them: `tests/fixtures/core1836-gate-seq208-rules.json`): POL-2101 disputed
+    /// beside RVWL-1002, a process rule's unchecked row that never holds the gate. The card said
+    /// "1 rule needs you" and its button "Skip 2 rules": the skip names exactly the rules the hold
+    /// names, and a process row is not one the person can skip.
+    #[test]
+    fn core1836_the_skip_names_the_rules_the_hold_names_on_the_real_gate_rows() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/core1836-gate-seq208-rules.json"
+        ))
+        .unwrap();
+        let rows: Vec<crate::rule_check::RuleVerdict> =
+            serde_json::from_value(fixture["rules"].clone()).expect("the wire rows parse");
+        let held: Vec<String> = serde_json::from_value(fixture["denialRuleIds"].clone()).unwrap();
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_rejudge_fix(store, run_id, &["claude", "pi"]);
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            let report = crate::rule_check::RuleCheckReport {
+                rows: rows.clone(),
+                ..Default::default()
+            };
+            let hold = report.hold().expect("the disputed rule holds");
+            units[2].denial_reason = Some(hold.reason.clone());
+            units[2].denial = Some(hold);
+            units[2].rule_check = Some(report);
+            put_node(store, units[2].to_node()).unwrap();
+            open_row(store, run_id, 3, "escalation");
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core1836-{}", std::process::id());
+        seed(&mut store, &run_id);
+        let unit = crate::domain::session_units(&store, &run_id).unwrap()[2].clone();
+        let denial = unit.denial.as_ref().unwrap();
+        assert_eq!(denial.rule_ids, held, "the hold is the payload's");
+        assert!(denial
+            .reason
+            .starts_with("1 steering rule(s) need you: POL-2101 DISPUTED"));
+        let listed = listed_is_accepted("rules-core1836-j4", &seed);
+        assert_eq!(
+            action(&listed, crate::rule_check::SKIP_ACTION)
+                .unwrap()
+                .rules,
+            held,
+            "{listed:#?}"
+        );
+        let err = recheck(&mut store, &run_id, &[("RVWL-1002", "not this change's")])
+            .expect_err("a process rule's row is not skipped");
+        assert!(err.to_string().contains("RVWL-1002"), "{err}");
     }
 
     /// (new issue) A review that ran on the builder's seat under a distinct-evaluator contract:

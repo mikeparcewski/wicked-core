@@ -542,6 +542,53 @@
     "gateKind": "escalation",
     "ord": 3
   },
+  "rules-core1836-j4": {
+    "actions": [
+      {
+        "action": "approve",
+        "intent": "retry",
+        "note": "optional"
+      },
+      {
+        "action": "retry_rules",
+        "intent": "retry_rules",
+        "note": "none"
+      },
+      {
+        "action": "skip_rules",
+        "intent": "skip_rules",
+        "note": "required",
+        "rules": [
+          "POL-2101"
+        ]
+      },
+      {
+        "action": "amend_intent",
+        "intent": "amend_intent",
+        "note": "required"
+      },
+      {
+        "action": "request_changes",
+        "intent": "send_back",
+        "note": "optional"
+      },
+      {
+        "action": "reassign",
+        "intent": "reseat_and_retry",
+        "note": "optional",
+        "seats": [
+          "pi"
+        ]
+      },
+      {
+        "action": "reject",
+        "intent": "stop",
+        "note": "none"
+      }
+    ],
+    "gateKind": "escalation",
+    "ord": 3
+  },
   "triage-tool-check": {
     "actions": [
       {
