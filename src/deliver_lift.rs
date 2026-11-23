@@ -1519,18 +1519,20 @@ pub(crate) fn delivery_receipt(
         }
         r.ran(crate::assurance::OPERATOR_JUDGE);
     }
+    // `skip` keeps the first per instrument: a real skip a gate recorded (above) stands. Missing
+    // evidence is said whether or not another gate ran a judge, as an `error` skip a gate recorded
+    // would be (xreview delta on #1827); a not-due skip speaks only when no gate ran one.
+    if let Some(ord) = judge_unknown {
+        r.skip(
+            crate::assurance::JUDGE,
+            crate::assurance::SKIP_ERROR,
+            Some(format!(
+                "unit {ord}'s gate receipt does not say whether a judge ran (a record from \
+                 before the engine said so): whether one was due is not known"
+            )),
+        );
+    }
     if !r.ran.iter().any(|i| i == crate::assurance::JUDGE) {
-        // `skip` keeps the first per instrument: a real skip a gate recorded (above) stands.
-        if let Some(ord) = judge_unknown {
-            r.skip(
-                crate::assurance::JUDGE,
-                crate::assurance::SKIP_ERROR,
-                Some(format!(
-                    "unit {ord}'s gate receipt does not say whether a judge ran (a record from \
-                     before the engine said so): whether one was due is not known"
-                )),
-            );
-        }
         if let Some(k) = judge_not_due {
             r.skip(&k.instrument, &k.reason, k.detail);
         }

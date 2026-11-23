@@ -23752,6 +23752,18 @@ pub(crate) mod sessions_detail_fold_tests {
             &[gate(1, &legacy), gate(2, &not_due), deliver.clone()],
         );
         assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
+        // (xreview delta) …and beside a gate that ran a judge, the unknown is still said.
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[
+                gate(1, &legacy),
+                gate(2, &judged),
+                gate(3, &not_due),
+                deliver.clone(),
+            ],
+        );
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert_eq!(judge_skips(&d), [a::SKIP_ERROR]);
         // A step that finished with no receipt at all is not a first-step delivery.
         let mut finished =
             crate::domain::WorkUnit::pending("judge-not-due-1799:0", "judge-not-due-1799", 0, "x");

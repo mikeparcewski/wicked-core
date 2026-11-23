@@ -3809,6 +3809,16 @@ pub(crate) fn judge_not_due(
         not_due(format!(
             "unit {ord} is the PA's review of a member's step: the PA's verdict decides it, no judge"
         ))
+    } else if has_workdir && unit.validator.as_ref().is_some_and(|v| v.approved) {
+        // (xreview delta on #1827) A pinned validator's judge runs whatever the guard or the
+        // default floor say (`cli_runner`: the pinned path).
+        (
+            SKIP_ERROR,
+            format!(
+                "unit {ord} has a pinned judge, and its completion carries no verdict and no \
+                 reason: whether it ran is not known"
+            ),
+        )
     } else if report_judge {
         (
             SKIP_ERROR,
@@ -7102,6 +7112,25 @@ mod guarded_read_step_tests {
         open_review.default_floor = true;
         assert_eq!(
             super::judge_not_due(&open_review, true, Some(true)).0,
+            SKIP_ERROR
+        );
+        // (xreview delta) A pinned judge runs whatever the guard or the default floor say: a
+        // guarded review and a no-floor step with one, and no verdict, are not known.
+        let pinned = crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        };
+        let mut pinned_review = review.clone();
+        pinned_review.validator = Some(pinned.clone());
+        assert_eq!(
+            super::judge_not_due(&pinned_review, true, None).0,
+            SKIP_ERROR
+        );
+        let mut pinned_step = build.clone();
+        pinned_step.validator = Some(pinned);
+        assert_eq!(
+            super::judge_not_due(&pinned_step, true, Some(false)).0,
             SKIP_ERROR
         );
     }
