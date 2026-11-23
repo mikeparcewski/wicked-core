@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::command::Command;
 use crate::execute_wrapped::WrappedCliStepRunner;
+use crate::team::MEMBER_CANCEL_DRAIN;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner};
 
 // ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
@@ -1921,9 +1922,6 @@ fn member_invocation(seat: &str) -> Result<String, String> {
     }
     Ok(cli.headless_invocation)
 }
-
-/// How long a timed-out member turn's seat is given to stop after it is cancelled.
-const MEMBER_CANCEL_DRAIN: Duration = Duration::from_secs(10);
 
 /// A run id unique to ONE member turn (`member-` is a one-shot prefix the wrapped runner cleans
 /// up after, `execute_wrapped::ONE_SHOT_RUN_PREFIXES`): never reused, so a cancel of one turn can

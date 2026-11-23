@@ -2440,6 +2440,12 @@ impl Clock {
     fn review_expired(&self) -> bool {
         now_ms() >= self.review_until
     }
+    /// (core#1822, codex r1) A member turn's budget: what is left of the review window less the
+    /// time a timed-out turn's seat is given to stop, so the whole call ends inside the window.
+    fn turn_budget(&self) -> Duration {
+        self.review_left()
+            .saturating_sub(super::MEMBER_CANCEL_DRAIN)
+    }
     fn left(&self) -> Duration {
         Duration::from_millis((self.work_until - now_ms()).max(0) as u64)
     }
@@ -2454,7 +2460,9 @@ impl Clock {
 /// (core#959, codex r1) What a final-pass vault record may spend: the pass's time left, less a
 /// margin to publish the hold after it — the hold is never late for the gate because of the vault.
 fn vault_budget(clock: &Clock) -> Duration {
-    clock.left().saturating_sub(Duration::from_secs(2))
+    // (core#1822, codex r1) Vault records are written before the councils: they spend the review
+    // window, never the councils' share.
+    clock.review_left().saturating_sub(Duration::from_secs(2))
 }
 
 /// The attempt's rows, from its `step.claimed` on.
@@ -2662,8 +2670,19 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     u.monitors[b.slot].timed_out = true;
                     continue;
                 }
-                b.budget = b.budget.min(clock.review_left());
+                b.budget = b.budget.min(clock.turn_budget());
                 let done = run_job(&b, host);
+                // (core#1822, codex r1) A final batch the deadline cut is a timed-out pass, even
+                // with nothing after it to notice.
+                if matches!(
+                    done.outcome,
+                    BatchOutcome::TurnFailed {
+                        timed_out: true,
+                        ..
+                    }
+                ) {
+                    timed_out = true;
+                }
                 job.unit
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2784,6 +2803,24 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             let ledger = tev::fold(&rows);
             let deliveries = delivery_outcomes(&rows);
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
+            // (core#1822, codex r1) Each member answers the PA's rejection of its step in the
+            // review window, before any council runs: a council that runs long never costs a
+            // member its answer.
+            let mut rejected: Vec<(&super::StepReviewRecord, String, Option<(bool, String)>)> =
+                Vec::new();
+            for r in &ledger.step_reviews {
+                if r.verdict != StepVerdict::Rejected {
+                    continue;
+                }
+                let Some(member) = job.members.get(&r.reviewed_attempt).cloned() else {
+                    continue;
+                };
+                if member == job.pa {
+                    continue;
+                }
+                let answer = member_answer(&u, host, &member, r, &clock);
+                rejected.push((r, member, answer));
+            }
             for f in tev::unresolved_highs(&ledger) {
                 // (core#959) A finding awaiting the operator gets no council: none may clear it.
                 if f.dispute.is_some() || tev::awaits_operator(f) {
@@ -2854,17 +2891,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                 );
             }
             // Member steps the PA rejected in this attempt: the member may HOLD (§8.8).
-            for r in &ledger.step_reviews {
-                if r.verdict != StepVerdict::Rejected {
-                    continue;
-                }
-                let Some(member) = job.members.get(&r.reviewed_attempt).cloned() else {
-                    continue;
-                };
-                if member == job.pa {
-                    continue;
-                }
-                let answer = member_answer(&u, host, &member, r, &clock);
+            for (r, member, answer) in rejected {
                 let Some((held, why)) = answer else {
                     continue;
                 };
@@ -3136,7 +3163,7 @@ fn hold_round(
                     true
                 };
                 if opened {
-                    let budget = clock.review_left().min(super::MONITOR_TURN_BUDGET);
+                    let budget = clock.turn_budget().min(super::MONITOR_TURN_BUDGET);
                     // (§8.8) The settled tree the findings are re-confirmed against.
                     let view = if u.repo_view {
                         RepoView::now(u.ctx.repo.as_ref())
@@ -3403,7 +3430,7 @@ fn member_answer(
     let reply = host.turn(
         &pool_key,
         &prompt,
-        clock.review_left().min(Duration::from_secs(240)),
+        clock.turn_budget().min(Duration::from_secs(240)),
         view.as_ref(),
     );
     host.close(&pool_key);
