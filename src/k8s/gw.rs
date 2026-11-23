@@ -786,7 +786,82 @@ impl RecordSpool {
         Ok((follower, offset))
     }
 
+    /// (core#1716) Whether every pod of lease `id` whose follower is still live has spooled the
+    /// gateway's latest log line: one bounded `kubectl logs --tail=1` snapshot per such pod, then a
+    /// bounded wait ([`CATCH_UP_WAIT`]) for the line to reach the spool. A record still in flight
+    /// through `kubectl logs -f` at release would otherwise be missing while the lease reads
+    /// complete. A pod whose follower reached EOF has spooled all it will; a failed snapshot or a
+    /// wait that runs out is not proof, so the caller reports the records incomplete. Residual: a
+    /// line identical to an earlier one would pass early (access-log records carry their own
+    /// request fields, so a repeat is not expected).
+    fn caught_up(&self, id: &str) -> bool {
+        let live: Vec<(String, PathBuf)> = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            Self::reap(&mut state);
+            let Some(lease) = state.leases.get(id) else {
+                return false;
+            };
+            lease
+                .uids
+                .iter()
+                .filter_map(|uid| state.pods.get(uid))
+                .filter(|pod| pod.follower.is_some() && !pod.finished)
+                .map(|pod| (pod.name.clone(), pod.path.clone()))
+                .collect()
+        };
+        // Never under the state lock: the snapshot and the wait are bounded but slow.
+        let deadline = Instant::now() + CATCH_UP_WAIT;
+        live.iter().all(|(pod, path)| match self.latest_line(pod) {
+            Ok(None) => true,
+            Ok(Some(line)) => {
+                let held = spool_holds_line(path, line.as_bytes(), deadline);
+                if !held {
+                    eprintln!(
+                        "wicked-core: gateway {pod}'s follower had not reached its latest log line \
+                         in {} s; the launch's records are incomplete (core#1716)",
+                        CATCH_UP_WAIT.as_secs()
+                    );
+                }
+                held
+            }
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not read gateway {pod}'s latest log line ({e}); the \
+                     launch's records are incomplete (core#1716)"
+                );
+                false
+            }
+        })
+    }
+
+    /// The gateway container's latest log line, `None` when it has logged nothing.
+    fn latest_line(&self, pod: &str) -> Result<Option<String>, String> {
+        let out = self.gw.kube.call_capped(
+            Some(&self.gw.ns),
+            &[
+                "logs",
+                "-c",
+                "gateway",
+                pod,
+                "--tail=1",
+                "--request-timeout=5s",
+            ],
+            None,
+            CATCH_UP_SNAPSHOT_LIMIT,
+            CATCH_UP_SNAPSHOT_CAP,
+        );
+        if !out.ok() {
+            return Err(out.err_text());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .rev()
+            .find(|l| !l.is_empty())
+            .map(str::to_string))
+    }
+
     fn records(&self, id: &str, unit: &str) -> (Vec<GatewayRecord>, bool) {
+        let caught_up = self.caught_up(id);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         Self::reap(&mut state);
         let watching = state
@@ -796,7 +871,7 @@ impl RecordSpool {
         let Some(lease) = state.leases.get(id) else {
             return (Vec::new(), false);
         };
-        let mut complete = lease.complete && state.covered && watching;
+        let mut complete = lease.complete && state.covered && watching && caught_up;
         let mut records = Vec::new();
         for uid in &lease.uids {
             let Some(pod) = state.pods.get(uid) else {
@@ -819,6 +894,40 @@ impl RecordSpool {
             }
         }
         (records, complete)
+    }
+}
+
+/// (core#1716) How long a release waits for a live follower to spool the gateway's latest line.
+const CATCH_UP_WAIT: Duration = Duration::from_secs(3);
+/// (core#1716) The bound on the `kubectl logs --tail=1` snapshot, and on what it may return.
+const CATCH_UP_SNAPSHOT_LIMIT: Duration = Duration::from_secs(10);
+const CATCH_UP_SNAPSHOT_CAP: u64 = 1024 * 1024;
+
+/// (core#1716) Whether the spool at `path` holds `line` as one whole line, polling the appended
+/// bytes until `deadline` (one pass at least). Reads only what was appended since the last poll
+/// (the spool may hold up to [`POD_SPOOL_CAP_BYTES`]), and compares complete lines only.
+fn spool_holds_line(path: &Path, line: &[u8], deadline: Instant) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut from = 0u64;
+    let mut partial: Vec<u8> = Vec::new();
+    loop {
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let mut appended = Vec::new();
+            if file.seek(SeekFrom::Start(from)).is_ok() && file.read_to_end(&mut appended).is_ok() {
+                from += appended.len() as u64;
+                partial.extend_from_slice(&appended);
+                if let Some(end) = partial.iter().rposition(|b| *b == b'\n') {
+                    if partial[..end].split(|b| *b == b'\n').any(|l| l == line) {
+                        return true;
+                    }
+                    partial.drain(..=end);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -1931,6 +2040,11 @@ case "$1:$2" in
         printf '{"type":"ERROR"}\n'
         wait;;
     logs:*)
+        # core#1716: the release snapshot (no -f) answers the gateway's latest line and exits.
+        case " $* " in *' -f '*) ;; *)
+            if [ -f latest ]; then cat latest; else tail -n 1 record; fi
+            exit 0;;
+        esac
         echo "$$" >> followers
         sleep 300 &
         echo "$!" > follower-descendant
@@ -2170,6 +2284,89 @@ esac
         assert!(spool.worker.lock().unwrap().is_none());
     }
 
+    /// core#1716 (red on main): at release the follower may still lag the gateway — a record the
+    /// gateway logged is still in flight through `kubectl logs -f`. Release waits (bounded) for the
+    /// follower to spool the gateway's latest line, and reports the records INCOMPLETE when it has
+    /// not, never complete with the record missing. Red on main: `complete` was true with no record.
+    #[cfg(unix)]
+    #[test]
+    fn a_lagging_follower_is_waited_for_or_reported_incomplete_1716() {
+        let dir = TestDir::new();
+        let gw = record_gateway(&dir);
+        let arm = gw.log_state().unwrap();
+        wait_until("initial records were not covered", || {
+            gw.records("0", "launch@nonce", Some(&arm)).1
+        });
+        let late = |unit: &str| {
+            format!(
+                "{{\"scope\":\"request\",\"wicked_unit\":\"{unit}\",\"wicked_run\":\"run\",\
+                 \"http.status\":200,\"llm_model\":\"B\"}}\n"
+            )
+        };
+        let emit = |name: &str, body: &str| {
+            let tmp = dir.path().join(format!("{name}.tmp"));
+            std::fs::write(&tmp, body).unwrap();
+            std::fs::rename(tmp, dir.path().join(name)).unwrap();
+        };
+        // The gateway logged the launch's record; the follower has not streamed it.
+        emit("latest", &late("launch@late"));
+        let started = Instant::now();
+        let (records, complete) = gw.records("0", "launch@late", Some(&arm));
+        assert!(records.is_empty());
+        assert!(!complete, "a record still in flight must not read complete");
+        assert!(
+            started.elapsed() >= CATCH_UP_WAIT,
+            "release waited for the follower first"
+        );
+        // The follower catches up: the record is there, and the records are complete.
+        emit("burst", &late("launch@late"));
+        wait_until("the follower did not catch up", || {
+            gw.records("0", "launch@late", Some(&arm)).1
+        });
+        assert_eq!(gw.records("0", "launch@late", Some(&arm)).0.len(), 1);
+        // A follower that catches up DURING the bounded wait completes the same read.
+        emit("latest", &late("launch@soon"));
+        let flush = {
+            let dir = dir.path().to_path_buf();
+            let body = late("launch@soon");
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(dir.join("burst.tmp"), body).unwrap();
+                std::fs::rename(dir.join("burst.tmp"), dir.join("burst")).unwrap();
+            })
+        };
+        let (records, complete) = gw.records("0", "launch@soon", Some(&arm));
+        flush.join().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(complete);
+    }
+
+    /// core#1716: the catch-up check matches whole lines only, reads what was appended, and gives
+    /// up at its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn spool_holds_line_matches_whole_lines_until_the_deadline() {
+        let dir = TestDir::new();
+        let path = dir.path().join("spool.log");
+        std::fs::write(&path, "alpha\nbeta-long\npartial").unwrap();
+        let now = Instant::now;
+        assert!(spool_holds_line(&path, b"alpha", now()));
+        assert!(spool_holds_line(&path, b"beta-long", now()));
+        assert!(
+            !spool_holds_line(&path, b"beta", now()),
+            "a prefix is not the line"
+        );
+        assert!(
+            !spool_holds_line(&path, b"partial", now()),
+            "an unterminated line is in flight"
+        );
+        assert!(!spool_holds_line(
+            &dir.path().join("none.log"),
+            b"alpha",
+            now()
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn lease_records_survive_a_gateway_pod_replacement() {
@@ -2201,6 +2398,7 @@ get)
     esac; fi;;
 logs)
     case " $* " in *' pod-1 '*) pod=1;; *) pod=2;; esac
+    case " $* " in *' -f '*) ;; *) tail -n 1 "record-$pod"; exit 0;; esac
     printf '%s\n' "$pod" >> followers
     case " $* " in *' --tail=0 '*) :;; *) cat "record-$pod";; esac
     while [ ! -f "end-$pod" ]; do
