@@ -432,7 +432,7 @@ pub struct RunAssurance {
     #[serde(default, rename = "standIn", skip_serializing_if = "Option::is_none")]
     pub stand_in: Option<crate::standin::StandInConsent>,
     /// (§3.3) Every binding the run reserved, in reservation order: the only place a stand-in
-    /// exists. Durable, so a restart replays one only through `standin::replayable`.
+    /// exists. Durable: the fold and the receipts read a stand-in only from here.
     #[serde(default, rename = "standIns", skip_serializing_if = "Vec::is_empty")]
     pub stand_ins: Vec<crate::standin::StandInBinding>,
     /// (§5.1) The run's canonical role records; `None` on a run recorded before stand-ins.

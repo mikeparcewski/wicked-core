@@ -238,13 +238,12 @@ impl Reason {
 }
 
 /// Binding states (§5.1, rev 3 N6). Only `answered` satisfies a check; every state counts as
-/// taking part.
+/// taking part. (`failed` comes with the councils' stand-ins, whose seats can fail and still count.)
 pub const STATE_SEATED: &str = "seated";
 pub const STATE_ANSWERED: &str = "answered";
-pub const STATE_FAILED: &str = "failed";
 
 /// (§3.3) One stand-in: a role filled on a base credential, for one scope. Durable on the run's
-/// contract (`RunAssurance::stand_ins`), so a restart replays it only through [`replayable`].
+/// contract (`RunAssurance::stand_ins`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StandInBinding {
@@ -448,14 +447,26 @@ pub(crate) fn judge_offer(
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     roster: &[crate::AgenticCli],
+    benched: &[crate::domain::BenchedSeat],
 ) -> Option<StandInBinding> {
     if !active(run) || run.stand_in.is_none() || run.reduced() {
         return None;
     }
     unit.validator.as_ref().filter(|v| v.approved)?;
     let base = seat_id::credential(unit.assigned_cli.as_deref()?).to_string();
-    let reason = Reason::OnlyOneHelper {
-        cli: display_name(roster, &base),
+    // (T-R13) A benched base stands nothing in: its credential is what failed.
+    if benched.iter().any(|b| seat_id::credential(&b.cli) == base) {
+        return None;
+    }
+    // (§3.7) Why, from the run's facts: a helper lost during the run, else only the one.
+    let reason = match benched.first() {
+        Some(b) => Reason::LostMidRun {
+            seat: display_name(roster, &b.cli),
+            cause: b.reason.clone(),
+        },
+        None => Reason::OnlyOneHelper {
+            cli: display_name(roster, &base),
+        },
     };
     match fill(FillRequest {
         role: Role::Judge,
@@ -489,9 +500,10 @@ pub(crate) fn judge_answered(
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     roster: &[crate::AgenticCli],
+    benched: &[crate::domain::BenchedSeat],
     key: &str,
 ) -> Option<StandInBinding> {
-    let mut b = judge_offer(run, unit, attempt, roster)?;
+    let mut b = judge_offer(run, unit, attempt, roster, benched)?;
     let (base, slot) = key.rsplit_once(wicked_apps_core::spawn::STAND_IN_SEP)?;
     if base != b.base || run.stand_ins.iter().any(|x| x.key == key) {
         return None;
@@ -500,27 +512,6 @@ pub(crate) fn judge_answered(
     b.key = key.to_string();
     b.state = STATE_ANSWERED.to_string();
     Some(b)
-}
-
-/// (§3.3, rev 3 R6) Whether a recorded binding may be dispatched again (a restart, a retry of the
-/// same attempt): the run is aware with consent, the base is still on the roster and not benched,
-/// the attempt is current and the binding is still `seated`. Anything else is refused, and a fresh
-/// binding is reserved instead.
-pub(crate) fn replayable(
-    run: &crate::assurance::RunAssurance,
-    binding: &StandInBinding,
-    roster: &[String],
-    benched: &[crate::domain::BenchedSeat],
-    attempt: u32,
-) -> bool {
-    active(run)
-        && run.stand_in.is_some()
-        && roster.iter().any(|k| k == &binding.base)
-        && !benched
-            .iter()
-            .any(|b| seat_id::credential(&b.cli) == binding.base)
-        && binding.attempt.is_none_or(|a| a == attempt)
-        && binding.state == STATE_SEATED
 }
 
 /// (§3.3, rev 3 N2, R7) The invocation a binding runs: its base's EXACT record on the run roster
@@ -574,24 +565,6 @@ pub(crate) fn packet_keeps(label: &str) -> bool {
         "[team ",
     ];
     !DROPPED.iter().any(|d| label.starts_with(d))
-}
-
-/// (§3.5) The lens list, by position inside one council or pool.
-pub(crate) const LENSES: [&str; 9] = [
-    "correctness",
-    "security and safety",
-    "user impact",
-    "operability",
-    "maintainability",
-    "cost",
-    "data handling",
-    "accessibility",
-    "compatibility",
-];
-
-/// The lens for position `i` of one council or pool.
-pub(crate) fn lens(i: usize) -> &'static str {
-    LENSES[i % LENSES.len()]
 }
 
 /// (§3.7) The stamp's label: who stood in, on what, and why ("Claude Code stood in for the
@@ -798,9 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn lenses_go_by_position() {
-        assert_eq!(lens(0), "correctness");
-        assert_eq!(lens(9), "correctness");
+    fn the_preface_names_a_lens_only_when_given_one() {
         assert!(preface(Some("security and safety")).ends_with("for security and safety."));
         assert!(!preface(None).contains("Look at it first"));
     }
@@ -843,7 +814,7 @@ mod tests {
             state: STATE_SEATED.into(),
             display: None,
         });
-        let offer = judge_offer(&run, &unit, 1, &[]).expect("consented aware run");
+        let offer = judge_offer(&run, &unit, 1, &[], &[]).expect("consented aware run");
         assert_eq!(
             (offer.key.as_str(), offer.base.as_str()),
             ("claude~2", "claude")
@@ -852,27 +823,53 @@ mod tests {
             (offer.role, offer.ord, offer.attempt),
             (Role::Judge, Some(2), Some(1))
         );
-        let answered = judge_answered(&run, &unit, 1, &[], "claude~2").expect("its own offer");
+        let answered = judge_answered(&run, &unit, 1, &[], &[], "claude~2").expect("its own offer");
         assert_eq!(answered.state, STATE_ANSWERED);
         assert!(
-            judge_answered(&run, &unit, 1, &[], "claude~1").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], "claude~1").is_none(),
             "taken"
         );
         assert!(
-            judge_answered(&run, &unit, 1, &[], "codex~2").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], "codex~2").is_none(),
             "another base"
         );
         assert!(
-            judge_answered(&run, &unit, 1, &[], "claude").is_none(),
+            judge_answered(&run, &unit, 1, &[], &[], "claude").is_none(),
             "a real seat"
         );
 
         let mut no_consent = run.clone();
         no_consent.stand_in = None;
-        assert!(judge_offer(&no_consent, &unit, 1, &[]).is_none());
-        assert!(judge_offer(&crate::assurance::RunAssurance::default(), &unit, 1, &[]).is_none());
+        assert!(judge_offer(&no_consent, &unit, 1, &[], &[]).is_none());
+        assert!(judge_offer(
+            &crate::assurance::RunAssurance::default(),
+            &unit,
+            1,
+            &[],
+            &[]
+        )
+        .is_none());
         let mut unpinned = unit.clone();
         unpinned.validator = None;
-        assert!(judge_offer(&run, &unpinned, 1, &[]).is_none());
+        assert!(judge_offer(&run, &unpinned, 1, &[], &[]).is_none());
+        // T-R13: a benched base stands nothing in; a helper lost during the run is the reason.
+        let bench = |cli: &str| crate::domain::BenchedSeat {
+            cli: cli.into(),
+            reason: "quota_exhausted".into(),
+            source: "judge".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        };
+        assert!(judge_offer(&run, &unit, 1, &[], &[bench("claude")]).is_none());
+        let lost = judge_offer(&run, &unit, 1, &[], &[bench("codex")]).expect("claude is up");
+        assert_eq!(
+            lost.reason,
+            Reason::LostMidRun {
+                seat: "codex".into(),
+                cause: "quota_exhausted".into()
+            }
+        );
     }
 }

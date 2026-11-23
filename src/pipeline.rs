@@ -1664,9 +1664,14 @@ pub(crate) fn apply_and_finish_unit(
     {
         let roster = crate::registry_roster();
         if let Some(mut s) = crate::domain::get_session(&*store, session_id)? {
-            if let Some(b) =
-                crate::standin::judge_answered(&s.assurance, unit, attempt, &roster, key)
-            {
+            if let Some(b) = crate::standin::judge_answered(
+                &s.assurance,
+                unit,
+                attempt,
+                &roster,
+                &s.benched_seats,
+                key,
+            ) {
                 let display = b.display().to_string();
                 s.assurance.stand_ins.push(b.clone());
                 crate::standin::note_label(&mut s.assurance, &b, &display);
@@ -7556,7 +7561,7 @@ mod guarded_read_step_tests {
             approved: true,
         });
         review_pinned.assigned_cli = Some("sj-claude".into());
-        let b = crate::standin::judge_answered(&run, &review_pinned, 1, &[], "sj-claude~1")
+        let b = crate::standin::judge_answered(&run, &review_pinned, 1, &[], &[], "sj-claude~1")
             .expect("the run's own offer");
         run.stand_ins.push(b);
         let verdict = crate::validator::AgentVerdict {

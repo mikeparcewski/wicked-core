@@ -15264,6 +15264,7 @@ fn dispatch_unit_with(
         unit,
         input.attempt,
         &crate::registry_roster(),
+        &session.benched_seats,
     );
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
