@@ -252,8 +252,10 @@ pub(crate) const NAMING_RETRY: std::time::Duration = std::time::Duration::from_s
 
 /// (core#1795) Run [`name_rows_under_their_runs`] if it is due at `now`, and say when it is next
 /// due: `None` once it has succeeded. A pass that fails (a store error at boot) is tried again
-/// [`NAMING_RETRY`] later, so a gate opened before the upgrade is not left unreadable for the
-/// daemon's whole life. The actor runs it at boot and, while it is still due, before each command.
+/// [`NAMING_RETRY`] after the failed attempt ended (not after it began: an attempt that waited out
+/// the store's busy timeout must not be due again at once), so a gate opened before the upgrade is
+/// not left unreadable for the daemon's whole life. The actor runs it at boot and, while it is
+/// still due, before each command.
 pub(crate) fn name_rows_when_due(
     store: &mut dyn GraphStore,
     due: Option<std::time::Instant>,
@@ -275,7 +277,7 @@ pub(crate) fn name_rows_when_due(
                  {e:#}; trying again in {}s (a gate opened before this version is not read until then)",
                 NAMING_RETRY.as_secs()
             );
-            Some(now + NAMING_RETRY)
+            Some(std::time::Instant::now() + NAMING_RETRY)
         }
     }
 }
@@ -564,14 +566,18 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         let mut ro = wicked_apps_core::open_store_ro(Some(db)).unwrap();
-        let due = name_rows_when_due(&mut ro, Some(t0), t0);
-        assert_eq!(
-            due,
-            Some(t0 + NAMING_RETRY),
-            "a failed pass is due again later"
+        // An attempt that began long before it ended (it waited out the store's busy timeout): the
+        // retry is due a full NAMING_RETRY after it ENDED, never at once.
+        let began = t0.checked_sub(NAMING_RETRY * 2).unwrap_or(t0);
+        let due = name_rows_when_due(&mut ro, Some(began), began);
+        let ended = std::time::Instant::now();
+        let at = due.expect("a failed pass is due again later");
+        assert!(
+            at + std::time::Duration::from_millis(1) >= ended + NAMING_RETRY,
+            "due a full NAMING_RETRY after the failed attempt ended"
         );
         assert_eq!(
-            name_rows_when_due(&mut rw, due, t0 + NAMING_RETRY / 2),
+            name_rows_when_due(&mut rw, due, at - std::time::Duration::from_millis(1)),
             due,
             "not before it is due"
         );
@@ -579,7 +585,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            name_rows_when_due(&mut rw, due, t0 + NAMING_RETRY),
+            name_rows_when_due(&mut rw, due, at),
             None,
             "done once it succeeds"
         );
@@ -587,10 +593,7 @@ mod tests {
             list_interactions(&rw, Some("run-r"), None).unwrap().len(),
             1
         );
-        assert_eq!(
-            name_rows_when_due(&mut rw, None, t0 + NAMING_RETRY * 2),
-            None
-        );
+        assert_eq!(name_rows_when_due(&mut rw, None, at + NAMING_RETRY), None);
         drop((rw, ro));
         let _ = std::fs::remove_dir_all(&dir);
     }
