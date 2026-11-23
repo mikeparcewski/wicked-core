@@ -1889,8 +1889,9 @@ fn settle_rule_disputes(
                 &pos,
             )
         };
-        // (core#1789) A change too big for a ballot whole (a paged one) is put to the council on
-        // the files the two readings named; the voters' KEPT names one of those.
+        // (core#1789) A change too big for a ballot whole (a paged one), where the reviewer claims
+        // the break the judge did not find, is put to the council on the files the reviewer's
+        // BROKEN lines name; the voters' KEPT names one of those.
         let evidence = crate::rule_check::Evidence::of_change(&row, change, floor_text);
         let Some((req, shown)) = request(&evidence).map(|r| (r, None)).or_else(|| {
             let (scoped, shown) =
@@ -1900,7 +1901,7 @@ fn settle_rule_disputes(
             drop(lock);
             report.rows[i] = hold(
                 "incomplete_evidence: the judge's evidence does not fit a council ballot whole, \
-                 nor do the changed files the two readings name"
+                 and it cannot be put to one on the files the reviewer named"
                     .into(),
             );
             continue;

@@ -337,19 +337,27 @@ fn a_judge_reviewer_split_goes_to_one_council_and_its_ruling_decides() {
 }
 
 /// (core#1789, field: the MCP-server run, 6 parts) A judge/reviewer split on a change too big for one
-/// ballot (the judge read it in parts) reaches a council on the files the two readings named,
-/// rather than holding with `incomplete_evidence`; its KEPT ruling decides.
+/// ballot (the judge read it in parts and kept the rule, the reviewer claims it broken) reaches a
+/// council on the files the reviewer named, rather than holding with `incomplete_evidence`; its
+/// ruling decides. A split the paged judge claims still holds.
 #[test]
 fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
+    // The fixture's review step with 200 KB more of change (a generated file), reviewed by codex.
+    let paged = |tag: &str| {
+        let (repo, base, db) = fixture(tag);
+        std::fs::create_dir_all(repo.join("gen")).unwrap();
+        std::fs::write(repo.join("gen/big.json"), "\"BIG-ROW\"\n".repeat(20 * 1024)).unwrap();
+        let mut input = review_input(&repo, &base, &db);
+        input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
+        input
+    };
     let tag = "paged-dispute";
-    let (repo, base, db) = fixture(tag);
-    std::fs::create_dir_all(repo.join("gen")).unwrap();
-    std::fs::write(repo.join("gen/big.json"), "\"BIG-ROW\"\n".repeat(20 * 1024)).unwrap();
-    let mut input = review_input(&repo, &base, &db);
-    input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
-    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
-    let council = FakeCouncil::new(tag, kept_3_0);
-    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    let input = paged(tag);
+    let judge = Judging::says("KEPT — src/a.rs:1 types both numbers");
+    let council = FakeCouncil::new(tag, broken_3_0);
+    let reviewer = "RULE R1: BROKEN — src/a.rs:2 add() is untyped\nRULE R2: N/A — not a fix\n\
+                    VERDICT: FAIL";
+    let r = settle_with(&input, &judge, reviewer, &council, &registry());
     assert!(
         judge.calls.load(Ordering::SeqCst) > 1,
         "the judge read the change in parts"
@@ -367,8 +375,17 @@ fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
         !req.evidence.contains("BIG-ROW"),
         "the unnamed file is listed, not shown"
     );
-    assert_eq!(r1.status, RuleStatus::Kept, "{r1:?}");
+    assert_eq!(r1.status, RuleStatus::Broken, "{r1:?}");
     assert_eq!(r1.origin, Some(RuleOrigin::Council));
+    // The judge claims the break: its paged BROKEN cannot be scoped, so the dispute holds.
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("paged-dispute-judge", kept_3_0);
+    let input = paged("paged-dispute-judge");
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    assert_eq!(council.convened(), 0);
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed, "{r1:?}");
+    assert!(r1.reason.contains("incomplete_evidence"), "{r1:?}");
 }
 
 /// A.7.2: no ruling — 1 of 3 answered, a timeout, an error — is `disputed`, and holds.

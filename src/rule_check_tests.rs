@@ -4357,24 +4357,10 @@ fn core_1474_part_answers_combine_broken_first_then_misses_then_kept() {
     assert_eq!(c.answers["N"].status, RuleStatus::NotApplicable);
 }
 
-/// (core#1789, codex r1) Two parts that broke one rule keep both claims, and a reviewer's two
-/// BROKEN lines both stand (an echo is one claim): a council scoped to the files the readings name
-/// must see each file a break was claimed in.
+/// (core#1789, codex r1) A reviewer's two BROKEN lines on one rule both stand in its reading (an
+/// echo is one claim): a council scoped to the files the reviewer names must see each.
 #[test]
-fn core_1789_every_broken_claim_is_kept_in_the_reading() {
-    let a = |c: &str| Answer {
-        status: RuleStatus::Broken,
-        cite: c.into(),
-    };
-    let p = |c: &str| Parsed {
-        answers: [("B".to_string(), a(c))].into_iter().collect(),
-        misses: BTreeMap::new(),
-    };
-    let c = combine_parts(&[p("src/a.rs untyped"), p("src/b.rs untyped")], &["B"], 2);
-    assert_eq!(
-        c.answers["B"].cite,
-        format!("part 1 of 2: src/a.rs untyped{CLAIM_SEP}part 2 of 2: src/b.rs untyped")
-    );
+fn core_1789_every_broken_line_of_the_reviewer_is_kept_in_its_reading() {
     let r = seat_positions(
         "RULE B: BROKEN — src/a.rs untyped\nRULE B: BROKEN — src/b.rs untyped\n\
          RULE B: BROKEN — src/a.rs untyped\n",
