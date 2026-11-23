@@ -246,6 +246,40 @@ pub(crate) fn name_rows_under_their_runs(store: &mut dyn GraphStore) -> anyhow::
     Ok(renamed.len())
 }
 
+/// (core#1795) How long the actor waits before it tries [`name_rows_under_their_runs`] again after
+/// the pass failed.
+pub(crate) const NAMING_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// (core#1795) Run [`name_rows_under_their_runs`] if it is due at `now`, and say when it is next
+/// due: `None` once it has succeeded. A pass that fails (a store error at boot) is tried again
+/// [`NAMING_RETRY`] later, so a gate opened before the upgrade is not left unreadable for the
+/// daemon's whole life. The actor runs it at boot and, while it is still due, before each command.
+pub(crate) fn name_rows_when_due(
+    store: &mut dyn GraphStore,
+    due: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let due = due?;
+    if now < due {
+        return Some(due);
+    }
+    match name_rows_under_their_runs(store) {
+        Ok(0) => None,
+        Ok(n) => {
+            eprintln!("wicked-core: named {n} interaction request(s) under their run (core#1795)");
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not name interaction requests under their run (core#1795): \
+                 {e:#}; trying again in {}s (a gate opened before this version is not read until then)",
+                NAMING_RETRY.as_secs()
+            );
+            Some(now + NAMING_RETRY)
+        }
+    }
+}
+
 /// All interaction requests, optionally filtered by session and/or status, newest first. One run's
 /// requests are read through the name index ([`run_rows`]); with no run, every request is read.
 pub fn list_interactions(
@@ -512,6 +546,53 @@ mod tests {
             54,
             "the whole-store read still lists every row"
         );
+    }
+
+    /// (core#1795) A naming pass that fails (here: the store refuses writes) is tried again once
+    /// it is due, never before, and stops being due once it has succeeded.
+    #[test]
+    fn a_failed_naming_pass_is_tried_again_when_due() {
+        let dir = std::env::temp_dir().join(format!("core-1795-naming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db");
+        let db = db.to_str().unwrap();
+        let mut rw = open_store(Some(db)).unwrap();
+        let mut legacy = open_gate("run-r", 1, None, "p", "def", 1).to_node();
+        legacy.name = legacy.metadata["id"].as_str().unwrap().to_string();
+        put_node(&mut rw, legacy).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let mut ro = wicked_apps_core::open_store_ro(Some(db)).unwrap();
+        let due = name_rows_when_due(&mut ro, Some(t0), t0);
+        assert_eq!(
+            due,
+            Some(t0 + NAMING_RETRY),
+            "a failed pass is due again later"
+        );
+        assert_eq!(
+            name_rows_when_due(&mut rw, due, t0 + NAMING_RETRY / 2),
+            due,
+            "not before it is due"
+        );
+        assert!(list_interactions(&rw, Some("run-r"), None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            name_rows_when_due(&mut rw, due, t0 + NAMING_RETRY),
+            None,
+            "done once it succeeds"
+        );
+        assert_eq!(
+            list_interactions(&rw, Some("run-r"), None).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            name_rows_when_due(&mut rw, None, t0 + NAMING_RETRY * 2),
+            None
+        );
+        drop((rw, ro));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

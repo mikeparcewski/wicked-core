@@ -323,6 +323,8 @@ fn a_gate_opened_before_the_upgrade_is_read_and_answered_after_it() {
     );
 
     let core = spawn(&db);
+    // An actor command's reply: the actor's startup (the naming pass first) is done.
+    core.ping();
     let actions = core.gate_actions("run-l").expect("gate actions");
     let actions = actions.expect("the run's gate is answerable after the upgrade");
     assert_eq!(actions.ord, 1);
