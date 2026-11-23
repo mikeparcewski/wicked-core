@@ -3,11 +3,12 @@
 //!
 //! ## The exposure
 //!
-//! core#1024 moved the claude seat to pass-through auth: the seat's own claude sends the operator's
-//! long-lived `claude setup-token` token, which reaches the seat container as
-//! `CLAUDE_CODE_OAUTH_TOKEN`. That is inherent to pass-through: the unit's own code can read its
-//! environment, and a token it writes into the worktree (a debug dump, a `.env`, a test fixture, a
-//! commit message) would ride the run branch to the remote at delivery.
+//! core#1024 moved the claude seat to pass-through auth: the seat's own claude sent the operator's
+//! long-lived `claude setup-token` token, which reached the seat container as
+//! `CLAUDE_CODE_OAUTH_TOKEN`. The unit's own code could read its environment, and a token it wrote
+//! into the worktree (a debug dump, a `.env`, a test fixture, a commit message) would ride the run
+//! branch to the remote at delivery. Since wicked-garden#1365 the seat holds only a placeholder and
+//! the gateway sends the token upstream; the guard still checks every unit and delivery for it.
 //!
 //! ## What the guard does
 //!
@@ -66,7 +67,7 @@ const REGISTRY_CAP: usize = 32;
 /// What a credential is, named in a refusal instead of its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SecretKind {
-    /// The operator's `claude setup-token` token a claude seat passes through (core#1024).
+    /// The operator's `claude setup-token` token a claude seat's gateway route sends upstream.
     ClaudeSetupToken,
 }
 

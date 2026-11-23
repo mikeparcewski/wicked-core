@@ -2072,10 +2072,10 @@ pub(crate) fn seat_sign_in(
     }
 }
 
-/// The token a claude seat signed in with OAuth passes through (core#1024): the operator's own
+/// The token a claude seat signed in with OAuth (core#1024): the operator's own
 /// `claude setup-token` token (or what an earlier `claude auth login` left, until it expires),
-/// read from the broker under its lock. The seat's claude sends it upstream itself; the gateway
-/// relays it unchanged.
+/// read from the broker under its lock. The gateway sends it upstream in place of the seat's
+/// placeholder; it never enters a seat (wicked-garden#1365).
 #[cfg(unix)]
 pub(crate) fn claude_seat_token(io: &dyn BrokerIo, dir: &Path) -> Result<String, String> {
     claude_broker_token(io, dir)?.ok_or_else(|| "claude is not signed in".into())

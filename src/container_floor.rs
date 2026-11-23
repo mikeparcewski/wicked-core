@@ -2140,7 +2140,7 @@ pub(crate) fn write_seat_files(
 
 /// A seat armed as a pod: the wrapper (`kubectl exec` into the seat pod), the argv to run after
 /// it, and the tool that runs it (`kubectl`). Its `Debug` names the env's
-/// variables, never their values (a unit key, a claude seat's pass-through token).
+/// variables, never their values (a unit key).
 pub(crate) struct ArmedContainer {
     pub(crate) wrapper: Vec<String>,
     pub(crate) argv: Vec<String>,
@@ -2769,17 +2769,18 @@ pub(crate) fn arm_noting(
                 .then(|| crate::seat_gateway::copilot_account(dir));
                 let oauth = cli == "claude"
                     && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
-                let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+                // Every kind, a claude OAuth seat included, gets placeholders only: the gateway
+                // sends the broker's credential upstream (wicked-garden#1365).
+                let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
                 if oauth {
-                    // core#1024: the operator's own setup-token, passed through; it reaches the pod
-                    // only in the unit env file, over exec stdin (never an argv).
+                    // The operator's setup-token never enters the seat; the seat-secret guard
+                    // still learns it, so a unit's diff is checked for it all the same.
                     let token = crate::k8s::gw::claude_seat_token(&gw)
                         .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
                     crate::seat_secret_guard::register(
                         crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
                         &token,
                     );
-                    env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
                 }
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -5149,18 +5150,20 @@ esac
     #[test]
     fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
         use crate::seat_credentials::CredentialKind;
-        // core#1024: a claude OAuth seat keeps no record; its unit rides a header of its own and
-        // its Authorization is the operator's own token (added at arming, never here).
+        // wicked-garden#1365: a claude OAuth seat holds a placeholder record whose access token
+        // is the unit's key (a nested `claude -p` reads the same file), and its unit also rides a
+        // header of its own. No credential is in its env.
         let (key, env, files) = placeholder_handoff(
             "claude",
             CredentialKind::ClaudeOauth,
             "test-run",
             "test-unit",
         );
-        assert_eq!(
-            files,
-            vec![(PathBuf::from(".credentials.json"), "{}".to_string())]
-        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, PathBuf::from(".credentials.json"));
+        let record: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+        assert_eq!(record["claudeAiOauth"]["accessToken"], key.key.as_str());
+        assert_eq!(key.bearer, key.key);
         assert!(env.iter().any(|(k, v)| k == "ANTHROPIC_CUSTOM_HEADERS"
             && v == &format!("{}: {}", crate::seat_gateway::UNIT_HEADER, key.key)));
         assert!(env
@@ -5246,6 +5249,131 @@ esac
         assert!(env
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == &key.key));
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, wicked-garden#1365): the seat shape a claude OAuth seat is
+    /// armed with signs in a nested `claude -p` that the seat starts from its Bash tool, which is how
+    /// a harness's rule model runs. claude scrubs `CLAUDE_CODE_OAUTH_TOKEN` from every tool child's
+    /// env, so a seat signed in only by that variable left the nested call "Not logged in". This
+    /// test runs the real seat image with no network. A loopback stub stands in for the gateway and
+    /// logs what each request carries. Set `WICKED_SEAT_IMAGE_CLAUDE` to an image that is already
+    /// present so nothing is built.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_claude_oauth_seats_nested_claude_signs_in_with_the_placeholder() {
+        use crate::seat_credentials::CredentialKind;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let (key, env, files) =
+            placeholder_handoff("claude", CredentialKind::ClaudeOauth, "nested-run", "u1");
+        assert!(
+            !env.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
+            "no credential rides the seat's env"
+        );
+        let dir = tmp("nested-claude");
+        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        for (rel, body) in &files {
+            std::fs::write(dir.join("cfg").join(rel), body).unwrap();
+        }
+        std::fs::write(
+            dir.join("stub.py"),
+            include_str!("../tests/fixtures/gateway/nested_claude_stub.py"),
+        )
+        .unwrap();
+        // The seat's own env, with the gateway's URL pointed at the stub. The config home is
+        // copied in, so the seat's claude may write beside its record.
+        let run = "python3 -I /probe/stub.py 8089 /tmp/requests.jsonl & sleep 1; \
+                   mkdir -p /tmp/cfg && cp -R /probe/cfg/. /tmp/cfg/; \
+                   timeout 60 claude -p PROBE-OUTER --dangerously-skip-permissions \
+                   --output-format stream-json --verbose > /tmp/out.jsonl 2>&1; \
+                   echo '--- out'; cat /tmp/out.jsonl; echo '--- requests'; cat /tmp/requests.jsonl";
+        let mount = format!("type=bind,src={},dst=/probe,readonly", dir.display());
+        let mut argv: Vec<String> = [
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network",
+            "none",
+            "--mount",
+            &mount,
+            "--entrypoint",
+            "sh",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for (k, v) in &env {
+            let v = if k == "ANTHROPIC_BASE_URL" {
+                "http://127.0.0.1:8089"
+            } else {
+                v.as_str()
+            };
+            argv.extend(["-e".to_string(), format!("{k}={v}")]);
+        }
+        for kv in [
+            "CLAUDE_CONFIG_DIR=/tmp/cfg",
+            "IS_SANDBOX=1",
+            "DISABLE_TELEMETRY=1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+        ] {
+            argv.extend(["-e".to_string(), kv.to_string()]);
+        }
+        argv.extend([image, "-c".to_string(), run.to_string()]);
+        let mut c = rt.cmd();
+        c.args(&argv);
+        let out = output_within(c, Duration::from_secs(80)).expect("the seat ran");
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let (claude_out, requests) = text
+            .split_once("--- requests")
+            .unwrap_or_else(|| panic!("no request log: {text}"));
+        let tool_result = claude_out
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "user")
+            .flat_map(|v| {
+                v["message"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .find(|c| c["type"] == "tool_result")
+            .map(|c| c["content"].to_string())
+            .unwrap_or_else(|| panic!("the outer claude never ran its Bash tool: {text}"));
+        assert!(
+            !tool_result.contains("Not logged in"),
+            "the nested claude -p is not signed in: {tool_result}"
+        );
+        assert!(tool_result.contains("INNER-OK"), "{tool_result}");
+        let requests: Vec<serde_json::Value> = requests
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|r: &serde_json::Value| {
+                r["path"].as_str().unwrap_or("").starts_with("/v1/messages")
+            })
+            .collect();
+        // Two outer turns and the nested one, each with the unit's placeholder bearer (which the
+        // gateway replaces) and the unit header, in claude's OAuth mode.
+        assert!(requests.len() >= 3, "{requests:?}");
+        for r in &requests {
+            assert_eq!(r["authorization"], format!("Bearer {}", key.key), "{r}");
+            assert_eq!(r["unit"], key.key.as_str(), "{r}");
+            assert_eq!(r["x-api-key"], "", "{r}");
+            assert!(
+                r["beta"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("oauth-2025-04-20"),
+                "claude stays in OAuth mode: {r}"
+            );
+        }
     }
 
     fn tmp(tag: &str) -> PathBuf {

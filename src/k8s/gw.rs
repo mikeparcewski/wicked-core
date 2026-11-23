@@ -2012,7 +2012,8 @@ pub(crate) fn seat_sign_in(
     crate::seat_login::seat_sign_in(&super::login::K8sIo::of(gw), &gw.dir, cli)
 }
 
-/// The claude setup-token a claude seat signed in with OAuth passes through (core#1024).
+/// The claude setup-token a claude OAuth seat's units run on; the gateway sends it upstream
+/// (wicked-garden#1365).
 #[cfg(unix)]
 pub(crate) fn claude_seat_token(gw: &Gw) -> Result<String, String> {
     crate::seat_login::claude_seat_token(&super::login::K8sIo::of(gw), &gw.dir)

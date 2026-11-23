@@ -1358,12 +1358,12 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
         unit: &str,
     ) -> (u16, String) {
         use crate::seat_credentials::CredentialKind;
-        let passthrough =
+        let claude_oauth =
             route.owner() == Some("claude") && route.kind == Some(CredentialKind::ClaudeOauth);
         let header = route
             .unit_header
             .as_deref()
-            .or(passthrough.then_some(crate::seat_gateway::UNIT_HEADER))
+            .or(claude_oauth.then_some(crate::seat_gateway::UNIT_HEADER))
             .unwrap_or(match route.kind {
                 Some(CredentialKind::ClaudeApiKey) => "x-api-key",
                 Some(CredentialKind::GeminiApiKey) => crate::seat_gateway::GEMINI_KEY_HEADER,
@@ -1374,8 +1374,9 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
         } else {
             ""
         };
-        let extra = if passthrough {
-            "-H \"authorization: Bearer $O\" -H 'x-api-key: FAKE-stray-key'"
+        let extra = if claude_oauth {
+            // The seat's placeholder record's bearer, and a stray API key (wicked-garden#1365).
+            "-H 'authorization: Bearer PLACEHOLDER-not-a-token' -H 'x-api-key: FAKE-stray-key'"
         } else if header == crate::seat_gateway::UNIT_HEADER
             && route.kind != Some(CredentialKind::ClaudeApiKey)
         {
@@ -1389,16 +1390,12 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
             ""
         };
         let script = format!(
-            "read K; read O; curl -sS --max-time 6 -w '\\n%{{http_code}}' \
+            "read K; curl -sS --max-time 6 -w '\\n%{{http_code}}' \
              -H \"{header}: {prefix}$K\" {extra} {account} \
              -H 'content-type: application/json' -d '{{}}' http://agw:{}/probe-{}",
             route.port, route.port,
         );
-        let reply = h.run(
-            ns,
-            &script,
-            Some(format!("{unit}\nFAKE-client-oauth\n").as_bytes()),
-        );
+        let reply = h.run(ns, &script, Some(format!("{unit}\n").as_bytes()));
         let (body, status) = reply.rsplit_once('\n').expect("curl status");
         (status.trim().parse().unwrap(), body.into())
     }
@@ -1476,8 +1473,7 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
             units.insert(cli, key);
         }
         let mut secrets = vec![
-            "FAKE-client-oauth".to_string(),
-            "wk-FAKE-unknown".into(),
+            "wk-FAKE-unknown".to_string(),
             "FAKE-stray-key".into(),
             "PLACEHOLDER-not-a-token".into(),
         ];
@@ -1522,12 +1518,8 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
                 &seat_a
             };
             let expected = format!("FAKE-broker-{}", route.port);
-            let passthrough = owner == "claude" && route.kind == Some(CredentialKind::ClaudeOauth);
-            let expected_auth = if passthrough {
-                "FAKE-client-oauth"
-            } else {
-                &expected
-            };
+            let claude_oauth = owner == "claude" && route.kind == Some(CredentialKind::ClaudeOauth);
+            let expected_auth = &expected;
             let (_, body) = route_eventually(&h, ns, route, &unit.key, |status, body| {
                 status == 200 && body.contains(expected_auth)
             });
@@ -1542,12 +1534,9 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
                 CredentialKind::GeminiApiKey => assert_eq!(upstream["gemini"], expected),
                 _ => assert_eq!(upstream["auth"], format!("Bearer {expected_auth}")),
             }
-            if passthrough {
+            if claude_oauth {
+                // wicked-garden#1365: the broker's setup-token replaces the seat's placeholder.
                 assert_eq!(upstream["key"], "", "a stray API key is stripped");
-                assert!(
-                    !body.contains(&expected),
-                    "no broker credential is injected into Claude OAuth"
-                );
             }
             if route.provider == Provider::ChatGpt {
                 assert_eq!(upstream["acct"], format!("acct-FAKE-{}", route.port));
@@ -1625,7 +1614,7 @@ HTTPServer(('127.0.0.1',8998),H).serve_forever()
                     status != 200 || !body.contains("FAKE-")
                 });
             }
-            // End the unit as well: this also revokes a Claude seat's copied pass-through token.
+            // End the unit as well: its key stops admitting any route.
             gw::deregister_live(&gateway, &unit.key).unwrap();
             for route in config
                 .providers
