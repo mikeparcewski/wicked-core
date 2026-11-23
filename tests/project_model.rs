@@ -278,6 +278,81 @@ fn gate_prompt_is_durable_survives_restart_and_resolves_answered() {
     }
 }
 
+/// (core#1795) A gate opened by an engine before its row was named under its run (the row named by
+/// its bare id) is still the run's open gate after the upgrade: the boot names it under the run, so
+/// the one-run reads (the gate card's `gate_actions`, the napi `interaction_requests`) find it and
+/// the person can answer it.
+#[test]
+fn a_gate_opened_before_the_upgrade_is_read_and_answered_after_it() {
+    use wicked_apps_core::{GraphRead, GraphWrite};
+    let db = fresh_db("legacy-gate-name");
+    {
+        let core = spawn(&db);
+        core.launch_run(spec("run-l", HumanConfirm::Before(1), None))
+            .expect("launch");
+        assert!(wait_status(&core, "run-l", SessionStatus::AwaitingHuman));
+    }
+    // The row the engine wrote, renamed to its bare id: the shape the writer before core#1795 left
+    // (`InteractionRequest::to_node` named the node `self.id`).
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).expect("store");
+        let query = wicked_estate_core::SymbolQuery {
+            kinds: vec![wicked_apps_core::NodeKind::Other(
+                wicked_core::INTERACTION_REQUEST.to_string(),
+            )],
+            ..Default::default()
+        };
+        let mut rows = store.find_symbols(&query).expect("rows");
+        assert_eq!(rows.len(), 1, "the pause wrote one row");
+        let mut row = rows.remove(0);
+        assert!(
+            row.name.starts_with("run-l:"),
+            "named under its run: {}",
+            row.name
+        );
+        row.name = row.metadata["id"].as_str().unwrap().to_string();
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[row]).unwrap();
+        store.commit_batch().unwrap();
+    }
+    assert!(
+        wicked_core::list_interactions(&ro(&db), Some("run-l"), None)
+            .unwrap()
+            .is_empty(),
+        "the one-run read reaches rows by the run's name only"
+    );
+
+    let core = spawn(&db);
+    // An actor command's reply: the actor's startup (the naming pass first) is done.
+    core.ping();
+    let actions = core.gate_actions("run-l").expect("gate actions");
+    let actions = actions.expect("the run's gate is answerable after the upgrade");
+    assert_eq!(actions.ord, 1);
+    let open =
+        wicked_core::list_interactions(&ro(&db), Some("run-l"), Some(InteractionStatus::Open))
+            .expect("interactions");
+    assert_eq!(open.len(), 1, "the boot named the row under its run");
+    assert_eq!(
+        Some(actions.gate_kind.as_str()),
+        open[0].gate_kind.as_deref(),
+        "the gate card offers the answers of the gate the row records"
+    );
+    let status = core
+        .confirm_gate(
+            "run-l",
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
+        .expect("confirm");
+    assert_eq!(status, SessionStatus::Executing);
+    assert!(wait_status(&core, "run-l", SessionStatus::Completed));
+    let all = wicked_core::list_interactions(&ro(&db), Some("run-l"), None).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, InteractionStatus::Answered);
+}
+
 #[test]
 fn cancel_resolves_open_prompt_cancelled() {
     let db = fresh_db("cancel-gate");
