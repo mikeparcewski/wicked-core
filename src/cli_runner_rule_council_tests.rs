@@ -336,6 +336,41 @@ fn a_judge_reviewer_split_goes_to_one_council_and_its_ruling_decides() {
     }
 }
 
+/// (core#1789, field: the MCP-server run, 6 parts) A judge/reviewer split on a change too big for one
+/// ballot (the judge read it in parts) reaches a council on the files the two readings named,
+/// rather than holding with `incomplete_evidence`; its KEPT ruling decides.
+#[test]
+fn core_1789_a_dispute_on_a_paged_change_reaches_a_council() {
+    let tag = "paged-dispute";
+    let (repo, base, db) = fixture(tag);
+    std::fs::create_dir_all(repo.join("gen")).unwrap();
+    std::fs::write(repo.join("gen/big.json"), "\"BIG-ROW\"\n".repeat(20 * 1024)).unwrap();
+    let mut input = review_input(&repo, &base, &db);
+    input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new(tag, kept_3_0);
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    assert!(
+        judge.calls.load(Ordering::SeqCst) > 1,
+        "the judge read the change in parts"
+    );
+    let r1 = row(&r, "R1");
+    assert_eq!(council.convened(), 1, "a council, not a hold: {r1:?}");
+    let (req, _) = &council.seen.lock().unwrap()[0];
+    assert!(
+        req.evidence.contains("THE CHANGE, IN PART"),
+        "{}",
+        req.evidence
+    );
+    assert!(req.evidence.contains("+fn add(a: i32, b: i32)"));
+    assert!(
+        !req.evidence.contains("BIG-ROW"),
+        "the unnamed file is listed, not shown"
+    );
+    assert_eq!(r1.status, RuleStatus::Kept, "{r1:?}");
+    assert_eq!(r1.origin, Some(RuleOrigin::Council));
+}
+
 /// A.7.2: no ruling — 1 of 3 answered, a timeout, an error — is `disputed`, and holds.
 #[test]
 fn a_council_with_no_ruling_leaves_the_rule_disputed() {

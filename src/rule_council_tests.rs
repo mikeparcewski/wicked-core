@@ -474,6 +474,66 @@ fn a_dispute_over_a_binary_change_carries_no_nul_and_keeps_the_hunk() {
     );
 }
 
+/// (core#1789) A dispute on a change too big for one ballot (a paged change) goes to the council on
+/// the files the two readings named: their whole diff, every other changed file listed as not
+/// shown, and a KEPT vote counted only when it names a file shown. With no changed file in the
+/// BROKEN reading there is nothing to scope to, and the dispute holds as before.
+#[test]
+fn core_1789_a_paged_dispute_reaches_a_council_on_the_files_the_readings_named() {
+    let r = rule("R1", "add() takes typed numbers");
+    let big = format!(
+        "{DIFF}diff --git a/gen/big.json b/gen/big.json\n--- a/gen/big.json\n+++ b/gen/big.json\n\
+         @@ -0,0 +1 @@\n{}",
+        "+\"BIG-ROW\"\n".repeat(20 * 1024)
+    );
+    let c = change_of(&big, &["src/add.rs", "gen/big.json"]);
+    let row = judged(
+        "R1",
+        RuleStatus::Broken,
+        "part 2 of 3: src/add.rs:1 add() is untyped",
+    );
+    let pos = positions_for(&row, RuleStatus::Kept);
+    let whole = Evidence::of_change(&row, &c, None);
+    assert!(
+        dispute_request("s", 2, &r, "", &whole, None, &pos).is_none(),
+        "the whole change does not fit a ballot"
+    );
+    let (scoped, shown) = Evidence::of_named_files(&row, &c, None, &pos).expect("scoped");
+    assert_eq!(shown, vec!["src/add.rs".to_string()]);
+    let req = dispute_request("s", 2, &r, "", &scoped, None, &pos).expect("a ballot");
+    assert!(req.evidence.contains(DIFF), "the named file's diff, whole");
+    assert!(
+        !req.evidence.contains("BIG-ROW"),
+        "the other file is not shown"
+    );
+    assert!(req.evidence.contains("THE CHANGE, IN PART"));
+    let listed = req
+        .evidence
+        .split("NOTSHOWN-")
+        .nth(1)
+        .expect("the not-shown list");
+    assert!(listed.contains("gen/big.json"), "{listed}");
+    // A KEPT vote counts only on a file shown: one naming only the file not shown is not counted.
+    let paths: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let bars = VoteBars {
+        paths: &paths,
+        ..bars(false, None)
+    };
+    let v = verdict(&[
+        ("agy", Some(1), "gen/big.json is generated, nothing to type"),
+        ("opencode", Some(1), "src/add.rs:1 types both numbers"),
+        ("copilot", Some(1), "src/add.rs:1 is typed"),
+    ]);
+    let settled = settle(&row, pos.clone(), &v, &bars);
+    let c0 = settled.council.as_ref().unwrap();
+    assert!(!c0.votes[0].counted, "{c0:?}");
+    assert!(c0.votes[1].counted && c0.votes[2].counted, "{c0:?}");
+    // The BROKEN reading names no changed file: no scope, the dispute holds.
+    let vague = judged("R1", RuleStatus::Broken, "part 2 of 3: the add is untyped");
+    let pos = positions_for(&vague, RuleStatus::Kept);
+    assert!(Evidence::of_named_files(&vague, &c, None, &pos).is_none());
+}
+
 // ── A.5 reuse ───────────────────────────────────────────────────────────────────────────────────
 
 #[test]

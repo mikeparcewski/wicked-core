@@ -1878,23 +1878,36 @@ fn settle_rule_disputes(
                     + crate::rule_check::pack_council_note(rule)
             })
             .unwrap_or_default();
+        let request = |evidence: &crate::rule_check::Evidence| {
+            crate::rule_check::dispute_request(
+                &input.run_id,
+                input.unit.ord,
+                rule,
+                &note,
+                evidence,
+                instructions,
+                &pos,
+            )
+        };
+        // (core#1789) A change too big for a ballot whole (a paged one) is put to the council on
+        // the files the two readings named; the voters' KEPT names one of those.
         let evidence = crate::rule_check::Evidence::of_change(&row, change, floor_text);
-        let Some(req) = crate::rule_check::dispute_request(
-            &input.run_id,
-            input.unit.ord,
-            rule,
-            &note,
-            &evidence,
-            instructions,
-            &pos,
-        ) else {
+        let Some((req, shown)) = request(&evidence).map(|r| (r, None)).or_else(|| {
+            let (scoped, shown) =
+                crate::rule_check::Evidence::of_named_files(&row, change, floor_text, &pos)?;
+            request(&scoped).map(|r| (r, Some(shown)))
+        }) else {
             drop(lock);
             report.rows[i] = hold(
-                "incomplete_evidence: the judge's evidence does not fit a council ballot whole"
+                "incomplete_evidence: the judge's evidence does not fit a council ballot whole, \
+                 nor do the changed files the two readings name"
                     .into(),
             );
             continue;
         };
+        let shown_paths: Option<Vec<&str>> = shown
+            .as_ref()
+            .map(|s| s.iter().map(String::as_str).collect());
         // Charged to the run durably BEFORE it starts: a council whose attempt is superseded or
         // whose result never folds is still spent.
         match ctx.council.reserve(&input.run_id, input.unit.ord) {
@@ -1934,7 +1947,7 @@ fn settle_rule_disputes(
         // the engine writes around them (`RULE <id> (<severity>, …)`).
         let rule_words = crate::rule_check::rule_words(rule);
         let bars = crate::rule_check::VoteBars {
-            paths: &paths,
+            paths: shown_paths.as_deref().unwrap_or(&paths),
             rule_text: &rule_words,
             established: m
                 .as_ref()

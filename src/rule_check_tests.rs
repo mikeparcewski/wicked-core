@@ -1612,6 +1612,44 @@ fn a_kept_cite_names_a_changed_path_whole() {
     );
 }
 
+/// (core#1803) A cite names a changed path only where the path stands delimited: a longer name
+/// that continues past it (`+backup`, `._backup`, a non-ASCII letter), or starts before it, names
+/// a different file. Ordinary prose, markup and line cites still name it.
+#[test]
+fn core_1803_a_cite_that_continues_past_a_changed_path_does_not_name_it() {
+    let ids = ["K"];
+    let frame = |c: &str| format!("BEGIN VERDICTS n\nRULE K: KEPT — {c}\nEND VERDICTS n\n");
+    let ok = |c: &str| {
+        parse_rule_lines(&frame(c), &ids, "n", &["fixtures/data.json"], None).contains_key("K")
+    };
+    for longer in [
+        "fixtures/data.json+backup is unchanged",
+        "fixtures/data.jsoné is unchanged",
+        "fixtures/data.json._backup is unchanged",
+        "fixtures/data.json-old is unchanged",
+        "old+fixtures/data.json is unchanged",
+        "fixtures/data.json.bak.",
+    ] {
+        assert!(!ok(longer), "{longer:?} names a longer path");
+    }
+    for named in [
+        "fixtures/data.json:4 keeps the shape",
+        "see fixtures/data.json.",
+        "see fixtures/data.json...",
+        "(fixtures/data.json) keeps the shape",
+        "**fixtures/data.json** keeps the shape",
+        "`fixtures/data.json`: keeps the shape",
+        "\"fixtures/data.json\", line 4",
+        "“fixtures/data.json” keeps the shape",
+        "fixtures/data.json, src/b.rs keep the shape",
+        "src/b.rs,fixtures/data.json keep the shape",
+        "fixtures/data.json — keeps the shape",
+        "is it fixtures/data.json? yes",
+    ] {
+        assert!(ok(named), "{named:?} names the path");
+    }
+}
+
 #[test]
 fn a_change_in_a_file_the_engine_cannot_name_leaves_languages_unknown() {
     let f = job_facts(
