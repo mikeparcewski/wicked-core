@@ -449,6 +449,56 @@ pub(super) fn retry_headroom_wait() -> Duration {
         .unwrap_or(RETRY_HEADROOM_WAIT)
 }
 
+/// (core#1767) The head's own RESULTS run of `check` (the base's shape: `results.how` argv, env and
+/// merge, a `how.path` file read through the held tree) and its results text, for the head's
+/// list coverage. A run that did not finish, could not start or exited outside `failedExit` and 0
+/// has no results to read.
+fn head_results(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> (CheckRun, Result<String, String>) {
+    if let Some(h) = held {
+        clear_results(h, check, g);
+    }
+    let since = std::time::SystemTime::now();
+    let mut r = run_one_with(
+        worktree,
+        held,
+        &RepoCheck {
+            argv: g.for_results(&check.argv),
+            source: format!("`{}`'s results on the head (core#1767)", check.name),
+            ..check.clone()
+        },
+        &results_exec(g),
+        sandbox,
+        scratch,
+        Tree::Head,
+    );
+    r.logs = relabel(r.logs, "results-head");
+    let text = if r.timed_out || r.spawn_error.is_some() {
+        Err(format!(
+            "the head's results run did not finish ({})",
+            r.summary()
+        ))
+    } else if !r
+        .exit_code
+        .is_some_and(|c| c == 0 || g.failed_exit.contains(&c))
+    {
+        Err(format!(
+            "the head's results run did not run to a test verdict ({})",
+            r.summary()
+        ))
+    } else {
+        results_text(held, check, g, &mut r, scratch, since)
+            .map_err(|e| format!("the head's results: {e}"))
+    };
+    (r, text)
+}
+
 /// The base side of a failed head check: the base run (fresh or cached) and, when it failed, its
 /// inventory.
 pub(super) struct BaseSide {
@@ -458,7 +508,8 @@ pub(super) struct BaseSide {
 
 /// (DES-FLOOR-V2 §3) Decide a FAILED head check `head` (its first, unchanged run) against its base
 /// side: the head's exit codes decide, the base's TOC-validated failures are the only ones that
-/// may be excluded, and head text is never read to decide.
+/// may be excluded, and head text never decides a run's outcome (core#1767: the head's results run
+/// is read only for whether the head's list covers it, which an exclusion requires).
 /// wicked-core#1701: a prose-only change may excuse an otherwise unseparated completed base failure.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decide(
@@ -493,6 +544,9 @@ pub(super) fn decide(
     }
     // The base is red and finished: separate its failures from the head's, if it can be precise.
     let red_base = base_run.filter(|b| !b.passed() && !b.timed_out && b.spawn_error.is_none());
+    // (core#1767) The head's results run, when the plan took one: its cost, and an environment
+    // refusal it met (terminal for the check, core#1627; its exit code is never the verdict).
+    let mut results_head: Option<CheckRun> = None;
     let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
     if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
@@ -605,9 +659,26 @@ pub(super) fn decide(
                             .into(),
                     );
                 }
+                // (core#1767) The head's list names exactly what the head's own results run
+                // executed (per qualifier): the probe proved the list on its clean copy only, and
+                // a binary added since that the list omits could make a name it shares look
+                // unique. Last, so only an exclusion still standing pays for this run; it decides
+                // nothing itself (the excluded run below does, by its exit code).
+                let (r, text) = head_results(worktree, held, check, g, sandbox, scratch);
+                logs.extend(r.logs.iter().cloned());
+                results_head = Some(r);
+                g.completeness(&text?, &head_toc.ids)
+                    .map_err(|e| format!("the head's list does not cover its run: {e}"))?;
             }
             Ok(names)
         })();
+    }
+    if let Some(r) = &results_head {
+        head.earlier_passes
+            .push(("head results".to_string(), r.duration_ms));
+        if r.environment_failure() {
+            head.spawn_error = r.spawn_error.clone();
+        }
     }
     // The deciding run: the excluded head run when exclusion is precise and has something to
     // deselect, else the unchanged head run itself.

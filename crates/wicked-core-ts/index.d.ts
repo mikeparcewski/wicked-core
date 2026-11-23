@@ -1752,6 +1752,7 @@ export interface FloorLogRefJson {
     | 'toc-base'
     | 'toc-head'
     | 'toc-excluded'
+    | 'results-head'
     | 'alone-base'
     | 'excluded'
     | 'retry'
