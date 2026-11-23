@@ -749,7 +749,8 @@ pub(crate) fn distribute_seated(
             let base = wicked_apps_core::spawn::seat_id::credential(&d.assigned_cli).to_string();
             // A review kept off a party seat that built nothing here is the party exclusion's
             // stand-in; one that stayed on a builder seat is the evaluator's.
-            let role = if is_party(&d.assigned_cli, parties) && !builders.contains(&d.assigned_cli)
+            let role = if is_party(&d.assigned_cli, parties, configured)
+                && !builders.contains(&d.assigned_cli)
             {
                 crate::standin::Role::PartyExcluded
             } else {
@@ -1305,7 +1306,7 @@ fn enforce_evaluator_distinct(
         }
         let gathered = crate::pipeline::report_gatherer_seats(&seated_units, u);
         let forbidden = |k: &String| {
-            !evaluator_seat_admitted(k, &|b| builder_clis.contains(b), parties)
+            !evaluator_seat_admitted(k, &|b| builder_clis.contains(b), parties, clis)
                 || gathered.contains(k)
         };
         if matches!(u.stage, StageKind::Review | StageKind::Test) && forbidden(&d.assigned_cli) {
@@ -1383,8 +1384,9 @@ pub(crate) fn evaluator_seat_admitted(
     k: &str,
     is_builder: &dyn Fn(&str) -> bool,
     parties: &[String],
+    records: &[AgenticCli],
 ) -> bool {
-    !is_builder(k) && !is_party(k, parties)
+    !is_builder(k) && !is_party(k, parties, records)
 }
 
 /// (core#1847) The worker pool's admission of one monitor, shared with the launch preflight: a
@@ -1393,13 +1395,23 @@ pub(crate) fn monitor_seat_admitted(k: &str, creator: &str, pa: Option<&str>) ->
     k != creator && Some(k) != pa
 }
 
-/// (DES-STANDIN-001 §3.8) Whether seat `k` is one of the run's parties: the party names the seat
-/// (`claude#2`) or its whole CLI (`claude`).
-pub(crate) fn is_party(k: &str, parties: &[String]) -> bool {
-    let k = wicked_apps_core::spawn::seat_id::credential(k);
-    parties
-        .iter()
-        .any(|p| p == k || p == wicked_apps_core::spawn::seat_id::family(k))
+/// (DES-STANDIN-001 §3.8, rev 3.1) Whether seat `k` is one of the run's parties. A party matches by
+/// key, by CLI key (`claude#2` and `claude` are one CLI) or by the binary its record runs
+/// (`validator::excluded_identity` over `records`), so an alias record `reviewer` that invokes
+/// `claude` is a `claude` party too: the preflight's `Named` rule. Empty `parties` (every run not
+/// launched stand-in-aware) is never a party.
+pub(crate) fn is_party(k: &str, parties: &[String], records: &[AgenticCli]) -> bool {
+    use wicked_apps_core::spawn::seat_id::{credential, family};
+    if parties.is_empty() {
+        return false;
+    }
+    let k = credential(k);
+    let id = crate::validator::excluded_identity(k, records);
+    parties.iter().any(|p| {
+        p == k
+            || family(p) == family(k)
+            || (!id.is_empty() && crate::validator::excluded_identity(p, records) == id)
+    })
 }
 
 /// (DES-STANDIN-001 §3.7) Why a review is short, as data: every usable seat a party, one
@@ -1419,7 +1431,7 @@ fn stand_in_reason(
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| k.to_string())
     };
-    if !parties.is_empty() && clis.iter().all(|c| is_party(&c.key, parties)) {
+    if !parties.is_empty() && clis.iter().all(|c| is_party(&c.key, parties, configured)) {
         return crate::standin::Reason::AllParties {
             seats: clis.iter().map(|c| display(&c.key)).collect(),
         };
@@ -4033,10 +4045,23 @@ mod tests {
         .expect("routes");
         assert_eq!(dists[1].assigned_cli, "pi");
         assert!(dists[1].stand_in.is_none());
-        // A party names an instance or a whole CLI.
-        assert!(is_party("codex#2", &["codex".to_string()]));
-        assert!(is_party("codex#2~1", &["codex#2".to_string()]));
-        assert!(!is_party("codex", &["codex#2".to_string()]));
+        // A party names a seat, its whole CLI, or the binary a record runs (codex r1 B3).
+        let records = [seat("claude"), seat("codex")];
+        let party = |k: &str, p: &str| is_party(k, &[p.to_string()], &records);
+        assert!(party("codex#2", "codex"));
+        assert!(party("codex#2~1", "codex#2"));
+        assert!(party("codex", "codex#2"));
+        assert!(!party("claude", "codex"));
+        assert!(!is_party("codex", &[], &records));
+        let mut alias = seat("reviewer");
+        alias.headless_invocation = seat("claude").headless_invocation;
+        let records = [seat("claude"), alias];
+        assert!(is_party("reviewer", &["claude".to_string()], &records));
+        assert!(is_party("claude", &["reviewer".to_string()], &records));
+        // A party the records do not hold still names its binary.
+        let mut bare = seat("reviewer");
+        bare.headless_invocation = "claude -p {PROMPT}".into();
+        assert!(is_party("reviewer", &["claude".to_string()], &[bare]));
     }
 
     /// T-B2: no candidate set, pool or bench a distribution writes ever holds a `~` key; the only

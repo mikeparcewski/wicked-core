@@ -11460,6 +11460,12 @@ fn distinct_evaluator_seat(
     // stays and the gate decides (codex r1 on #898).
     let mut candidates = eligible_roster_keys(session);
     candidates.sort_by_key(|k| shares(k));
+    // A party is matched by its record's binary too; no registry read on a run with no parties.
+    let party_records = if session.assurance.parties.is_empty() {
+        Vec::new()
+    } else {
+        crate::registry_roster()
+    };
     candidates.into_iter().find(|k| {
         crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_none()
             && (key_author || !shares(k))
@@ -11467,7 +11473,7 @@ fn distinct_evaluator_seat(
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
             // (DES-STANDIN-001 §3.8) A party never reviews for real: empty on an unaware run.
-            && !crate::distribute::is_party(k, &session.assurance.parties)
+            && !crate::distribute::is_party(k, &session.assurance.parties, &party_records)
     })
 }
 

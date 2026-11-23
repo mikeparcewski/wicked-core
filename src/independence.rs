@@ -635,6 +635,7 @@ pub(crate) fn independence_preflight_in(
                     &c.key,
                     &|k| author_keys.iter().any(|a| a == k),
                     &party_keys,
+                    &records,
                 )
             })
             .collect();
@@ -811,7 +812,7 @@ pub(crate) fn independence_preflight_in(
                 .filter(|c| {
                     author.is_some_and(|a| {
                         crate::distribute::monitor_seat_admitted(&c.key, &a.key, pa)
-                    }) && !crate::distribute::is_party(&c.key, &party_keys)
+                    }) && !crate::distribute::is_party(&c.key, &party_keys, &records)
                 })
                 .map(|c| c.key.clone())
                 .collect();
@@ -1388,7 +1389,8 @@ mod tests {
         assert!(crate::distribute::evaluator_seat_admitted(
             "i2-claude#2",
             &|k| k == "i2-claude",
-            &[]
+            &[],
+            &clis
         ));
         assert!(crate::qe_acceptance::review::qe_seat_authored(
             "i2-claude#2",
