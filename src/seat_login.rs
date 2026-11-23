@@ -908,9 +908,8 @@ pub(crate) fn extract_tokens(
     broker_files(cli)?;
     match cli {
         "claude" => {
-            // The token claude's gateway route sends upstream (core#1024, wicked-garden#1365).
-            // It is not an OAuth record: nothing to renew, and it replaces any record an earlier
-            // `claude auth login` left.
+            // The seat's pass-through token (core#1024). It is not an OAuth record: nothing to
+            // renew, and it replaces any record an earlier `claude auth login` left.
             if let Some(bytes) = input_file(cli, files, CLAUDE_SETUP_TOKEN_PATH)? {
                 return Ok(vec![token_file("anthropic.token", &setup_token(bytes)?)]);
             }
@@ -2073,10 +2072,10 @@ pub(crate) fn seat_sign_in(
     }
 }
 
-/// The token a claude seat signed in with OAuth (core#1024): the operator's own
+/// The token a claude seat signed in with OAuth passes through (core#1024): the operator's own
 /// `claude setup-token` token (or what an earlier `claude auth login` left, until it expires),
-/// read from the broker under its lock. The gateway sends it upstream in place of the seat's
-/// placeholder; it never enters a seat (wicked-garden#1365).
+/// read from the broker under its lock. The seat's claude sends it upstream itself; the gateway
+/// relays it unchanged.
 #[cfg(unix)]
 pub(crate) fn claude_seat_token(io: &dyn BrokerIo, dir: &Path) -> Result<String, String> {
     claude_broker_token(io, dir)?.ok_or_else(|| "claude is not signed in".into())
@@ -3685,13 +3684,13 @@ mod tests {
 
     /// core#1024: claude signs in with `claude setup-token` (the real CLI's own flow, run in the
     /// login container): the token it prints is pasted back unechoed and left for ingest, which
-    /// moves it to the broker, where claude's gateway route reads it. No OAuth record is kept, an
+    /// moves it to the broker as the seat's pass-through token. No OAuth record is kept, an
     /// earlier one is emptied, and there is nothing for the broker to renew.
     #[cfg(unix)]
     #[test]
-    fn a_claude_setup_token_sign_in_is_brokered_for_the_gateway() {
+    fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
         if crate::validator::skip_when_nested(
-            "a_claude_setup_token_sign_in_is_brokered_for_the_gateway",
+            "a_claude_setup_token_sign_in_is_brokered_for_pass_through",
         ) {
             return;
         }
@@ -3801,7 +3800,7 @@ mod tests {
         assert_eq!(
             crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", true).unwrap(),
             crate::seat_refresh::Outcome::NotRefreshable,
-            "a setup-token is never renewed by the broker"
+            "a pass-through token is never renewed by the broker"
         );
         // A bad paste is refused before the broker changes, and never repeated.
         new_session(&fake.io, &fake.dir, "claude").unwrap();
