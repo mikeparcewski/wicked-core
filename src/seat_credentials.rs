@@ -1,7 +1,6 @@
 //! Pure, per-unit CLI credential files. Only placeholders enter a seat; the gateway owns
-//! upstream credentials (a claude OAuth seat is the one exception: it passes the operator's own
-//! `claude setup-token` token through, from its environment, core#1024). Paths are relative to
-//! the runner's isolated CLI home.
+//! upstream credentials, a claude OAuth seat's `claude setup-token` token included
+//! (wicked-garden#1365). Paths are relative to the runner's isolated CLI home.
 
 use std::path::{Path, PathBuf};
 
@@ -314,15 +313,28 @@ pub(crate) fn placeholder_files(
     gateway_url: &str,
 ) -> Vec<(PathBuf, String)> {
     let (path, value) = match (cli, kind) {
-        // Neither claude mode keeps an OAuth record in the seat. OAuth (core#1024): the seat's
-        // claude passes the operator's `claude setup-token` token through, from its env
-        // (`CLAUDE_CODE_OAUTH_TOKEN`), and the unit's key rides `x-wicked-unit`
-        // ([`crate::seat_gateway::seat_env_for`]). API key: selected by ANTHROPIC_API_KEY. The
-        // file is still written, empty, so a seat home an earlier unit used keeps no stale
-        // record there (agy c6-r1).
-        ("claude", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
-            (".credentials.json", json!({}))
-        }
+        // OAuth (wicked-garden#1365): a placeholder record whose access token is the unit's key.
+        // claude stays in OAuth mode (it sends its own OAuth beta), and a `claude -p` the seat
+        // starts from its Bash tool reads the same file. claude scrubs CLAUDE_CODE_OAUTH_TOKEN
+        // from every tool child's env, so a credential in the env never reached a nested call.
+        // The gateway sends the operator's `claude setup-token` token upstream in place of the
+        // placeholder; the unit's key also rides `x-wicked-unit`
+        // ([`crate::seat_gateway::seat_env_for`]). The record never expires, so claude never
+        // tries to refresh it.
+        ("claude", CredentialKind::ClaudeOauth) => (
+            ".credentials.json",
+            json!({"claudeAiOauth": {
+                "accessToken": unit_key,
+                "refreshToken": "PLACEHOLDER-refresh-not-a-token",
+                "expiresAt": 4102444800000_u64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "max"
+            }}),
+        ),
+        // Claude API-key mode is selected by ANTHROPIC_API_KEY, not an OAuth file. The file is
+        // still written, with no OAuth record, so a seat home an earlier unit of the run used
+        // under an OAuth sign-in keeps no stale placeholder there (agy c6-r1).
+        ("claude", CredentialKind::ClaudeApiKey) => (".credentials.json", json!({})),
         // core#997: the refresh token is the unit's own key. codex posts it to the gate-hook
         // relay (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`, never auth.openai.com) after an upstream
         // 401, and the relay renews the broker's sign-in only for a live codex unit's key.
@@ -505,15 +517,31 @@ mod tests {
         serde_json::from_str(&files[0].1).unwrap()
     }
 
-    /// core#1024: a claude OAuth seat keeps no OAuth record of ours (the operator's own
-    /// `claude setup-token` token rides its env); the unit's key is its `x-wicked-unit` header.
+    /// wicked-garden#1365: a claude OAuth seat holds the spike's placeholder record, whose access
+    /// token is the unit's key; the operator's token is the gateway's, never the seat's.
     #[test]
-    fn claude_oauth_seat_holds_no_record_and_sends_the_unit_key_as_a_header() {
+    fn claude_oauth_matches_spike_structure_and_sends_unit_key() {
+        let line = SPIKE.lines().find(|l| l.contains("claudeAiOauth")).unwrap();
+        let literal = line
+            .split("printf '%s' '")
+            .nth(1)
+            .unwrap()
+            .split("' >")
+            .next()
+            .unwrap();
+        let mut expected: Value = serde_json::from_str(literal).unwrap();
+        expected["claudeAiOauth"]["accessToken"] = json!(KEY);
+        expected["claudeAiOauth"]["refreshToken"] = json!("PLACEHOLDER-refresh-not-a-token");
+        let actual = file("claude", CredentialKind::ClaudeOauth, ".credentials.json");
+        assert_eq!(actual, expected);
         assert_eq!(
-            file("claude", CredentialKind::ClaudeOauth, ".credentials.json"),
+            actual["claudeAiOauth"]["accessToken"],
+            sent_bearer("claude", CredentialKind::ClaudeOauth, KEY)
+        );
+        assert_eq!(
+            file("claude", CredentialKind::ClaudeApiKey, ".credentials.json"),
             json!({})
         );
-        assert_eq!(sent_bearer("claude", CredentialKind::ClaudeOauth, KEY), KEY);
     }
 
     #[test]
