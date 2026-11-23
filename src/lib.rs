@@ -963,13 +963,10 @@ impl Core {
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
         let team_cfg = crate::team::publish::TeamConfig::for_store(&log_path);
-        // Each actor gets its own lifecycle maps (epoch tracking + tombstone) and an empty
-        // write registry (no ACP sessions for PTY path).
+        // Each actor gets its own lifecycle maps (epoch tracking + tombstone).
         let lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::acp_runner::ElicitationMaps::new(),
         ));
-        let empty_write_reg: crate::acp_runner::WriteReg =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
@@ -998,7 +995,6 @@ impl Core {
                 None,
                 false, // is_acp
                 Some(lifecycle_arc),
-                empty_write_reg,
                 team_link,
                 qe_host_actor,
                 stats_actor,
@@ -1024,12 +1020,10 @@ impl Core {
         (core, runner)
     }
 
-    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam — units within the
-    /// same run share a persistent ACP session per CLI (no per-unit cold-start). Uses the real
-    /// council dispatcher. The returned `Core` also exposes an [`AcpStepRunner`] handle so the
-    /// caller can call [`AcpStepRunner::drop_session`] after each run completes to release the
-    /// ACP child processes. See [`Core::spawn`] for the simpler version that manages the runner
-    /// internally.
+    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam (every unit runs its
+    /// CLI's headless mode on the wrapped carrier since C5). Uses the real council dispatcher. The
+    /// returned `Core` also exposes the [`AcpStepRunner`] handle. See [`Core::spawn`] for the
+    /// simpler version that manages the runner internally.
     pub fn spawn_with_acp_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<AcpStepRunner>) {
@@ -1046,10 +1040,9 @@ impl Core {
         // The runner knows the store it serves (codex round 8): the database's canonical parent is
         // the daemon's operational state home, fenced on every launch — snapshot or not.
         let runner = std::sync::Arc::new(AcpStepRunner::new_for_store(tx.clone(), &path));
-        // Share the maps and write registry already inside the runner so the actor and the
-        // ACP execution layer use a single consistent lock.
+        // Share the maps already inside the runner so the actor and the execution layer use a
+        // single consistent lock.
         let actor_maps = runner.elicitation_maps().clone();
-        let actor_write_reg = runner.write_reg.clone();
         let runner_actor = runner.clone();
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
@@ -1091,7 +1084,6 @@ impl Core {
                 None,
                 true, // is_acp
                 Some(actor_maps),
-                actor_write_reg,
                 team_link,
                 qe_host_actor,
                 stats_actor,
@@ -1169,8 +1161,6 @@ impl Core {
         let spawn_lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::acp_runner::ElicitationMaps::new(),
         ));
-        let spawn_write_reg: crate::acp_runner::WriteReg =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
@@ -1199,7 +1189,6 @@ impl Core {
                 exec_bus,
                 false, // is_acp
                 Some(spawn_lifecycle_arc),
-                spawn_write_reg,
                 team_link,
                 qe_host_actor,
                 stats_actor,
