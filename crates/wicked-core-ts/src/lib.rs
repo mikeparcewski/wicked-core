@@ -2646,15 +2646,18 @@ impl Core {
         task(move || wicked_core::run_editor_conformance(&request_json).map_err(err))
     }
 
-    /// (core#1708) Stop every `runEditorConformance` call in flight in this process: each resolves
-    /// to a refused record, and each jailed harness's process group gets SIGTERM, a bounded wait
-    /// (about 500 ms), then SIGKILL. Resolves to JSON `{ "stopped": number }` (the process groups
-    /// signalled). A host calls it on its way down: the harness runs in its own process group, so
-    /// it would otherwise outlive the host until its deadline.
+    /// (core#1708) Shut install-time conformance down for this process, for a host on its way out.
+    /// Synchronously, before this returns its promise: every `runEditorConformance` call in flight
+    /// is stopped (its jailed harness's process group is killed within one 50 ms poll, and the
+    /// call resolves to a refused record), and every later call is refused before it starts. The
+    /// promise resolves to JSON `{ "stopped": number, "settled": boolean }`: the calls that were
+    /// in flight, and whether all of them had ended within 5 seconds.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn stop_editor_conformance() -> AsyncTask<CoreTask> {
-        task(|| {
-            Ok(serde_json::json!({ "stopped": wicked_core::stop_install_harnesses() }).to_string())
+    pub fn shutdown_editor_conformance() -> AsyncTask<CoreTask> {
+        let stopped = wicked_core::shut_down_install_harnesses();
+        task(move || {
+            let settled = wicked_core::install_harnesses_settled(std::time::Duration::from_secs(5));
+            Ok(serde_json::json!({ "stopped": stopped, "settled": settled }).to_string())
         })
     }
 
