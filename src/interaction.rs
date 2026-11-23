@@ -93,7 +93,7 @@ impl ToNode for InteractionRequest {
         let mut node = Node::new(
             synthetic_symbol(INTERACTION_REQUEST, &self.id),
             NodeKind::Other(INTERACTION_REQUEST.to_string()),
-            self.id.clone(),
+            row_name(&self.session_id, &self.id),
             Language::new(SYMBOL_SCHEME),
             Location::new(format!("{INTERACTION_REQUEST}/{}", self.id), Span::ZERO),
         );
@@ -190,18 +190,110 @@ pub fn open_gate_keyed(
     }
 }
 
-/// All interaction requests, optionally filtered by session and/or status, newest first.
+/// (core#1795) The node name of request `id` on run `session_id`: `{session_id}:{id}`. The name is
+/// what the store indexes, so one run's requests are reached by the name prefix `{session_id}:`
+/// without reading every request on the store (as a run's units are, `domain::session_units`).
+/// The symbol id stays `synthetic_symbol(INTERACTION_REQUEST, id)`: only the name carries the run.
+fn row_name(session_id: &str, id: &str) -> String {
+    format!("{session_id}:{id}")
+}
+
+/// Every interaction request node, of every run: the whole-store read.
+fn all_rows(store: &dyn GraphRead) -> anyhow::Result<Vec<Node>> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(INTERACTION_REQUEST.to_string())],
+        ..Default::default()
+    };
+    Ok(store.find_symbols(&query)?)
+}
+
+/// (core#1795) One run's request nodes, reached through the store's name index ([`row_name`]), so
+/// a one-run read (the gate card's, `gate_actions`) costs the same on a store of 4 runs or 4000.
+/// The prefix match is ASCII case-insensitive and also takes the run's units and any run whose id
+/// this one prefixes, so a node is kept only when it is a request whose raw `session_id` is this
+/// run's.
+fn run_rows(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<Vec<Node>> {
+    let kind = NodeKind::Other(INTERACTION_REQUEST.to_string());
+    Ok(store
+        .find_symbols_by_name_prefix(&format!("{session_id}:"), None)?
+        .into_iter()
+        .filter(|n| n.kind == kind)
+        .filter(|n| n.metadata.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+        .collect())
+}
+
+/// (core#1795) Name every request row written before [`row_name`] (named by its bare id) under its
+/// run, so [`list_interactions`] reaches it by the run's name prefix. Run once by the actor at
+/// boot, before its startup work; a row already named under its run is left untouched, so every
+/// boot after the first writes nothing. A row whose `session_id` or `id` cannot be read is left as
+/// it is: [`list_interactions`] could never decode it either. Returns how many rows were renamed.
+pub(crate) fn name_rows_under_their_runs(store: &mut dyn GraphStore) -> anyhow::Result<usize> {
+    let mut renamed = Vec::new();
+    for mut node in all_rows(store)? {
+        let field = |k: &str| node.metadata.get(k).and_then(|v| v.as_str());
+        let (Some(session_id), Some(id)) = (field("session_id"), field("id")) else {
+            continue;
+        };
+        let name = row_name(session_id, id);
+        if node.name != name {
+            node.name = name;
+            renamed.push(node);
+        }
+    }
+    if !renamed.is_empty() {
+        crate::domain::put_nodes(store, &renamed)?;
+    }
+    Ok(renamed.len())
+}
+
+/// (core#1795) How long the actor waits before it tries [`name_rows_under_their_runs`] again after
+/// the pass failed.
+pub(crate) const NAMING_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// (core#1795) Run [`name_rows_under_their_runs`] if it is due at `now`, and say when it is next
+/// due: `None` once it has succeeded. A pass that fails (a store error at boot) is tried again
+/// [`NAMING_RETRY`] after the failed attempt ended (not after it began: an attempt that waited out
+/// the store's busy timeout must not be due again at once), so a gate opened before the upgrade is
+/// not left unreadable for the daemon's whole life. The actor runs it at boot and, while it is
+/// still due, before each command.
+pub(crate) fn name_rows_when_due(
+    store: &mut dyn GraphStore,
+    due: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let due = due?;
+    if now < due {
+        return Some(due);
+    }
+    match name_rows_under_their_runs(store) {
+        Ok(0) => None,
+        Ok(n) => {
+            eprintln!("wicked-core: named {n} interaction request(s) under their run (core#1795)");
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not name interaction requests under their run (core#1795): \
+                 {e:#}; trying again in {}s (a gate opened before this version is not read until then)",
+                NAMING_RETRY.as_secs()
+            );
+            Some(std::time::Instant::now() + NAMING_RETRY)
+        }
+    }
+}
+
+/// All interaction requests, optionally filtered by session and/or status, newest first. One run's
+/// requests are read through the name index ([`run_rows`]); with no run, every request is read.
 pub fn list_interactions(
     store: &dyn GraphRead,
     session_id: Option<&str>,
     status: Option<InteractionStatus>,
 ) -> anyhow::Result<Vec<InteractionRequest>> {
-    let query = SymbolQuery {
-        kinds: vec![NodeKind::Other(INTERACTION_REQUEST.to_string())],
-        ..Default::default()
+    let rows = match session_id {
+        Some(s) => run_rows(store, s)?,
+        None => all_rows(store)?,
     };
-    let mut requests: Vec<InteractionRequest> = store
-        .find_symbols(&query)?
+    let mut requests: Vec<InteractionRequest> = rows
         .iter()
         .filter_map(|n| InteractionRequest::from_node(n).ok())
         .filter(|r| session_id.is_none_or(|s| r.session_id == s))
@@ -308,6 +400,202 @@ mod tests {
             assert!(!recorded.prompt.contains(&token));
             assert!(!recorded.answer.as_deref().unwrap().contains(&token));
         }
+    }
+
+    /// (core#1795) A one-run read reaches the run's requests through the store's name index: it
+    /// never asks the store for every request node, so the gate card's read costs the same on a
+    /// store of 4 runs or 4000. A run whose id the asked one prefixes and the run's units are not
+    /// its requests. A row written before the rows were named under their run (named by its bare
+    /// id) is reached once the boot pass has renamed it, and a second pass writes nothing.
+    #[test]
+    fn a_one_run_interaction_read_never_scans_every_request_on_the_store() {
+        use std::cell::Cell;
+        use wicked_apps_core::SqliteStore;
+        use wicked_estate_core::*;
+
+        struct ScanProbe {
+            inner: SqliteStore,
+            request_scans: Cell<usize>,
+        }
+        macro_rules! forward {
+            ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+                $(fn $name(&self, $($arg: $ty),*) -> $ret {
+                    GraphRead::$name(&self.inner, $($arg),*)
+                })*
+            };
+        }
+        impl GraphRead for ScanProbe {
+            forward! {
+                capabilities() -> StoreCapabilities;
+                get_node(id: &SymbolId) -> Result<Option<Node>>;
+                find_symbols_by_name_prefix(prefix: &str, limit: Option<usize>) -> Result<Vec<Node>>;
+                neighbors(id: &SymbolId, dir: Direction) -> Result<Vec<Edge>>;
+                traverse(start: &SymbolId, spec: &TraversalSpec) -> Result<Subgraph>;
+                all_nodes() -> Result<Vec<Node>>;
+                all_edges() -> Result<Vec<Edge>>;
+                unresolved_refs_for_name(name: &str) -> Result<Vec<UnresolvedRef>>;
+                file_digest(file: &str) -> Result<Option<String>>;
+                indexed_files() -> Result<Vec<String>>;
+                file_git_sha(file: &str) -> Result<Option<String>>;
+                repo_info() -> Result<Option<RepoInfo>>;
+                edge_history(file: &str) -> Result<Vec<HistoricalEdge>>;
+                file_content(file: &str) -> Result<Option<String>>;
+                symbol_source(node: &Node) -> Result<Option<String>>;
+                changes_since(cursor: u64) -> Result<Vec<Change>>;
+                node_semantics(symbol: &SymbolId) -> Result<Option<NodeSemantics>>;
+                find_by_requirement(requirement: &str) -> Result<Vec<Node>>;
+                annotations(symbol: &SymbolId) -> Result<Vec<Annotation>>;
+                annotations_by_type(ty: &str) -> Result<Vec<(SymbolId, Annotation)>>;
+                annotations_stale_since(cutoff: i64) -> Result<Vec<(SymbolId, Annotation)>>;
+                symbol_epoch(id: &SymbolId) -> Result<Option<u64>>;
+                edge_supports(source: &SymbolId, target: &SymbolId, kind: &EdgeKind) -> Result<Vec<EdgeSupport>>;
+                support_generation(owner: &SupportOwner) -> Result<Option<u64>>;
+                support_owners() -> Result<Vec<SupportOwnerState>>;
+                stats() -> Result<GraphStats>;
+            }
+            fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                if query
+                    .kinds
+                    .contains(&NodeKind::Other(INTERACTION_REQUEST.to_string()))
+                {
+                    self.request_scans.set(self.request_scans.get() + 1);
+                }
+                self.inner.find_symbols(query)
+            }
+        }
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut nodes = Vec::new();
+        for run in 0..50 {
+            let id = format!("run-{run}");
+            nodes.push(open_gate(&id, 1, None, "p", "def", run).to_node());
+        }
+        // The asked run: two gates, an answered one first.
+        let mut answered = open_gate("run-x", 1, None, "first", "def", 100);
+        answered.status = InteractionStatus::Answered;
+        nodes.push(answered.to_node());
+        nodes.push(open_gate("run-x", 2, Some(1), "second", "def", 200).to_node());
+        // A run whose id the asked one prefixes, and a unit of the asked run.
+        nodes.push(open_gate("run-x:2", 1, None, "other run", "def", 300).to_node());
+        nodes.push(crate::domain::WorkUnit::pending("run-x:u1", "run-x", 1, "d").to_node());
+        // A row as the writer before core#1795 named it: by its bare id (`to_node` used `self.id`).
+        let mut legacy = open_gate("run-x", 3, None, "written before", "deliver", 400).to_node();
+        legacy.name = legacy
+            .metadata
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        nodes.push(legacy);
+        crate::domain::put_nodes(&mut store, &nodes).unwrap();
+
+        let probe = ScanProbe {
+            inner: store,
+            request_scans: Cell::new(0),
+        };
+        let prompts = |status| -> Vec<String> {
+            list_interactions(&probe, Some("run-x"), status)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.prompt)
+                .collect()
+        };
+        assert_eq!(
+            prompts(None),
+            vec!["second", "first"],
+            "the run's own rows, newest first; the bare-id row is not reached by the run's name"
+        );
+        assert_eq!(prompts(Some(InteractionStatus::Open)), vec!["second"]);
+        assert_eq!(
+            probe.request_scans.get(),
+            0,
+            "no one-run read asked the store for every request node"
+        );
+
+        let mut store = probe.inner;
+        assert_eq!(name_rows_under_their_runs(&mut store).unwrap(), 1);
+        assert_eq!(
+            name_rows_under_their_runs(&mut store).unwrap(),
+            0,
+            "a boot after the first renames nothing"
+        );
+        let probe = ScanProbe {
+            inner: store,
+            request_scans: Cell::new(0),
+        };
+        let prompts = |status| -> Vec<String> {
+            list_interactions(&probe, Some("run-x"), status)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.prompt)
+                .collect()
+        };
+        assert_eq!(prompts(None), vec!["written before", "second", "first"]);
+        assert_eq!(
+            prompts(Some(InteractionStatus::Open)),
+            vec!["written before", "second"]
+        );
+        assert_eq!(
+            list_interactions(&probe, Some("run-x:2"), None)
+                .unwrap()
+                .len(),
+            1,
+            "the prefixed run reads its own row"
+        );
+        assert_eq!(probe.request_scans.get(), 0);
+        assert_eq!(
+            list_interactions(&probe, None, None).unwrap().len(),
+            54,
+            "the whole-store read still lists every row"
+        );
+    }
+
+    /// (core#1795) A naming pass that fails (here: the store refuses writes) is tried again once
+    /// it is due, never before, and stops being due once it has succeeded.
+    #[test]
+    fn a_failed_naming_pass_is_tried_again_when_due() {
+        let dir = std::env::temp_dir().join(format!("core-1795-naming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db");
+        let db = db.to_str().unwrap();
+        let mut rw = open_store(Some(db)).unwrap();
+        let mut legacy = open_gate("run-r", 1, None, "p", "def", 1).to_node();
+        legacy.name = legacy.metadata["id"].as_str().unwrap().to_string();
+        put_node(&mut rw, legacy).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let mut ro = wicked_apps_core::open_store_ro(Some(db)).unwrap();
+        // An attempt that began long before it ended (it waited out the store's busy timeout): the
+        // retry is due a full NAMING_RETRY after it ENDED, never at once.
+        let began = t0.checked_sub(NAMING_RETRY * 2).unwrap_or(t0);
+        let due = name_rows_when_due(&mut ro, Some(began), began);
+        let ended = std::time::Instant::now();
+        let at = due.expect("a failed pass is due again later");
+        assert!(
+            at + std::time::Duration::from_millis(1) >= ended + NAMING_RETRY,
+            "due a full NAMING_RETRY after the failed attempt ended"
+        );
+        assert_eq!(
+            name_rows_when_due(&mut rw, due, at - std::time::Duration::from_millis(1)),
+            due,
+            "not before it is due"
+        );
+        assert!(list_interactions(&rw, Some("run-r"), None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            name_rows_when_due(&mut rw, due, at),
+            None,
+            "done once it succeeds"
+        );
+        assert_eq!(
+            list_interactions(&rw, Some("run-r"), None).unwrap().len(),
+            1
+        );
+        assert_eq!(name_rows_when_due(&mut rw, None, at + NAMING_RETRY), None);
+        drop((rw, ro));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
