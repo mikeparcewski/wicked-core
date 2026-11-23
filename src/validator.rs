@@ -1849,10 +1849,11 @@ fn own_process_group(cmd: &mut Command) {
 /// The bounded wait behind [`run_bounded_status`]: poll; at the bound kill the tree and reap bounded.
 ///
 /// (core#1810) At the leader's natural exit the group is killed BEFORE the leader is reaped, the
-/// QUIESCE a Tool phase does (`run_tool_cmd`): anything the script backgrounded ends with its
-/// verdict instead of writing on in the worktree, and the leader's pid (the group id) is still
-/// reserved while the kill lands ([`has_exited_unreaped`]). Callers release the group's
-/// registration after this returns, so it is never released while a member lives.
+/// QUIESCE a Tool phase does (`run_tool_cmd`): anything the script backgrounded IN ITS GROUP ends
+/// with its verdict instead of writing on in the worktree, and the leader's pid (the group id) is
+/// still reserved while the kill lands ([`has_exited_unreaped`]). Callers release the group's
+/// registration after this returns. Stated limit, as for a Tool phase: a descendant that leaves
+/// the group (`setsid`, a daemonizing helper) is not reached by a group kill.
 fn wait_bounded(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -6698,32 +6699,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// core#1810: a validator's backgrounded descendant ends with its verdict. The script exits 0
-    /// at once and leaves a subshell that writes a file a second later; once the wait returns,
-    /// nothing may write. Red on main: the wait reaped the leader and returned, and the subshell
-    /// wrote on. On macOS the same holds through `sandbox-exec`, the validator's launcher, on the
-    /// production wait (`run_bounded_status_capturing_stderr`).
+    /// core#1810: a validator's backgrounded descendant ends with its verdict. The script starts a
+    /// subshell, waits until it runs (`ready`), and exits 0; the subshell writes `late` only once
+    /// the test releases it (`go`), which happens after the wait returned, so a write can only be
+    /// a post-verdict one. Red on main: the wait reaped the leader and returned, and the subshell
+    /// wrote on release. On macOS the same holds through `sandbox-exec`, the validator's launcher,
+    /// when it can arm here (not inside another sandbox), on the production wait
+    /// (`run_bounded_status_capturing_stderr`).
     #[cfg(unix)]
     #[test]
     fn a_validators_backgrounded_writer_ends_with_its_verdict_1810() {
         let dir = crate::repo_checks::PrivateTmp::create().unwrap();
-        let script = "(sleep 1; : > late) >/dev/null 2>&1 </dev/null & exit 0";
+        // Both loops are bounded (about 10 s), so a failing run leaves nothing behind for long.
+        let script = "(: > ready; i=0; while [ ! -e go ] && [ $i -lt 500 ]; do sleep 0.02; \
+                      i=$((i+1)); done; [ -e go ] && : > late) >/dev/null 2>&1 </dev/null & \
+                      i=0; while [ ! -e ready ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; \
+                      exit 0";
         let mut launches: Vec<(&str, Command)> = Vec::new();
         // spawn-audit: test-only — process-tree fixture, on the same minimal env as the validator.
         let mut plain = Command::new("sh");
         plain.arg("-c").arg(script);
         launches.push(("plain", plain));
-        if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
+        let launcher = find_on_path("sandbox-exec").filter(|_| sandbox_exec_arms());
+        if let Some(tool) = launcher.filter(|_| cfg!(target_os = "macos")) {
             // spawn-audit: test-only — the validator's macOS launcher with an allow-all profile.
-            let mut jailed = Command::new("/usr/bin/sandbox-exec");
+            let mut jailed = Command::new(tool);
             jailed
                 .args(["-p", "(version 1)(allow default)", "sh", "-c"])
                 .arg(script);
             launches.push(("sandbox-exec", jailed));
+        } else if cfg!(target_os = "macos") {
+            eprintln!("core#1810: sandbox-exec cannot arm here; the jailed launch is skipped");
         }
         for (name, mut cmd) in launches {
-            let late = dir.path().join("late");
-            let _ = std::fs::remove_file(&late);
+            for f in ["ready", "go", "late"] {
+                let _ = std::fs::remove_file(dir.path().join(f));
+            }
             cmd.current_dir(dir.path());
             apply_minimal_env(&mut cmd);
             let (status, _) = run_bounded_status_capturing_stderr(cmd, crate::test_env::PATIENT);
@@ -6731,9 +6742,15 @@ mod tests {
                 status.unwrap().is_some_and(|s| s.success()),
                 "{name}: the script itself exits 0"
             );
-            std::thread::sleep(Duration::from_millis(2500));
             assert!(
-                !late.exists(),
+                dir.path().join("ready").exists(),
+                "{name}: the descendant ran before the verdict"
+            );
+            std::fs::write(dir.path().join("go"), "").unwrap();
+            // A surviving writer polls every 20 ms; give it ample time to show itself.
+            std::thread::sleep(Duration::from_millis(1500));
+            assert!(
+                !dir.path().join("late").exists(),
                 "{name}: a descendant the validator backgrounded wrote after its verdict"
             );
         }
