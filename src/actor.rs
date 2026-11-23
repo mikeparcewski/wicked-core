@@ -857,6 +857,18 @@ pub(crate) fn run(
             return;
         }
     };
+    // (core#1795) Before any startup work: interaction rows written before they were named under
+    // their run are renamed, so a one-run read (the gate card's) reaches them by the name index.
+    match crate::interaction::name_rows_under_their_runs(&mut store) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("wicked-core: named {n} interaction request(s) under their run (core#1795)")
+        }
+        Err(e) => eprintln!(
+            "wicked-core: could not name interaction requests under their run (core#1795): {e:#}; \
+             a gate opened before this version may not be read until the next boot"
+        ),
+    }
 
     crate::gate_hook::gov_root_for_state_home(operational_home.as_deref());
     if let Err(why) = crate::gate_hook::gov_root_ready() {
