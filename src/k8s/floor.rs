@@ -97,13 +97,25 @@ impl Place {
 
     /// Run `argv` in `pod`, bounded: its stdout on success, else the reason.
     pub(crate) fn run(&self, pod: &str, argv: &[&str], limit: Duration) -> Result<String, String> {
+        self.run_coded(pod, argv, limit).map_err(|(_, e)| e)
+    }
+
+    /// [`Place::run`], its failure with kubectl's own exit code: the command's, or `None` when the
+    /// call was cut at `limit` or ended by a signal (core#1887: only a completed exit is the
+    /// command's own answer).
+    pub(crate) fn run_coded(
+        &self,
+        pod: &str,
+        argv: &[&str],
+        limit: Duration,
+    ) -> Result<String, (Option<i32>, String)> {
         let mut a: Vec<&str> = vec!["exec", "-c", CONTAINER, pod, "--"];
         a.extend(argv);
         let r = self.kube.call(Some(&self.ns), &a, None, limit);
         if r.ok() {
             Ok(String::from_utf8_lossy(&r.stdout).into_owned())
         } else {
-            Err(r.err_text())
+            Err((r.code, r.err_text()))
         }
     }
 

@@ -28,22 +28,28 @@ RUN apt-get update \
 # Chromium work there from /etc/chromium.d (headless, no Chromium sandbox, shared memory in /tmp).
 # Best effort only where the base's archive has no candidate for them (core#1888): an operator
 # base whose archive lacks them still builds, and its seats then have no browser. Any other failure
-# (a mirror error, a partial download) is retried once and then fails the build, because the image
-# is tagged by this file, the pin and the base: a browserless image would be reused until one of
-# them changes. A failed index fetch is an error, never a missing candidate
-# (APT::Update::Error-Mode=any: apt 2.1.16 and later; an older apt ignores the setting).
+# (a mirror error, a partial download, an apt-cache that cannot answer) is retried once and then
+# fails the build, because the image is tagged by this file, the pin and the base: a browserless
+# image would be reused until one of them changes. An index fetch that failed is a failed update,
+# never a missing candidate: apt 2.1.16 and later exit non-zero for it (APT::Update::Error-Mode=any;
+# an older apt ignores the setting), and an older apt's warning for it fails the update too.
 RUN set -e; \
-    apt_update() { apt-get update -o APT::Update::Error-Mode=any; }; \
+    apt_update() { \
+      rc=0; out=$(LC_ALL=C apt-get update -o APT::Update::Error-Mode=any 2>&1) || rc=$?; \
+      printf '%s\n' "$out"; \
+      [ "$rc" = 0 ] && ! printf '%s\n' "$out" | grep -Eq '^(W: (Failed to fetch|Some index files failed)|E: )'; \
+    }; \
     browser_install() { apt-get install -y chromium fonts-liberation ffmpeg --no-install-recommends; }; \
-    apt_update || { sleep 10; apt_update; }; \
+    apt_update || { sleep 10; apt_update; } || exit 1; \
     missing=""; \
     for p in chromium fonts-liberation ffmpeg; do \
-      LC_ALL=C apt-cache policy "$p" | grep -q '^ *Candidate: [^(]' || missing="$missing $p"; \
+      policy=$(LC_ALL=C apt-cache policy "$p") || exit 1; \
+      printf '%s\n' "$policy" | grep -q '^ *Candidate: [^(]' || missing="$missing $p"; \
     done; \
     if [ -n "$missing" ]; then \
       echo "wicked-seat: this base's archive has no$missing; its seats cannot take screenshots or sample video stills" >&2; \
     else \
-      browser_install || { sleep 10; apt_update && browser_install; }; \
+      browser_install || { sleep 10; apt_update && browser_install; } || exit 1; \
       if test -d /etc/chromium.d; then \
         printf '%s\n' 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --headless --no-sandbox --disable-dev-shm-usage --disable-gpu"' > /etc/chromium.d/wicked-seat; \
       else \

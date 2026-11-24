@@ -4505,11 +4505,12 @@ fn git_config_key_inert(key: &str) -> bool {
         )
 }
 
-/// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`) naming a pager that only prints.
-/// `less` is not one (core#1882): it runs `LESSOPEN`'s preprocessor on what git pipes into it
-/// (`|-`), and `more` and `less` read commands from their own environment.
+/// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`, `PAGER`) naming no pager at all:
+/// git pages only when the value is not exactly empty or `cat` (pager.c), so a padded `cat` is a
+/// shell command too. `less` is a program (core#1882): it runs `LESSOPEN`'s preprocessor on what
+/// git pipes into it (`|-`).
 fn git_pager_harmless(value: &str) -> bool {
-    matches!(value.trim(), "" | "cat")
+    matches!(value, "" | "cat")
 }
 
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder
@@ -4595,8 +4596,11 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
                 writes = true;
                 traces.extend(strip_shell_prefix(a, &format!("{name}=")));
             }
-        } else if name == "GIT_PAGER" {
+        } else if name == "GIT_PAGER" || name == "PAGER" {
             runs |= !git_pager_harmless(strip_one_quote_layer(value));
+        } else if name == "LESSOPEN" || name == "LESSCLOSE" {
+            // (core#1882) Commands git's default pager (`less`) runs.
+            runs = true;
         } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
             runs = true;
         }
@@ -10918,6 +10922,13 @@ mod tests {
             ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' git -c core.pager=less -C {r} -p log -1")),
             ("i1882", Advisory, format!("GIT_PAGER='less -FRX' git -C {r} -p log -1")),
             ("i1882", Advisory, format!("git -c pager.log=more -C {r} log -1")),
+            // (review r1) `PAGER` is git's pager when no git setting names one; `less` is its
+            // default, which runs a LESSOPEN set here; and only an exact `cat` turns paging off.
+            ("i1882", Advisory, format!("PAGER=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("GIT_PAGER=' cat ' git -C {r} log -1")),
+            ("i1882", Advisory, format!("git -c 'core.pager= cat' -C {r} log -1")),
+            ("i1882", Read, format!("PAGER=cat git -C {r} log -1")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (

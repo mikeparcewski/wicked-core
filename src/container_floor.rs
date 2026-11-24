@@ -4664,10 +4664,11 @@ esac
     }
 
     /// core#1888: the browser layer is best effort only where the base's archive has no candidate
-    /// for its packages. Any other failure (an index fetch, a partial download) is retried once and
-    /// then fails the build, so a passing mirror error never bakes a browserless image that is
-    /// reused until this file changes. The layer's own shell runs here, with `apt-get`,
-    /// `apt-cache` and `sleep` stand-ins and its system paths re-pointed into a scratch dir.
+    /// for its packages. Any other failure (an index fetch, a partial download, an apt-cache that
+    /// cannot answer) is retried once and then fails the build, so a passing mirror error never
+    /// bakes a browserless image that is reused until this file changes. The layer's own shell runs
+    /// here, with `apt-get`, `apt-cache` and `sleep` stand-ins and its system paths re-pointed into
+    /// a scratch dir.
     #[cfg(unix)]
     #[test]
     fn the_browser_layer_falls_back_only_when_the_archive_has_no_candidate_core1888() {
@@ -4689,19 +4690,31 @@ esac
                 "/var/lib/apt/lists",
                 &root.join("lists").display().to_string(),
             );
-        // `apt-get` logs each call and fails the next `<verb>-fails` times; a good install brings
-        // chromium's launcher dir. `apt-cache policy` answers as apt does: a package the archive
-        // lists with no installable version shows `Candidate: (none)`, an unknown one prints nothing.
+        // `apt-get` logs each call and answers its n-th call of a verb as the n-th word of
+        // `<verb>-plan` says: `fail` (an error exit), `warn` (an older apt's index fetch that
+        // failed: a warning, exit 0, and no index), anything else a success. A good update
+        // brings the index back, and a good install chromium's launcher dir. `apt-cache policy`
+        // answers as apt does: a package the archive lists with no installable version shows
+        // `Candidate: (none)`, an unknown one (or any, with no index) prints nothing.
         crate::test_env::install_stub(
             &bin.join("apt-get"),
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROOT/apt.log\"\n\
-             f=\"$ROOT/$1-fails\"; n=$(cat \"$f\" 2>/dev/null || echo 0)\n\
-             if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$f\"; echo \"E: $1 failed\" >&2; exit 100; fi\n\
-             [ \"$1\" != install ] || mkdir -p \"$ROOT/chromium.d\"\n",
+            "#!/bin/sh\nv=$1\nprintf '%s\\n' \"$*\" >> \"$ROOT/apt.log\"\n\
+             n=$(( $(cat \"$ROOT/$v-calls\" 2>/dev/null || echo 0) + 1 )); echo $n > \"$ROOT/$v-calls\"\n\
+             w=$(awk -v n=$n '{print $n}' \"$ROOT/$v-plan\" 2>/dev/null)\n\
+             if [ \"$w\" = fail ]; then echo \"E: $v failed\" >&2; exit 100; fi\n\
+             if [ \"$w\" = warn ]; then : > \"$ROOT/no-index\"; \
+             echo \"W: Failed to fetch http://deb.debian.org/debian/dists/trixie/InRelease  \
+             Temporary failure resolving 'deb.debian.org'\"; \
+             echo 'W: Some index files failed to download. They have been ignored, or old ones used instead.'; \
+             exit 0; fi\n\
+             if [ \"$v\" = update ]; then rm -f \"$ROOT/no-index\"; fi\n\
+             if [ \"$v\" = install ]; then mkdir -p \"$ROOT/chromium.d\"; fi\n",
         );
         crate::test_env::install_stub(
             &bin.join("apt-cache"),
             "#!/bin/sh\n[ \"$1\" = policy ] || exit 1\n\
+             if [ -e \"$ROOT/policy-fails\" ]; then echo 'E: Could not open file' >&2; exit 100; fi\n\
+             if [ -e \"$ROOT/no-index\" ]; then exit 0; fi\n\
              if grep -qx \"$2\" \"$ROOT/unknown\" 2>/dev/null; then exit 0; fi\n\
              c=1.0-1; if grep -qx \"$2\" \"$ROOT/none\" 2>/dev/null; then c='(none)'; fi\n\
              printf '%s:\\n  Installed: (none)\\n  Candidate: %s\\n  Version table:\\n' \"$2\" \"$c\"\n",
@@ -4711,8 +4724,12 @@ esac
             let _ = std::fs::remove_dir_all(root.join("chromium.d"));
             for f in [
                 "apt.log",
-                "update-fails",
-                "install-fails",
+                "update-calls",
+                "install-calls",
+                "update-plan",
+                "install-plan",
+                "no-index",
+                "policy-fails",
                 "none",
                 "unknown",
             ] {
@@ -4734,16 +4751,20 @@ esac
             let log = std::fs::read_to_string(root.join("apt.log")).unwrap_or_default();
             (
                 o.status.success(),
-                String::from_utf8_lossy(&o.stderr).into_owned(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
                 log.lines().map(str::to_string).collect(),
                 root.join("chromium.d/wicked-seat").is_file(),
             )
         };
-        let installs = |log: &[String]| log.iter().filter(|l| l.starts_with("install")).count();
+        let count = |log: &[String], verb: &str| log.iter().filter(|l| l.starts_with(verb)).count();
         // The archive has them: installed, and Chromium gets the seat flags.
-        let (ok, err, log, flags) = run(&[]);
-        assert!(ok && flags, "{err}");
-        assert_eq!(installs(&log), 1, "{log:?}");
+        let (ok, out, log, flags) = run(&[]);
+        assert!(ok && flags, "{out}");
+        assert_eq!(count(&log, "install"), 1, "{log:?}");
         // A failed index fetch is an error, never read as a missing package.
         assert!(
             log.iter()
@@ -4754,22 +4775,38 @@ esac
         // No candidate for one of them (listed with none, or not known at all): the image still
         // builds without a browser, says which is missing, and installs nothing.
         for (file, what) in [("none", "chromium"), ("unknown", "ffmpeg")] {
-            let (ok, err, log, flags) = run(&[(file, what)]);
-            assert!(ok && !flags, "{file}: {err}");
-            assert_eq!(installs(&log), 0, "{file}: {log:?}");
-            assert!(err.contains(what), "{file}: {err}");
+            let (ok, out, log, flags) = run(&[(file, what)]);
+            assert!(ok && !flags, "{file}: {out}");
+            assert_eq!(count(&log, "install"), 0, "{file}: {log:?}");
+            assert!(out.contains(&format!("has no {what}")), "{file}: {out}");
         }
-        // A passing install failure is retried; one that stays fails the build.
-        let (ok, err, log, flags) = run(&[("install-fails", "1")]);
-        assert!(ok && flags, "{err}");
-        assert_eq!(installs(&log), 2, "{log:?}");
-        let (ok, _, log, flags) = run(&[("install-fails", "2")]);
-        assert!(!ok && !flags, "{log:?}");
-        assert_eq!(installs(&log), 2, "{log:?}");
-        // So does an index fetch that keeps failing.
-        let (ok, _, log, _) = run(&[("update-fails", "2")]);
+        // A passing install failure is retried; one that stays fails the build, and so does a
+        // retry whose update fails (review r1: not a fall-through to a browserless image).
+        let (ok, out, log, flags) = run(&[("install-plan", "fail")]);
+        assert!(ok && flags, "{out}");
+        assert_eq!(count(&log, "install"), 2, "{log:?}");
+        for plan in [
+            [("install-plan", "fail fail"), ("update-plan", "ok ok")],
+            [("install-plan", "fail"), ("update-plan", "ok fail")],
+        ] {
+            let (ok, _, log, flags) = run(&plan);
+            assert!(!ok && !flags, "{plan:?}: {log:?}");
+        }
+        // An update that keeps failing fails the build before any query.
+        let (ok, _, log, _) = run(&[("update-plan", "fail fail")]);
         assert!(!ok, "{log:?}");
-        assert_eq!(installs(&log), 0, "{log:?}");
+        assert_eq!(count(&log, "install"), 0, "{log:?}");
+        // An older apt's failed index fetch (a warning, exit 0, no index) is a failed update: it
+        // is retried, and never read as "no candidate" (review r1).
+        let (ok, out, log, flags) = run(&[("update-plan", "warn")]);
+        assert!(ok && flags, "{out}");
+        assert_eq!(count(&log, "update"), 2, "{log:?}");
+        let (ok, out, log, flags) = run(&[("update-plan", "warn warn")]);
+        assert!(!ok && !flags, "{out}");
+        assert_eq!(count(&log, "install"), 0, "{log:?}");
+        // An apt-cache that cannot answer is no evidence of a missing package (review r1).
+        let (ok, out, _, flags) = run(&[("policy-fails", "")]);
+        assert!(!ok && !flags, "{out}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

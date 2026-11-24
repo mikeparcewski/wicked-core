@@ -1911,10 +1911,11 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     crate::test_env::install_stub(&npm, "#!/bin/sh\nexit 0\n");
     std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
     // With JAIL_ABI2 set, the jail proof answers as on a Landlock ABI v1/v2 kernel (core#1886):
-    // the open refused, the truncate allowed.
+    // the open refused, the truncate allowed. With JAIL_CRASH set, it does not run to an answer.
     crate::test_env::install_stub(
         &bin.join("python3"),
-        "#!/bin/sh\n[ -z \"$JAIL_ABI2\" ] || exit 5\nPATH=/usr/bin:/bin exec python3 \"$@\"\n",
+        "#!/bin/sh\n[ -z \"$JAIL_ABI2\" ] || exit 5\n[ -z \"$JAIL_CRASH\" ] || exit 9\n\
+         PATH=/usr/bin:/bin exec python3 \"$@\"\n",
     );
     crate::test_env::install_stub(
         &bin.join("node"),
@@ -2003,6 +2004,14 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     // A failed build is no refusal: a later unit may build again.
     let (code, _) = run_code(&[("GYP_FAILS", "1")]);
     assert_eq!(code, Some(1));
+    // So is a proof that did not run to an answer (review r1): nothing is built, and a later unit
+    // may try again.
+    let (code, out) = run_code(&[("JAIL_CRASH", "1")]);
+    assert!(
+        code == Some(1) && out.contains("the jail proof did not run (exit 9)"),
+        "{code:?} {out}"
+    );
+    assert!(!claim.join(NATIVE_BUILT).exists());
     assert!(
         !claim.join(NATIVE_BUILT).exists(),
         "a failed build leaves no marker"
@@ -2085,7 +2094,9 @@ fn a_native_build_note_is_the_scripts_reason_and_only_its_refusals_are_kept() {
         native_build_note(&jail),
         "Landlock is not in force in the build pod; nothing is built"
     );
-    assert!(native_build_refused(&jail));
+    assert!(native_build_refused(Some(NATIVE_REFUSED), &jail));
+    // Cut at its deadline, kubectl has no exit code, whatever the build printed last (review r1).
+    assert!(!native_build_refused(None, &jail));
     // node-gyp's own failure: its last line, never kubectl's; and a build may be tried again.
     let gyp = exec(
         "gyp ERR! build error\ngyp ERR! stack Error: `make` failed with exit code: 2\n",
@@ -2095,7 +2106,7 @@ fn a_native_build_note_is_the_scripts_reason_and_only_its_refusals_are_kept() {
         native_build_note(&gyp),
         "gyp ERR! stack Error: `make` failed with exit code: 2"
     );
-    assert!(!native_build_refused(&gyp));
+    assert!(!native_build_refused(Some(1), &gyp));
     // The script's last `wicked-core:` line wins over output after it.
     let built = exec(
         "wicked-core: no node-gyp beside npm (/usr/bin/npm)\nls: cannot access 'x': No such file",
@@ -2115,8 +2126,8 @@ fn a_native_build_note_is_the_scripts_reason_and_only_its_refusals_are_kept() {
         &format!("command terminated with exit code {NATIVE_REFUSED}"),
         1,
     );
-    assert!(!native_build_refused(&spoof));
-    assert!(!native_build_refused("kubectl timed out"));
+    assert!(!native_build_refused(Some(1), &spoof));
+    assert!(!native_build_refused(None, "kubectl timed out"));
 }
 
 /// core#1886, core#1887: a seat claim's native build through `build_native`, against a stand-in
