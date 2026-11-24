@@ -8548,7 +8548,8 @@ pub(crate) fn read_line_capped(
     }
 }
 
-#[cfg(test)]
+// Its test callers are all unix-only (process groups, `/bin/sh` stubs).
+#[cfg(all(test, unix))]
 pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,

@@ -13,6 +13,7 @@ fn s(v: &[&str]) -> Vec<String> {
 /// A prompt of `size` bytes or a little more, with newlines, quotes, a leading dash, shell
 /// metacharacters, non-ASCII and leading and trailing whitespace, so a byte that is re-quoted,
 /// split, trimmed or dropped shows.
+#[cfg(unix)]
 fn prompt_of(size: usize) -> String {
     let mut p = String::from("  -not an option\n\"quoted\" 'single' $HOME `tick` \\ back\n");
     while p.len() < size {
@@ -23,6 +24,7 @@ fn prompt_of(size: usize) -> String {
 }
 
 /// J6 v3's largest writer calls are about 150 KB.
+#[cfg(unix)]
 fn big_prompt() -> String {
     prompt_of(150 * 1024)
 }
