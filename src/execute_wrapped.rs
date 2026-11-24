@@ -3662,7 +3662,23 @@ impl WrappedCliStepRunner {
                     })
             });
         let mut ask_enabled = gateway_ok && crate::seat_gateway::mcp_route_ready();
-        let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
+        // (DES-j6-build C0a) A prompt handed on stdin: the argv keeps only its stdin form
+        // (`stdin_prompt_argv`), and the prompt's bytes are fed to the spawned command.
+        let on_stdin = prompt_on_stdin();
+        let mut argv = build_argv(
+            &invocation,
+            if on_stdin { STDIN_PROMPT_SLOT } else { &prompt },
+            &input.unit.allowed_skills,
+        );
+        let argv_prompt: Option<String> = if on_stdin {
+            match stdin_prompt_argv(&mut argv, seat_cli) {
+                Ok(p) => p,
+                Err(why) => return stdin_refusal(input, &why),
+            }
+        } else {
+            Some(prompt.clone())
+        };
+        let stdin_body = on_stdin.then(|| prompt.clone().into_bytes());
         // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
         // read-only lever — folded into the governance disclosure so the record says which
         // control is actually holding the line (the post-hoc worktree guard, not the posture).
@@ -3726,7 +3742,7 @@ impl WrappedCliStepRunner {
                 &mut argv,
                 &invocation,
                 handed.map(|s| s.root.as_path()),
-                Some(&prompt),
+                argv_prompt.as_deref(),
                 operational_home,
                 // The tree the unit runs in, so its `CLAUDE.md` loads (the env half is set at the
                 // spawn below). A member turn's repository view rides here instead: under
@@ -4371,7 +4387,7 @@ impl WrappedCliStepRunner {
                     }
                     narrow_container_fence(
                         &mut [],
-                        Some(prompt.as_str()),
+                        argv_prompt.as_deref(),
                         fence_settings.as_deref(),
                         handed.map(|s| s.root.as_path()),
                         operational_home,
@@ -4387,7 +4403,7 @@ impl WrappedCliStepRunner {
                     input.unit.ord,
                     &read_roots,
                     member_view.as_deref(),
-                    Some(prompt.as_str()),
+                    argv_prompt.as_deref(),
                     gateway_dir.as_deref(),
                     &mut on_built,
                     &mut before_copy,
@@ -4426,7 +4442,7 @@ impl WrappedCliStepRunner {
                         if is_claude {
                             if let Err(why) = narrow_container_fence(
                                 &mut c.argv,
-                                Some(prompt.as_str()),
+                                argv_prompt.as_deref(),
                                 None,
                                 handed.map(|s| s.root.as_path()),
                                 operational_home,
@@ -5066,7 +5082,14 @@ impl WrappedCliStepRunner {
                     let cwd = cmd.get_current_dir().map(Path::to_path_buf);
                     crate::hook_relay::register(t, crate::hook_relay::HookContext { env, cwd })
                 });
-            let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
+            let bounded = run_bounded_fed(
+                cmd,
+                stdin_body,
+                timeout,
+                emit,
+                adapter,
+                Some(cancel_token.clone()),
+            );
             // Revoking waits for the unit's calls still being judged, so its decisions log is
             // complete here; a refusal the relay could not record in it fails the unit (below).
             let unrecorded_refusal = hook_registration.is_some_and(|r| r.finish());
@@ -8091,6 +8114,14 @@ pub(crate) fn seat_model_refused(input: &StepInput, cli_key: &str, why: &str) ->
     }
 }
 
+/// (DES-j6-build C0a) A unit whose prompt was to ride stdin, refused before anything spawned.
+fn stdin_refusal(input: &StepInput, why: &str) -> StepOutput {
+    StepOutput {
+        output: format!("(the prompt could not be handed on stdin: {why})"),
+        ..posture_refusal(input, why)
+    }
+}
+
 pub(crate) fn posture_refusal(input: &StepInput, why: &str) -> StepOutput {
     StepOutput {
         run_id: input.run_id.clone(),
@@ -8359,6 +8390,94 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
 thread_local! {
     /// (core#1290) The retained-stdout cap this thread's caller set ([`with_stdout_cap`]).
     static STDOUT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// (DES-j6-build C0a) Whether this thread's caller asked for the prompt on stdin
+    /// ([`with_prompt_on_stdin`]).
+    static PROMPT_ON_STDIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// (DES-j6-build C0a) Run `f` with every unit the wrapped runner launches on THIS thread handed
+/// its prompt on stdin instead of argv when `on` (else on argv, as without the switch): the prompt's bytes exactly as argv would have carried
+/// them, at any size, on the host floor and in a seat pod alike, with no file pointer (a
+/// tool-less seat cannot read a file). The argv form is [`stdin_prompt_argv`]. A carried
+/// council ballot sets it for a seat that reads stdin, and for every model call.
+pub(crate) fn with_prompt_on_stdin<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROMPT_ON_STDIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(PROMPT_ON_STDIN.with(|c| c.replace(on)));
+    f()
+}
+
+pub(crate) fn prompt_on_stdin() -> bool {
+    PROMPT_ON_STDIN.with(|c| c.get())
+}
+
+/// The token [`build_argv`] places for a prompt that rides stdin, replaced by
+/// [`stdin_prompt_argv`] before anything else reads the argv (a NUL-free control string no
+/// template or prompt could hold as a whole argument).
+const STDIN_PROMPT_SLOT: &str = "\u{1}wicked-prompt-on-stdin\u{1}";
+
+/// (DES-j6-build C0a) The argv of a unit whose prompt rides stdin, from the argv
+/// [`build_argv`] built with [`STDIN_PROMPT_SLOT`] as its prompt. Two seats are converted, each by
+/// its own verified rule: claude gets no prompt argument (`claude -p` reads its prompt from stdin
+/// when none is given; `-p`/`--print` takes no value), and an option guard left last goes with
+/// it; codex gets `-` (`codex exec` reads its prompt from stdin then), or keeps the `-` its
+/// template already states. Returns the prompt token as it now stands on argv (`Some("-")` or
+/// `None`), for the later steps that keep their flags clear of it. `Err` for any other seat
+/// (each reads stdin its own way: pi trims it, copilot's `-p` needs a value, agy's carrier needs
+/// argv), and for a template that places the prompt more than once or joins it to other text.
+pub(crate) fn stdin_prompt_argv(
+    argv: &mut Vec<String>,
+    seat: wicked_apps_core::spawn::SeatCli,
+) -> Result<Option<String>, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    if !matches!(seat, SeatCli::Claude | SeatCli::Codex) {
+        return Err(format!(
+            "only claude and codex seats take their prompt on stdin, not {}",
+            argv.first().map(String::as_str).unwrap_or("this seat")
+        ));
+    }
+    if argv
+        .iter()
+        .any(|a| a != STDIN_PROMPT_SLOT && a.contains(STDIN_PROMPT_SLOT))
+    {
+        return Err(
+            "the seat's invocation template joins {PROMPT} to other text in one \
+                    argument; a prompt on stdin needs `{PROMPT}` as its own argument"
+                .into(),
+        );
+    }
+    let slots: Vec<usize> = (0..argv.len())
+        .filter(|&i| argv[i] == STDIN_PROMPT_SLOT)
+        .collect();
+    let [at] = slots[..] else {
+        return Err(format!(
+            "the seat's invocation template places the prompt {} times; a prompt on stdin needs \
+             exactly one `{{PROMPT}}`",
+            slots.len()
+        ));
+    };
+    if seat == SeatCli::Codex {
+        // A template that already reads stdin (`codex exec -`, with the slot appended after it, or
+        // `codex exec {PROMPT} -`): the slot goes, with a guard `build_argv` put before it.
+        if argv.iter().enumerate().any(|(i, a)| i != at && a == "-") {
+            argv.remove(at);
+            if at == argv.len() && argv.last().is_some_and(|a| a == "--") {
+                argv.pop();
+            }
+        } else {
+            argv[at] = "-".to_string();
+        }
+        return Ok(Some("-".to_string()));
+    }
+    argv.remove(at);
+    if at == argv.len() && argv.last().is_some_and(|a| a == "--") {
+        argv.pop();
+    }
+    Ok(None)
 }
 
 /// The stdout cap [`with_stdout_cap`] set on this thread, if any (tests read what a runner saw).
@@ -8429,13 +8548,32 @@ pub(crate) fn read_line_capped(
     }
 }
 
+// Its test callers are all unix-only (process groups, `/bin/sh` stubs).
+#[cfg(all(test, unix))]
 pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,
     emit: &DeltaSink,
-    mut adapter: Box<dyn OutputAdapter>,
+    adapter: Box<dyn OutputAdapter>,
     // crew#277: flipped by `cancel_run_workers` when the run terminates (cancel included) —
     // the poll loop kills the child instead of letting it orphan past the run's death.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> std::io::Result<BoundedRun> {
+    run_bounded_fed(cmd, None, timeout, emit, adapter, cancel)
+}
+
+/// [`run_bounded`], with `stdin` (when given) written to the child's stdin and then closed
+/// (DES-j6-build C0a: a prompt handed on stdin, [`with_prompt_on_stdin`]). The same pipe is fed
+/// whether the command is the host CLI or a seat pod's `kubectl exec -i` client, whose stdin the
+/// pod's wrapper and launcher hand on to the CLI. A feeder thread writes it, so a CLI that prints
+/// before it has read all of its input never deadlocks the pipes; a CLI that exits without
+/// reading ends the feed (the write fails, and is dropped).
+pub(crate) fn run_bounded_fed(
+    cmd: Command,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    emit: &DeltaSink,
+    mut adapter: Box<dyn OutputAdapter>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<BoundedRun> {
     // Pre-spawn guard (core#358): a token born cancelled means `ReassignUnit` landed in the
@@ -8484,14 +8622,16 @@ pub(crate) fn run_bounded(
             .as_ref()
             .map(|s| crate::container_floor::SeatContainer { name: s.id.clone() }),
     );
-    // agy: a pipe, closed below at once (EOF), never `/dev/null` (see the predicate).
-    let piped_stdin = match &pod_seat {
-        Some(seat) => {
-            wicked_apps_core::spawn::SeatCli::from_binary(&seat.cli)
-                == wicked_apps_core::spawn::SeatCli::Agy
-        }
-        None => crate::container_floor::stdin_must_be_a_pipe(&cmd),
-    };
+    // agy: a pipe, closed below at once (EOF), never `/dev/null` (see the predicate). A fed
+    // prompt: a pipe on either command.
+    let piped_stdin = stdin.is_some()
+        || match &pod_seat {
+            Some(seat) => {
+                wicked_apps_core::spawn::SeatCli::from_binary(&seat.cli)
+                    == wicked_apps_core::spawn::SeatCli::Agy
+            }
+            None => crate::container_floor::stdin_must_be_a_pipe(&cmd),
+        };
     cmd.stdin(if piped_stdin {
         Stdio::piped()
     } else {
@@ -8510,7 +8650,21 @@ pub(crate) fn run_bounded(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
-    drop(child.stdin.take());
+    let feed = match (stdin, child.stdin.take()) {
+        (Some(body), Some(pipe)) => Some(PromptFeed::start(pipe, body)),
+        (Some(_), None) => {
+            // Unreachable (`piped_stdin` above): the prompt is never dropped silently.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(
+                "the seat was launched without the stdin pipe its prompt needs",
+            ));
+        }
+        (None, pipe) => {
+            drop(pipe);
+            None
+        }
+    };
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
@@ -8710,11 +8864,122 @@ pub(crate) fn run_bounded(
         }
         k => k,
     };
+    // (C0a) The child has ended: a prompt its stdin did not take whole is stopped here, never
+    // left blocked on a pipe a descendant holds, and an exit 0 that did not take it is no answer.
+    // (A pipe that took every byte cannot say the seat read them, any more than argv can: the
+    // short feed is the failure this can see. Every return above drops `feed`, which stops it.)
+    let unfed = feed.and_then(PromptFeed::finish);
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))
+    } else if let Some(why) = unfed.filter(|_| code == 0) {
+        Ok((
+            1,
+            out,
+            format!("(wicked-core) {why}\n{err}"),
+            usage,
+            files,
+            tools,
+        ))
     } else {
         Ok((code, out, err, usage, files, tools))
+    }
+}
+
+/// (DES-j6-build C0a) A prompt written to a child's stdin by its own thread, so a CLI that prints
+/// before it has read all of its input never deadlocks the pipes. On unix the write end is
+/// non-blocking and the thread stops when asked. Ending the feed (`finish`, or a drop on any
+/// early return) never waits more than [`FEED_GRACE`] for the thread: where a write can block (no
+/// non-blocking pipe: Windows) on a pipe a descendant holds open without reading, the thread is
+/// left to end with that pipe and the launch is not held.
+struct PromptFeed {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+/// How long ending a feed waits for its thread to see the stop.
+const FEED_GRACE: Duration = Duration::from_secs(2);
+
+impl PromptFeed {
+    fn start(mut pipe: std::process::ChildStdin, body: Vec<u8>) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = pipe.as_raw_fd();
+            // SAFETY: `fd` is this process's own open write end of the child's stdin pipe, owned
+            // by `pipe` for the whole call; F_GETFL/F_SETFL only read and set its status flags.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halt = stop.clone();
+        let handle = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut at = 0;
+            while at < body.len() {
+                if halt.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match pipe.write(&body[at..]) {
+                    Ok(0) => break,
+                    Ok(n) => at += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(pipe);
+            if at == body.len() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the seat ended before it took its whole prompt on stdin ({at} of {} bytes)",
+                    body.len()
+                ))
+            }
+        });
+        PromptFeed {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the feed (the child has ended) and say why the prompt was not handed over whole, if not.
+    fn finish(mut self) -> Option<String> {
+        self.end()
+    }
+
+    fn end(&mut self) -> Option<String> {
+        let handle = self.handle.take()?;
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + FEED_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !handle.is_finished() {
+            return Some(
+                "the seat ended before it took its whole prompt on stdin (its feed is blocked on \
+                 a pipe a descendant holds)"
+                    .to_string(),
+            );
+        }
+        match handle.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(why)) => Some(why),
+            Err(_) => Some("the prompt's stdin feed panicked".to_string()),
+        }
+    }
+}
+
+impl Drop for PromptFeed {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 
@@ -9373,6 +9638,11 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 #[cfg(test)]
 #[path = "execute_wrapped_agy_tests.rs"]
 mod agy_tests;
+
+/// (DES-j6-build C0a) A prompt handed on stdin, on the host floor and through a seat pod.
+#[cfg(test)]
+#[path = "execute_wrapped_stdin_tests.rs"]
+mod stdin_tests;
 
 #[cfg(test)]
 mod tests {

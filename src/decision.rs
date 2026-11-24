@@ -62,6 +62,9 @@ pub(crate) struct SeatBallots {
     inflight: BallotReaper,
     /// How long a cancelled ballot is given to stop before its timeout is reported.
     drain: std::time::Duration,
+    /// (DES-j6-build C0a) Hand every ballot's prompt on stdin, whatever the seat's input mode
+    /// ([`SeatBallots::prompt_on_stdin`]).
+    stdin: bool,
 }
 
 /// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
@@ -134,7 +137,17 @@ impl SeatBallots {
             parent_run_id: parent_run_id.map(str::to_string),
             inflight: BallotReaper::default(),
             drain: BALLOT_CANCEL_DRAIN,
+            stdin: false,
         }
+    }
+
+    /// (DES-j6-build C0a) Hand every ballot its prompt on stdin
+    /// ([`crate::execute_wrapped::with_prompt_on_stdin`]): byte-exact at any size, on the host
+    /// floor and in a seat container alike, never as a file the seat is told to read.
+    #[allow(dead_code)] // the model-call channel's switch (DES-j6-build C0, core#1894)
+    pub(crate) fn prompt_on_stdin(mut self) -> Self {
+        self.stdin = true;
+        self
     }
 
     /// (core#1290) The handle that reaps this carrier's ballots.
@@ -180,9 +193,11 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         use crate::workflow::StepStatus;
         use wicked_council::types::{BallotRun, InputMode, SeatFailure, SeatFailureKind};
         // The seat's carrier hands the prompt on argv (`{PROMPT}`), as it does for every worker
-        // and judge; a seat registered to read it from stdin or a file would get the wrong
-        // input, so it is refused by name instead (every shipped seat is `PromptArg`).
-        if cli.input_mode != InputMode::PromptArg {
+        // and judge, or (C0a) on stdin: for a seat registered to read it there, and for every
+        // ballot of a carrier set to ([`SeatBallots::prompt_on_stdin`]). A seat registered to
+        // read it from a file or a terminal session would get the wrong input, so it is refused
+        // by name instead.
+        if !matches!(cli.input_mode, InputMode::PromptArg | InputMode::Stdin) {
             return Err(SeatFailure::new(
                 if cli.input_mode == InputMode::PtySession {
                     SeatFailureKind::PtyUnsupported
@@ -191,11 +206,12 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
                 },
                 format!(
                     "seat `{}` reads its prompt as {:?}; a ballot in a seat container is handed \
-                     its prompt on the command line only",
+                     its prompt on the command line or on stdin only",
                     cli.key, cli.input_mode
                 ),
             ));
         }
+        let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
         let run_id = ballot_run_id(task_id, &cli.key);
         let mut unit = crate::domain::WorkUnit::pending(
             crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
@@ -230,7 +246,11 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         // as it reads (`execute_wrapped::with_stdout_cap`, on this ballot's own thread).
         let ballot = std::thread::spawn(move || {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::execute_wrapped::with_stdout_cap(stdout_cap, || runner.run_unit(&input))
+                crate::execute_wrapped::with_stdout_cap(stdout_cap, || {
+                    crate::execute_wrapped::with_prompt_on_stdin(on_stdin, || {
+                        runner.run_unit(&input)
+                    })
+                })
             }));
             let _ = tx.send(out);
         });
@@ -1955,6 +1975,8 @@ mod tests {
         parents: std::sync::Mutex<Vec<Option<String>>>,
         /// The stdout cap each run saw on its own thread (core#1290).
         caps: std::sync::Mutex<Vec<Option<usize>>>,
+        /// Whether each run was asked for its prompt on stdin (C0a).
+        stdin: std::sync::Mutex<Vec<bool>>,
     }
 
     impl crate::workflow::StepRunner for SlowSeat {
@@ -1968,6 +1990,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(crate::execute_wrapped::current_stdout_cap());
+            self.stdin
+                .lock()
+                .unwrap()
+                .push(crate::execute_wrapped::prompt_on_stdin());
             std::thread::sleep(self.delay);
             crate::workflow::StepOutput {
                 run_id: i.run_id.clone(),
@@ -1993,6 +2019,7 @@ mod tests {
             cancels: AtomicUsize::new(0),
             parents: Default::default(),
             caps: Default::default(),
+            stdin: Default::default(),
         })
     }
 
@@ -2143,14 +2170,55 @@ mod tests {
         );
     }
 
-    /// codex council-r1: the seat carrier hands the prompt on the command line, so a seat that
-    /// reads it another way is refused by name before anything runs.
+    /// (C0a) A ballot hands its prompt on stdin for a seat that reads it there, and for every
+    /// ballot of a carrier set to; an argv seat on a plain carrier keeps argv. The switch is the
+    /// ballot thread's own: the council's thread never carries it.
+    #[test]
+    fn a_seat_ballot_hands_its_prompt_on_stdin_to_a_stdin_seat_and_when_asked() {
+        use wicked_council::types::{BallotCarrier, InputMode};
+        let runner = slow(0);
+        let mut stdin_seat = seat("pi");
+        stdin_seat.input_mode = InputMode::Stdin;
+        let ask = |carrier: SeatBallots, s: &AgenticCli| {
+            carrier
+                .run_ballot(
+                    s,
+                    "t-stdin",
+                    "ballot",
+                    std::time::Duration::from_secs(5),
+                    None,
+                    1024,
+                )
+                .expect("the seat answered");
+        };
+        ask(SeatBallots::new(runner.clone(), None), &seat("pi"));
+        ask(SeatBallots::new(runner.clone(), None), &stdin_seat);
+        ask(
+            SeatBallots::new(runner.clone(), None).prompt_on_stdin(),
+            &seat("pi"),
+        );
+        assert_eq!(*runner.stdin.lock().unwrap(), vec![false, true, true]);
+        assert!(!crate::execute_wrapped::prompt_on_stdin());
+    }
+
+    /// codex council-r1: the seat carrier hands the prompt on the command line or on stdin, so a
+    /// seat that reads it from a file or a terminal session is refused by name before anything
+    /// runs, whether or not the carrier hands every prompt on stdin.
     #[test]
     fn a_seat_ballot_refuses_a_seat_that_does_not_read_its_prompt_from_argv() {
         use wicked_council::types::{BallotCarrier, InputMode, SeatFailureKind};
         let runner = slow(0);
-        let carrier = SeatBallots::new(runner.clone(), None);
-        for mode in [InputMode::Stdin, InputMode::AtFile, InputMode::PtySession] {
+        for (carrier, mode) in [false, true].into_iter().flat_map(|stdin| {
+            [
+                InputMode::AtFile,
+                InputMode::MessageFile,
+                InputMode::PtySession,
+            ]
+            .map(|m| {
+                let c = SeatBallots::new(runner.clone(), None);
+                (if stdin { c.prompt_on_stdin() } else { c }, m)
+            })
+        }) {
             let mut s = seat("pi");
             s.input_mode = mode;
             let f = carrier
@@ -2163,7 +2231,7 @@ mod tests {
                     1024,
                 )
                 .unwrap_err();
-            assert!(f.detail.contains("command line only"), "{f:?}");
+            assert!(f.detail.contains("command line or on stdin only"), "{f:?}");
             if mode == InputMode::PtySession {
                 assert_eq!(f.kind, SeatFailureKind::PtyUnsupported);
             }
