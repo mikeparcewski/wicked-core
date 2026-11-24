@@ -449,6 +449,62 @@ fn view_init(floor_image: &str, sub: &str) -> Value {
     })
 }
 
+/// The size limit of a seat pod's native addon build dir (core#1406), as the floor pod's.
+pub(crate) const NATIVE_BUILD_SIZE: &str = "1Gi";
+
+/// (core#1406) The init container that builds a seat's declared native addons (`native`, the
+/// allowlist's own spelling) before the seat starts: the floor's own native-build step
+/// ([`crate::repo_checks::native_build_argv`]: node-gyp beside the image's npm, against its own
+/// node's headers, no download and no npm lifecycle) run in the SEAT image, so the binding matches
+/// the node the seat loads it with. It has the seat's own mounts (its tree, the read-only claim,
+/// scratch and home) plus the build dirs (`builds`, which the seat mounts too); never the floor,
+/// the canary, the unit dir or the tool caches. It runs as the seat's uid, hardened as the seat,
+/// on the pod's network (the seat's: the gateway only); the build needs none. A build that
+/// fails leaves the addon unbuilt, as before, and never keeps the seat from starting: the init
+/// says why in its log and exits 0.
+fn native_build_init(
+    s: &SeatPod,
+    tree: &Path,
+    seat_mounts: &[Value],
+    builds: &[Value],
+    native: &[&str],
+) -> Value {
+    let mut mounts: Vec<Value> = seat_mounts
+        .iter()
+        .filter(|m| {
+            let name = m["name"].as_str().unwrap_or("");
+            !matches!(name, "floor" | "canary" | "unit") && !name.starts_with("nmw")
+        })
+        .cloned()
+        .collect();
+    mounts.extend(builds.iter().cloned());
+    let argv = crate::repo_checks::native_build_argv(native);
+    let script = format!(
+        "({}) || echo \"wicked-core: the seat's native addons ({}) did not build; a test that \
+         loads them fails in this seat\" >&2; exit 0",
+        argv[2],
+        native.join(", ")
+    );
+    json!({
+        "name": "native-build",
+        "image": s.image,
+        "imagePullPolicy": "Never",
+        "command": [argv[0], argv[1], script],
+        "workingDir": tree.to_string_lossy(),
+        "env": [
+            {"name": "HOME", "value": "/home/seat"},
+            {"name": "TMPDIR", "value": "/tmp"},
+            {"name": "LANG", "value": "C.UTF-8"},
+        ],
+        "securityContext": hardened_context(),
+        "resources": {
+            "requests": {"memory": s.memory_request, "cpu": s.cpu_request},
+            "limits": {"memory": s.memory_limit},
+        },
+        "volumeMounts": mounts,
+    })
+}
+
 /// The init container that copies the engine's trusted launcher files out of the floor image
 /// into the pod's read-only `/floor` (a cri-dockerd pod has no image volume).
 fn floor_init(floor_image: &str) -> Value {
@@ -583,6 +639,42 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         for i in 0..NM_WRITABLE.len() {
             extra_volumes.push(json!({"name": format!("nmw{i}"),
                 "emptyDir": {"medium": "Memory", "sizeLimit": NM_WRITABLE_SIZE}}));
+        }
+        // (core#1406) The declared native addons the claim was filled for: each one's `build/`
+        // (empty in the claim) is this pod's own dir, where an init builds it offline with the
+        // floor's own native-build step before the seat starts, as each floor pod does (core#1393).
+        let native = crate::checks_container::seat_claim_native(claim);
+        if !native.is_empty() {
+            let builds: Vec<Value> = native
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    json!({"name": format!("nmb{i}"),
+                        "mountPath": at.join(n).join("build").to_string_lossy()})
+                })
+                .collect();
+            for i in 0..native.len() {
+                extra_volumes.push(json!({"name": format!("nmb{i}"),
+                    "emptyDir": {"sizeLimit": NATIVE_BUILD_SIZE}}));
+            }
+            let seat_mounts = spec
+                .pointer("/containers/0/volumeMounts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let init = native_build_init(s, tree, &seat_mounts, &builds, &native);
+            if let Some(m) = spec
+                .pointer_mut("/containers/0/volumeMounts")
+                .and_then(Value::as_array_mut)
+            {
+                m.extend(builds);
+            }
+            if let Some(i) = spec
+                .pointer_mut("/initContainers")
+                .and_then(Value::as_array_mut)
+            {
+                i.push(init);
+            }
         }
     }
     if let Some(v) = spec["volumes"].as_array_mut() {

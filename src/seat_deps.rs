@@ -424,7 +424,148 @@ pub(crate) fn install_argv(platform: &SeatPlatform) -> Vec<String> {
 /// Make `worktree`'s dependencies present for `platform` (see the module doc). `git_dir` is the
 /// run's pinned git dir (the unit's worktree baseline carries it); `None` installs nothing. Runs
 /// the install on the calling thread; call it off the actor.
+///
+/// (core#1406) Once the dependencies are in place, the repository's declared native addons
+/// (`native_rebuild` in `.wicked/checks.json`) are built in the worktree's `node_modules` with the
+/// floor's own native-build step ([`crate::repo_checks::native_build_argv`]: offline, no npm
+/// lifecycle), under the floor's sandbox, unless their binding is there already. The install runs
+/// with scripts off, so without this a seat's `better-sqlite3` has no binding and its suite
+/// cannot load it. What happened is said in the platform label the seat and the stream read.
 pub(crate) fn provision(
+    worktree: &Path,
+    git_dir: Option<&Path>,
+    run_id: &str,
+    platform: &SeatPlatform,
+) -> Provisioned {
+    match install(worktree, git_dir, run_id, platform) {
+        Provisioned::AlreadyFor(label) => {
+            Provisioned::AlreadyFor(with_native(worktree, run_id, platform, label))
+        }
+        Provisioned::Installed {
+            platform: label,
+            argv,
+            duration_ms,
+            restored,
+        } => Provisioned::Installed {
+            platform: with_native(worktree, run_id, platform, label),
+            argv,
+            duration_ms,
+            restored,
+        },
+        other => other,
+    }
+}
+
+/// (core#1406) The native addons `worktree`'s `.wicked/checks.json` declares (validated against
+/// the floor's allowlist, so the names are the engine's own spelling). No config is none; a config
+/// that is a link, not a regular file, or does not parse is an error.
+fn declared_native(worktree: &Path) -> Result<Vec<&'static str>, String> {
+    let path = worktree.join(crate::repo_checks::CONFIG_PATH);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("it could not be read: {e}")),
+    };
+    if !meta.is_file() || meta.len() > 1 << 20 {
+        return Err("it is not a regular file".into());
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("it could not be read: {e}"))?;
+    crate::repo_checks::native_rebuild_in(&raw)
+}
+
+/// Whether `name`'s binding is built in `worktree`'s `node_modules` (a `build/Release/*.node`,
+/// what the native-build step requires).
+fn binding_built(worktree: &Path, name: &str) -> bool {
+    std::fs::read_dir(
+        worktree
+            .join("node_modules")
+            .join(name)
+            .join("build/Release"),
+    )
+    .is_ok_and(|d| {
+        d.flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "node"))
+    })
+}
+
+/// (core#1406) Build `worktree`'s declared native addons for the seat (see [`provision`]) and
+/// return `label` with what happened, for the stream and the seat's context.
+fn with_native(worktree: &Path, run_id: &str, platform: &SeatPlatform, label: String) -> String {
+    let native = match declared_native(worktree) {
+        Ok(n) if n.is_empty() => return label,
+        Ok(n) => n,
+        Err(e) => {
+            return format!(
+                "{label}; the native addons were not built: `{}`: {e}",
+                crate::repo_checks::CONFIG_PATH
+            )
+        }
+    };
+    let names = native.join(", ");
+    if native.iter().all(|n| binding_built(worktree, n)) {
+        return format!("{label}; {names} built natively");
+    }
+    if platform.foreign {
+        return format!(
+            "{label}; {names} not built: this host cannot build a binding for {}",
+            platform.label()
+        );
+    }
+    let scratch = match CheckScratch::prepare_for(worktree, Some(run_id)) {
+        Ok(s) => s,
+        Err(e) => return format!("{label}; {names} not built: the build scratch: {e}"),
+    };
+    let sandbox = crate::repo_checks::floor_sandbox(&[
+        worktree.to_path_buf(),
+        scratch.tmp_path().to_path_buf(),
+        scratch.root().to_path_buf(),
+    ]);
+    if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
+        return format!(
+            "{label}; {names} not built: the floor's sandbox does not arm on this host"
+        );
+    }
+    let check = RepoCheck {
+        name: "seat-native-build".into(),
+        argv: crate::repo_checks::native_build_argv(&native),
+        source: format!(
+            "{} native_rebuild ({names})",
+            crate::repo_checks::CONFIG_PATH
+        ),
+        timeout_s: Some(INSTALL_TIMEOUT_S),
+        dir: String::new(),
+    };
+    let run = crate::repo_checks::run_one_with(
+        worktree,
+        None,
+        &check,
+        &ExecOpts::default(),
+        &sandbox,
+        &scratch,
+        Tree::Head,
+    );
+    if run.exit_code == Some(0) {
+        format!("{label}; {names} built natively")
+    } else {
+        let tail = format!("{}{}", run.stdout_tail, run.stderr_tail);
+        let last = tail
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        format!(
+            "{label}; {names} did not build natively ({}), so a test that loads it fails in this \
+             seat: {last}",
+            run.spawn_error.clone().unwrap_or_else(|| format!(
+                "exit {}",
+                run.exit_code.map_or("none".into(), |c| c.to_string())
+            ))
+        )
+    }
+}
+
+/// [`provision`]'s install: the dependencies, without the native build.
+fn install(
     worktree: &Path,
     git_dir: Option<&Path>,
     run_id: &str,
@@ -946,5 +1087,197 @@ pub(crate) mod tests {
             provision(&wt, Some(&gd), "r", &SeatPlatform::host()),
             Provisioned::AlreadyFor(_)
         ));
+    }
+
+    /// core#1406: a repository that declares `native_rebuild` (crew: better-sqlite3) gets its
+    /// addon built for the seat: the install runs with scripts off, then the floor's own
+    /// native-build step builds the binding in the worktree's node_modules, offline, under the
+    /// floor's sandbox, and the seat's `require` loads it. The fixture is a real node-gyp addon
+    /// installed from a tarball under the allowlisted name (npm installs a tarball as a copy, as it
+    /// installs a registry package: never a link), so nothing is downloaded. A second unit finds
+    /// the binding and builds nothing; an undeclared addon stays unbuilt, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_native_addon_is_built_for_the_seat_and_its_binding_loads() {
+        if !installs_here() {
+            return;
+        }
+        let tmp = crate::repo_checks::tests::scratch("seat-deps-native");
+        let wt = tmp.join("wt");
+        let pkg = tmp.join("src/package");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"better-sqlite3","version":"1.0.0","main":"index.js","gypfile":true,
+"scripts":{"install":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("binding.gyp"),
+            r#"{"targets":[{"target_name":"probe","sources":["probe.c"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("probe.c"),
+            "#include <node_api.h>\n\
+             static napi_value init(napi_env env, napi_value exports) {\n\
+               napi_value v;\n\
+               napi_create_string_utf8(env, \"bound\", NAPI_AUTO_LENGTH, &v);\n\
+               napi_set_named_property(env, exports, \"probe\", v);\n\
+               return exports;\n\
+             }\n\
+             NAPI_MODULE(NODE_GYP_MODULE_NAME, init)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("index.js"),
+            "module.exports = require('./build/Release/probe.node');\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join("vendor")).unwrap();
+        // spawn-audit: test-only — the fixture's package tarball (npm's own layout, `package/`).
+        let st = Command::new("tar")
+            .args(["-czf"])
+            .arg(wt.join("vendor/better-sqlite3-1.0.0.tgz"))
+            .arg("-C")
+            .arg(tmp.join("src"))
+            .arg("package")
+            .output()
+            .unwrap();
+        assert!(st.status.success());
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"name":"crew-native","version":"0.0.0","private":true,
+"dependencies":{"better-sqlite3":"file:vendor/better-sqlite3-1.0.0.tgz"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(crate::repo_checks::CONFIG_PATH),
+            r#"{"native_rebuild":["better-sqlite3"]}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join(".gitignore"), "node_modules/\n").unwrap();
+        git(&wt, &["init", "-q"]);
+        // spawn-audit: test-only — npm writes the fixture's lockfile.
+        let st = Command::new("npm")
+            .args([
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--offline",
+            ])
+            .current_dir(&wt)
+            .env("npm_config_cache", tmp.join("npm-cache"))
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        let gd = git_dir_of(&wt);
+        let before = tree_of(&wt);
+        let loads = || -> String {
+            // spawn-audit: test-only — the seat's own `require` of the addon.
+            let out = Command::new("node")
+                .args(["-e", "console.log(require('better-sqlite3').probe)"])
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+
+        let got = provision(&wt, Some(&gd), "r", &SeatPlatform::host());
+        let Provisioned::Installed { platform, .. } = &got else {
+            panic!("{got:?}");
+        };
+        assert!(
+            platform.ends_with("; better-sqlite3 built natively"),
+            "{platform}"
+        );
+        assert!(got
+            .seat_context()
+            .unwrap()
+            .contains("better-sqlite3 built natively"));
+        assert_eq!(loads().trim(), "bound");
+        assert_eq!(tree_of(&wt), before, "the reviewed tree is untouched");
+        // The marker keeps the install's own platform (a later unit matches it).
+        assert_eq!(
+            marker_platform(&wt).as_deref(),
+            Some(SeatPlatform::host().label().as_str())
+        );
+
+        // The next unit: nothing installed, nothing built, the binding still loads.
+        let built = wt.join("node_modules/better-sqlite3/build/Release/probe.node");
+        let stamp = std::fs::metadata(&built).unwrap().modified().unwrap();
+        let again = provision(&wt, Some(&gd), "r", &SeatPlatform::host());
+        assert_eq!(
+            again,
+            Provisioned::AlreadyFor(format!(
+                "{}; better-sqlite3 built natively",
+                SeatPlatform::host().label()
+            ))
+        );
+        assert_eq!(
+            std::fs::metadata(&built).unwrap().modified().unwrap(),
+            stamp
+        );
+
+        // Undeclared: the install leaves it unbuilt (scripts off), and the label says nothing.
+        std::fs::remove_file(wt.join(crate::repo_checks::CONFIG_PATH)).unwrap();
+        std::fs::remove_dir_all(wt.join("node_modules")).unwrap();
+        let plain = provision(&wt, Some(&gd), "r", &SeatPlatform::host());
+        let Provisioned::Installed { platform, .. } = &plain else {
+            panic!("{plain:?}");
+        };
+        assert_eq!(platform, &SeatPlatform::host().label());
+        assert!(!built.exists());
+        assert!(loads().contains("probe.node"), "{}", loads());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// core#1406: a config the engine cannot read is said on the label, and the install stands.
+    #[test]
+    fn a_native_config_that_does_not_parse_is_said_and_the_install_stands() {
+        let tmp = crate::repo_checks::tests::scratch("seat-deps-native-bad");
+        std::fs::create_dir_all(tmp.join(".wicked")).unwrap();
+        std::fs::write(
+            tmp.join(crate::repo_checks::CONFIG_PATH),
+            r#"{"native_rebuild":["leftpad"]}"#,
+        )
+        .unwrap();
+        let label = with_native(&tmp, "r", &SeatPlatform::host(), "darwin-arm64".into());
+        assert!(
+            label.starts_with(
+                "darwin-arm64; the native addons were not built: `.wicked/checks.json`: "
+            ) && label.contains("leftpad"),
+            "{label}"
+        );
+        std::fs::remove_file(tmp.join(crate::repo_checks::CONFIG_PATH)).unwrap();
+        assert_eq!(
+            with_native(&tmp, "r", &SeatPlatform::host(), "darwin-arm64".into()),
+            "darwin-arm64"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The script CI's `seat-native-addon` job runs to build a real better-sqlite3 offline in the
+    /// seat's base image and load it: the engine's own native-build step, byte for byte
+    /// ([`crate::repo_checks::native_build_argv`], what a seat pod's init and a floor pod run).
+    #[test]
+    fn the_ci_native_build_fixture_is_the_engines_own_step() {
+        let argv = crate::repo_checks::native_build_argv(&["better-sqlite3"]);
+        assert_eq!(argv[..2], ["sh", "-c"]);
+        let fixture = include_str!("../tests/fixtures/native-build/better-sqlite3.sh");
+        assert_eq!(fixture, format!("{}\n", argv[2]));
     }
 }

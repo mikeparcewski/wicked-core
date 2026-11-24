@@ -1038,6 +1038,111 @@ fn k8s_a_deleted_namespace_forgets_its_filled_claims() {
     ));
 }
 
+/// core#1406: a seat whose run claim was filled for a declared native addon builds it in its own
+/// pod before the seat starts: an init in the SEAT image (its node's ABI) runs the floor's own
+/// native-build step over the read-only claim, into a pod-owned `build/` the seat mounts too. It
+/// has the seat's tree and scratch, never the floor, canary or unit dir, and a failed build never
+/// keeps the seat from starting. A claim filled with no native addon renders as before.
+#[test]
+fn k8s_a_deps_seat_builds_its_declared_native_addon_in_its_own_pod() {
+    let tree = PathBuf::from("/home/op/.wicked/repos/x/wt/run-1");
+    let claim = format!("wfloor-nm-native-{}", uuid::Uuid::new_v4().simple());
+    let plain = format!("wfloor-nm-plain-{}", uuid::Uuid::new_v4().simple());
+    crate::checks_container::remember_seat_claim_for_test(
+        "run-1",
+        &tree,
+        &claim,
+        vec!["better-sqlite3"],
+    );
+    crate::checks_container::remember_seat_claim_for_test("run-2", &tree, &plain, Vec::new());
+
+    let mut s = seat();
+    s.deps = Some((plain.clone(), tree.clone()));
+    let spec = render::seat_pod_spec(&s).unwrap();
+    let inits: Vec<&str> = spec["initContainers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    assert_eq!(inits, ["floor"], "a plain claim adds no build");
+    assert!(!spec.to_string().contains("/build"));
+
+    s.deps = Some((claim.clone(), tree.clone()));
+    let spec = render::seat_pod_spec(&s).unwrap();
+    let build = "/home/op/.wicked/repos/x/wt/run-1/node_modules/better-sqlite3/build";
+    let inits = spec["initContainers"].as_array().unwrap();
+    assert_eq!(inits.len(), 2, "{inits:?}");
+    let init = &inits[1];
+    assert_eq!(init["name"], "native-build");
+    assert_eq!(
+        init["image"], "wicked-seat-codex:abc",
+        "the seat image's own node"
+    );
+    assert_eq!(init["imagePullPolicy"], "Never");
+    assert_eq!(init["securityContext"], render::hardened_context());
+    assert_eq!(init["workingDir"], tree.to_string_lossy().as_ref());
+    assert_eq!(init["resources"]["limits"]["memory"], "3Gi");
+    // The floor's own step, verbatim, and a failure that never fails the pod.
+    let argv = crate::repo_checks::native_build_argv(&["better-sqlite3"]);
+    assert_eq!(init["command"][0], argv[0].as_str());
+    assert_eq!(init["command"][1], argv[1].as_str());
+    let script = init["command"][2].as_str().unwrap();
+    assert!(script.starts_with(&format!("({})", argv[2])), "{script}");
+    assert!(
+        script.ends_with("exit 0") && script.contains("did not build"),
+        "{script}"
+    );
+    let paths = |c: &Value| -> Vec<(String, String, bool)> {
+        c["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["name"].as_str().unwrap().to_string(),
+                    m["mountPath"].as_str().unwrap().to_string(),
+                    m["readOnly"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect()
+    };
+    let im = paths(init);
+    let names: Vec<&str> = im.iter().map(|(n, _, _)| n.as_str()).collect();
+    for absent in ["floor", "canary", "unit", "nmw0", "nmw1", "nmw2"] {
+        assert!(!names.contains(&absent), "{absent} in {im:?}");
+    }
+    assert!(im.contains(&(
+        render::REPLICA_PVC.to_string(),
+        tree.to_string_lossy().into_owned(),
+        false
+    )));
+    let nm = format!("{}/node_modules", tree.display());
+    assert!(im.contains(&("deps".into(), nm.clone(), true)), "{im:?}");
+    assert!(im.contains(&("nmb0".into(), build.into(), false)), "{im:?}");
+    for (n, at) in [("tmp", "/tmp"), ("home", "/home/seat")] {
+        assert!(
+            im.iter().any(|(m, p, _)| m == n && p == at),
+            "{n} in {im:?}"
+        );
+    }
+    // The claim's mount comes before the build dir inside it.
+    let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+    assert!(at("deps") < at("nmb0"));
+    // The seat mounts the same build dir, over its read-only claim.
+    let sm = paths(&spec["containers"][0]);
+    let seat_at = |p: &str| sm.iter().position(|(_, x, _)| x == p).unwrap();
+    assert!(sm.contains(&("nmb0".into(), build.into(), false)), "{sm:?}");
+    assert!(seat_at(&nm) < seat_at(build));
+    let vol = spec["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "nmb0")
+        .unwrap();
+    assert_eq!(vol["emptyDir"]["sizeLimit"], render::NATIVE_BUILD_SIZE);
+}
+
 #[test]
 fn k8s_a_commit_into_the_runs_node_modules_is_refused_for_a_deps_seat() {
     assert!(crate::k8s::seat::in_node_modules(

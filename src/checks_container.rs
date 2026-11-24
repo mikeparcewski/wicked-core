@@ -3026,36 +3026,72 @@ impl Filler<'_> {
     }
 }
 
-/// The seats' `node_modules` (core#1155 on pods, PARITY B14): `(run id, tree, claim)` of every
-/// tree whose run claim [`provision_seat_node_modules`] filled, read by the seat arm
-/// ([`seat_claim`]) to mount it read-only at `<tree>/node_modules`.
-static SEAT_NM: Mutex<Vec<(String, PathBuf, String)>> = Mutex::new(Vec::new());
+/// One tree's filled seat claim: `(run id, tree, claim, the declared native addons it was filled
+/// for)`.
+type SeatNmEntry = (String, PathBuf, String, Vec<&'static str>);
+
+/// The seats' `node_modules` (core#1155 on pods, PARITY B14): every tree whose run claim
+/// [`provision_seat_node_modules`] filled, read by the seat arm ([`seat_claim`]) to mount it
+/// read-only at `<tree>/node_modules`, and by the seat pod's render ([`seat_claim_native`]) to
+/// build its declared native addons (core#1406).
+static SEAT_NM: Mutex<Vec<SeatNmEntry>> = Mutex::new(Vec::new());
 
 /// The run's `node_modules` claim for `tree`, if this unit's provisioning filled one.
 pub(crate) fn seat_claim(run_id: &str, tree: &Path) -> Option<String> {
     let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
     SEAT_NM.lock().ok().and_then(|m| {
         m.iter()
-            .find(|(r, t, _)| r == run_id && *t == tree)
-            .map(|(_, _, c)| c.clone())
+            .find(|(r, t, _, _)| r == run_id && *t == tree)
+            .map(|(_, _, c, _)| c.clone())
     })
 }
 
-fn remember_seat_claim(run_id: &str, tree: &Path, claim: Option<String>) {
+/// (core#1406) The native addons (`native_rebuild`, the allowlist's own spelling) the seat claim
+/// `claim` was filled for: each has an empty `build/` in the claim, the mount point of the seat
+/// pod's own build dir. The claim's name keys its native set ([`nm_volume`]), so any run's entry
+/// for it answers. Empty for a claim this process did not fill.
+pub(crate) fn seat_claim_native(claim: &str) -> Vec<&'static str> {
+    SEAT_NM
+        .lock()
+        .ok()
+        .and_then(|m| {
+            m.iter()
+                .find(|(_, _, c, _)| c == claim)
+                .map(|(_, _, _, n)| n.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn remember_seat_claim(run_id: &str, tree: &Path, claim: Option<(String, Vec<&'static str>)>) {
     let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
     if let Ok(mut m) = SEAT_NM.lock() {
-        m.retain(|(r, t, _)| !(r == run_id && *t == tree));
-        if let Some(c) = claim {
-            m.push((run_id.to_string(), tree, c));
+        m.retain(|(r, t, _, _)| !(r == run_id && *t == tree));
+        if let Some((c, native)) = claim {
+            m.push((run_id.to_string(), tree, c, native));
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn remember_seat_claim_for_test(
+    run_id: &str,
+    tree: &Path,
+    claim: &str,
+    native: Vec<&'static str>,
+) {
+    remember_seat_claim(run_id, tree, Some((claim.to_string(), native)));
 }
 
 /// What a seat tree's `node_modules` fill decided.
 #[derive(Debug)]
 pub(crate) enum SeatNm {
-    /// The run's claim holds this tree's install (`hit`: already filled).
-    Claim { claim: String, hit: bool },
+    /// The run's claim holds this tree's install (`hit`: already filled), with an empty
+    /// `build/` for each declared native addon (`native`, core#1406).
+    Claim {
+        claim: String,
+        hit: bool,
+        native: Vec<&'static str>,
+    },
     /// Not filled, on purpose (the reason).
     Skip(String),
     /// The repository's own install failed (its log).
@@ -3108,6 +3144,13 @@ pub(crate) fn seat_node_modules(
     }
     let lock =
         read_blob(git_dir, &snap.tree, &lock_name).ok_or("the lockfile could not be read")?;
+    // (core#1406) The addons the tree's own `.wicked/checks.json` declares, read from the snapshot
+    // as the floor reads its tree (validated against the allowlist; a config that does not parse
+    // is not "none").
+    let native = match read_blob(git_dir, &snap.tree, crate::repo_checks::CONFIG_PATH) {
+        Some(raw) => crate::repo_checks::native_rebuild_in(&String::from_utf8_lossy(&raw))?,
+        None => Vec::new(),
+    };
     if let Some(dep) = git_dependency(&lock) {
         return Ok(SeatNm::Skip(format!(
             "the lockfile installs a git dependency ({dep}), whose `prepare` npm runs even with \
@@ -3139,14 +3182,16 @@ pub(crate) fn seat_node_modules(
         std::env::var(MEMORY_ENV).ok().as_deref(),
         crate::container_floor::seat_cpus(),
     )?;
-    // A declared native addon is built per floor (core#1393); a seat's copy has it unbuilt
-    // (core#1406), so its claim is the plain install's.
+    // (core#1406) Keyed and filled as the floor's own claim for this tree: a declared native
+    // addon gets an empty `build/` in the claim (nothing is built in the shared volume), and each
+    // seat pod builds it there in its own dir, offline, before the seat starts
+    // ([`crate::k8s::render`] `native_build_init`), as each floor pod does (core#1393).
     let volume = nm_volume(
         &tag,
         "",
         &lock,
         &npm_inputs(&entries, &lock, &snap.tree),
-        &[],
+        &native,
     );
     let filler = Filler {
         place: &place,
@@ -3156,18 +3201,34 @@ pub(crate) fn seat_node_modules(
         git_dir,
     };
     Ok(
-        match filler.fill_nm(&snap.tree, &entries, "", &volume, &[])? {
+        match filler.fill_nm(&snap.tree, &entries, "", &volume, &native)? {
             Fill::Hit => SeatNm::Claim {
                 claim: volume,
                 hit: true,
+                native,
             },
             Fill::Filled => SeatNm::Claim {
                 claim: volume,
                 hit: false,
+                native,
             },
             Fill::Failed(log) => SeatNm::Failed(log),
         },
     )
+}
+
+/// How a pod seat's dependencies are named on its stream and in its context: the run's cache, and
+/// the native addons its pod builds before the seat starts (core#1406).
+fn seat_platform_note(claim: &str, native: &[&str]) -> String {
+    let mut s = format!("linux pods, the run's read-only cache {claim}");
+    if !native.is_empty() {
+        s.push_str(&format!(
+            "; the seat's pod builds {} natively (offline, the floor's native-build step) before \
+             the seat starts",
+            native.join(", ")
+        ));
+    }
+    s
 }
 
 /// [`seat_node_modules`] as the seats' dependency provisioning ([`crate::seat_deps`]'s result
@@ -3194,9 +3255,9 @@ pub(crate) fn provision_seat_node_modules(
     };
     let started = Instant::now();
     match seat_node_modules(run_id, tree, git_dir) {
-        Ok(SeatNm::Claim { claim, hit }) => {
-            let platform = format!("linux pods, the run's read-only cache {claim}");
-            remember_seat_claim(run_id, tree, Some(claim));
+        Ok(SeatNm::Claim { claim, hit, native }) => {
+            let platform = seat_platform_note(&claim, &native);
+            remember_seat_claim(run_id, tree, Some((claim, native)));
             if hit {
                 Provisioned::AlreadyFor(platform)
             } else {
