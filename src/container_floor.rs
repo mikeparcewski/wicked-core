@@ -4616,6 +4616,20 @@ esac
                 );
             }
         }
+        // CI runs the seat's browser and media checks under exactly this policy
+        // (tests/fixtures/seat-floor/landrun-work-ro.args: the seat's grants with its fixture dir
+        // `/work` read-only, up to the launcher's own `--check`).
+        let p = landrun_prefix(
+            &[Mount::Bind {
+                path: PathBuf::from("/work"),
+                rw: false,
+            }],
+            &[],
+            &[],
+        );
+        let end = p.iter().position(|a| a == "--").unwrap();
+        let fixture = include_str!("../tests/fixtures/seat-floor/landrun-work-ro.args");
+        assert_eq!(fixture.lines().collect::<Vec<_>>(), p[..end]);
         // The floor really does deny /dev writes beyond /dev/null: the flag is needed.
         let p = landrun_prefix(&[], &[], &[]);
         let ro_dev = p.windows(2).any(|w| w[0] == "--ro" && w[1] == "/dev");
