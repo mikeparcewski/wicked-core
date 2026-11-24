@@ -181,6 +181,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         evidence_root: None,
         primary: None,
         reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),
@@ -257,6 +258,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         evidence_root: None,
         primary: None,
         reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

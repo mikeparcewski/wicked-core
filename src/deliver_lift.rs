@@ -1442,6 +1442,7 @@ pub(crate) fn delivery_receipt(
     // gate: the delivery says it is not known (xreview r2 on #1827).
     let mut judge_not_due: Option<crate::assurance::SkippedInstrument> = None;
     let mut judge_unknown: Option<u32> = None;
+    let mut stood_in: Vec<crate::assurance::SkippedInstrument> = Vec::new();
     for (ord, g) in units
         .iter()
         .filter_map(|u| u.assurance.as_ref().map(|g| (u.ord, g)))
@@ -1463,6 +1464,14 @@ pub(crate) fn delivery_receipt(
                 && k.reason == crate::assurance::SKIP_NOT_APPLICABLE
             {
                 judge_not_due.get_or_insert_with(|| k.clone());
+                continue;
+            }
+            // (DES-STANDIN-001 §5.1) Applied after every gate's own skips: a stand-in never hides
+            // another gate's real skip of the same instrument.
+            if k.reason == crate::assurance::SKIP_STAND_IN {
+                if !stood_in.iter().any(|s| s.instrument == k.instrument) {
+                    stood_in.push(k.clone());
+                }
                 continue;
             }
             r.skip(&k.instrument, &k.reason, k.detail.clone());
@@ -1532,10 +1541,41 @@ pub(crate) fn delivery_receipt(
             )),
         );
     }
+    // (DES-STANDIN-001 §5.1, T-R15) The CONSERVATIVE LEGACY PROJECTION: an instrument any gate
+    // stood in for is never `ran` for the delivery, and says `stand_in` unless a gate skipped it
+    // for another reason (that skip stands: a required judge missing at one gate stays
+    // unsatisfied when another gate's judge was stood in, T-R20).
+    for k in stood_in {
+        r.ran.retain(|i| i != &k.instrument);
+        r.skip(&k.instrument, &k.reason, k.detail);
+    }
     if !r.ran.iter().any(|i| i == crate::assurance::JUDGE) {
         if let Some(k) = judge_not_due {
             r.skip(&k.instrument, &k.reason, k.detail);
         }
+    }
+    // (DES-STANDIN-001 §5.1, T-R15, T-R20) A stand-in-aware run's delivery is canonical: the keyed
+    // union (role, ord, attempt) of every gate's records, so a role real at one gate and stood in at
+    // another lists both, and an obligation unfilled at one gate stays there. Independence reads
+    // them all: `mixed` once any stand-in took part beside a real helper.
+    if session.assurance.roles.is_some() {
+        use crate::assurance::RoleRecord;
+        let mut roles: Vec<RoleRecord> = Vec::new();
+        for role in units
+            .iter()
+            .filter_map(|u| u.assurance.as_ref())
+            .flat_map(|g| g.roles.iter().flatten())
+        {
+            let key = |x: &RoleRecord| (x.role.clone(), x.ord, x.attempt);
+            if !roles.iter().any(|x| key(x) == key(role)) {
+                roles.push(role.clone());
+            }
+        }
+        r.independence = crate::assurance::independence_of(&roles);
+        if roles.iter().any(RoleRecord::is_stand_in) {
+            r.stand_in_label = session.assurance.stand_in_label.clone();
+        }
+        r.roles = Some(roles);
     }
     // (xreview r1, r2 on #1827) The run's first step delivers: no step has finished and none cut
     // a gate receipt, and the delivery's own step is scripted, so no judge was due. Read from the

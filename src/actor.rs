@@ -43,6 +43,9 @@ pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
+mod stand_in_gate;
+#[cfg(test)]
+mod stand_in_packet_tests;
 mod team_gate;
 mod worktree_cleanup;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
@@ -1499,6 +1502,7 @@ pub(crate) fn run(
                     power: _,
                     // …and no orchestrator to hear a voice (core#1216).
                     voice: _,
+                    stand_in,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1528,6 +1532,14 @@ pub(crate) fn run(
                     )),
                     // (core#850) The reduced-assurance opt-in is recorded on the governed
                     // dispatch's session: refused here rather than silently dropped.
+                    // (DES-STANDIN-001 §3.8) Stand-in facts live on the run's contract, which
+                    // only the governed dispatch records: refused here, never dropped.
+                    Ok(None) if stand_in != crate::standin::LaunchStandIn::default() => {
+                        Err(anyhow::anyhow!(
+                            "a standInAware launch must use launch_run: the straight-through \
+                             path does not record the run's assurance contract"
+                        ))
+                    }
                     Ok(None) if reduced_assurance => Err(anyhow::anyhow!(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
@@ -1655,6 +1667,12 @@ pub(crate) fn run(
                     // (core#1216) The orchestrator's voice block: bounded, refused with NO
                     // session persisted.
                     crate::power::validate_voice(spec.voice.as_deref())?;
+                    // (DES-STANDIN-001 §3.8, rev 3 N4) Stand-in facts that cannot hold together
+                    // (aware + reduced, consent on an unaware launch, a malformed consent) are
+                    // refused with NO session persisted.
+                    spec.stand_in
+                        .validate(spec.reduced_assurance)
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     // core#411 / wicked-crew#497: the state-home INTAKE fence. An entry under the
                     // handed snapshot's state home that the registry cannot classify would refuse
                     // EVERY worker launch of this run — surfaced, until now, at the first worker
@@ -1928,19 +1946,25 @@ pub(crate) fn run(
                         // (QE acceptance) The operator's explicit skip or force, refused before
                         // anything persists when it is malformed or has nothing to apply to; an
                         // Apps run's contract carries its preset, and a publish's QE is forced.
-                        assurance: crate::apps::contract(
-                            crate::assurance::RunAssurance::new(
-                                selected_def
-                                    .as_ref()
-                                    .and_then(|d| d.required_instruments.as_deref()),
-                                spec.reduced_assurance,
-                            ),
-                            apps.clone(),
-                            &spec.qe_acceptance,
-                        )
-                        // Typed, so the bus bridge drops a request that will never launch
-                        // instead of retrying it forever.
-                        .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
+                        // (DES-STANDIN-001 §3.3, rev 3 N3) …and the launch's stand-in facts,
+                        // persisted here and read from here afterwards.
+                        assurance: spec.stand_in.apply(
+                            crate::apps::contract(
+                                crate::assurance::RunAssurance::new(
+                                    selected_def
+                                        .as_ref()
+                                        .and_then(|d| d.required_instruments.as_deref()),
+                                    spec.reduced_assurance,
+                                ),
+                                apps.clone(),
+                                &spec.qe_acceptance,
+                            )
+                            // Typed, so the bus bridge drops a request that will never launch
+                            // instead of retrying it forever.
+                            .map_err(|e| {
+                                anyhow::Error::new(crate::assurance::QeOverrideRefused(e))
+                            })?,
+                        ),
                         run_context: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
@@ -2595,15 +2619,23 @@ pub(crate) fn run(
                 // 390b273e's launch-time twin). Every other distribution error keeps the fail
                 // contract. `fail_run_by_id` guards the terminal statuses: do not clobber
                 // Cancelled with Failed if the run was cancelled while the council thread ran.
-                let parked = match error.downcast_ref::<NoEligibleSeat>() {
-                    Some(refusal) => park_at_dead_seat_gate(
+                // (DES-STANDIN-001 §3.2) A review a stand-in-aware run cannot seat independently,
+                // with no consent: the run parks at the `stand_in_needed` gate the same way.
+                let parked = match (
+                    error.downcast_ref::<NoEligibleSeat>(),
+                    error.downcast_ref::<crate::distribute::StandInNeeded>(),
+                ) {
+                    (Some(refusal), _) => park_at_dead_seat_gate(
                         &mut store,
                         &mut subscribers,
                         &self_tx,
                         &run_id,
                         refusal,
                     ),
-                    None => Ok(false),
+                    (None, Some(need)) => {
+                        stand_in_gate::park(&mut store, &mut subscribers, &self_tx, &run_id, need)
+                    }
+                    (None, None) => Ok(false),
                 };
                 match parked {
                     Ok(true) => {}
@@ -5737,11 +5769,11 @@ fn team_plan_at_launch(
         {
             stub.assurance
         }
-        _ => launch_plan_assurance(
+        _ => spec.stand_in.apply(launch_plan_assurance(
             instruments.as_deref(),
             spec.reduced_assurance,
             &spec.qe_acceptance,
-        ),
+        )),
     };
     let prior = crate::plan_gate::TeamPlanState {
         roster: spec
@@ -10098,6 +10130,11 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // no eligible seat left — a decision about SEATS, not a verdict on the work
         // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
         Some("dead_seat") => "dead_seat",
+        // (DES-STANDIN-001 §3.10) A check no independent helper can take and no one has agreed
+        // to stand in for: a decision about SEATS and consent, never a verdict on the work.
+        Some(stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED) => {
+            stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED
+        }
         // (core#850) A review that ran on a seat that built its work, on a run that requires a
         // distinct evaluator — a decision about SEATS: reassign it, as for a dead seat.
         Some(crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR) => "dead_seat",
@@ -10982,6 +11019,7 @@ fn denial_gate_prompt_body(
         .map(|d| d.source.as_str())
         .unwrap_or("gate");
     match class {
+        stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED => stand_in_gate::prompt(unit, reason, note),
         "evaluator_mutated_worktree" => {
             let phase = unit.phase_id().unwrap_or("read-only");
             let paths = mutation
@@ -11450,12 +11488,20 @@ fn distinct_evaluator_seat(
     // stays and the gate decides (codex r1 on #898).
     let mut candidates = eligible_roster_keys(session);
     candidates.sort_by_key(|k| shares(k));
+    // A party is matched by its record's binary too; no registry read on a run with no parties.
+    let party_records = if session.assurance.parties.is_empty() {
+        Vec::new()
+    } else {
+        crate::registry_roster()
+    };
     candidates.into_iter().find(|k| {
         crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_none()
             && (key_author || !shares(k))
             && k != seat
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
+            // (DES-STANDIN-001 §3.8) A party never reviews for real: empty on an unaware run.
+            && !crate::distribute::is_party(k, &session.assurance.parties, &party_records)
     })
 }
 
@@ -12121,7 +12167,9 @@ fn reseat_off_benched_seat(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
-    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == seat) else {
+    // (DES-STANDIN-001 §3.3) A stand-in (`claude~1`) is benched with its credential (`claude`).
+    let credential = wicked_apps_core::spawn::seat_id::credential(&seat);
+    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == credential) else {
         return Ok(Reseat::Unchanged);
     };
     // The template the unit would carry on each seat: the launch roster's own, when another unit
@@ -13256,12 +13304,18 @@ fn power_dispatch(
             let task = crate::power::authored_task(&unit);
             unit.description = task.clone();
             // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
-            // hand-off's reviewers, judges and QE are dispatched without it.
+            // hand-off's reviewers, judges and QE are dispatched without it. (DES-STANDIN-001
+            // §3.4, core#1863) Never a stand-in's: none is minted for a creator, and if one were,
+            // it hears no communication.
+            let voice = power
+                .voice
+                .clone()
+                .filter(|_| !crate::execute_wrapped::is_stand_in_unit(&unit));
             unit.description.push_str(&crate::power::orchestrator_brief(
                 power.rigor,
                 power.plan.as_ref(),
                 round,
-                power.voice.as_deref(),
+                voice.as_deref(),
             ));
             // (core#1486) The attempt's retry or send-back notes ride turn 1 as their own block
             // too, and every later turn restates them ahead of the (clipped) task.
@@ -13277,7 +13331,7 @@ fn power_dispatch(
                     cli: unit.assigned_cli.clone().unwrap_or_default(),
                     round,
                     base: session.base_commit.clone(),
-                    voice: power.voice.clone(),
+                    voice,
                     notes,
                 },
             );
@@ -14094,6 +14148,18 @@ fn dispatch_unit_with(
     // and dropping (1) is the bug. Declared-dependency membership is by PHASE ID, the token the def
     // uses; `phase_id()` returns None for prose-planned units, which correctly matches nothing.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
+    // (DES-STANDIN-001 §3.4) A stand-in's packet is ALLOW-LISTED: of the earlier units it gets the
+    // work (every unit that is no review: a `creator` or an unroled build, a tool's facts), never an
+    // earlier review's or test's verdict. Keyed on the stage too, since a def's phases need not
+    // name a role (an unroled `build` is the work; an unroled `review` is a verdict).
+    let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
+    let is_verdict = |u: &crate::domain::WorkUnit| {
+        u.role == crate::workflow::PhaseRole::Evaluator
+            || matches!(
+                u.stage,
+                crate::domain::StageKind::Review | crate::domain::StageKind::Test
+            )
+    };
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
     let (mut prior_outputs, mut context_items): (
@@ -14101,6 +14167,7 @@ fn dispatch_unit_with(
         Vec<crate::event::InjectedContext>,
     ) = units
         .iter()
+        .filter(|u| !stand_in || !is_verdict(u))
         .filter_map(|u| {
             let label = prior_context_label(unit, u, current_cli)?;
             let output = crate::domain::get_work_output(store, &u.id)?;
@@ -14114,6 +14181,8 @@ fn dispatch_unit_with(
             ))
         })
         .unzip();
+    // (core#1862) The work a stand-in is handed: exactly the blocks above, by position.
+    let work_blocks = prior_outputs.len();
     // (DES-L1 PR-1B, core#549) A creator re-run after `request_changes` is handed the full
     // amendment (evaluator findings + operator note) as prior context. The amendment is persisted
     // on the unit as `rework_amendment` (stored by `rewind_to_creator` since core#549); older
@@ -14323,7 +14392,8 @@ fn dispatch_unit_with(
     // (program DES-POWER-MODE) OPERATOR MESSAGES queued while no turn could hear them (the
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
-    if unit.tool_cmd.is_none() && review_of.is_none() {
+    // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
+    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -14360,6 +14430,40 @@ fn dispatch_unit_with(
     // for this unit's seats BEFORE any of them is built (a restarted engine re-primes here), and
     // named on the unit's context event. The carrier renders it (not a prior output: never clipped,
     // never read as an earlier phase's work).
+    // (DES-STANDIN-001 §3.4) A STAND-IN's context is an allow-listed packet: the step's task and
+    // checklist, the work's final output, the engine's records (floor, requirements, rulings) and
+    // the stand-in preface — never team findings, earlier verdicts, communications or anything
+    // that carries the builder's reasoning ([`crate::standin::packet_keeps`]).
+    if stand_in {
+        let keep: Vec<bool> = prior_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| i < work_blocks || crate::standin::packet_keeps(&p.label))
+            .collect();
+        let mut k = keep.iter();
+        prior_outputs.retain(|_| *k.next().unwrap_or(&false));
+        let mut k = keep.iter();
+        context_items.retain(|_| *k.next().unwrap_or(&false));
+        let lens = session
+            .assurance
+            .stand_ins
+            .iter()
+            .find(|b| Some(b.key.as_str()) == unit.assigned_cli.as_deref())
+            .and_then(|b| b.lens.clone());
+        let preface = crate::standin::preface(lens.as_deref());
+        let label = crate::standin::PREFACE_LABEL.to_string();
+        context_items.insert(
+            0,
+            crate::event::InjectedContext::new(unit.ord, label.clone(), preface.len()),
+        );
+        prior_outputs.insert(
+            0,
+            PriorUnitOutput {
+                label,
+                output: preface,
+            },
+        );
+    }
     crate::run_context::publish(run_id, session.run_context.as_ref());
     let run_context_item = (unit.tool_cmd.is_none())
         .then(|| crate::run_context::current(run_id))
@@ -15219,6 +15323,23 @@ fn dispatch_unit_with(
     // waits for the fold through it.
     let team_runner = team_gate::team_runner();
     let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
+    // (DES-STANDIN-001 §3.6) The stand-in this unit's judge (pinned or default) may run on, minted HERE on the
+    // actor (slots never repeat); the judge takes it only when no distinct judge is left, and the
+    // fold records it then.
+    let stand_in_judge = session
+        .assurance
+        .stand_in_aware
+        .then(|| crate::standin::JudgeStandIn {
+            aware: true,
+            offer: crate::standin::judge_offer(
+                &session.assurance,
+                unit,
+                input.attempt,
+                &crate::registry_roster(),
+                &session.clis,
+                &session.benched_seats,
+            ),
+        });
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -15264,6 +15385,7 @@ fn dispatch_unit_with(
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
             floor_stop,
+            stand_in_judge.as_ref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
@@ -18457,7 +18579,8 @@ pub(crate) fn plan_answer_refusal(
         | HumanDecision::RetryQe
         | HumanDecision::RecheckRules { .. }
         | HumanDecision::OperatorJudgment { .. }
-        | HumanDecision::SkipQe { .. } => anyhow::bail!(
+        | HumanDecision::SkipQe { .. }
+        | HumanDecision::UseStandIns { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
              amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
              plan, or reject"
@@ -20117,6 +20240,13 @@ pub(crate) fn confirm_gate_expecting(
             "approve": true, "action": choice, "amend": null,
         })
         .to_string(),
+        // (DES-STANDIN-001 §3.8) The consent's scope is the record.
+        crate::workflow::HumanDecision::UseStandIns { scope } => serde_json::json!({
+            "approve": true,
+            "action": crate::workflow::USE_STAND_INS_ACTION,
+            "scope": scope,
+        })
+        .to_string(),
     };
     // (core#1313) Domain helpers batch independently. Suppress those inner boundaries
     // until the row and the state this answer arms are durable together.
@@ -20297,6 +20427,52 @@ pub(crate) fn confirm_gate_expecting(
         }
         d => d,
     };
+    // (DES-STANDIN-001 §3.10) THE STAND-IN GATE: a grant puts the consent on the contract; a grant
+    // or a retry re-routes the units that have not run (real helpers first, a stand-in only with
+    // consent) and the cursor then runs as a plain approve — or, still short, the gate re-opens.
+    let decision = match decision {
+        crate::workflow::HumanDecision::UseStandIns { .. }
+        | crate::workflow::HumanDecision::Approve { amend: None, .. }
+            if stand_in_gate::gate_open(
+                crate::domain::session_units(store, run_id)?.get(session.unit_ix),
+            ) =>
+        {
+            let grant = match &decision {
+                crate::workflow::HumanDecision::UseStandIns { scope } => Some(scope.as_str()),
+                _ => None,
+            };
+            match stand_in_gate::answer(
+                store,
+                &mut answer_events,
+                self_tx,
+                &mut session,
+                run_id,
+                grant,
+                actor.as_deref(),
+            )? {
+                // (T-R12) A check held after its seat ran (a missing judge): only the judge runs
+                // again, on the reviewed attempt's output and tree; no seat is re-dispatched.
+                stand_in_gate::Answered::Run
+                    if crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .is_some_and(|u| u.last_attempt.is_some()) =>
+                {
+                    armed_rejudge = Some(rejudge_basis(&*store, run_id, Vec::new())?);
+                    crate::workflow::HumanDecision::Rejudge
+                }
+                stand_in_gate::Answered::Run => crate::workflow::HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+                stand_in_gate::Answered::Held => {
+                    finish_answer(store, subscribers)?;
+                    in_flight.remove(run_id);
+                    return Ok(SessionStatus::AwaitingHuman);
+                }
+            }
+        }
+        d => d,
+    };
     if let crate::workflow::HumanDecision::OperatorJudgment { rationale } = &decision {
         let units = crate::domain::session_units(store, run_id)?;
         let grant = floor_override_for(
@@ -20461,6 +20637,10 @@ pub(crate) fn confirm_gate_expecting(
         // Answered above (`answer_skip_qe`): it became an approve, a judgment or a re-opened gate.
         crate::workflow::HumanDecision::SkipQe { .. } => {
             anyhow::bail!("run {run_id}: a QE skip is answered before any re-dispatch")
+        }
+        // Answered above (`stand_in_gate::answer`): it became an approve or a re-opened gate.
+        crate::workflow::HumanDecision::UseStandIns { .. } => {
+            anyhow::bail!("run {run_id}: stand-ins are granted before any re-dispatch")
         }
     };
     {
@@ -21274,6 +21454,17 @@ fn rejudge_request(
             }
         );
     }
+    rejudge_basis(store, run_id, r.eligible)
+}
+
+/// (rejudge) The re-judge of `run_id`'s cursor unit as it stands: the reviewed attempt's captured
+/// output (the seat does not run again), its attempt and monitors. `seats` names the judges
+/// eligible when it was armed (the record's; a stand-in grant names none).
+pub(crate) fn rejudge_basis(
+    store: &dyn GraphStore,
+    run_id: &str,
+    seats: Vec<String>,
+) -> anyhow::Result<crate::domain::RequestedRejudge> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -21294,7 +21485,7 @@ fn rejudge_request(
     Ok(crate::domain::RequestedRejudge {
         output,
         attempt,
-        seats: r.eligible,
+        seats,
         monitors: crate::cli_runner::unit_team_monitors(cursor),
         team: cursor.team.clone().map(Box::new),
         consumed: false,
@@ -21709,6 +21900,22 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (DES-STANDIN-001 §3.10) A `stand_in_needed` gate takes three answers: use stand-ins,
+    // approve (retry) and reject; `use_stand_ins` answers nothing else.
+    if let crate::workflow::HumanDecision::UseStandIns { scope } = decision {
+        stand_in_gate::refuse_use_stand_ins(session, cursor, scope, actor)?;
+    } else if stand_in_gate::gate_open(cursor)
+        && !matches!(
+            decision,
+            crate::workflow::HumanDecision::Approve { amend: None, .. }
+                | crate::workflow::HumanDecision::Reject
+        )
+    {
+        anyhow::bail!(
+            "run {run_id} is held for want of an independent helper: use stand-ins, approve to \
+             retry, or reject"
+        );
+    }
     // (core#1748, codex xreview) A lost PA review's `failure` gate re-runs the review (approve) or
     // stops the run (reject). A send-back there would rewind onto the same unit with its review
     // state kept, and re-run the PA's review over the member's unchanged output: sending the
@@ -24105,6 +24312,104 @@ pub(crate) mod sessions_detail_fold_tests {
         finished.status = crate::domain::UnitStatus::Done;
         let d = crate::deliver_lift::delivery_receipt(&s, &[finished, deliver]);
         assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
+    }
+
+    /// T-R15 / T-R20 (DES-STANDIN-001 §5.1): on a stand-in-aware run, gate 1's real judge and
+    /// gate 2's stand-in judge both stay in the delivery's roles (the keyed union) and make its
+    /// independence `mixed`, and the legacy projection is conservative (the judge never `ran`). A judge missing
+    /// at a third gate stays unsatisfied: the stand-in never hides that skip. A gate with no judge
+    /// due beside a real judge stays `independent`.
+    #[test]
+    fn a_stand_in_judge_at_one_gate_makes_the_delivery_mixed_and_never_ran() {
+        use crate::assurance as a;
+        let mut s = session("stand-in-delivery");
+        s.assurance.roles = Some(Vec::new());
+        s.assurance.stand_in_aware = true;
+        s.assurance.stand_in_label = Some("Checked by a stand-in".into());
+        let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("stand-in-delivery:{ord}"),
+                "stand-in-delivery",
+                ord,
+                "step",
+            );
+            let mut r = a::AssuranceReceipt::for_run(&s.assurance, 0);
+            f(&mut r);
+            u.assurance = Some(r);
+            u
+        };
+        let real = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::JUDGE);
+            r.judge = Some("codex".into());
+            r.roles = Some(vec![a::RoleRecord::real(
+                crate::standin::Role::Judge,
+                "codex",
+                1,
+                0,
+            )]);
+        };
+        let stood = |r: &mut a::AssuranceReceipt| {
+            let b = crate::standin::StandInBinding {
+                key: "claude~1".into(),
+                base: "claude".into(),
+                role: crate::standin::Role::Judge,
+                slot: 1,
+                model: None,
+                builder_model: None,
+                lens: None,
+                ord: Some(2),
+                attempt: Some(0),
+                subject: None,
+                evidence: None,
+                invocation: "i".into(),
+                reason: crate::standin::Reason::OnlyOneHelper {
+                    cli: "Claude Code".into(),
+                },
+                state: crate::standin::STATE_ANSWERED.into(),
+                display: None,
+            };
+            r.skip(a::JUDGE, a::SKIP_STAND_IN, Some("by a stand-in".into()));
+            r.roles = Some(vec![a::RoleRecord::stand_in(&b, "Claude Code")]);
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &stood)]);
+        assert!(!d.ran.iter().any(|i| i == a::JUDGE), "{:?}", d.ran);
+        assert!(d
+            .skipped
+            .iter()
+            .any(|k| k.instrument == a::JUDGE && k.reason == a::SKIP_STAND_IN));
+        // The keyed union: gate 1's real judge and gate 2's stand-in both stay.
+        let roles = d.roles.as_ref().expect("canonical");
+        let filled: Vec<(&str, Option<u32>)> =
+            roles.iter().map(|r| (r.filled.as_str(), r.ord)).collect();
+        assert_eq!(
+            filled,
+            [(a::FILLED_REAL, Some(1)), (a::FILLED_STAND_IN, Some(2))]
+        );
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENCE_MIXED));
+        assert_eq!(d.stand_in_label.as_deref(), Some("Checked by a stand-in"));
+        // A required judge missing at gate 3 is the delivery's word.
+        let missing = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NO_DISTINCT_SEAT, Some("no seat".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[gate(1, &real), gate(2, &stood), gate(3, &missing)],
+        );
+        let judge_skips: Vec<&str> = d
+            .skipped
+            .iter()
+            .filter(|k| k.instrument == a::JUDGE)
+            .map(|k| k.reason.as_str())
+            .collect();
+        assert_eq!(judge_skips, [a::SKIP_NO_DISTINCT_SEAT]);
+        // No judge due at gate 2, a real one at gate 1: independent.
+        let not_due = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NOT_APPLICABLE, Some("no files".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &not_due)]);
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENT));
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert_eq!(d.stand_in_label, None);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored

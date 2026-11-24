@@ -145,6 +145,24 @@ export interface LaunchOptions {
    */
   reducedAssurance?: boolean
   /**
+   * (DES-STANDIN-001 §3.8, §8) The launcher implements the stand-in choice. Omit (or `false`)
+   * and the run behaves exactly as before, reduced assurance included; `true` with
+   * `reducedAssurance` REJECTS the launch.
+   */
+  standInAware?: boolean
+  /**
+   * (DES-STANDIN-001 §3.8) Seats that authored the work under review: never seated for real in
+   * an independent role, still on the roster so a stand-in can be based on them. Only with
+   * `standInAware`.
+   */
+  parties?: Array<string>
+  /**
+   * (DES-STANDIN-001 §3.8) A human's consent to stand-ins, as JSON:
+   * `{"scope":"job"|"always","by":"<actor>","at":<ms>,"via":"launch"|…}`. `by`/`at` are the
+   * launcher server's, never a request body's. Only with `standInAware`.
+   */
+  standInJson?: string
+  /**
    * (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
    * step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
    * session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
@@ -452,6 +470,17 @@ export declare class Core {
    * another opening, and the answer is refused with an error that starts `gate_changed:`.
    */
   confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectPlanRev?: number | undefined | null, expectGateSeq?: number | undefined | null): Promise<string>
+  /**
+   * (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at the run's open `stand_in_needed` gate (the
+   * answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
+   * or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
+   * on the run's contract and exactly the held check continues. Refused at any other gate, on a
+   * run that is not stand-in-aware or runs reduced, without an `actor` (consent is a person's), and
+   * with an error that starts `gate_changed:` when the opening `expectGateSeq` names (the open
+   * gate's `gateSeq`, required) or `expectOrd` is no longer the open one. Resolves to the status
+   * token.
+   */
+  grantStandIns(runId: string, scope: string, expectGateSeq: number, actor?: string | undefined | null, expectOrd?: number | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.

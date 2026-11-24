@@ -199,6 +199,9 @@ pub const SKIP_NO_DISTINCT_SEAT: &str = "no_distinct_seat";
 pub const SKIP_NO_BOUNDARY: &str = "no_boundary";
 pub const SKIP_ERROR: &str = "error";
 pub const SKIP_NOT_APPLICABLE: &str = "not_applicable";
+/// (DES-STANDIN-001 §5.1) The legacy projection's skip: the instrument was filled by a stand-in,
+/// so no reader on main ever reads it as an independent check.
+pub const SKIP_STAND_IN: &str = "stand_in";
 
 /// (QE acceptance) A waived or skipped QE acceptance on a receipt's `skipped[]`.
 pub const SKIP_QE_WAIVED: &str = "qe_waived_by_score";
@@ -411,6 +414,183 @@ pub struct RunAssurance {
     /// Absent on every other run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<crate::apps::AppsContract>,
+    /// (DES-STANDIN-001 §3.3, §3.8, rev 3 N3) The launch carried `standInAware`: the one switch
+    /// every stand-in path reads, persisted here and never re-read from the launch spec. A run
+    /// recorded before it, and every launch from a launcher that does not send it, reads `false`
+    /// and takes today's path byte for byte.
+    #[serde(
+        default,
+        rename = "standInAware",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub stand_in_aware: bool,
+    /// (§3.8) Seats that authored the work under review: never seated for real in an
+    /// independent role of the run, and still on the roster, so a stand-in can be based on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parties: Vec<String>,
+    /// (§3.8) The human consent to stand-ins, from the launch or a mid-run grant.
+    #[serde(default, rename = "standIn", skip_serializing_if = "Option::is_none")]
+    pub stand_in: Option<crate::standin::StandInConsent>,
+    /// (§3.3) Every binding the run reserved, in reservation order: the only place a stand-in
+    /// exists. Durable: the fold and the receipts read a stand-in only from here.
+    #[serde(default, rename = "standIns", skip_serializing_if = "Vec::is_empty")]
+    pub stand_ins: Vec<crate::standin::StandInBinding>,
+    /// (§5.1) Whether the run's receipts are canonical: `Some` (empty) from a stand-in-aware launch,
+    /// `None` on every other run and every run recorded before stand-ins. The records themselves
+    /// live on each gate receipt and on the delivery receipt (their keyed union); this field holds
+    /// none (codex r1 B19: a second copy here would be a second writer to keep in step).
+    #[serde(default, rename = "roles", skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<RoleRecord>>,
+    /// (§3.7) The run's stand-in label: the first reason, and "and later: …" once.
+    #[serde(
+        default,
+        rename = "standInLabel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stand_in_label: Option<String>,
+    /// (§3.10, rev 3 R8) The check a `stand_in_needed` gate is holding, consumed by the gate's
+    /// retry or a grant, which continue exactly it.
+    #[serde(
+        default,
+        rename = "pendingStandIn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pending_stand_in: Option<PendingStandIn>,
+}
+
+/// (§3.10, rev 3 R8) A check held for want of consent: which role, for which unit and attempt,
+/// at which evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingStandIn {
+    pub role: crate::standin::Role,
+    pub ord: u32,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    pub reason: crate::standin::Reason,
+}
+
+/// Role-record fill values (§5.1).
+pub const FILLED_REAL: &str = "real";
+pub const FILLED_STAND_IN: &str = "stand_in";
+pub const FILLED_NONE: &str = "none";
+/// Independence values (§5.1).
+pub const INDEPENDENT: &str = "independent";
+pub const INDEPENDENCE_STAND_IN: &str = "stand_in";
+pub const INDEPENDENCE_MIXED: &str = "mixed";
+
+/// (§5.1) Who filled one independent role at one decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleRecord {
+    /// The role's wire token (§3.1).
+    pub role: String,
+    /// `real` | `stand_in` | `none`.
+    pub filled: String,
+    /// (rev 3 N6) `answered` | `failed` | `seated`.
+    pub state: String,
+    /// The real seat key, or the binding key (`claude~1`).
+    pub seat: Option<String>,
+    pub stand_in: Option<StandIn>,
+    pub ord: Option<u32>,
+    pub attempt: Option<u32>,
+    pub subject: Option<String>,
+}
+
+/// (§5.1) A stand-in's stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandIn {
+    pub cli: String,
+    pub base: String,
+    pub model: Option<String>,
+    pub builder_model: Option<String>,
+    pub lens: Option<String>,
+    pub reason: String,
+    pub label: String,
+}
+
+impl RoleRecord {
+    /// A real seat that answered.
+    pub fn real(role: crate::standin::Role, seat: &str, ord: u32, attempt: u32) -> Self {
+        Self {
+            role: role.as_str().to_string(),
+            filled: FILLED_REAL.to_string(),
+            state: crate::standin::STATE_ANSWERED.to_string(),
+            seat: Some(seat.to_string()),
+            stand_in: None,
+            ord: Some(ord),
+            attempt: Some(attempt),
+            subject: None,
+        }
+    }
+
+    /// (§5.1) An obligation due at this gate that nobody filled: kept, so no other gate's record
+    /// can stand for it.
+    pub fn none(role: crate::standin::Role, ord: u32, attempt: u32) -> Self {
+        Self {
+            role: role.as_str().to_string(),
+            filled: FILLED_NONE.to_string(),
+            // (core#1864) The DES state enum is `answered|failed|seated`: an obligation nobody
+            // filled is a failed one.
+            state: crate::standin::STATE_FAILED.to_string(),
+            seat: None,
+            stand_in: None,
+            ord: Some(ord),
+            attempt: Some(attempt),
+            subject: None,
+        }
+    }
+
+    /// A stand-in, in the binding's state.
+    pub fn stand_in(b: &crate::standin::StandInBinding, display: &str) -> Self {
+        Self {
+            role: b.role.as_str().to_string(),
+            filled: FILLED_STAND_IN.to_string(),
+            state: b.state.clone(),
+            seat: Some(b.key.clone()),
+            stand_in: Some(StandIn {
+                cli: b.key.clone(),
+                base: b.base.clone(),
+                model: b.model.clone(),
+                builder_model: b.builder_model.clone(),
+                lens: b.lens.clone(),
+                reason: b.reason.words(),
+                label: crate::standin::label(b, display),
+            }),
+            ord: b.ord,
+            attempt: b.attempt,
+            subject: b.subject.clone(),
+        }
+    }
+
+    pub fn is_stand_in(&self) -> bool {
+        self.filled == FILLED_STAND_IN
+    }
+}
+
+/// (§5.1, rev 3 N6/N7) A decision's independence from its role records: `independent` when no
+/// stand-in took part, `stand_in` when every role was stood in, `mixed` otherwise. `None` when no
+/// seat-bound role was recorded.
+pub fn independence_of(roles: &[RoleRecord]) -> Option<String> {
+    let took_part: Vec<&RoleRecord> = roles.iter().filter(|r| r.filled != FILLED_NONE).collect();
+    if took_part.is_empty() {
+        return None;
+    }
+    let stood = took_part.iter().filter(|r| r.is_stand_in()).count();
+    Some(
+        if stood == 0 {
+            INDEPENDENT
+        } else if stood == took_part.len() {
+            INDEPENDENCE_STAND_IN
+        } else {
+            INDEPENDENCE_MIXED
+        }
+        .to_string(),
+    )
 }
 
 impl Default for RunAssurance {
@@ -452,6 +632,13 @@ impl RunAssurance {
             qe,
             floor_overrides: Vec::new(),
             apps: None,
+            stand_in_aware: false,
+            parties: Vec::new(),
+            stand_in: None,
+            stand_ins: Vec::new(),
+            roles: None,
+            stand_in_label: None,
+            pending_stand_in: None,
         }
     }
 
@@ -578,6 +765,20 @@ pub struct AssuranceReceipt {
     /// row per rule across the run's gates. Absent when no rule check ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<crate::rule_check::RuleVerdict>,
+    /// (DES-STANDIN-001 §5.1, rev 3 N5/N10) Who filled each independent role. `None` on a receipt
+    /// cut before stand-ins (every reader takes the legacy path for it); `Some(..)`, empty
+    /// included, is canonical. Absent on the wire when `None`, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<RoleRecord>>,
+    /// `independent` | `stand_in` | `mixed` ([`independence_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independence: Option<String>,
+    #[serde(
+        default,
+        rename = "standInLabel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stand_in_label: Option<String>,
 }
 
 impl AssuranceReceipt {
@@ -666,6 +867,17 @@ impl AssuranceReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (core#1864) A role nobody filled carries a state the DES enum names (`answered|failed|
+    /// seated`): `failed`, with `filled: none`.
+    #[test]
+    fn a_role_nobody_filled_is_failed_on_the_wire() {
+        let r = RoleRecord::none(crate::standin::Role::Judge, 2, 0);
+        assert_eq!(r.filled, FILLED_NONE);
+        assert_eq!(r.state, crate::standin::STATE_FAILED);
+        let wire = serde_json::to_value(&r).unwrap();
+        assert_eq!(wire["state"], "failed", "{wire}");
+    }
 
     /// core#1392 (review): an operator's waiver is never hidden behind another skip of the same
     /// instrument, and a delivery keeps every gate's waiver detail (once each).

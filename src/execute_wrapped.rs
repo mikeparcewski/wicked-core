@@ -3286,6 +3286,22 @@ impl OneShotScratch {
     }
 }
 
+/// (DES-STANDIN-001 §3.4) Whether the unit runs on a stand-in binding (its `assigned_cli` is a
+/// `<base>~<slot>` key): such a unit never resumes a session and is never recorded as one.
+pub(crate) fn is_stand_in_unit(unit: &crate::domain::WorkUnit) -> bool {
+    unit.assigned_cli
+        .as_deref()
+        .is_some_and(wicked_apps_core::spawn::seat_id::is_stand_in)
+}
+
+/// Whether a container headless launch of `unit` resumes (and records) its run's session on its
+/// seat. Never an isolated QE review session (codex hl-r1 P1), never the engine's own one-shot
+/// sessions (judge, triage, ballot), and (DES-STANDIN-001 §3.4, core#1863) never a stand-in: it
+/// has none of its builder's reasoning, by construction.
+pub(crate) fn resumes_headless_session(unit: &crate::domain::WorkUnit) -> bool {
+    unit.qe_review_session.is_none() && !is_engine_internal(unit) && !is_stand_in_unit(unit)
+}
+
 /// The seat key a wrapped launch of `input` runs as: the unit's assigned seat, else `claude`. Its
 /// `skillUsed` and `toolActivity` frames carry it as `cli` (core#1786).
 pub(crate) fn launch_cli_key(input: &StepInput) -> String {
@@ -3420,6 +3436,7 @@ impl WrappedCliStepRunner {
                 crate::container_floor::container_mode(),
                 stable.as_deref().unwrap_or(&input.run_id),
                 posture.label(),
+                &cli_key,
             )?;
             c.ensure_dirs().map(|()| c)
         }) {
@@ -4634,9 +4651,9 @@ impl WrappedCliStepRunner {
             let headless = (container && structured).then(|| {
                 // The engine's own sessions (judge, triage, ballot) are one-shot under a run id of
                 // their own: nothing to resume, and no entry to leave behind (codex council-r2).
-                let turn = (input.unit.qe_review_session.is_none()
-                    && !is_engine_internal(&input.unit))
-                .then(|| {
+                // (DES-STANDIN-001 §3.4) …and a stand-in never resumes or records one either: it
+                // has none of its builder's reasoning, by construction.
+                let turn = resumes_headless_session(&input.unit).then(|| {
                     self.sessions.begin(
                         crate::headless::SessionKey {
                             run_id: input.run_id.clone(),
@@ -7938,12 +7955,32 @@ fn config_for_container_launch(
     container_mode: bool,
     run: &str,
     posture: &str,
+    cli_key: &str,
 ) -> anyhow::Result<wicked_apps_core::spawn::SeatConfig> {
     if uses_container_seat(governed, container_mode) {
-        crate::container_floor::container_seat_config(config, run, posture)
+        crate::container_floor::container_seat_config(
+            config,
+            run,
+            &seat_home_leaf(posture, cli_key),
+        )
     } else {
         Ok(config)
     }
+}
+
+/// (DES-STANDIN-001 §3.4, core#1861) The leaf of a container seat's home under its run: the
+/// posture, and for a stand-in (`claude~1`) a leaf of its own, so it never reads the session store
+/// or auto-memory its base's builder turns wrote there. Credential-neutral: no container home is
+/// ever seeded with a credential (the broker supplies it). The host floor's home stays the base's.
+pub(crate) fn seat_home_leaf(posture: &str, cli_key: &str) -> String {
+    if !wicked_apps_core::spawn::seat_id::is_stand_in(cli_key) {
+        return posture.to_string();
+    }
+    let key: String = cli_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{posture}.stand-in-{key}")
 }
 
 fn compose_seat_opencode_config(
@@ -9480,8 +9517,15 @@ mod tests {
             },
         ] {
             assert_eq!(
-                config_for_container_launch(config.clone(), false, true, "FAKE-run", "read-only")
-                    .unwrap(),
+                config_for_container_launch(
+                    config.clone(),
+                    false,
+                    true,
+                    "FAKE-run",
+                    "read-only",
+                    "codex"
+                )
+                .unwrap(),
                 config
             );
         }
@@ -9490,9 +9534,77 @@ mod tests {
             true,
             true,
             "FAKE-run",
-            "read-only"
+            "read-only",
+            "claude"
         )
         .is_err());
+    }
+
+    /// (core#1863) A stand-in never resumes a headless session, even one its base's builder left on
+    /// the same run and posture; the base's own later unit does.
+    #[test]
+    fn a_stand_in_never_resumes_a_headless_session() {
+        let mut unit = WorkUnit::pending("r:2", "r", 2, "review");
+        unit.role = crate::workflow::PhaseRole::Evaluator;
+        unit.assigned_cli = Some("claude".into());
+        assert!(
+            resumes_headless_session(&unit),
+            "the control: a real seat resumes"
+        );
+        for key in ["claude~1", "codex#2~1"] {
+            unit.assigned_cli = Some(key.into());
+            assert!(!resumes_headless_session(&unit), "{key} never resumes");
+        }
+    }
+
+    /// (core#1861) A builder and a stand-in on the same base get distinct container seat homes in
+    /// one run and posture: the stand-in never reads the base's session store or auto-memory.
+    /// Unix only, as the container floor is (its config seeds refuse elsewhere).
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_gets_a_container_seat_home_of_its_own() {
+        use wicked_apps_core::spawn::{SeatCli, SeatConfig};
+        let root =
+            std::env::temp_dir().join(format!("wicked-core-standin-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let seat = SeatConfig::Isolated {
+            cli: SeatCli::Claude,
+            root: Some(root.clone()),
+            set: vec![("CLAUDE_CONFIG_DIR", root.clone())],
+            strip: vec![],
+        };
+        let home = |key: &str| {
+            config_for_container_launch(seat.clone(), true, true, "run-1", "read-only", key)
+                .unwrap()
+                .root()
+                .unwrap()
+                .to_path_buf()
+        };
+        let builder = home("claude");
+        let stand_in = home("claude~1");
+        let other = home("claude~2");
+        assert_ne!(
+            builder, stand_in,
+            "a stand-in never shares its builder's home"
+        );
+        assert_ne!(stand_in, other, "nor another stand-in's");
+        assert_eq!(
+            builder,
+            home("claude"),
+            "a seat keeps its own home across units"
+        );
+        assert_eq!(
+            builder.parent(),
+            stand_in.parent(),
+            "both live under the run's directory"
+        );
+        assert!(builder.ends_with("read-only"), "{builder:?}");
+        assert_eq!(
+            seat_home_leaf("read-only", "codex#2~1"),
+            "read-only.stand-in-codex_2_1"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -21263,6 +21375,7 @@ mod project_graph_end_to_end_tests {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),

@@ -423,44 +423,9 @@ pub struct StandInFrom {
     pub models: Vec<Option<String>>,
 }
 
-/// Why a job is short, as data (DES §3.7): never parsed from the words.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ShortReason {
-    OnlyOneHelper {
-        cli: String,
-    },
-    AllParties {
-        seats: Vec<String>,
-    },
-    HelpersShort {
-        signed_in: usize,
-        need: usize,
-        have: usize,
-    },
-}
-
-impl ShortReason {
-    /// The reason in a person's words (display names from the roster).
-    pub fn words(&self) -> String {
-        match self {
-            ShortReason::OnlyOneHelper { cli } => format!("only {cli} was signed in"),
-            ShortReason::AllParties { seats } => format!(
-                "every signed-in helper ({}) built or reviewed this work",
-                seats.join(", ")
-            ),
-            ShortReason::HelpersShort {
-                signed_in,
-                need,
-                have,
-            } => format!(
-                "{signed_in} helper{} signed in: {have} can check this job independently and it \
-                 needs {need}",
-                if *signed_in == 1 { " is" } else { "s are" }
-            ),
-        }
-    }
-}
+/// Why a job is short, as data (DES §3.7): never parsed from the words. The stand-in reason
+/// ([`crate::standin::Reason`]); a preflight produces only its first three kinds.
+pub type ShortReason = crate::standin::Reason;
 
 /// (core#1721) Provider diversity among the signed-in work seats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -627,17 +592,52 @@ pub(crate) fn independence_preflight_in(
     let qe_base = workers.iter().find(|c| qe_admits(c)).map(|c| c.key.clone());
     let vote_base = voters.first().map(|c| c.key.clone());
 
+    // (core#1847) Each role's real seats come from its gate's own admission function, called with
+    // the launch's facts; the differences the launch cannot share with a gate are named in DES §8
+    // (the C2 row): the per-unit report gatherers (no report exists at launch), the parties on the
+    // QE reviewer, judge, rule judge and councils (DES §3.8: a party never decides; the gates take
+    // them in C3c), and a seat's observed providers, read through the host seam.
+    let party_keys = crate::domain::normalize_exclude_seats(&shape.parties);
+    let exclude_keys = crate::domain::normalize_exclude_seats(&shape.exclude_seats);
+    let owned = |cs: &[&AgenticCli]| cs.iter().map(|c| (*c).clone()).collect::<Vec<AgenticCli>>();
+    // One voter per identity: a council resolves a seat by its CLI's record.
+    let one_per_identity = |seats: &mut dyn Iterator<Item = &AgenticCli>| -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        seats
+            .filter(|c| {
+                let id = identity(c);
+                let fresh = !ids.contains(&id);
+                if fresh {
+                    ids.push(id);
+                }
+                fresh
+            })
+            .map(|c| c.key.clone())
+            .collect()
+    };
+
     // The roles for one author: `None` for the author means no seat can author at all.
     let roles_for = |author: Option<&AgenticCli>| -> Vec<RolePreflight> {
-        let author_id = author.map(identity);
         let author_seen = author.and_then(|a| (host.seen)(&a.key)).unwrap_or_default();
         let shares_author = |c: &AgenticCli| {
             (host.seen)(&c.key).is_some_and(|ps| ps.iter().any(|p| author_seen.contains(p)))
         };
+        let author_keys: Vec<String> = author.map(|a| a.key.clone()).into_iter().collect();
+        let author_bins: Option<Vec<String>> = author.map(crate::cli_runner::record_identities);
+        // The evaluator gate (`distribute::enforce_evaluator_distinct`): a seat distinct from the
+        // author's SEAT, so a configured second instance (`claude#2`) is a real reviewer, disclosed
+        // `same_cli_instance`; never a party.
         let evaluators: Vec<&AgenticCli> = workers
             .iter()
             .copied()
-            .filter(|c| author_id.as_ref().is_none_or(|a| identity(c) != *a) && !parties.names(c))
+            .filter(|c| {
+                crate::distribute::evaluator_seat_admitted(
+                    &c.key,
+                    &|k| author_keys.iter().any(|a| a == k),
+                    &party_keys,
+                    &records,
+                )
+            })
             .collect();
         let keys = |cs: &[&AgenticCli]| cs.iter().map(|c| c.key.clone()).collect::<Vec<_>>();
         let judges: Vec<String> = author
@@ -654,15 +654,28 @@ pub(crate) fn independence_preflight_in(
                     .collect()
             })
             .unwrap_or_default();
-        // QE admission (`qe_acceptance/review.rs`): not excluded, admitted by the QE skill's
-        // routing, not seen calling the author's provider.
-        let qe_reviewers: Vec<&AgenticCli> = evaluators
+        // The QE reviewer (`qe_acceptance::review::candidates`): not launch-excluded by key or
+        // CLI, admitted by the QE skill's routing, not the author by key, credential or CLI (so a
+        // second instance of the author's CLI is NOT a real QE reviewer), not seen calling the
+        // author's provider.
+        let qe_reviewers: Vec<&AgenticCli> = workers
             .iter()
             .copied()
-            .filter(|c| !excluded.names(c) && qe_admits(c) && !shares_author(c))
+            .filter(|c| {
+                let seen = (host.seen)(&c.key).unwrap_or_default();
+                !parties.names(c)
+                    && !crate::qe_acceptance::review::qe_seat_excluded(&c.key, &exclude_keys)
+                    && qe_admits(c)
+                    && !crate::qe_acceptance::review::qe_seat_authored(
+                        &c.key,
+                        Some(&seen),
+                        &author_keys,
+                        &author_seen,
+                    )
+            })
             .collect();
-        // The expected shape (DES §2.2, §2.4): the first reviewer also judges when it can, so a
-        // council's parties are the launch's parties, the author and that reviewer (plus the
+        // The expected shape (DES §2.2, §2.4, §3.9): the first reviewer also judges when it can, so
+        // a council's parties are the launch's parties, the author and that reviewer (plus the
         // judge when the reviewer cannot judge).
         let reviewer = if contract.evaluator {
             evaluators.first().map(|c| c.key.clone())
@@ -675,30 +688,16 @@ pub(crate) fn independence_preflight_in(
             _ => judges.first().cloned(),
         };
         let mut seated: Vec<String> = author.map(|a| a.key.clone()).into_iter().collect();
-        seated.extend(reviewer);
+        seated.extend(reviewer.clone());
         seated.extend(judge);
-        let council_parties = Named::new(seated, &records);
-        let council_voters = |extra: &Named, shares: &dyn Fn(&AgenticCli) -> bool| {
-            let mut ids: Vec<String> = Vec::new();
-            voters
-                .iter()
-                .filter(|c| {
-                    !parties.names(c) && !council_parties.names(c) && !extra.names(c) && !shares(c)
-                })
-                .filter(|c| {
-                    // One voter per identity: the council resolves a seat by its CLI's record.
-                    let id = identity(c);
-                    let fresh = !ids.contains(&id);
-                    if fresh {
-                        ids.push(id);
-                    }
-                    fresh
-                })
-                .map(|c| c.key.clone())
-                .collect::<Vec<_>>()
-        };
-        let none = Named::new(Vec::new(), &records);
-        let council = council_voters(&none, &|_: &AgenticCli| false);
+        // The team council (`team::supervisor::team_council_seats`, by key and identity) over the
+        // voters, its parties the launch's plus the expected shape's.
+        let mut team_parties = party_keys.clone();
+        team_parties.extend(seated);
+        let council: Vec<String> =
+            crate::team::supervisor::team_council_seats(owned(&voters), &team_parties)
+                .map(|seats| one_per_identity(&mut seats.iter()))
+                .unwrap_or_default();
         let non_party_workers: Vec<String> = workers
             .iter()
             .filter(|c| !parties.names(c))
@@ -741,23 +740,69 @@ pub(crate) fn independence_preflight_in(
             push("qe_reviewer", 1, keys(&qe_reviewers), &qe_base, false);
         }
         if shape.repo_bound && contract.rules {
-            // The rule judge (`cli_runner.rs`, `rule_judge_seats`): not excluded at launch, not the
-            // author's binary. The rule council (`cli_runner.rs`, the rule council's seats): its
-            // parties are the expected shape's plus the rule judge, launch exclusions apply, and a
-            // seat seen calling the author's provider does not vote.
-            let rule_judges: Vec<&AgenticCli> = evaluators
-                .iter()
-                .copied()
-                .filter(|c| !excluded.names(c))
+            // The rule judge (`cli_runner::rule_judge_seats`) over the work seats, the author its
+            // creator; a party never judges (DES §3.8).
+            let (rj, _) = crate::cli_runner::rule_judge_seats(
+                &author_keys,
+                author_bins.as_deref(),
+                &author_seen,
+                &exclude_keys,
+                &[],
+                &[],
+                &owned(&workers),
+                &records,
+                false,
+            );
+            let rule_judges: Vec<String> = rj
+                .into_iter()
+                .filter(|k| !parties.names_key(k, &records))
                 .collect();
-            let mut rule_ex = excluded.keys.clone();
-            rule_ex.extend(rule_judges.first().map(|c| c.key.clone()));
-            let rule_ex = Named::new(rule_ex, &records);
-            push("rule_judge", 1, keys(&rule_judges), &work_base, true);
+            // The rule council (`cli_runner::rule_council_candidates`): its parties the author,
+            // the rule judge and the reviewer (the rule judge when no reviewer sits), launch
+            // exclusions by identity, no seat seen calling the author's provider; drawn from the
+            // voters, never a party.
+            let rule_judge_ids: Vec<String> = rule_judges
+                .first()
+                .and_then(|k| records.iter().find(|c| &c.key == k))
+                .map(crate::cli_runner::record_identities)
+                .unwrap_or_default();
+            let rule_reviewer = reviewer.clone().or_else(|| rule_judges.first().cloned());
+            // The reviewer's launch as the gate reads it (its unit's `assigned_invocation`): its
+            // record's own template, so a launch-roster record is never looked up in the registry.
+            let rule_reviewer_inv: Option<String> = rule_reviewer
+                .as_deref()
+                .and_then(|k| records.iter().find(|c| c.key == k))
+                .map(|c| c.headless_invocation.clone());
+            let rule_council: Vec<String> = crate::cli_runner::rule_council_candidates(
+                &author_keys,
+                author_bins.as_deref(),
+                &author_seen,
+                &exclude_keys,
+                &[],
+                &[],
+                (rule_judges.first().map(String::as_str), &rule_judge_ids),
+                (rule_reviewer.as_deref(), rule_reviewer_inv.as_deref()),
+                None,
+                &records,
+                false,
+            )
+            .map(|seats| {
+                let mut seen_keys: Vec<&str> = Vec::new();
+                one_per_identity(&mut seats.iter().filter(|c| {
+                    let fresh = !seen_keys.contains(&c.key.as_str());
+                    seen_keys.push(c.key.as_str());
+                    fresh
+                        && voters.iter().any(|v| v.key == c.key)
+                        && !parties.names(c)
+                        && !shares_author(c)
+                }))
+            })
+            .unwrap_or_default();
+            push("rule_judge", 1, rule_judges, &work_base, true);
             push(
                 "rule_council",
                 crate::decision::RULE_COUNCIL_SIZE,
-                council_voters(&rule_ex, &shares_author),
+                rule_council,
                 &vote_base,
                 true,
             );
@@ -765,7 +810,19 @@ pub(crate) fn independence_preflight_in(
         if contract.team {
             push("council", council_size, council, &vote_base, true);
             let target = usize::from(crate::team::supervisor::monitor_target(None, 0));
-            push("monitor", target, keys(&evaluators), &work_base, true);
+            // The worker pool (`distribute::pool_seating`): an instance distinct from the creator
+            // and from the run's PA; never a party.
+            let pa = chosen.map(|c| c.key.as_str());
+            let monitors: Vec<String> = workers
+                .iter()
+                .filter(|c| {
+                    author.is_some_and(|a| {
+                        crate::distribute::monitor_seat_admitted(&c.key, &a.key, pa)
+                    }) && !crate::distribute::is_party(&c.key, &party_keys, &records)
+                })
+                .map(|c| c.key.clone())
+                .collect();
+            push("monitor", target, monitors, &work_base, true);
         }
         if !parties.keys.is_empty() {
             push("party_excluded", 1, non_party_workers, &work_base, false);
@@ -1313,6 +1370,40 @@ mod tests {
                 have: 0
             })
         );
+    }
+
+    /// core#1847: a `claude` + `claude#2` roster has a real evaluator (the second instance, as
+    /// the evaluator gate seats it) and a short judge (the judge excludes the author's binary),
+    /// and its QE reviewer is short too (the QE gate fences the author's whole CLI).
+    #[test]
+    fn a_second_instance_is_a_real_evaluator_and_no_judge() {
+        let mut second = roster_seat("i2", "claude");
+        second.key = "i2-claude#2".into();
+        let clis = [roster_seat("i2", "claude"), second];
+        let shape = PreflightShape {
+            primary: Some("i2-claude".into()),
+            ..bug_shape()
+        };
+        let p = preflight(&clis, &shape, contract_for(&shape, false));
+        assert_eq!(role(&p, "evaluator").real, ["i2-claude#2"]);
+        assert_eq!(role(&p, "evaluator").short_by, 0);
+        assert!(role(&p, "judge").real.is_empty());
+        assert_eq!(role(&p, "judge").short_by, 1);
+        assert!(role(&p, "qe_reviewer").real.is_empty());
+        assert_eq!(role(&p, "qe_reviewer").short_by, 1);
+        // The gates' own answers on the same seats, so the preflight cannot drift from them.
+        assert!(crate::distribute::evaluator_seat_admitted(
+            "i2-claude#2",
+            &|k| k == "i2-claude",
+            &[],
+            &clis
+        ));
+        assert!(crate::qe_acceptance::review::qe_seat_authored(
+            "i2-claude#2",
+            Some(&[]),
+            &["i2-claude".to_string()],
+            &[]
+        ));
     }
 
     /// The other side of §3.9: a full roster is not asked. Five signed-in CLIs on a repo-bound bug

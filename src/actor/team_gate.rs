@@ -2171,7 +2171,8 @@ pub(super) fn answer_dispute_gate(
         | crate::workflow::HumanDecision::RetryQe
         | crate::workflow::HumanDecision::RecheckRules { .. }
         | crate::workflow::HumanDecision::OperatorJudgment { .. }
-        | crate::workflow::HumanDecision::SkipQe { .. } => {
+        | crate::workflow::HumanDecision::SkipQe { .. }
+        | crate::workflow::HumanDecision::UseStandIns { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
         }
     };

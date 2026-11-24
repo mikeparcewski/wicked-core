@@ -352,6 +352,7 @@ fn launch_with(rig: &mut Rig, run: &str, declared: bool) {
             evidence_root: None,
             primary: Some("a".into()),
             reduced_assurance: false,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),

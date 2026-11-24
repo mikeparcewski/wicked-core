@@ -174,6 +174,7 @@ fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpe
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

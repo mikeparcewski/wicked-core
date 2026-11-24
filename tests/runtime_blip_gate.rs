@@ -79,6 +79,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

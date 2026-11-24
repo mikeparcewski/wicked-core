@@ -132,6 +132,7 @@ pub mod run_context;
 mod run_mirror;
 mod runtime_wait;
 mod skill_use;
+mod standin;
 pub mod tool_activity;
 // S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
 #[allow(dead_code)]
@@ -446,6 +447,10 @@ pub use repo_intel::{
 pub use scope::{resolve_scope, EntityMode};
 pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use standin::{
+    refuse_forged_stand_ins, LaunchStandIn, Reason as StandInReason, Role as StandInRole,
+    StandInBinding, StandInConsent,
+};
 pub use state_home::{
     preflight_state_home, StateHomeConfigError, StateHomePreflight, UnregisteredEntry,
 };
@@ -605,6 +610,10 @@ pub struct LaunchSpec {
     /// [`power::VOICE_MAX_BYTES`] (a longer one refuses the launch, nothing persisted). Ignored
     /// on a phased run (there is no orchestrator). `None` ⇒ no voice section.
     pub voice: Option<String>,
+    /// (DES-STANDIN-001 §3.8) The launch's stand-in facts: `standInAware` (the activation switch;
+    /// `false`, the default, keeps today's behaviour), the parties and any human consent.
+    /// Persisted on the run's contract, never re-read from here.
+    pub stand_in: crate::standin::LaunchStandIn,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):
@@ -1374,6 +1383,36 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at `run_id`'s open `stand_in_needed` gate —
+    /// studio's `{approve: true, action: "use_stand_ins", scope}`: the consent (`scope` `job` |
+    /// `always`, `by` = `actor`, recorded `via: "grant"`) goes on the run's contract and exactly the
+    /// held check continues, on a stand-in where no real helper can take it. Refused at any other
+    /// gate, on a run that is not stand-in-aware or runs reduced, and (through `expect`) for a gate
+    /// that is no longer the open one. Idempotent per gate: the gate it answered is closed.
+    pub fn grant_stand_ins(
+        &self,
+        run_id: &str,
+        scope: &str,
+        actor: Option<String>,
+        gate_seq: u32,
+        ord: Option<u32>,
+    ) -> anyhow::Result<SessionStatus> {
+        // (DES-STANDIN-001 §3.10, T-R12) A grant always names the opening it answers: a delayed
+        // grant never answers a later `stand_in_needed` opening (`gate_changed`).
+        self.confirm_gate_expecting(
+            run_id,
+            HumanDecision::UseStandIns {
+                scope: scope.to_string(),
+            },
+            actor,
+            Some(crate::workflow::GateExpect {
+                ord,
+                plan_rev: None,
+                gate_seq: Some(gate_seq),
+            }),
+        )
     }
 
     /// (rejudge) Whether `run_id`'s open gate can RE-RUN ITS JUDGE now

@@ -826,6 +826,18 @@ pub struct LaunchOptions {
     /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
     /// whose required judge was skipped holds (`judge_unavailable`).
     pub reduced_assurance: Option<bool>,
+    /// (DES-STANDIN-001 §3.8, §8) The launcher implements the stand-in choice. Omit (or `false`)
+    /// and the run behaves exactly as before, reduced assurance included; `true` with
+    /// `reducedAssurance` REJECTS the launch.
+    pub stand_in_aware: Option<bool>,
+    /// (DES-STANDIN-001 §3.8) Seats that authored the work under review: never seated for real in
+    /// an independent role, still on the roster so a stand-in can be based on them. Only with
+    /// `standInAware`.
+    pub parties: Option<Vec<String>>,
+    /// (DES-STANDIN-001 §3.8) A human's consent to stand-ins, as JSON:
+    /// `{"scope":"job"|"always","by":"<actor>","at":<ms>,"via":"launch"|…}`. `by`/`at` are the
+    /// launcher server's, never a request body's. Only with `standInAware`.
+    pub stand_in_json: Option<String>,
     /// (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
     /// step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
     /// session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
@@ -904,8 +916,23 @@ fn consider_rules_at(db_path: &str, query_json: &str) -> Result<String, String> 
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
+    // (DES-STANDIN-001 §3.3, T-R14) A roster never hands in a stand-in: refused before typing,
+    // which would drop an unknown `standIn` field silently.
+    let raw: Vec<serde_json::Value> = serde_json::from_str(&o.clis_json)
+        .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+    wicked_core::refuse_forged_stand_ins(&raw).map_err(err)?;
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+    let stand_in = wicked_core::LaunchStandIn {
+        aware: o.stand_in_aware.unwrap_or(false),
+        parties: o.parties.unwrap_or_default(),
+        consent: o
+            .stand_in_json
+            .as_deref()
+            .map(serde_json::from_str::<wicked_core::StandInConsent>)
+            .transpose()
+            .map_err(|e| err(format!("standInJson is not a stand-in consent: {e}")))?,
+    };
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
     let qe_acceptance = wicked_core::assurance::QeOverride::from_wire(
         o.skip_qe_acceptance_reason,
@@ -947,6 +974,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         evidence_root: o.evidence_root,
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
+        stand_in,
         power: o.power.unwrap_or(false),
         voice: o.voice,
         deliverables: o.deliverables.unwrap_or_default(),
@@ -1642,6 +1670,14 @@ impl Core {
                          retry_rules, skip_rules and retry_qe require approve=true)"
                     )))
                 }
+                // (DES-STANDIN-001 §3.10) The stand-in answer carries a scope and the opening it
+                // answers: it has its own door, one mechanism, never a second decoder here.
+                (Some("use_stand_ins"), _) => {
+                    return Err(err(anyhow::anyhow!(
+                        "action `use_stand_ins` is answered through grantStandIns(runId, scope, \
+                         gateSeq), with scope `job` or `always`"
+                    )))
+                }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
@@ -1652,6 +1688,30 @@ impl Core {
                 }
             };
             core.confirm_gate_expecting(&run_id, decision, actor.clone(), expect)
+                .map(status_token)
+                .map_err(err)
+        })
+    }
+
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at the run's open `stand_in_needed` gate (the
+    /// answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
+    /// or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
+    /// on the run's contract and exactly the held check continues. Refused at any other gate, on a
+    /// run that is not stand-in-aware or runs reduced, without an `actor` (consent is a person's),
+    /// and with an error that starts `gate_changed:` when the opening `expectGateSeq` names
+    /// (required) or `expectOrd` is no longer the open one. Resolves to the status token.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn grant_stand_ins(
+        &self,
+        run_id: String,
+        scope: String,
+        expect_gate_seq: u32,
+        actor: Option<String>,
+        expect_ord: Option<u32>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.grant_stand_ins(&run_id, &scope, actor, expect_gate_seq, expect_ord)
                 .map(status_token)
                 .map_err(err)
         })
