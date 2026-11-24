@@ -252,9 +252,10 @@ fn declared_in(
 /// postures ([`crate::write_posture::WritePosture::of`]) so the runner reconciles them with the
 /// seat's invocation and resolved trust flags at its one launch boundary:
 /// - claude is an answer-only unit, the tool-less posture: `--tools ""` (core#1257);
-/// - codex is a read-only evaluator, codex's `--sandbox read-only` lever in a per-call check
-///   scratch, the tree denied (F-036, core#503). Under the container floor the floor turns codex's
-///   own sandbox off, and the seat container is the boundary.
+/// - codex is a read-only evaluator: on the host floor its `--sandbox workspace-write` rooted at a
+///   per-call check scratch (`-C`), the tree denied by the kernel (F-036, core#503); under the
+///   container floor the floor turns codex's own sandbox off, and the seat container is the
+///   boundary.
 pub(crate) fn tool_free(unit: &mut crate::domain::WorkUnit, family: &str) {
     if family == "claude" {
         unit.answer_only = true;
@@ -640,8 +641,8 @@ mod tests {
         assert!(seen.iter().all(|s| s.1.as_deref() == Some("run-1")));
         assert_eq!(seen[1].2, long);
         // (coord fold 2) No tools, through the engine's own postures: claude is tool-less (the
-        // runner's `--tools ""`), codex a read-only evaluator (its `--sandbox read-only` lever in
-        // a check scratch). The seat's own invocation is handed on unchanged; the runner applies
+        // runner's `--tools ""`), codex a read-only evaluator (its `--sandbox workspace-write` rooted
+        // at a check scratch, the tree denied). The seat's own invocation is handed on unchanged; the runner applies
         // the posture to it and to the seat's resolved trust flags at its launch boundary.
         use crate::write_posture::WritePosture;
         assert_eq!(seen[0].4, WritePosture::ToolLess);
