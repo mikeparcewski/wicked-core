@@ -1932,8 +1932,11 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         .replace("/tmp/wicked-native", &root.join("t").display().to_string())
         .replace("/floor/landrun", &landrun.display().to_string());
     let run = |env: &[(&str, &str)]| {
+        // spawn-audit: test-only — runs the engine's build script against a stand-in claim, with
+        // the environment cleared and only the stand-ins' variables set.
         let mut c = std::process::Command::new("sh");
-        c.args(["-c", &local])
+        c.hardened()
+            .args(["-c", &local])
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("CLAIM", &claim);
@@ -2020,7 +2023,9 @@ fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
              exec(compile({:?}, \"proof\", \"exec\"))\n",
             JAIL_PROOF
         );
+        // spawn-audit: test-only — runs the jail proof's own code with injected denials.
         let o = std::process::Command::new("python3")
+            .hardened()
             .args(["-I", "-c", &prelude])
             .arg(&canary)
             .output()
@@ -2052,7 +2057,9 @@ fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
     let root = std::env::temp_dir().join(format!("native-decl-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join(".wicked")).unwrap();
     let git = |args: &[&str]| -> String {
+        // spawn-audit: test-only — builds the fixture repository.
         let o = std::process::Command::new("git")
+            .hardened()
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(&root)
