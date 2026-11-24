@@ -158,7 +158,7 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          through the channel the step was armed with ($WICKED_MODEL_CALL_SOCK), and the seat's \
          text is written to --out. Exit 0 = answered, 2 = refused or the seat failed (the reason \
          on stderr), 1 = bad arguments or files. Budget: --timeout-s, default 1500, at most 3600. \
-         --max-output-tokens caps a claude call's answer (1..128000; the seat's \
+         --max-output-tokens caps a claude call's answer (1..=128000; the seat's \
          CLAUDE_CODE_MAX_OUTPUT_TOKENS); a codex call that names it is refused.",
     ),
     (

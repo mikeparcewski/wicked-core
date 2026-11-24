@@ -150,7 +150,7 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
              "executor": {"type": "tool", "cmd": call("codex", "check.out")}}
         ]
     });
-    core.register_workflow(&def.to_string())
+    core.register_workflow(def.to_string())
         .expect("register workflow");
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
