@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use wicked_core::{
     Core, CoreEvent, HumanConfirm, HumanDecision, LaunchSpec, LaunchStandIn, RepoSpec,
-    SessionStatus, StandInConsent, StepInput, StepOutput, StepRunner, StepStatus,
+    StandInConsent, StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -453,18 +453,27 @@ fn t_r12_a_missing_judge_holds_and_a_grant_re_runs_only_the_judge() {
             },
         )
         .expect("a retry is taken");
-    let evs = if status == SessionStatus::AwaitingHuman {
-        Vec::new()
-    } else {
-        collect_until(&ev, ends(sid))
+    // Wait on the gate itself, not on an event: the first hold may have left a later
+    // `awaitingHuman` in the channel, and the re-judge runs on its own thread (a slow runner saw the
+    // gate between the retry and the re-opening).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let now = loop {
+        let open = rig.core.gate_actions(sid).unwrap().filter(|g| {
+            g.gate_seq != Some(first_seq) && g.actions.iter().any(|a| a.action == "use_stand_ins")
+        });
+        if let Some(g) = open {
+            break g;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gate re-opened at stand_in_needed after the retry ({status:?})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     };
-    let now = rig
-        .core
-        .gate_actions(sid)
-        .unwrap()
-        .unwrap_or_else(|| panic!("the gate re-opened: {evs:?}"));
     let now_seq = now.gate_seq.expect("gate_seq");
     assert_ne!(first_seq, now_seq, "the retry is another opening");
+    // The held gate is idle: what the channel holds is the retry's, never the grant's.
+    while ev.try_recv().is_ok() {}
     assert_eq!(tallies(&rig), (Vec::new(), 1), "a retry re-ran no build");
 
     // The earlier opening is gone: its grant is refused; the current one is taken.
