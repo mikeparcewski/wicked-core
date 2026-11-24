@@ -1998,6 +1998,52 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// core#1406: the confined half of the jail proof passes only when a write-open AND a
+/// `truncate(2)` of the canary each fail with `EACCES`. Landlock ABI v1/v2 deny the open but not
+/// the truncate, and another error (a full claim) is no denial; both must fail the proof. The
+/// denials are injected into the proof's own code (an interpreter prelude) so each is exercised
+/// on its own, which a filesystem stand-in cannot do.
+#[cfg(unix)]
+#[test]
+fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
+    let root = std::env::temp_dir().join(format!("jail-proof-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let canary = root.join(JAIL_PROBE);
+    let proof = |open: &str, truncate: &str| -> (i32, u64) {
+        std::fs::write(&canary, "x").unwrap();
+        let prelude = format!(
+            "import builtins, errno, os\n\
+             real_open, real_truncate = builtins.open, os.truncate\n\
+             def fail(e):\n    raise OSError(e, os.strerror(e))\n\
+             builtins.open = lambda *a, **k: fail({open}) if {open} else real_open(*a, **k)\n\
+             os.truncate = lambda p, n: fail({truncate}) if {truncate} else real_truncate(p, n)\n\
+             exec(compile({:?}, \"proof\", \"exec\"))\n",
+            JAIL_PROOF
+        );
+        let o = std::process::Command::new("python3")
+            .args(["-I", "-c", &prelude])
+            .arg(&canary)
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap_or(-1),
+            std::fs::metadata(&canary).unwrap().len(),
+        )
+    };
+    let (eacces, enospc) = ("errno.EACCES", "errno.ENOSPC");
+    assert_eq!(
+        proof(eacces, eacces),
+        (0, 1),
+        "both refused by Landlock: proven"
+    );
+    // ABI v1/v2: the open refused, the truncate allowed (it ran: the canary is empty).
+    assert_eq!(proof(eacces, "0"), (4, 0));
+    assert_eq!(proof("0", eacces).0, 4, "a writable canary");
+    assert_eq!(proof(enospc, eacces).0, 4, "a full claim is no denial");
+    assert_eq!(proof(eacces, enospc).0, 4);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// core#1406: the native addons a seat's claim is built for come from the snapshot tree's own
 /// `.wicked/checks.json` blob (never the worktree's file), validated as the floor validates them.
 #[cfg(unix)]
