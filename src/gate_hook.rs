@@ -4233,6 +4233,25 @@ const GIT_REV_OPTIONS: &[&str] = &[
     "--log-size", "--no-color-moved",
 ];
 
+/// The verbs that read with [`GIT_REV_OPTIONS`].
+const GIT_REV_VERBS: &[&str] = &[
+    "log",
+    "show",
+    "whatchanged",
+    "diff",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "reflog",
+    "stash",
+    "rev-list",
+    "shortlog",
+];
+
+/// The short options git's diff parser reads (they cluster: `-pw`, `-sS<s>`); a value-taking
+/// one (`S G O I U B M C X`) takes the rest of the word.
+const GIT_DIFF_CLUSTER_LETTERS: &str = "pusRzabwWDSGOIUBMCX";
+
 /// `rev-list`'s own options, on top of [`GIT_REV_OPTIONS`].
 #[rustfmt::skip]
 const GIT_REV_LIST_OPTIONS: &[&str] = &[
@@ -4474,6 +4493,7 @@ fn git_config_key_inert(key: &str) -> bool {
                 | "user.email"
                 | "i18n.logoutputencoding"
                 | "log.showroot"
+                | "log.showsignature"
                 | "log.date"
                 | "log.decorate"
                 | "log.abbrevcommit"
@@ -4483,6 +4503,14 @@ fn git_config_key_inert(key: &str) -> bool {
                 | "diff.noprefix"
                 | "diff.mnemonicprefix"
         )
+}
+
+/// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`) naming a pager that only prints.
+fn git_pager_harmless(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "" | "cat" | "less" | "more" | "less -R" | "less -FRX" | "less -FRSX"
+    )
 }
 
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder
@@ -4568,8 +4596,9 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
                 writes = true;
                 traces.extend(strip_shell_prefix(a, &format!("{name}=")));
             }
+        } else if name == "GIT_PAGER" {
+            runs |= !git_pager_harmless(strip_one_quote_layer(value));
         } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
-            writes = true;
             runs = true;
         }
     }
@@ -4636,10 +4665,17 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
             j += 1;
         } else if w == "-c" {
             match words.get(j + 1) {
+                // (coord B1) A key that may carry a command adds a target no text settles
+                // (advisory); it proves no write, so a read under `-C <root>` stays a read.
                 Some(GitWord::Known(kv)) => {
-                    let key = kv.split_once('=').map_or(kv.as_str(), |p| p.0);
-                    writes |= !git_config_key_inert(key);
-                    runs |= !git_config_key_runs_nothing(key);
+                    let (key, value) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                    let pager = key.eq_ignore_ascii_case("core.pager")
+                        || key.to_ascii_lowercase().starts_with("pager.");
+                    runs |= if pager {
+                        !git_pager_harmless(value)
+                    } else {
+                        !git_config_key_runs_nothing(key)
+                    };
                 }
                 _ => unsettled = true,
             }
@@ -4748,6 +4784,29 @@ fn git_option(verb: &str, tables: &[&[&str]], w: &str) -> Option<(Vec<String>, O
     // word, when it ends the cluster).
     let chars: Vec<char> = short.chars().collect();
     chars.first()?;
+    // (coord A1) The log / diff family reads its options with two parsers: diff options cluster,
+    // revision options (`-n`, `-L`, `-g`, `-m`, `-c`, `-t`, `-i`, …) never do. git refuses a
+    // mixed cluster (`-sn`) only after it has opened `--output`, so a cluster reads only when
+    // every letter is a diff flag (`shortlog` clusters its own `-sne` too).
+    // A first letter that takes a value is one option with its value glued (`-n5`, `-L1,5:f`).
+    let flag_first = lookup(&format!("-{}", chars[0])) == Some(GitValue::None);
+    if chars.len() > 1 && flag_first && GIT_REV_VERBS.contains(&verb) {
+        let own = |c: &char| {
+            GIT_DIFF_CLUSTER_LETTERS.contains(*c)
+                || (verb == "shortlog" && GIT_SHORTLOG_OPTIONS.contains(&format!("-{c}").as_str()))
+        };
+        // The letters up to the first that takes a value; the rest of the word is its value.
+        let mut letters = Vec::new();
+        for c in &chars {
+            letters.push(*c);
+            if lookup(&format!("-{c}")).is_some_and(|v| v != GitValue::None) {
+                break;
+            }
+        }
+        if !letters.iter().all(own) {
+            return None;
+        }
+    }
     let mut names = Vec::new();
     for (k, c) in chars.iter().enumerate() {
         let name = format!("-{c}");
@@ -4877,7 +4936,9 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
                 .all(|o| matches!(o.as_str(), "-v" | "--verbose" | "--push" | "--all")),
             Some(_) => false,
         },
-        "stash" => matches!(first, Some("list" | "show")),
+        // (coord A2) Only the word right after `stash`: an option before it (`stash -m list`)
+        // makes git run `stash push` with that word as its message or pathspec.
+        "stash" => matches!(words.first(), Some(GitWord::Known(w)) if w == "list" || w == "show"),
         "worktree" => first == Some("list"),
         // `show`, `exists`, or no subcommand reads; `expire`, `delete` or a ref name does not.
         "reflog" => matches!(first, None | Some("show" | "exists")),
@@ -4903,7 +4964,7 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
     let could_read = match verb {
         "branch" | "tag" => operands.iter().any(|o| o == GIT_UNSETTLED),
         "remote" => may_be(&["show", "get-url"]),
-        "stash" => may_be(&["list", "show"]),
+        "stash" => !matches!(words.first(), Some(GitWord::Known(_))) && may_be(&["list", "show"]),
         "worktree" => may_be(&["list"]),
         "reflog" => may_be(&["show", "exists"]),
         "config" => {
@@ -5044,13 +5105,14 @@ fn git_output_targets(
                     // A flag, a count digit (`-1O<cmd>`) or a letter this list does not know:
                     // read on, so nothing after it is missed.
                     Some(GitValue::None) | None => {}
-                    // `-e <pattern>`: the next word is a value; `-fOWNERS`: the rest is one.
-                    Some(GitValue::Next) if settled && rest.is_empty() => {
-                        k += 1;
-                        break;
-                    }
+                    // `-fOWNERS`: the rest of the word is a value.
                     Some(_) => break,
                 }
+            }
+            // `-e <pattern>`: the next word is a value, only where git's parser takes it so
+            // (`log -sn --output=<f>` is a cluster git refuses after opening `<f>`: coord A1).
+            if settled && matches!(git_option(verb, tables, text), Some((_, Some(true)))) {
+                k += 1;
             }
         }
         k += 1;
@@ -10760,7 +10822,7 @@ mod tests {
             // The family: what names the repository and git's own options are judged too.
             ("family", Fatal, format!("GIT_DIR={r}/.git git branch wip")),
             ("family", Fatal, format!("env GIT_WORK_TREE={r} git checkout -- src")),
-            ("family", Fatal, format!("git -c core.fsmonitor='touch x' -C {r} status")),
+            ("family", Advisory, format!("git -c core.fsmonitor='touch x' -C {r} status")),
             ("family", Refused, format!("git --exec-path={w} -C {r} log -1")),
             ("family", Read, format!("GIT_DIR={r}/.git git log -1 --oneline")),
             ("family", Read, format!("git -c color.ui=never -C {r} log -1")),
@@ -10777,7 +10839,7 @@ mod tests {
             ("r1.runs", Advisory, "git -c core.pager='touch victim; cat' -p log".to_string()),
             ("r1.runs", Advisory, "GIT_PAGER='touch victim' git log -1".to_string()),
             ("r1.runs", Advisory, "GIT_CONFIG_COUNT=1 git log -1".to_string()),
-            ("r1.runs", Fatal, format!("git -C {r} -c core.pager='touch x; cat' --paginate log")),
+            ("r1.runs", Advisory, format!("git -C {r} -c core.pager='touch x; cat' --paginate log")),
             ("r1.runs", Fatal, format!("GIT_TRACE={o}/trace git log -1")),
             ("r1.runs", Read, "GIT_TRACE=1 git log -1".to_string()),
             ("r1.runs", Read, "git -c commit.gpgsign=false commit -qm x".to_string()),
@@ -10827,6 +10889,30 @@ mod tests {
             ("r2.find", Refused, "find ~/rr -maxdepth 0 -exec git -C '{}' branch x \\;".to_string()),
             ("r2.find", Read, "find \".\" -maxdepth 0 -execdir git branch x \\;".to_string()),
             ("r2.find", Read, "find . -maxdepth 0 -exec git -C {} log -S '-files0-from' -1 \\;".to_string()),
+            // Coord round 2 (A1): a cluster mixing git's two option parsers reads no value.
+            ("c2.A1", Fatal, format!("git -C {r} log -sn --output={r}/f")),
+            ("c2.A1", Fatal, format!("git log -sn --output={o}/f")),
+            ("c2.A1", Fatal, format!("cd {r} && git log -sn --output=x")),
+            ("c2.A1", Fatal, format!("git -C {r} show -pL --output={r}/f")),
+            ("c2.A1", Fatal, format!("git -C {r} diff -Rn --output={r}/f")),
+            ("c2.A1", Fatal, format!("git -C {r} stash show -pn --output={r}/f")),
+            ("c2.A1", Fatal, format!("git -C {r} log -gS --output={r}/f")),
+            ("c2.A1", Read, format!("git -C {r} log -sS median")),
+            ("c2.A1", Read, format!("git -C {r} diff -pw HEAD")),
+            ("c2.A1", Read, format!("git -C {r} log -n5 --oneline")),
+            ("c2.A1", Read, format!("git -C {r} shortlog -sne")),
+            // (A2) `stash` reads only on `list` / `show` right after the verb.
+            ("c2.A2", Fatal, format!("git -C {r} stash -m list")),
+            ("c2.A2", Fatal, format!("git -C {r} stash -u -m show")),
+            ("c2.A2", Fatal, format!("git -C {r} stash -- show")),
+            ("c2.A2", Fatal, format!("cd {r} && git stash --staged -m list")),
+            // (B1) A harmless pager or a key that runs nothing keeps a read a read.
+            ("c2.B1", Read, format!("GIT_PAGER=cat git -C {r} log -5")),
+            ("c2.B1", Read, format!("git -c core.pager=cat -C {r} log")),
+            ("c2.B1", Read, format!("git -c core.fileMode=false -C {r} status")),
+            ("c2.B1", Read, format!("git -c log.showSignature=false -C {r} log")),
+            ("c2.B1", Read, format!("cd {r} && GIT_PAGER=cat git log -5")),
+            ("c2.B1", Read, format!("cd {r} && git -c core.pager=cat log -3")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (
