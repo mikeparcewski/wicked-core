@@ -450,16 +450,16 @@ pub(crate) fn provision(
     platform: &SeatPlatform,
 ) -> Provisioned {
     match install(worktree, git_dir, run_id, platform) {
-        Provisioned::AlreadyFor(label) => {
-            Provisioned::AlreadyFor(with_native(worktree, git_dir, run_id, platform, label))
-        }
+        Provisioned::AlreadyFor(label) => Provisioned::AlreadyFor(with_native(
+            worktree, git_dir, run_id, platform, label, false,
+        )),
         Provisioned::Installed {
             platform: label,
             argv,
             duration_ms,
             restored,
         } => Provisioned::Installed {
-            platform: with_native(worktree, git_dir, run_id, platform, label),
+            platform: with_native(worktree, git_dir, run_id, platform, label, true),
             argv,
             duration_ms,
             restored,
@@ -495,9 +495,18 @@ fn declared_native(worktree: &Path) -> Result<Vec<&'static str>, String> {
     crate::repo_checks::native_rebuild_in(&raw)
 }
 
-/// Whether this step built `build` (its marker is there, a regular file).
+/// Whether this step built `build` and its binding is still there: its marker and a
+/// `Release/*.node`, regular files, in a real directory.
 fn built_here(build: &Path) -> bool {
-    std::fs::symlink_metadata(build.join(NATIVE_BUILT)).is_ok_and(|m| m.is_file())
+    let file = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
+    std::fs::symlink_metadata(build).is_ok_and(|m| m.is_dir())
+        && file(&build.join(NATIVE_BUILT))
+        && std::fs::read_dir(build.join("Release")).is_ok_and(|d| {
+            d.flatten().any(|e| {
+                e.path().extension().is_some_and(|x| x == "node")
+                    && e.file_type().is_ok_and(|t| t.is_file())
+            })
+        })
 }
 
 /// Empty an addon's `build/` (a link there is removed, never followed) and make it again.
@@ -519,13 +528,16 @@ fn empty_dir(build: &Path) -> bool {
 }
 
 /// (core#1406) Build `worktree`'s declared native addons for the seat (see [`provision`]) and
-/// return `label` with what happened, for the stream and the seat's context.
+/// return `label` with what happened, for the stream and the seat's context. `fresh`: the
+/// dependencies were installed just now, so whatever their packages shipped in `build/` (a marker
+/// included) is never reused.
 fn with_native(
     worktree: &Path,
     git_dir: Option<&Path>,
     run_id: &str,
     platform: &SeatPlatform,
     label: String,
+    fresh: bool,
 ) -> String {
     let native = match declared_native(worktree) {
         Ok(n) if n.is_empty() => return label,
@@ -555,7 +567,7 @@ fn with_native(
         }
         builds.push(pkg.join("build"));
     }
-    if builds.iter().all(|b| built_here(b)) {
+    if !fresh && builds.iter().all(|b| built_here(b)) {
         return format!("{label}; {names} built natively");
     }
     if platform.foreign {
@@ -1198,6 +1210,7 @@ pub(crate) mod tests {
         // A binding the package ships (another platform's, or anything): never reused.
         std::fs::create_dir_all(pkg.join("build/Release")).unwrap();
         std::fs::write(pkg.join("build/Release/shipped.node"), "not a binding").unwrap();
+        std::fs::write(pkg.join("build").join(NATIVE_BUILT), "").unwrap();
         std::fs::create_dir_all(wt.join("vendor")).unwrap();
         // spawn-audit: test-only — the fixture's package tarball (npm's own layout, `package/`).
         let st = Command::new("tar")
@@ -1413,6 +1426,15 @@ pub(crate) mod tests {
             std::fs::metadata(&built).unwrap().modified().unwrap(),
             stamp
         );
+        // Its binding gone (a seat removed it): the marker alone is not a build; built again.
+        std::fs::remove_dir_all(wt.join("node_modules/better-sqlite3/build/Release")).unwrap();
+        let rebuilt = provision(&wt, Some(&gd), "r", &SeatPlatform::host());
+        assert!(
+            matches!(&rebuilt, Provisioned::AlreadyFor(p) if p.ends_with("built natively just now")),
+            "{rebuilt:?}"
+        );
+        assert!(rebuilt.note().is_some());
+        assert_eq!(loads().trim(), "bound");
 
         // Undeclared: the install leaves it unbuilt (scripts off), and the label says nothing.
         std::fs::remove_file(wt.join(crate::repo_checks::CONFIG_PATH)).unwrap();
@@ -1443,6 +1465,7 @@ pub(crate) mod tests {
             "r",
             &SeatPlatform::host(),
             "darwin-arm64".into(),
+            true,
         );
         assert!(
             label.starts_with(
@@ -1457,7 +1480,8 @@ pub(crate) mod tests {
                 None,
                 "r",
                 &SeatPlatform::host(),
-                "darwin-arm64".into()
+                "darwin-arm64".into(),
+                true
             ),
             "darwin-arm64"
         );

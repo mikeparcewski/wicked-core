@@ -2899,13 +2899,15 @@ impl Filler<'_> {
     /// in a pod with NO network (a floor pod, proven offline before anything runs), the claim
     /// read-write, running [`native_build_script`] in the checks image, whose node is the default
     /// seat image's own. The build runs repository-installed code with exactly the trust the
-    /// floor's own native-build step gives it, and writes only the seat's claim. Once per claim
-    /// and run; the pod goes on every path.
-    fn build_native(&self, volume: &str, native: &[&str]) -> Result<(), String> {
+    /// floor's own native-build step gives it, confined to the addons' `build/` in the seat's claim.
+    /// Once per claim and run; the pod goes on every path. `Ok(true)` = built now, `Ok(false)` =
+    /// built before; `Err` (failed, cut short, or its pod not confirmed gone) = the claim must not
+    /// reach a seat.
+    fn build_native(&self, volume: &str, native: &[&str]) -> Result<bool, String> {
         let key = format!("{}/{volume}/{NATIVE_BUILT}", self.place.ns);
         let _lock = lock_volume(&format!("{}-{volume}", self.place.ns))?;
         if filled(&key) {
-            return Ok(());
+            return Ok(false);
         }
         let name = format!("build-{volume}");
         // An earlier build of this claim that outlived its client may still write it: confirmed
@@ -2935,7 +2937,8 @@ impl Filler<'_> {
         let gone = Gone(self.place, &name);
         self.place.prove_offline(&name)?;
         let script = native_build_script(native);
-        self.place
+        let out = self
+            .place
             .run(&name, &["sh", "-c", &script], FILL)
             .map_err(|e| {
                 let last = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
@@ -2952,7 +2955,7 @@ impl Filler<'_> {
                 format!("the build pod is not confirmed gone: {e}")
             })?;
         mark_filled(&key);
-        Ok(())
+        Ok(!out.lines().any(|l| l.trim() == "WICKED-HIT"))
     }
 
     /// Run a fill pod (the network, the claim `claim` read-write at [`FILL_DIR`]) over `entries`
@@ -3207,12 +3210,8 @@ pub(crate) fn seat_node_modules(
         std::env::var(MEMORY_ENV).ok().as_deref(),
         crate::container_floor::seat_cpus(),
     )?;
-    let volume = seat_nm_volume(
-        &tag,
-        &lock,
-        &npm_inputs(&entries, &lock, &snap.tree),
-        &native,
-    );
+    let inputs = npm_inputs(&entries, &lock, &snap.tree);
+    let volume = seat_nm_volume(&tag, &lock, &inputs, &native);
     let filler = Filler {
         place: &place,
         tag: &tag,
@@ -3225,20 +3224,44 @@ pub(crate) fn seat_node_modules(
         Fill::Filled => false,
         Fill::Failed(log) => return Ok(SeatNm::Failed(log)),
     };
-    let native = (!native.is_empty()).then(|| {
-        let names = native.join(", ");
-        match filler.build_native(&volume, &native) {
-            Ok(()) => format!("{names} built natively"),
-            Err(e) => format!(
-                "{names} did not build natively ({e}), so a test that loads it fails in this seat"
-            ),
+    if native.is_empty() {
+        return Ok(SeatNm::Claim {
+            claim: volume,
+            hit,
+            native: None,
+        });
+    }
+    let names = native.join(", ");
+    match filler.build_native(&volume, &native) {
+        Ok(now) => Ok(SeatNm::Claim {
+            claim: volume,
+            hit: hit && !now,
+            native: Some(if now {
+                format!("{names} built natively just now")
+            } else {
+                format!("{names} built natively")
+            }),
+        }),
+        // A build that failed, was cut short or whose pod is not confirmed gone: its claim is
+        // never handed to the seat. The seat gets the plain install instead (the addon unbuilt,
+        // as before core#1406), so it still starts.
+        Err(e) => {
+            let plain = nm_volume(&tag, "", &lock, &inputs, &[]);
+            let hit = match filler.fill_nm(&snap.tree, &entries, "", &plain, &[])? {
+                Fill::Hit => true,
+                Fill::Filled => false,
+                Fill::Failed(log) => return Ok(SeatNm::Failed(log)),
+            };
+            Ok(SeatNm::Claim {
+                claim: plain,
+                hit,
+                native: Some(format!(
+                    "{names} did not build natively ({e}), so a test that loads it fails in this \
+                     seat"
+                )),
+            })
         }
-    });
-    Ok(SeatNm::Claim {
-        claim: volume,
-        hit,
-        native,
-    })
+    }
 }
 
 /// (core#1406) The native addons the tree `tree` (a snapshot) declares in its root

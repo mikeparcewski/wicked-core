@@ -276,11 +276,10 @@ jobs:
               mkdir -p node_modules/better-sqlite3/build
               if ls node_modules/better-sqlite3/build/Release/*.node 2>/dev/null; then
                 echo "the install built a binding with scripts off" >&2; exit 1
-              fi'
+              fi
+              # A file outside build/ proves the confinement: the build cannot touch it.
+              echo untouched > node_modules/.probe'
           # The claim's build pod: no network, the claim at /wicked/vol, the engine's own script.
-          # A file outside build/ proves the confinement: the build cannot touch it.
-          echo untouched > "$dir/t/node_modules/.probe"
-          chmod a+rw "$dir/t/node_modules/.probe"
           docker run --rm --network none --read-only --user 1000:1000 \
             --security-opt no-new-privileges --cap-drop ALL \
             --tmpfs /tmp:exec --tmpfs /home/floor -v "$dir/floor:/floor:ro" \
