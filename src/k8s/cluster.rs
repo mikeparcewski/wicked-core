@@ -1203,7 +1203,6 @@ pub(crate) fn ensure_pids_limited(
 #[cfg(all(test, unix))]
 mod renewal_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn idle_timer_caps_sleep_and_preserves_near_due_delay() {
@@ -1263,16 +1262,16 @@ mod renewal_tests {
         let now = 1_000_000;
         let expiry = now + TOKEN_RENEW_BELOW_SECS + 10;
         let fresh = token(expiry + 30 * 24 * 3600);
-        std::fs::write(
+        // (core#1769) Both stand-ins go in through `install_stub`: this process never holds a
+        // writable descriptor to a script it then execs, so no exec fails with `ETXTBSY`.
+        crate::test_env::install_stub(
             &kubectl,
-            format!(
+            &format!(
                 "#!/bin/sh\ncase \"$*\" in\n\
                  *'create token wicked-engine'*) printf '%s' '{fresh}';;\n\
                  *) exit 91;; esac\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let path = super::super::own_kubeconfig(&dir);
         write_private(
             &path,
@@ -1310,12 +1309,11 @@ mod renewal_tests {
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(
+        crate::test_env::install_stub(
             &engine.kubectl,
             "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\n\
              printf 'attempt\\n' >> attempts\nexit 23\n",
-        )
-        .unwrap();
+        );
         for (elapsed, delay) in [(0, 1), (1, 2), (2, 1), (3, 60)] {
             assert_eq!(
                 token_renewal_step(&engine, now + elapsed, &mut backoff),
