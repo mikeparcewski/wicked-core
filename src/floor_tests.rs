@@ -5529,6 +5529,82 @@ fn core_1157_a_check_that_left_outputs_runs_fresh_and_the_rest_is_reused() {
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
+/// (core#1870) Tool caches are no left outputs. pytest writes `.pytest_cache/` (its cacheprovider
+/// is on by default), ruff `.ruff_cache/` and mypy `.mypy_cache/` into the project on every run,
+/// so on a Python repository `test` and `lint` always "left outputs" and the verify floor ran them
+/// again in full. These checks write each cache's real layout (pytest 8: `v/cache/lastfailed`,
+/// `.gitignore`, `CACHEDIR.TAG`, `README.md`; ruff 0.6 and mypy 1.x their own); the verify floor
+/// reuses both. A check that writes a cache AND a generated output (`typecheck`) still left the
+/// output, and runs again.
+#[cfg(unix)]
+#[test]
+fn core_1870_python_tool_caches_are_no_left_outputs_and_test_and_lint_are_reused() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(0.5, 4);
+    let nonce = "echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')";
+    let cache = |dir: &str, files: &[&str]| {
+        let mut s = format!(
+            "mkdir -p {dir} && printf '# Created by tool automatically.\\n*\\n' > {dir}/.gitignore \
+             && printf 'Signature: 8a477f597d28d172789f06886806bc55\\n' > {dir}/CACHEDIR.TAG"
+        );
+        for f in files {
+            let parent = f.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            s.push_str(&format!(
+                " && mkdir -p {dir}/{parent} && echo '{{}}' > {dir}/{f}"
+            ));
+        }
+        s
+    };
+    let pytest = cache(
+        ".pytest_cache",
+        &["v/cache/lastfailed", "v/cache/nodeids", "README.md"],
+    );
+    let ruff = cache(".ruff_cache", &["0.6.9/1234567890123456789"]);
+    let mypy = cache(".mypy_cache", &["3.12/app.meta.json", "3.12/app.data.json"]);
+    let r = Core1144::new(
+        "core-1870-caches",
+        serde_json::json!({
+            "typecheck": ["sh", "-c", format!("{mypy} && mkdir -p out && echo g > out/gen.txt && {nonce}")],
+            "lint": ["sh", "-c", format!("{ruff} && {mypy} && {nonce}")],
+            "test": ["sh", "-c", format!("{pytest} && {nonce}")],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed, "{creator:#?}");
+    for name in ["lint", "test"] {
+        assert_eq!(
+            check_of(&creator, name).left_outputs,
+            Vec::<String>::new(),
+            "`{name}` left only its tool cache"
+        );
+    }
+    assert_eq!(
+        check_of(&creator, "typecheck").left_outputs,
+        vec!["out/".to_string(), "out/gen.txt".to_string()],
+        "a generated output beside a cache is still recorded"
+    );
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(verify.passed, "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("the reuse is disclosed");
+    assert_eq!(reuse.voided, None, "{reuse:?}");
+    assert_eq!(reuse.reused, vec!["lint".to_string(), "test".to_string()]);
+    assert_eq!(reuse.fresh, vec!["typecheck".to_string()]);
+    for name in ["lint", "test"] {
+        assert_eq!(stdout_of(&verify, name), stdout_of(&creator, name));
+    }
+    assert_ne!(
+        stdout_of(&verify, "typecheck"),
+        stdout_of(&creator, "typecheck")
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
 /// (core#1157, xreview r1 on #1866) A producer that writes beneath a directory an EARLIER check
 /// created: `typecheck` makes `out/keep`, `lint` adds `out/failing.test.sh`. A listing collapsed
 /// per directory sees `out/` before and after `lint` alike; the floor lists what its own checks
