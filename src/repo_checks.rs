@@ -1249,45 +1249,83 @@ fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
 /// (core#1157) At most this many paths are kept on [`CheckRun::left_outputs`].
 pub const LEFT_OUTPUTS_CAP: usize = 20;
 
-/// (core#1157) The untracked and ignored paths in a guarded checkout, collapsed per directory as
-/// git lists them (`--ignored=matching`: an ignored directory is one entry, never walked). The
-/// engine's own scratch (`tmp/`, where the base export lives) is not a check's output. `Err` when
-/// the checkout cannot be listed.
-pub(crate) fn untracked_inventory(
-    worktree: &Path,
+/// (core#1157) At most this many paths are listed under the directories a floor's checks created;
+/// more is "cannot be listed" (the check is not reused), never a partial list.
+pub const INVENTORY_CAP: usize = 20_000;
+
+/// (core#1157) Runs `git <args>` where the checks execute (the guarded checkout on the host, the
+/// floor pod's copy in a container floor) and returns its stdout.
+pub(crate) type GitAt<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u8>, String>;
+
+/// (core#1157) Git's listing of every path outside the tree (untracked or ignored alike), an
+/// entirely untracked directory as one entry (`dir/`). The engine's own scratch (`tmp/`, where the
+/// base export lives) is not a check's output. A name that is not UTF-8 is kept, lossily.
+pub(crate) fn outside_tree(
+    git: GitAt,
+    under: &[String],
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    let no_hooks = no_hooks_dir()?;
-    let hooks = format!("core.hooksPath={}", no_hooks.to_string_lossy());
-    let env: [(&str, &Path); 1] = [("GIT_OPTIONAL_LOCKS", Path::new("0"))];
-    let out = crate::worktree_guard::git(
-        worktree,
-        &[
-            "-c",
-            &hooks,
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--ignored=matching",
-            "--untracked-files=normal",
-            "--no-renames",
-        ],
-        &env,
-    )
-    .map_err(|e| format!("the checkout's files could not be listed: {e}"))?;
+    let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--others"];
+    if under.is_empty() {
+        args.push("--directory");
+    } else {
+        args.push("--");
+        args.extend(under.iter().map(String::as_str));
+    }
+    let out = git(&args).map_err(|e| format!("the checkout's files could not be listed: {e}"))?;
     let scratch = crate::worktree_guard::ENGINE_SCRATCH_DIR;
     Ok(out
         .split(|b| *b == 0)
-        .filter_map(|e| {
-            let e = std::str::from_utf8(e).ok()?;
-            let path = e.strip_prefix("?? ").or_else(|| e.strip_prefix("!! "))?;
-            let top = path.trim_end_matches('/');
-            (top != scratch && !path.starts_with(&format!("{scratch}/"))).then(|| path.to_string())
+        .filter(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .filter(|path| {
+            path.trim_end_matches('/') != scratch && !path.starts_with(&format!("{scratch}/"))
         })
         .collect())
+}
+
+/// (core#1157) The paths outside the tree in a guarded checkout: git's collapsed listing
+/// ([`outside_tree`]), with every directory NOT in `settled` (one an earlier check of this floor
+/// created) listed file by file, so a later check that writes beneath it is seen. `settled` holds
+/// what the checkout had before the floor's first check and what its provisioning left (the
+/// dependency trees every floor installs again): those are not walked. `Err` when the checkout
+/// cannot be listed, or holds more than [`INVENTORY_CAP`] such files.
+pub(crate) fn untracked_inventory(
+    git: GitAt,
+    settled: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut all = outside_tree(git, &[])?;
+    let created: Vec<String> = all
+        .iter()
+        .filter(|p| p.ends_with('/') && !settled.contains(*p))
+        .cloned()
+        .collect();
+    if !created.is_empty() {
+        all.extend(outside_tree(git, &created)?);
+    }
+    if all.len() > INVENTORY_CAP {
+        return Err(format!(
+            "more than {INVENTORY_CAP} files outside the tree could not be listed one by one"
+        ));
+    }
+    Ok(all)
+}
+
+/// (core#1157) Runs git in a guarded host checkout for [`untracked_inventory`]: no hooks, no
+/// fsmonitor, no untracked cache, no optional locks.
+pub(crate) fn git_at_checkout(worktree: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let no_hooks = no_hooks_dir()?;
+    let hooks = format!("core.hooksPath={}", no_hooks.to_string_lossy());
+    let env: [(&str, &Path); 1] = [("GIT_OPTIONAL_LOCKS", Path::new("0"))];
+    let mut a = vec![
+        "-c",
+        hooks.as_str(),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+    ];
+    a.extend(args);
+    crate::worktree_guard::git(worktree, &a, &env).map_err(|e| e.to_string())
 }
 
 /// (core#1157) What a check left: the paths in `after` that were not in `before`, capped. A listing
@@ -1461,10 +1499,13 @@ impl CreatorSeed {
 }
 
 /// (core#1208) The checks a hand-off round's creator floor may narrow to what the round changed: the
-/// test set. The cheap checks (install, typecheck, lint, the formatter) read the whole tree and
-/// always run in full.
+/// test set the repository declares a targeted command for (`test_targeted`, its `{files}` = the
+/// round's files). The cheap checks (install, typecheck, lint, the formatter) read the whole tree
+/// and always run in full. A cargo workspace's engine-affected set is NOT narrowed: its code graph
+/// is indexed at the run base, so a call an earlier round added is in no graph, and only the whole
+/// change since the base reaches its callers (xreview r1 on #1866).
 pub(crate) fn is_delta_check(name: &str) -> bool {
-    matches!(name, "test" | "test_targeted" | "cargo-test")
+    matches!(name, "test" | "test_targeted")
 }
 
 /// (core#1208) A path whose change can reach any test, so a round that touched it runs its test
@@ -1533,20 +1574,31 @@ pub(crate) fn reaches_any_test(path: &str) -> bool {
         || lower.contains("setup")
 }
 
-/// (core#1208) A hand-off round's creator floor on `T_cur` whose unit already ran a floor on
-/// `T_prev` against the same base, with the same engine, boundary and exclusion switch (that
-/// floor's published [`CreatorFloorRecord`]): its test check runs only what the files changed
-/// between the two trees reach, and stands on the previous pass for the rest.
+/// (core#1208) A hand-off round's creator floor on `T_cur` whose unit already ran floors on earlier
+/// trees against the same base, with the same engine, boundary and exclusion switch (their
+/// published [`CreatorFloorRecord`]s): its test check runs only what the files changed since the
+/// newest of them where that check passed IN FULL reach, and stands on that pass for the rest.
 #[derive(Debug, Clone)]
 pub(crate) struct DeltaPlan {
+    /// The earlier floors, newest first.
+    pub(crate) from: Vec<DeltaFrom>,
+}
+
+/// One earlier floor a round may stand on, and the files changed between its tree and this one
+/// (added or modified; anything else, or a path that reaches any test, is the `Err` that widens).
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaFrom {
     record: CreatorFloorRecord,
-    /// The files changed between the two trees (added or modified: anything else widens).
-    pub(crate) files: Vec<String>,
+    pub(crate) files: Result<Vec<String>, String>,
+}
+
+fn tree_label(tree: &str) -> String {
+    format!("the floor on tree {}", &tree[..tree.len().min(10)])
 }
 
 impl DeltaPlan {
     /// The plan for the floor `j` runs: `Ok(None)` when its unit ran no earlier published floor on
-    /// another tree against this base; `Err(why)` when it did but this round runs in full.
+    /// another tree against this base; `Err(why)` when it did but none can stand for this round.
     pub(crate) fn load(
         logs: &Path,
         j: &FloorJournal,
@@ -1559,7 +1611,7 @@ impl DeltaPlan {
         let Ok(dir) = std::fs::read_dir(logs) else {
             return Ok(None);
         };
-        let record = dir
+        let mut records: Vec<CreatorFloorRecord> = dir
             .filter_map(Result::ok)
             .filter(|e| {
                 let n = e.file_name();
@@ -1571,110 +1623,142 @@ impl DeltaPlan {
             .filter(|r| {
                 r.ord == j.ord && r.base == base && r.attempt < j.attempt && r.tree != j.tree
             })
-            .max_by_key(|r| r.attempt);
-        let Some(record) = record else {
+            .collect();
+        records.sort_by_key(|r| std::cmp::Reverse(r.attempt));
+        let Some(newest) = records.first() else {
             return Ok(None);
         };
-        let prev = format!(
-            "the floor on tree {}",
-            &record.tree[..record.tree.len().min(10)]
-        );
-        if record.floor_policy != FLOOR_POLICY_VERSION {
-            return Err(format!("{prev} ran under another engine version"));
-        }
-        if record.sandbox_level != posture_level || record.exclude != exclude {
+        let prev = tree_label(&newest.tree);
+        records.retain(|r| {
+            r.floor_policy == FLOOR_POLICY_VERSION
+                && r.sandbox_level == posture_level
+                && r.exclude == exclude
+        });
+        if records.is_empty() {
             return Err(format!(
-                "{prev} ran under another boundary or exclusion switch"
+                "{prev} ran under another engine version, boundary or exclusion switch"
             ));
         }
-        let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
-        let raw = crate::worktree_guard::git(
-            worktree,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--no-renames",
-                "--name-status",
-                &record.tree,
-                &j.tree,
-            ],
-            &env,
-        )
-        .map_err(|e| format!("the files changed since {prev} could not be listed: {e}"))?;
-        let fields: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|f| !f.is_empty())
-            .map(|f| String::from_utf8_lossy(f).into_owned())
+        let from = records
+            .into_iter()
+            .map(|record| {
+                let files = delta_files(&record.tree, &j.tree, git_dir, worktree);
+                DeltaFrom { record, files }
+            })
             .collect();
-        let mut files = Vec::new();
-        for pair in fields.chunks(2) {
-            let [status, path] = pair else {
-                return Err(format!("the files changed since {prev} could not be read"));
-            };
-            match status.as_str() {
-                "A" | "M" => {}
-                "D" => return Err(format!("this round deleted or renamed `{path}`")),
-                _ => return Err(format!("this round changed the type of `{path}`")),
-            }
-            if reaches_any_test(path) {
-                return Err(format!(
-                    "this round changed `{path}`, which can reach any test"
-                ));
-            }
-            files.push(path.clone());
-        }
-        if files.is_empty() {
-            return Err(format!("no file changed since {prev}"));
-        }
-        Ok(Some(DeltaPlan { record, files }))
+        Ok(Some(DeltaPlan { from }))
     }
 
-    /// The previous round's result of `check` this round may stand on: the same check (directory,
-    /// name, bound and source; the argv too, except a `test_targeted`, whose `{files}` are the
-    /// change's) that finished there, passed, left nothing outside the tree, with its logs whole.
-    pub(crate) fn entry_for(&self, check: &RepoCheck, logs: &Path) -> Result<(), String> {
-        let prev = format!(
-            "the floor on tree {}",
-            &self.record.tree[..self.record.tree.len().min(10)]
-        );
-        let entry = self
-            .record
-            .checks
-            .iter()
-            .find(|e| {
+    /// The earlier floor `check` may stand on this round (an index into [`Self::from`]): the newest
+    /// whose same check (directory, name, bound and source; the argv too, except a
+    /// `test_targeted`, whose `{files}` are the change's) passed there IN FULL (never itself a
+    /// delta: its own evidence is all there is), left nothing outside the tree, with its logs
+    /// whole. A failed or narrowed result there sends the search to an older floor, whose change
+    /// set holds this one. `Err(why)` when none can, or the change since it widens.
+    pub(crate) fn source_for(&self, check: &RepoCheck, logs: &Path) -> Result<usize, String> {
+        let mut why = None;
+        for (i, f) in self.from.iter().enumerate() {
+            let prev = tree_label(&f.record.tree);
+            let entry = f.record.checks.iter().find(|e| {
                 e.dir == check.dir
                     && e.name == check.name
                     && e.timeout_s == check.timeout_s
                     && e.source.as_deref() == Some(check.source.as_str())
                     && (check.name == "test_targeted" || e.argv == check.argv)
-            })
-            .ok_or_else(|| format!("{prev} did not run `{}` as this floor does", check.name))?;
-        let run = &entry.run;
-        if run.denies() {
-            return Err(format!("`{}` did not pass on {prev}", check.name));
+            });
+            let run = match entry {
+                None => {
+                    why.get_or_insert(format!(
+                        "{prev} did not run `{}` as this floor does",
+                        check.name
+                    ));
+                    continue;
+                }
+                Some(e) => &e.run,
+            };
+            if run.denies() || run.delta.is_some() {
+                why.get_or_insert(format!("`{}` did not pass in full on {prev}", check.name));
+                continue;
+            }
+            if !(run.left_outputs.is_empty() && finished_whole(run, logs)) {
+                why.get_or_insert(format!(
+                    "`{}`'s result on {prev} cannot stand (it left files outside the tree, or \
+                     its logs are gone)",
+                    check.name
+                ));
+                continue;
+            }
+            return f.files.as_ref().map(|_| i).map_err(Clone::clone);
         }
-        if !(run.left_outputs.is_empty() && finished_whole(run, logs)) {
-            return Err(format!(
-                "`{}`'s result on {prev} cannot stand (it left files outside the tree, or its \
-                 logs are gone)",
-                check.name
-            ));
-        }
-        Ok(())
+        Err(why.unwrap_or_else(|| "no earlier floor ran it".into()))
     }
 
-    /// The mark a delta check that passed carries ([`CheckRun::delta`]).
-    pub(crate) fn mark(&self) -> FloorDelta {
+    /// The mark a delta check that stood on `from[i]` and passed carries ([`CheckRun::delta`]).
+    pub(crate) fn mark(&self, i: usize) -> FloorDelta {
+        let f = &self.from[i];
+        let files = f.files.as_deref().unwrap_or_default();
         FloorDelta {
-            from_tree: self.record.tree.clone(),
-            phase: self.record.phase.clone(),
-            ord: self.record.ord,
-            attempt: self.record.attempt,
-            changed: self.files.iter().take(DELTA_FILES_SHOWN).cloned().collect(),
-            changed_count: self.files.len(),
+            from_tree: f.record.tree.clone(),
+            phase: f.record.phase.clone(),
+            ord: f.record.ord,
+            attempt: f.record.attempt,
+            changed: files.iter().take(DELTA_FILES_SHOWN).cloned().collect(),
+            changed_count: files.len(),
         }
     }
+}
+
+/// (core#1208) The files changed between `from` and `to` through the pinned `git_dir`: added or
+/// modified only. A deletion, rename or type change, a path that can reach any test
+/// ([`reaches_any_test`]), no change, or a listing that cannot be read is the reason to widen.
+fn delta_files(
+    from: &str,
+    to: &str,
+    git_dir: &Path,
+    worktree: &Path,
+) -> Result<Vec<String>, String> {
+    let prev = tree_label(from);
+    let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+    let raw = crate::worktree_guard::git(
+        worktree,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--name-status",
+            from,
+            to,
+        ],
+        &env,
+    )
+    .map_err(|e| format!("the files changed since {prev} could not be listed: {e}"))?;
+    let fields: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    let mut files = Vec::new();
+    for pair in fields.chunks(2) {
+        let [status, path] = pair else {
+            return Err(format!("the files changed since {prev} could not be read"));
+        };
+        match status.as_str() {
+            "A" | "M" => {}
+            "D" => return Err(format!("this round deleted or renamed `{path}`")),
+            _ => return Err(format!("this round changed the type of `{path}`")),
+        }
+        if reaches_any_test(path) {
+            return Err(format!(
+                "this round changed `{path}`, which can reach any test"
+            ));
+        }
+        files.push(path.clone());
+    }
+    if files.is_empty() {
+        return Err(format!("no file changed since {prev}"));
+    }
+    Ok(files)
 }
 
 /// The journal file of `ord`'s floor in the run's log store.
@@ -8683,9 +8767,10 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// its package through the held directory and builds the root's declared native addons for a
 /// member, so a base result recorded without them is not reused; v18, core#1767: a red base's
 /// inventory holds only when its own run executed exactly what its list names, so an inventory
-/// recorded without that check is not reused): a record of any other version, or a bare
-/// `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 18;
+/// recorded without that check is not reused; v19, core#1157: a run's record says what it left
+/// outside the tree, so a creator record or journal written before it says so is not reused): a
+/// record of any other version, or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 19;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;

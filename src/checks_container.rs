@@ -2517,6 +2517,41 @@ print(json.dumps({'dirs':dirs,'files':files}))
         Ok(c)
     }
 
+    /// (core#1157) `git <args>` in the head side's pod, at the copy's root (no hooks, no optional
+    /// locks): what a check left outside the tree is listed where it ran. Starts the side's pod
+    /// when no check has yet, as the first check would. `Err` when the pod is gone or git fails
+    /// there (the copy's `.git` is best effort): the caller treats that as "cannot be listed".
+    pub(crate) fn git_at_head(&self, args: &[&str]) -> Result<Vec<u8>, String> {
+        let mut live = self
+            .live
+            .lock()
+            .map_err(|_| "the container floor's state is poisoned".to_string())?;
+        let slot = &mut live[idx(Tree::Head)];
+        if slot.is_none() {
+            *slot = Some(self.start(Tree::Head, None)?);
+        }
+        let l = slot.as_ref().expect("started above");
+        if let Some(why) = &l.dead {
+            return Err(why.clone());
+        }
+        let work = Self::work(Tree::Head);
+        let mut argv = vec![
+            "env",
+            "GIT_OPTIONAL_LOCKS=0",
+            "git",
+            "-C",
+            work.as_str(),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ];
+        argv.extend(args);
+        self.place.run(&l.name, &argv, REAP).map(String::into_bytes)
+    }
+
     /// After a check in `tree`'s container: end everything it left running, then say whether it
     /// can stand as evidence. `Some(reason)` when the container ran out of memory during it,
     /// stopped answering, or the copied tree no longer holds what was copied in — whatever the
