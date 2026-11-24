@@ -586,6 +586,8 @@ mod tests {
     #[derive(Default)]
     struct Echo {
         seen: Mutex<Vec<Handed>>,
+        /// What each run's launch thread was set to: (its claude answer cap, prompt on stdin).
+        launch: Mutex<Vec<(Option<u32>, bool)>>,
         fail: bool,
     }
 
@@ -597,6 +599,10 @@ mod tests {
                 i.unit.description.clone(),
                 i.unit.assigned_invocation.clone(),
                 crate::write_posture::WritePosture::of(&i.unit, i.workdir.is_some()),
+            ));
+            self.launch.lock().unwrap().push((
+                crate::execute_wrapped::answer_cap(),
+                crate::execute_wrapped::prompt_on_stdin(),
             ));
             crate::workflow::StepOutput {
                 run_id: i.run_id.clone(),
@@ -675,6 +681,34 @@ mod tests {
         let tools = argv.iter().position(|a| a == "--tools").unwrap();
         assert!(tools < guard && argv[tools + 1].is_empty(), "{argv:?}");
         assert_eq!(argv.iter().filter(|a| *a == "--tools").count(), 1);
+    }
+
+    /// (C0a, C0) Every model call's prompt rides stdin; (coord round 2 on garden#1557) a claude
+    /// call's answer cap reaches its launch thread, and nothing else carries one: a codex call
+    /// that names a cap, and a cap out of range, are refused before any seat runs.
+    #[test]
+    fn a_claude_answer_cap_reaches_its_launch_and_every_prompt_rides_stdin() {
+        let echo = Arc::new(Echo::default());
+        let ch = arm(echo.clone(), vec![seat("claude"), seat("codex")], "run-c", 1).unwrap();
+        let (sock, token) = sock_and_token(&ch);
+        assert_eq!(
+            call_at(&sock, &token, "claude", "w", None, Some(64000)).unwrap(),
+            "claude: w"
+        );
+        call_at(&sock, &token, "claude", "w", None, None).unwrap();
+        call_at(&sock, &token, "codex", "c", None, None).unwrap();
+        let codex_cap = call_at(&sock, &token, "codex", "c", None, Some(64000)).unwrap_err();
+        assert!(codex_cap.contains("claude setting"), "{codex_cap}");
+        for bad in [0, MAX_OUTPUT_TOKENS + 1] {
+            let e = call_at(&sock, &token, "claude", "w", None, Some(bad)).unwrap_err();
+            assert!(e.contains("max_output_tokens"), "{e}");
+        }
+        assert_eq!(
+            *echo.launch.lock().unwrap(),
+            vec![(Some(64000), true), (None, true), (None, true)]
+        );
+        // the cap is the launch thread's alone: none is left behind on this one
+        assert_eq!(crate::execute_wrapped::answer_cap(), None);
     }
 
     fn unit(step: &str, cmd: &[String]) -> crate::domain::WorkUnit {

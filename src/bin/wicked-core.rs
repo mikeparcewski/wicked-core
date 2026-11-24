@@ -76,6 +76,9 @@
 //!       # corroboration reads; front-half coverage RECOMPUTED from the store, FAIL-CLOSED
 //!       # below the configured minimum, default 80%;
 //!       # a supplied --coverage file is an optional cross-check that must agree; modern package-dir grouping)
+//!   wicked-core domain-graph --retire <domain>::<REQ-NNN>
+//!       # retire one requirement whose code was deleted (core#1698): removed from the stored graph,
+//!       # never carried by a later build, its id never reused; refused while its code is indexed
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
@@ -165,7 +168,11 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          store (domain, requirement and business-rule nodes, SatisfiedBy edges to code; what crew \
          reads). --out also writes it as a JSON export file. Fails closed below the configured \
          minimum coverage (--min-coverage-pct, else the repository's own target \
-         (requirements-target), else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
+         (requirements-target), else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).\n\
+         wicked-core domain-graph [--db <path>] --retire <domain>::<REQ-NNN>\n  \
+         Retire one requirement whose code was deleted: it leaves the stored graph now, no later \
+         build carries it, and its id is never given to other code. Refused while its code is \
+         still in the index.",
     ),
     (
         "coverage",
@@ -1200,6 +1207,11 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
+    // `--retire` with no target is refused, never read as a full build (review r1).
+    if args.iter().any(|a| a == "--retire") {
+        domain_graph_retire(args, &flag(args, "--retire").unwrap_or_default());
+        return;
+    }
     // `--repo-root` names the checkout the graph belongs to (`{repo_root}` in the preset): the
     // corroboration reads which files git tracks there. The graph itself is saved into the estate
     // store (operator ruling 2026-10-31: never a JSON file in the repository); crew reads it from
@@ -1373,6 +1385,37 @@ fn domain_graph_cmd(args: &[String]) {
             wicked_governance::coverage_verdict(&coverage, min_pct)
         ),
         Err(e) => fail(&format!("domain-graph: cannot write {out_path}: {e}")),
+    }
+}
+
+/// `wicked-core domain-graph --retire <domain>::<REQ-NNN>` (core#1698): retire one requirement whose
+/// code was deleted ([`wicked_governance::retire_requirement`]). Exit 0 with one line saying what
+/// went; 1 with what to do otherwise.
+fn domain_graph_retire(args: &[String], target: &str) {
+    let Some((domain, req)) = target
+        .rsplit_once("::")
+        .filter(|(d, r)| !d.is_empty() && r.starts_with("REQ-"))
+    else {
+        fail(&format!(
+            "domain-graph: --retire takes <domain>::<REQ-NNN> (as the requirements page names it), not {target:?}"
+        ));
+        return;
+    };
+    let _settle = wicked_core::RepoGraphWrite::begin(std::path::Path::new(&store_path(args)));
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("domain-graph: open store failed: {e}"));
+            return;
+        }
+    };
+    match wicked_governance::retire_requirement(&mut store, domain, req) {
+        Ok(r) => println!(
+            "domain-graph: retired {domain}::{req} (its code {} is gone; {} business rule(s) \
+             removed); no later build lists it and its id is not reused",
+            r.code_symbol, r.rules
+        ),
+        Err(e) => fail(&format!("domain-graph: {domain}::{req} not retired: {e}")),
     }
 }
 

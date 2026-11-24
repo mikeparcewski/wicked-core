@@ -121,6 +121,37 @@ fn domain_graph_help_documents_and_writes_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// core#1698: the help names `--retire` (crew asks it before sending one), and `--retire` with no
+/// target or a malformed one is refused before any store is opened — never read as a full build.
+#[test]
+fn domain_graph_retire_is_documented_and_refuses_a_missing_target() {
+    let dir = scratch_dir("domain-graph-retire");
+    let help = Command::new(bin())
+        .args(["domain-graph", "--help"])
+        .current_dir(&dir)
+        .output()
+        .expect("run wicked-core domain-graph --help");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--retire <domain>::<REQ-NNN>"));
+    let db = dir.join("estate.db");
+    for args in [vec!["--retire"], vec!["--retire", "billing"]] {
+        let out = Command::new(bin())
+            .arg("domain-graph")
+            .args(["--db", db.to_str().unwrap()])
+            .args(&args)
+            .current_dir(&dir)
+            .output()
+            .expect("run wicked-core domain-graph --retire");
+        assert!(!out.status.success(), "{args:?} must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--retire takes <domain>::<REQ-NNN>"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!db.exists(), "{args:?}: no store opened");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `rules eval --corpus <file.json>` — core#395 and core#394 through the binary: a markdown doc
 /// carrying `effect: deny` ingests into a scratch store, and a corpus FILE on disk (the documented
 /// `{name, samples}` shape, no import) replays against it — the bad sample is caught, the report

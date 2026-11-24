@@ -3708,6 +3708,7 @@ fn collect_bash_write_targets(
                 word,
                 argv_expansion,
                 argv_tail,
+                assignments,
             } => {
                 // INDEPENDENT REVIEW item 3b: the raw token scan that was here produced FATAL
                 // false denials for read commands (`sh -c 'cat /etc/hosts'` → `/etc/hosts` as
@@ -3725,6 +3726,9 @@ fn collect_bash_write_targets(
                     // a redirect (`R='> /outside/f'; sh -c "echo x $R"`). So the `-c` word itself
                     // is unresolved whenever it carries one ([`OPAQUE_EXPANSION`]), whether or not
                     // the rest of the inner command writes.
+                    // (core#1882) A pager setting before the wrapper is in the environment of every
+                    // git the inner command line runs: its rescan judges them with it.
+                    let _pager = PagerHanded::hand(&assignments);
                     match lex_shell_word(&word, home, true, !cfg!(windows)) {
                         Some((mut exact, opaque)) => {
                             exact.push_str(&argv_tail);
@@ -4505,12 +4509,55 @@ fn git_config_key_inert(key: &str) -> bool {
         )
 }
 
-/// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`) naming a pager that only prints.
+/// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`, `PAGER`) naming no pager at all:
+/// git pages only when the value is not exactly empty or `cat` (pager.c), so a padded `cat` is a
+/// shell command too. `less` is a program (core#1882): it runs `LESSOPEN`'s preprocessor on what
+/// git pipes into it (`|-`).
 fn git_pager_harmless(value: &str) -> bool {
-    matches!(
-        value.trim(),
-        "" | "cat" | "less" | "more" | "less -R" | "less -FRX" | "less -FRSX"
-    )
+    matches!(value, "" | "cat")
+}
+
+/// (core#1882) Whether an assignment word sets the pager git runs (`GIT_PAGER`, `PAGER`) to one
+/// that is not harmless, or a command git's default pager (`less`) runs (`LESSOPEN`,
+/// `LESSCLOSE`); `None` when it sets neither. Bash's `NAME+=value` appends to a value this text
+/// cannot see, so it is never harmless.
+fn pager_assignment_runs(assignment: &str) -> Option<bool> {
+    let (name, value) = assignment.split_once('=')?;
+    let (name, appends) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+    match name {
+        "GIT_PAGER" | "PAGER" => Some(appends || !git_pager_harmless(strip_one_quote_layer(value))),
+        "LESSOPEN" | "LESSCLOSE" => Some(true),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// (core#1882) How many wrappers around the command line being rescanned hand it a pager
+    /// setting that is not harmless ([`pager_assignment_runs`]): every git in it may page.
+    static PAGER_HANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One wrapper's hand of a pager setting to the command line it runs, for as long as its rescan.
+struct PagerHanded(bool);
+
+impl PagerHanded {
+    fn hand(assignments: &[&str]) -> Self {
+        let hands = assignments
+            .iter()
+            .any(|a| pager_assignment_runs(a) == Some(true));
+        if hands {
+            PAGER_HANDED.with(|n| n.set(n.get() + 1));
+        }
+        Self(hands)
+    }
+}
+
+impl Drop for PagerHanded {
+    fn drop(&mut self) {
+        if self.0 {
+            PAGER_HANDED.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
 }
 
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder
@@ -4596,12 +4643,14 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
                 writes = true;
                 traces.extend(strip_shell_prefix(a, &format!("{name}=")));
             }
-        } else if name == "GIT_PAGER" {
-            runs |= !git_pager_harmless(strip_one_quote_layer(value));
+        } else if let Some(pager) = pager_assignment_runs(a) {
+            runs |= pager;
         } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
             runs = true;
         }
     }
+    // (core#1882) A wrapper around this command line handed it a pager setting.
+    runs |= PAGER_HANDED.with(|n| n.get() > 0);
     // Each word as git receives it; a word holding a replace string is one fed word of any
     // spelling (any number of words for BSD `-J`), and appended words are any number of them.
     let fed = |raw: &str| {
@@ -5864,6 +5913,9 @@ enum Unwrapped<'a> {
         // while preserving main's one-shell-level behavior for non-read callers.
         argv_expansion: bool,
         argv_tail: String,
+        /// The `NAME=value` words before the wrapper and `env`'s own: the environment of what
+        /// the inner command runs, which its rescan does not see (core#1882).
+        assignments: Vec<&'a str>,
     },
 }
 
@@ -5981,6 +6033,7 @@ fn unwrap_program_with_reads<'a>(
                         word: words[j..].join(" "),
                         argv_expansion: false,
                         argv_tail: String::new(),
+                        assignments,
                     }
                 } else {
                     Unwrapped::Program {
@@ -6061,6 +6114,7 @@ fn unwrap_program_with_reads<'a>(
                             word: word.to_string(),
                             argv_expansion: true,
                             argv_tail: tail,
+                            assignments,
                         };
                     }
                     if takes_value {
@@ -6120,6 +6174,7 @@ fn unwrap_program_with_reads<'a>(
                                     word: word.to_string(),
                                     argv_expansion: false,
                                     argv_tail: String::new(),
+                                    assignments,
                                 };
                             }
                         }
@@ -6165,6 +6220,7 @@ fn unwrap_program_with_reads<'a>(
                                 word: word.to_string(),
                                 argv_expansion: false,
                                 argv_tail: String::new(),
+                                assignments,
                             },
                             None => Unwrapped::Program {
                                 idx,
@@ -10671,6 +10727,42 @@ mod tests {
         }
     }
 
+    /// core#1882 (review r2): a pager setting before `env -S` or `sh -c` is in the environment of
+    /// the git the inner command line runs, and of nothing else: the git is judged with it (its
+    /// stand-in target, the read-root advisory's case after a `cd`), and an inner command that runs
+    /// no git gets no target from it.
+    #[test]
+    fn a_wrappers_pager_setting_reaches_the_git_it_runs_and_nothing_else_core1882() {
+        let stand_in = |c: &str| {
+            resolved_bash_write_targets(c, None)
+                .iter()
+                .any(|t| matches!(t, ShellTarget::Unresolved(w) if w.starts_with("$(git ")))
+        };
+        for c in [
+            "PAGER=less env -S 'git log -1'",
+            "env PAGER=less -S 'git log -1'",
+            "PAGER+=cat env -S 'git log -1'",
+            "LESSOPEN='|- touch /x' sh -c 'git log -1'",
+            "GIT_PAGER=less sh -c 'cd src && git log -1'",
+        ] {
+            assert!(
+                stand_in(c),
+                "{c}: {:?}",
+                resolved_bash_write_targets(c, None)
+            );
+        }
+        for c in [
+            "PAGER=less env -S 'cat README.md'",
+            "LESSOPEN='|- touch /x' sh -c 'ls src'",
+            "PAGER=cat env -S 'git log -1'",
+            "env -S 'git log -1'",
+        ] {
+            assert_eq!(resolved_bash_write_targets(c, None), Vec::new(), "{c}");
+        }
+        // The hand ends with the wrapper's rescan.
+        assert_eq!(PAGER_HANDED.with(|n| n.get()), 0);
+    }
+
     /// core#1857, #1858, #1859, #1868 (the gate_hook git read/write family): a git invocation is a
     /// READ only on an allow-listed form, every word of it settled by the text. Each issue's
     /// examples are rows here, beside a read of the same form that must stay allowed, and the
@@ -10913,6 +11005,30 @@ mod tests {
             ("c2.B1", Read, format!("git -c log.showSignature=false -C {r} log")),
             ("c2.B1", Read, format!("cd {r} && GIT_PAGER=cat git log -5")),
             ("c2.B1", Read, format!("cd {r} && git -c core.pager=cat log -3")),
+            // (core#1882) `less` runs LESSOPEN's preprocessor on what git pipes into it (`|-`): only
+            // a pager that prints nothing but its input is harmless.
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' GIT_PAGER=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' git -c core.pager=less -C {r} -p log -1")),
+            ("i1882", Advisory, format!("GIT_PAGER='less -FRX' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("git -c pager.log=more -C {r} log -1")),
+            // (review r1) `PAGER` is git's pager when no git setting names one; `less` is its
+            // default, which runs a LESSOPEN set here; and only an exact `cat` turns paging off.
+            ("i1882", Advisory, format!("PAGER=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("GIT_PAGER=' cat ' git -C {r} log -1")),
+            ("i1882", Advisory, format!("git -c 'core.pager= cat' -C {r} log -1")),
+            ("i1882", Read, format!("PAGER=cat git -C {r} log -1")),
+            // (review r2) An append extends a value the text cannot see; and a wrapper's inner
+            // command runs with the assignments before it.
+            ("i1882", Advisory, format!("PAGER+=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("PAGER+=cat git -C {r} log -1")),
+            ("i1882", Advisory, format!("LESSOPEN+='|- touch {o}/victim' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("PAGER=less env -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("env PAGER=less -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' env -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("GIT_PAGER=less sh -c 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("cd {r} && PAGER=less sh -c 'git log -1'")),
+            ("i1882", Advisory, format!("cd {r} && LESSOPEN='|- touch {o}/victim' env -S 'git log -1'")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (

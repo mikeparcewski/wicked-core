@@ -26,16 +26,37 @@ RUN apt-get update \
 # (core#1614: ffmpeg, ffprobe). The seat's floor has no display, no user namespaces and a read-only
 # /dev (src/container_floor.rs landrun_prefix), so Debian's launcher reads the flags that make
 # Chromium work there from /etc/chromium.d (headless, no Chromium sandbox, shared memory in /tmp).
-# Best effort, like the ledger below: an operator base whose archive lacks them still builds, and
-# its seats then have no browser.
-RUN if apt-get update \
-     && apt-get install -y --no-install-recommends chromium fonts-liberation ffmpeg \
-     && test -d /etc/chromium.d; then \
-      printf '%s\n' 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --headless --no-sandbox --disable-dev-shm-usage --disable-gpu"' > /etc/chromium.d/wicked-seat; \
+# Best effort only where the base's archive has no candidate for them (core#1888): an operator
+# base whose archive lacks them still builds, and its seats then have no browser. Any other failure
+# fails the build: a mirror error or a partial download after one retry, an apt-cache that cannot
+# answer at once. The image is tagged by this file, the pin and the base, so a browserless image
+# would be reused until one of them changes. An index fetch that failed is a failed update,
+# never a missing candidate: apt 2.1.16 and later exit non-zero for it (APT::Update::Error-Mode=any;
+# an older apt ignores the setting), and an older apt's warning for it fails the update too.
+RUN set -e; \
+    apt_update() { \
+      rc=0; out=$(LC_ALL=C apt-get update -o APT::Update::Error-Mode=any 2>&1) || rc=$?; \
+      printf '%s\n' "$out"; \
+      [ "$rc" = 0 ] && ! printf '%s\n' "$out" | grep -Eq '^(W: (Failed to fetch|Some index files failed)|E: )'; \
+    }; \
+    browser_install() { apt-get install -y chromium fonts-liberation ffmpeg --no-install-recommends; }; \
+    apt_update || { sleep 10; apt_update; } || exit 1; \
+    missing=""; \
+    for p in chromium fonts-liberation ffmpeg; do \
+      policy=$(LC_ALL=C apt-cache policy "$p") || exit 1; \
+      printf '%s\n' "$policy" | grep -q '^ *Candidate: [^(]' || missing="$missing $p"; \
+    done; \
+    if [ -n "$missing" ]; then \
+      echo "wicked-seat: this base's archive has no$missing; its seats cannot take screenshots or sample video stills" >&2; \
     else \
-      echo "wicked-seat: chromium and ffmpeg did not install on this base; its seats cannot take screenshots or sample video stills" >&2; \
-    fi \
- && rm -rf /var/lib/apt/lists/*
+      browser_install || { sleep 10; apt_update && browser_install; } || exit 1; \
+      if test -d /etc/chromium.d; then \
+        printf '%s\n' 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --headless --no-sandbox --disable-dev-shm-usage --disable-gpu"' > /etc/chromium.d/wicked-seat; \
+      else \
+        echo "wicked-seat: this base's chromium reads no /etc/chromium.d; its seats' browser runs without the seat flags" >&2; \
+      fi; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 # wicked-ledger at the version wicked-crew's QE acceptance check reads (core#1009). The QE unit
 # records its verdict with it: the carrier hands that unit WICKED_LEDGER_PKG_DIR naming this copy
 # (src/qe_acceptance.rs SEAT_LEDGER_PKG_DIR). A seat never installs it itself (it is fenced, and an
