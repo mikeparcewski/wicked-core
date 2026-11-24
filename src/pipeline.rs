@@ -6541,6 +6541,27 @@ mod judge_bench_tests {
         );
     }
 
+    /// (core#1854 D1) Only the missing-boundary refusal is carried as a disclosure. An ENVIRONMENT
+    /// refusal (no disk, a stop) of an operator retry, extend or targeted run overwrites the
+    /// failed report on the same tree; carried to a rework that left that tree unchanged, it still
+    /// denies, or a tree whose checks failed would pass the machine gate.
+    #[test]
+    fn a_carried_environment_refusal_of_the_default_floor_still_denies() {
+        let refused = serde_json::json!({
+            "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
+            "sandbox_error": format!(
+                "{} the host has 1.0 GiB free on the check cache's volume; no check ran",
+                crate::repo_checks::ENVIRONMENT_REFUSAL_PREFIX
+            ),
+            "tree": "t1", "checks": [],
+        });
+        assert_eq!(
+            fold_unchanged_tree("carry-environment", refused).as_deref(),
+            Some(crate::repo_checks::DENIAL_SOURCE),
+            "a carried environment refusal denies"
+        );
+    }
+
     /// (core#1186) On an unchanged tree the floor's last result stands; when the operator already
     /// overrode that very failure on that tree (its identity) and nothing else denied behind it,
     /// the override is carried instead of asking again. Another failure, or a layer that denied
