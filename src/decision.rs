@@ -273,7 +273,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::execute_wrapped::with_stdout_cap(stdout_cap, || {
                     crate::execute_wrapped::with_prompt_on_stdin(on_stdin, || {
-                        crate::execute_wrapped::with_answer_cap(answer_cap, || runner.run_unit(&input))
+                        crate::execute_wrapped::with_answer_cap(answer_cap, || {
+                            runner.run_unit(&input)
+                        })
                     })
                 })
             }));

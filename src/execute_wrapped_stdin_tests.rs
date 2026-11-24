@@ -527,7 +527,10 @@ fn a_claude_answer_cap_reaches_the_claude_process_and_nothing_else() {
     let _env = crate::test_env::ENV_LOCK
         .write()
         .unwrap_or_else(|p| p.into_inner());
-    let dir = std::env::temp_dir().join(format!("wicked-answer-cap-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-answer-cap-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::create_dir_all(dir.join("config")).unwrap();
     let dir = dir.canonicalize().unwrap();
     let _snapshot = set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, None);
@@ -551,7 +554,11 @@ fn a_claude_answer_cap_reaches_the_claude_process_and_nothing_else() {
         }
         let mut unit = WorkUnit::pending(COUNCIL_BALLOT_UNIT, "council", 1, "answer");
         unit.assigned_cli = Some(cli.to_string());
-        let flags = if cli == "claude" { "-p" } else { "exec --skip-git-repo-check" };
+        let flags = if cli == "claude" {
+            "-p"
+        } else {
+            "exec --skip-git-repo-check"
+        };
         unit.assigned_invocation = Some(format!("{} {flags} {{PROMPT}}", bin.display()));
         crate::model_call::tool_free(&mut unit, cli);
         let input = StepInput {

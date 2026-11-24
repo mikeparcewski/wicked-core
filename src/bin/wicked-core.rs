@@ -1517,7 +1517,13 @@ fn min_coverage_pct_arg(
 /// step's channel. Opens no store and spawns no actor: the daemon that armed the step runs the seat.
 fn model_call_cmd(args: &[String]) {
     // A flag named with no value after it is bad input, never the default (codex r1 on #1894).
-    for name in ["--family", "--in", "--out", "--timeout-s", "--max-output-tokens"] {
+    for name in [
+        "--family",
+        "--in",
+        "--out",
+        "--timeout-s",
+        "--max-output-tokens",
+    ] {
         if let Some(i) = args.iter().position(|a| a == name) {
             if args.get(i + 1).is_none_or(|v| v.starts_with("--")) {
                 return fail(&format!("model-call: {name} needs a value"));

@@ -61,10 +61,13 @@ impl Dispatcher for NoCouncil {
     }
 }
 
+/// What a seat was handed: (the seat, the asking run, the prompt).
+type Handed = (Option<String>, Option<String>, String);
+
 /// The seats: each answers `<seat>: <prompt>` and records the seat, the asking run and the prompt.
 #[derive(Default)]
 struct Seats {
-    seen: Mutex<Vec<(Option<String>, Option<String>, String)>>,
+    seen: Mutex<Vec<Handed>>,
 }
 
 impl StepRunner for Seats {

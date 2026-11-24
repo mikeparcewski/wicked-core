@@ -689,7 +689,13 @@ mod tests {
     #[test]
     fn a_claude_answer_cap_reaches_its_launch_and_every_prompt_rides_stdin() {
         let echo = Arc::new(Echo::default());
-        let ch = arm(echo.clone(), vec![seat("claude"), seat("codex")], "run-c", 1).unwrap();
+        let ch = arm(
+            echo.clone(),
+            vec![seat("claude"), seat("codex")],
+            "run-c",
+            1,
+        )
+        .unwrap();
         let (sock, token) = sock_and_token(&ch);
         assert_eq!(
             call_at(&sock, &token, "claude", "w", None, Some(64000)).unwrap(),
@@ -885,7 +891,7 @@ mod tests {
     fn the_client_outside_a_tool_step_names_the_missing_channel() {
         // Read-only on the process env: the test harness never sets the channel variables.
         if std::env::var_os(SOCK_ENV).is_none() {
-            let err = call_from_env("claude", "p", None).unwrap_err();
+            let err = call_from_env("claude", "p", None, None).unwrap_err();
             assert!(err.contains(SOCK_ENV), "{err}");
         }
     }
