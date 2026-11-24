@@ -1793,8 +1793,66 @@ impl HardenedCommand for Command {
         for key in ENGINE_INTERNAL_ENV {
             self.env_remove(key);
         }
+        if is_git(self) {
+            harden_git(self);
+        }
         self
     }
+}
+
+/// (wicked-crew#1843) The daemon's raw Azure DevOps credential: a personal access token, or the
+/// service principal crew mints a header from. No git the engine starts needs it (git reads none
+/// of them; a push that needs Azure DevOps gets a minted header from the deliver script), and a
+/// git passes its environment to every hook, filter and `fsmonitor--daemon` it starts.
+pub const ADO_RAW_CREDENTIAL_ENV: &[&str] = &[
+    "AZURE_DEVOPS_EXT_PAT",
+    "CREW_ADO_TENANT_ID",
+    "CREW_ADO_CLIENT_ID",
+    "CREW_ADO_CLIENT_SECRET",
+];
+
+/// Whether `cmd` runs git itself (`git`, a path to it, `git.exe`), by the last component of its
+/// program on either separator.
+fn is_git(cmd: &Command) -> bool {
+    let program = cmd.get_program().to_string_lossy();
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("");
+    name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+}
+
+/// The `-c` entry every engine git carries (wicked-crew#1843), in `GIT_CONFIG_PARAMETERS`' quoting.
+const FSMONITOR_OFF_PARAMETER: &str = "'core.fsmonitor=false'";
+
+/// (wicked-crew#1843) Every engine git: no raw Azure DevOps credential, and `core.fsmonitor=false`.
+/// A host whose global config turns fsmonitor on would otherwise start a `git fsmonitor--daemon`
+/// for each worktree the engine reads, carrying the git's environment and outliving the daemon.
+///
+/// The setting rides `GIT_CONFIG_PARAMETERS`, the channel `git -c` uses: git reads it after every
+/// config file AND after the `GIT_CONFIG_COUNT` entries, and within it the last entry wins, so it is
+/// APPENDED to what the command would otherwise pass (its own value, else the daemon's). A site
+/// that sets its own `GIT_CONFIG_COUNT` entries before or after this keeps them and cannot undo it;
+/// only a later `env_remove`/`env_clear` of the variable, or a `-c core.fsmonitor=…` argument, does.
+fn harden_git(cmd: &mut Command) {
+    for key in ADO_RAW_CREDENTIAL_ENV {
+        cmd.env_remove(key);
+    }
+    let same = |k: &std::ffi::OsStr| {
+        if cfg!(windows) {
+            k.to_string_lossy()
+                .eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS")
+        } else {
+            k == "GIT_CONFIG_PARAMETERS"
+        }
+    };
+    let current = match cmd.get_envs().find(|(k, _)| same(k)) {
+        Some((_, set)) => set.map(std::ffi::OsStr::to_os_string),
+        None => std::env::var_os("GIT_CONFIG_PARAMETERS"),
+    };
+    let mut value = current.unwrap_or_default();
+    if !value.to_string_lossy().trim().is_empty() {
+        value.push(" ");
+    }
+    value.push(FSMONITOR_OFF_PARAMETER);
+    cmd.env("GIT_CONFIG_PARAMETERS", value);
 }
 
 /// Marker documenting where the rule is mechanically enforced.
@@ -1917,6 +1975,112 @@ mod tests {
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned());
         assert_eq!(found.as_deref(), Some("/run/store.db"));
+    }
+
+    /// (wicked-crew#1843) An engine git carries no raw Azure DevOps credential and runs with
+    /// `core.fsmonitor=false`, appended after the `-c` entries the command already carries.
+    #[test]
+    fn a_hardened_git_drops_the_ado_credential_and_turns_fsmonitor_off() {
+        let envs = |cmd: &Command| -> std::collections::HashMap<String, Option<String>> {
+            cmd.get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        for program in [
+            "git",
+            "/usr/bin/git",
+            "git.exe",
+            r"C:\Program Files\Git\cmd\git.exe",
+        ] {
+            let mut cmd = Command::new(program);
+            for key in ADO_RAW_CREDENTIAL_ENV {
+                cmd.env(key, "made-up"); // ggignore: a made-up test value
+            }
+            cmd.env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'");
+            cmd.hardened();
+            let e = envs(&cmd);
+            for key in ADO_RAW_CREDENTIAL_ENV {
+                assert_eq!(e.get(*key), Some(&None), "{program}: {key} is removed");
+            }
+            assert_eq!(
+                e["GIT_CONFIG_PARAMETERS"].as_deref(),
+                Some("'core.fsmonitor=true' 'core.fsmonitor=false'"),
+                "{program}: appended, so it is the entry git reads last"
+            );
+        }
+        // Nothing to append to: the entry alone.
+        let mut bare = Command::new("git");
+        bare.env_remove("GIT_CONFIG_PARAMETERS").hardened();
+        assert_eq!(
+            envs(&bare)["GIT_CONFIG_PARAMETERS"].as_deref(),
+            Some("'core.fsmonitor=false'")
+        );
+        // Anything else keeps the credential (the deliver script mints its header from it), and a
+        // program merely NAMED like git is not git.
+        for program in ["sh", "git.sh", "/usr/bin/gitk", "git-lfs"] {
+            let mut other = Command::new(program);
+            other.env("AZURE_DEVOPS_EXT_PAT", "made-up"); // ggignore: a made-up test value
+            other.hardened();
+            let e = envs(&other);
+            assert_eq!(
+                e["AZURE_DEVOPS_EXT_PAT"].as_deref(),
+                Some("made-up"),
+                "{program}"
+            );
+            assert!(!e.contains_key("GIT_CONFIG_PARAMETERS"), "{program}");
+        }
+    }
+
+    /// (wicked-crew#1843) The same, observed by a real git: fsmonitor reads off over a global
+    /// config that turns it on, over an inherited `-c core.fsmonitor=true`, and over a
+    /// `GIT_CONFIG_COUNT` entry the site sets after hardening (as an authenticated fetch sets its
+    /// header entries); and a command git starts sees no Azure DevOps credential.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_hardened_git_reads_fsmonitor_off_and_passes_no_ado_credential_on() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("wicked-1843-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        std::fs::write(&global, "[core]\n\tfsmonitor = true\n").unwrap();
+        let run = |args: &[&str]| -> String {
+            let mut cmd = Command::new("git");
+            cmd.env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'")
+                .env("AZURE_DEVOPS_EXT_PAT", "made-up") // ggignore: a made-up test value
+                .env("CREW_ADO_CLIENT_SECRET", "made-up") // ggignore: a made-up test value
+                .current_dir(&dir)
+                .hardened()
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+                .env("GIT_CONFIG_VALUE_0", "true")
+                .args(args);
+            let out = cmd.output().expect("git runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run(&["config", "--get", "core.fsmonitor"]), "false");
+        // A shell alias is a command git starts with its own environment (as a hook or filter is).
+        let probe = run(&[
+            "-c",
+            "alias.probe=!f() { test -n \"${AZURE_DEVOPS_EXT_PAT+x}\" && echo pat-present || echo pat-absent; test -n \"${CREW_ADO_CLIENT_SECRET+x}\" && echo sp-present || echo sp-absent; }; f",
+            "probe",
+        ]);
+        assert_eq!(probe, "pat-absent\nsp-absent");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The worker-home resolver, over explicit values so no test mutates the process environment:
