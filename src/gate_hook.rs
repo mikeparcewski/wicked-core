@@ -16779,14 +16779,20 @@ mod boundary_tests {
             assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
             assert!(bash_write_targets(cmd).is_empty(), "{cmd:?}");
         }
-        // (coord ruling, r3) Only a sink is cut: any other target keeps its whole word, as on main.
+        // (coord ruling, r3) Only a sink is cut: any other target keeps its whole word (judged
+        // alongside the split reading's `/tmp/x`), as on main.
         for (cmd, target) in [
             ("echo ${X} >/tmp/x|head", "/tmp/x|head"),
             ("echo ${X} > /tmp/x&&true", "/tmp/x&&true"),
+            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b|head"),
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(targets.contains(&P(target.into())), "{cmd:?}: {targets:?}");
+        }
+        for (cmd, target) in [
             ("echo x >/tmp/a\\|b", "/tmp/a|b"),
             ("echo ${X} >/tmp/a\\|b", "/tmp/a|b"),
             ("echo ${X} >\"/tmp/a|b\"", "/tmp/a|b"),
-            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b|head"),
         ] {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
