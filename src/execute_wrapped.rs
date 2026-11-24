@@ -9559,6 +9559,8 @@ mod tests {
 
     /// (core#1861) A builder and a stand-in on the same base get distinct container seat homes in
     /// one run and posture: the stand-in never reads the base's session store or auto-memory.
+    /// Unix only, as the container floor is (its config seeds refuse elsewhere).
+    #[cfg(unix)]
     #[test]
     fn a_stand_in_gets_a_container_seat_home_of_its_own() {
         use wicked_apps_core::spawn::{SeatCli, SeatConfig};
