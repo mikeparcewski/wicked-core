@@ -1607,6 +1607,7 @@ fn k8s_the_production_plan_packs_and_unpacks_through_the_pod_codec() {
         files: Vec::new(),
         masks: vec![".env".into()],
         repo: false,
+        ro: false,
     };
     let plan = seat::codec_plan(&[("w".into(), &r)]).to_string();
     let stream = sync::encode(&[Root {
@@ -1791,6 +1792,7 @@ fn k8s_a_refusal_in_a_later_root_leaves_every_earlier_root_unchanged() {
         files: Vec::new(),
         masks,
         repo: false,
+        ro: false,
     };
     let ra = plain(&a, Vec::new());
     let rb = plain(&b, vec!["secret.txt".into()]);
@@ -1938,6 +1940,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
     assert!(e.detail.contains("larger than"), "{}", e.detail);
@@ -2100,6 +2103,7 @@ fn k8s_links_in_two_roots_cannot_combine_into_an_escape() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let outer = plain(&root, vec!["sub".into()]);
     let inner = plain(&root.join("sub"), Vec::new());
@@ -2132,6 +2136,7 @@ fn k8s_a_host_link_the_write_back_replaces_is_not_followed() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     // `a` becomes a directory; `b -> a/../out` then resolves to `out`, inside the root.
     let plans: Vec<seat::RootPlan<'_>> = vec![(
@@ -3144,6 +3149,7 @@ fn k8s_copy_in_snapshots_host_tracked_paths_for_each_tree() {
                 files: Vec::new(),
                 masks: Vec::new(),
                 repo: false,
+                ro: false,
             })
             .collect();
         let (_, _, _, baseline, tracked) =
@@ -3424,6 +3430,7 @@ fn k8s_a_file_replacing_a_directory_with_unseen_contents_is_refused_before_any_c
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let plans: Vec<seat::RootPlan<'_>> = vec![(
         &r,
@@ -4039,6 +4046,7 @@ fn k8s_a_seeded_cache_is_not_sent_again() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let rep = seat::replica_of(None, &cache).unwrap();
     let first = seat::copy_in_stream(
@@ -4527,6 +4535,7 @@ fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let (stream, _, _, baseline, _) =
         seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap();
@@ -4575,6 +4584,7 @@ fn k8s_the_fenced_scratch_is_no_home_and_goes_at_settle() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let mut roots = vec![mk("/w/home"), mk("/w/scratch")];
     let dirs = [PathBuf::from("/w/home"), PathBuf::from("/w/scratch")];
@@ -4760,6 +4770,7 @@ fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let body = |r: &PlanRoot| {
         let (b, _, _, _, _) = seat::copy_in_stream(
@@ -4826,6 +4837,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let git_of = |r: &PlanRoot| {
         let (b, _, base, _, _) =
@@ -4851,6 +4863,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
     let masked = PlanRoot {
         masks: vec!["b.txt".into()],
         repo: false,
+        ro: false,
         ..tree.clone()
     };
     let (_, g4) = git_of(&masked);
@@ -5126,6 +5139,7 @@ fn k8s_a_refused_copy_in_is_reported_as_copy_in_refused() {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     let (why, e) = seat::copy_in(&kube, "ns", None, &data, &[r], false).unwrap_err();
     assert_eq!(why, FloorUnarmed::CopyInRefused, "{e}");
@@ -5179,6 +5193,7 @@ fn partial_clone(host: &Path) -> (PathBuf, PathBuf, PlanRoot) {
         files: Vec::new(),
         masks: Vec::new(),
         repo: false,
+        ro: false,
     };
     (source, part, root)
 }
@@ -5868,6 +5883,7 @@ fn k8s_skills_generation_signs_without_a_walk_and_reuses_its_read() {
         files: vec![],
         masks: vec![],
         repo: false,
+        ro: false,
     };
     seat::SIG_WALKS.with(|n| n.set(0));
     let before = seat::HOST_READS.with(|n| n.get());
@@ -5906,6 +5922,7 @@ fn repo_stamp_fixture() -> (PathBuf, PathBuf, PlanRoot) {
         files: vec![],
         masks: vec![],
         repo: true,
+        ro: false,
     };
     (host, replica, r)
 }
@@ -6134,6 +6151,209 @@ fn k8s_replica_stamp_storage_cannot_be_a_seat_root() {
     assert!(seat::replica_of(None, Path::new("/.wicked-stamps")).is_err());
     assert!(seat::replica_of(None, Path::new("/.wicked-stamps/guessed-key")).is_err());
     assert!(seat::replica_of(None, Path::new("/.wicked-stamps-other")).is_ok());
+}
+
+/// (core#1747) One arm's copy-in, as `copy_in` runs it on a chat's plan: the replica's stamps are
+/// read, the host roots signed, the stream unpacked by the pod codec. Returns the stream and the
+/// `copy_in_read` arm-timing detail.
+#[cfg(unix)]
+fn chat_turn(replica: &Path, tree: &Path, roots: &[PlanRoot]) -> (Vec<u8>, String) {
+    let mut stamps = seat::RepoStamps::new(None, roots).unwrap();
+    let paths: Vec<String> = roots
+        .iter()
+        .filter(|r| r.stamped())
+        .map(|r| seat::replica_of(None, &r.host).unwrap())
+        .collect();
+    let out = codec(replica, &["stamps", &json!(paths).to_string()], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stamps.have = serde_json::from_slice(&out.stdout).unwrap();
+    super::clock::begin();
+    let (body, plan, ..) =
+        seat::copy_in_stream_stamped(None, tree, roots, false, &Default::default(), &stamps)
+            .unwrap();
+    let (phases, _) = super::clock::take().unwrap();
+    let detail = phases
+        .into_iter()
+        .find(|p| p.name == "copy_in_read")
+        .and_then(|p| p.detail)
+        .unwrap();
+    let out = codec(replica, &["unpack", &plan.to_string()], &body);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (body, detail)
+}
+
+/// (core#1747) A chat's follow-up turn arms in the same replica as its first: every read-only root
+/// whose host state did not change (its repositories, the skills snapshot, the attachments
+/// directory) is kept there, never read or sent again, and the arm timing says which roots were
+/// kept and which were re-read and why. The mounts are those `container_floor::mount_plan` and
+/// `add_read_roots` make for a read-only chat unit (src/container_floor.rs:1437-1455, 3273-3287):
+/// the chat's scratch tree, a seat home read-write, the run's read roots read-only.
+#[cfg(unix)]
+#[test]
+fn k8s_a_follow_up_chat_turn_keeps_every_unchanged_read_only_root() {
+    let host = tmp("chat-follow-up");
+    let replica = tmp("chat-follow-up-replica");
+    let tree = host.join("chats/c1");
+    let home = host.join("worker/homes/claude");
+    let repo = host.join("repos/estate");
+    let skills = host.join("state/skills/snapshots/7");
+    let attach = host.join("state/attachments/c1");
+    for d in [&tree, &home, &repo, &skills.join("a"), &attach] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(tree.join("AGENTS.md"), "scope").unwrap();
+    std::fs::write(home.join("settings.json"), "{}").unwrap();
+    git_in(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("lib.rs"), "repository payload").unwrap();
+    git_in(&repo, &["add", "lib.rs"]);
+    std::fs::write(skills.join("a/SKILL.md"), "skills payload").unwrap();
+    std::fs::write(attach.join("notes.txt"), "attachment one").unwrap();
+    let bind = |path: &PathBuf, rw: bool| PlanMount::Bind {
+        path: path.clone(),
+        rw,
+    };
+    let mounts = vec![
+        bind(&home, true),
+        bind(&tree, false),
+        bind(&repo, false),
+        bind(&skills, false),
+        bind(&attach, false),
+    ];
+    let (mut roots, _) = seat::plan(&tree, true, &mounts, &[], &[], None);
+    seat::mark_homes(&mut roots, std::slice::from_ref(&home), None);
+    let rep = |p: &Path| seat::replica_of(None, p).unwrap();
+    let stamped: Vec<String> = roots
+        .iter()
+        .filter(|r| r.stamped())
+        .map(|r| rep(&r.host))
+        .collect();
+    assert_eq!(stamped.len(), 3, "{roots:?}");
+    for p in [&repo, &skills, &attach] {
+        assert!(
+            stamped.contains(&rep(p)),
+            "{} is not kept: {roots:?}",
+            p.display()
+        );
+    }
+
+    // Turn 1: nothing is in the replica yet; every read-only root is read, and says why.
+    let (_, first) = chat_turn(&replica, &tree, &roots);
+    assert!(first.starts_with("kept 0 re-read 3;"), "{first}");
+    assert!(
+        first.contains(&format!("{}:1/", rep(&repo)))
+            && first.contains(&format!("{}:", rep(&repo)))
+            && first.contains(":re-read:no-stamp"),
+        "{first}"
+    );
+
+    // Turn 2, nothing changed on the host: the read-only roots stay in the replica.
+    let reads = seat::HOST_READS.with(|c| c.get());
+    let (body, second) = chat_turn(&replica, &tree, &roots);
+    assert!(second.starts_with("kept 3 re-read 0;"), "{second}");
+    for p in [&repo, &skills, &attach] {
+        assert!(second.contains(&format!("{}:kept", rep(p))), "{second}");
+    }
+    for payload in ["repository payload", "skills payload", "attachment one"] {
+        assert!(
+            !body.windows(payload.len()).any(|w| w == payload.as_bytes()),
+            "{payload} was sent again"
+        );
+    }
+    assert_eq!(
+        seat::HOST_READS.with(|c| c.get()),
+        reads,
+        "a kept root was read from the host"
+    );
+    // What the seat reads is still there, as the host has it.
+    assert_eq!(
+        std::fs::read_to_string(replica.join(rep(&skills)).join("a/SKILL.md")).unwrap(),
+        "skills payload"
+    );
+
+    // Turn 3, one attachment changed: only that root is re-read, and the timing says why.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(attach.join("notes.txt"), "attachment two").unwrap();
+    let (_, third) = chat_turn(&replica, &tree, &roots);
+    assert!(third.starts_with("kept 2 re-read 1;"), "{third}");
+    assert!(
+        third.contains(&format!("{}:1/14/", rep(&attach))) && third.contains(":re-read:changed"),
+        "{third}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(replica.join(rep(&attach)).join("notes.txt")).unwrap(),
+        "attachment two"
+    );
+    // Turn 4 keeps all three again.
+    let (_, fourth) = chat_turn(&replica, &tree, &roots);
+    assert!(fourth.starts_with("kept 3 re-read 0;"), "{fourth}");
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+/// (core#1747) A read-only root a live seat of the namespace can write is never kept, and the arm
+/// timing names the writer as the reason.
+#[cfg(unix)]
+#[test]
+fn k8s_a_writable_overlap_names_the_writer_as_why_a_root_is_re_read() {
+    let host = tmp("chat-writer");
+    let replica = tmp("chat-writer-replica");
+    let plugins = host.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("p.md"), "plugin").unwrap();
+    let mounts = vec![PlanMount::Bind {
+        path: plugins.clone(),
+        rw: false,
+    }];
+    let (roots, _) = seat::plan(&host.join("t"), true, &mounts, &[], &[], None);
+    let plugin_roots: Vec<PlanRoot> = roots.into_iter().filter(|r| r.host == plugins).collect();
+    assert!(plugin_roots[0].stamped());
+    chat_turn(&replica, &host, &plugin_roots);
+    let kube = super::Kube {
+        kubectl: host.join("unused-kubectl"),
+        kubeconfig: None,
+        context: "t".into(),
+        owner: "o".into(),
+    };
+    let id = format!("writer-{}", uuid::Uuid::new_v4());
+    let live = seat::register_for_test(&kube, &id, &host, "test");
+    let mut stamps = seat::RepoStamps::new(None, &plugin_roots).unwrap();
+    let rep = seat::replica_of(None, &plugins).unwrap();
+    stamps.have = read_repo_stamps(&replica, &rep);
+    stamps.block_writers("ns");
+    super::clock::begin();
+    seat::copy_in_stream_stamped(
+        None,
+        &host,
+        &plugin_roots,
+        false,
+        &Default::default(),
+        &stamps,
+    )
+    .unwrap();
+    let (phases, _) = super::clock::take().unwrap();
+    seat::forget_for_test(&id);
+    drop(live);
+    let detail = phases
+        .into_iter()
+        .find(|p| p.name == "copy_in_read")
+        .and_then(|p| p.detail)
+        .unwrap();
+    assert!(
+        detail.starts_with("kept 0 re-read 1;") && detail.contains(":re-read:writer"),
+        "{detail}"
+    );
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
 }
 
 // (core#1541) Every failed arm contributes evidence, with the final attempt first.
@@ -6939,6 +7159,7 @@ fn warm_seed_copy_bypasses_the_old_replica_stamp_and_restores_trusted_contents()
         files: vec![],
         masks: vec![],
         repo: false,
+        ro: false,
     };
     let rep = seat::replica_of(Some("warm-test"), &dir).unwrap();
     let seeded = [rep].into_iter().collect();
@@ -7007,6 +7228,7 @@ fn pr_c2_dependency_pack_prunes_before_sizing_or_validating() {
         files: vec![],
         masks: vec![],
         repo: false,
+        ro: false,
     };
     let refs = [("w".into(), &want)];
     let plan = seat::pack_plan(&refs, Some(&want.host)).to_string();

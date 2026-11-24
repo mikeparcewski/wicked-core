@@ -265,24 +265,33 @@ fn root_signature(_r: &PlanRoot) -> Option<[u8; 32]> {
     None
 }
 
-/// (core#1463) A read-only repository root's stamp key: its signature under the process secret
-/// and its replica path. A replica stamp with this key holds exactly this state of the root.
-#[cfg(unix)]
+/// (core#1463) A read-only root's stamp key: its signature under the process secret and its
+/// replica path. A replica stamp with this key holds exactly this state of the root.
+#[cfg(all(test, unix))]
 pub(crate) fn repo_key(r: &PlanRoot, replica: &str, secret: &[u8; 32]) -> Option<String> {
-    let mut prefix = secret.to_vec();
-    prefix.extend_from_slice(&(replica.len() as u64).to_le_bytes());
-    prefix.extend_from_slice(replica.as_bytes());
-    root_digest(r, &prefix).map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
+    root_signature(r).map(|sig| key_of(&sig, replica, secret))
+}
+
+/// (core#1747) The stamp key of a root signed `sig`: one walk signs a root for the read cache and
+/// for its stamp alike.
+#[cfg(unix)]
+fn key_of(sig: &[u8; 32], replica: &str, secret: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(secret);
+    signature_field(&mut h, replica.as_bytes());
+    h.update(sig);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(unix)]
-fn current_repo_key(r: &PlanRoot, replica: &str) -> Result<Option<String>, String> {
-    Ok(repo_key(r, replica, stamp_secret()?))
+fn current_key(sig: &[u8; 32], replica: &str) -> Result<String, String> {
+    Ok(key_of(sig, replica, stamp_secret()?))
 }
 
 #[cfg(not(unix))]
-fn current_repo_key(_r: &PlanRoot, _replica: &str) -> Result<Option<String>, String> {
-    Ok(None)
+fn current_key(_sig: &[u8; 32], _replica: &str) -> Result<String, String> {
+    Err("replica stamps need a unix host".into())
 }
 
 #[cfg(unix)]
@@ -302,20 +311,50 @@ fn stamp_secret() -> Result<&'static [u8; 32], String> {
         .map_err(Clone::clone)
 }
 
+/// (core#1463, core#1747) The replica stamps of one copy-in: what the host's read-only roots are
+/// now (`keys`, with the signature each was taken from), what the replica holds (`have`), and the
+/// live seats' writable mounts that bar a keep.
 #[derive(Default)]
 pub(crate) struct RepoStamps {
     keys: HashMap<String, String>,
+    sigs: HashMap<String, [u8; 32]>,
     pub(crate) have: HashMap<String, String>,
     writable: Vec<String>,
+}
+
+/// (core#1747) Why a root that could be kept in the replica was read and sent again, as the arm
+/// timing names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resent {
+    /// The replica holds no stamp for it: its first copy, or a copy of an overlapping root since.
+    NoStamp,
+    /// Its host state changed since the replica's copy.
+    Changed,
+    /// A live seat in the namespace can write it.
+    Writer,
+    /// Its host state could not be signed (a listing that failed, or a non-unix host).
+    Unsigned,
+}
+
+impl Resent {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Resent::NoStamp => "no-stamp",
+            Resent::Changed => "changed",
+            Resent::Writer => "writer",
+            Resent::Unsigned => "unsigned",
+        }
+    }
 }
 
 impl RepoStamps {
     pub(crate) fn new(scope: Option<&str>, roots: &[PlanRoot]) -> Result<Self, String> {
         let mut result = Self::default();
-        for r in roots.iter().filter(|r| r.repo) {
+        for r in roots.iter().filter(|r| r.stamped()) {
             let rep = replica_of(scope, &r.host)?;
-            if let Some(key) = current_repo_key(r, &rep)? {
-                result.keys.insert(rep, key);
+            if let Some(sig) = root_signature(r) {
+                result.keys.insert(rep.clone(), current_key(&sig, &rep)?);
+                result.sigs.insert(rep, sig);
             }
         }
         Ok(result)
@@ -340,11 +379,17 @@ impl RepoStamps {
             .any(|p| sync::under(p, replica) || sync::under(replica, p))
     }
 
-    fn kept(&self, replica: &str) -> bool {
-        self.keys
-            .get(replica)
-            .is_some_and(|key| self.have.get(replica) == Some(key))
-            && !self.blocked(replica)
+    /// `Ok` when the replica's copy of `replica` is this host state; else why it is sent.
+    fn keep(&self, replica: &str) -> Result<(), Resent> {
+        if self.blocked(replica) {
+            return Err(Resent::Writer);
+        }
+        let key = self.keys.get(replica).ok_or(Resent::Unsigned)?;
+        match self.have.get(replica) {
+            None => Err(Resent::NoStamp),
+            Some(have) if have == key => Ok(()),
+            Some(_) => Err(Resent::Changed),
+        }
     }
 }
 
@@ -410,6 +455,17 @@ pub(crate) struct PlanRoot {
     /// git lists, never its ignored files, never from the read cache (fix-k8s-chat: a chat's "All
     /// repos" read roots, crew#1034, were copied whole, build output and run worktrees included).
     pub(crate) repo: bool,
+    /// (core#1747) Bound read-only: no seat writes it, so the replica keeps its copy between
+    /// units under a stamp while its host state is unchanged ([`RepoStamps`]).
+    pub(crate) ro: bool,
+}
+
+impl PlanRoot {
+    /// A root the replica keeps under a stamp: a plain root bound read-only (a repository, the
+    /// skills snapshot, a plugin or attachments directory).
+    pub(crate) fn stamped(&self) -> bool {
+        self.mode == Mode::Plain && (self.ro || self.repo)
+    }
 }
 
 /// A mount of the floor's plan, as the pod renders it.
@@ -524,6 +580,7 @@ pub(crate) fn plan(
             files: Vec::new(),
             masks: root_masks,
             repo,
+            ro: !*rw,
         });
     }
     let mut file_roots: Vec<(PathBuf, (Vec<String>, bool))> = files.into_iter().collect();
@@ -540,6 +597,7 @@ pub(crate) fn plan(
             files: names,
             masks: Vec::new(),
             repo: false,
+            ro: !rw,
         });
     }
     // Parents before their nested roots (a nested root lands inside its parent's copy).
@@ -2040,6 +2098,8 @@ fn copy_in_stream_with(
     fresh_seeds: bool,
 ) -> Result<CopyInStream, CopyInRefusal> {
     let mut kept = Vec::new();
+    // (core#1747) Each root the replica could have kept but did not, and why.
+    let mut resent: HashMap<String, Resent> = HashMap::new();
     let mut signed = HashMap::new();
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
@@ -2056,9 +2116,16 @@ fn copy_in_stream_with(
     for r in roots {
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
-        if r.repo && stamps.kept(&replica) {
-            kept.push(format!("{replica}:kept"));
-            continue;
+        if r.stamped() {
+            match stamps.keep(&replica) {
+                Ok(()) => {
+                    kept.push(format!("{replica}:kept"));
+                    continue;
+                }
+                Err(why) => {
+                    resent.insert(replica.clone(), why);
+                }
+            }
         }
         if r.mode == Mode::Tree || (r.mode == Mode::Plain && r.back) {
             tracked.insert(r.host.clone(), sync::host_tracked(&r.host)?);
@@ -2089,8 +2156,15 @@ fn copy_in_stream_with(
         // skills snapshot took up to 35 s to open file by file, for every replica and judge).
         // Signed BEFORE it is listed and read, and kept only when signed the same after (codex
         // r1 #5): the entries kept are those of the state the signature names.
+        // (core#1747) A stamped root was signed with the copy-in's stamps: that walk serves both.
         let cached = (r.mode == Mode::Plain && !r.repo)
-            .then(|| root_signature(r))
+            .then(|| {
+                stamps
+                    .sigs
+                    .get(&replica)
+                    .copied()
+                    .or_else(|| root_signature(r))
+            })
             .flatten()
             .map(|sig| (sig, read_cache_get(&r.host, &sig)));
         let rels: Vec<String> = if matches!(&cached, Some((_, Some(_)))) {
@@ -2172,14 +2246,22 @@ fn copy_in_stream_with(
         if read_now && r.mode == Mode::Plain {
             HOST_READS.with(|c| c.set(c.get() + 1));
         }
+        // Signed again after the read, once for the read cache and the stamp alike: what was read
+        // is the state both name only when the signature did not move under the read.
+        let signs = stamps.sigs.get(&replica);
+        let after = (read_now
+            && (matches!(&cached, Some((_, None))) || (r.stamped() && signs.is_some())))
+        .then(|| root_signature(r))
+        .flatten();
         if let Some((sig, None)) = &cached {
-            if root_signature(r).as_ref() == Some(sig) {
+            if after.as_ref() == Some(sig) {
                 read_cache_put(&r.host, sig, &entries);
             }
         }
-        if r.repo && !stamps.blocked(&replica) {
-            if let Some(key) = stamps.keys.get(&replica) {
-                if current_repo_key(r, &replica)?.as_ref() == Some(key) {
+        // A cache hit holds exactly the state its signature names, the one the key was made from.
+        if r.stamped() && !stamps.blocked(&replica) {
+            if let (Some(key), Some(before)) = (stamps.keys.get(&replica), signs) {
+                if !read_now || after.as_ref() == Some(before) {
                     signed.insert(replica.clone(), key.clone());
                 }
             }
@@ -2223,6 +2305,7 @@ fn copy_in_stream_with(
                         files: Vec::new(),
                         masks: Vec::new(),
                         repo: false,
+                        ro: false,
                     },
                 ));
                 base = sha;
@@ -2262,23 +2345,39 @@ fn copy_in_stream_with(
             }
         }
     }
-    // What each root moved (k8s-final arm timing): `replica:entries/bytes/ms`.
+    // What each root moved (k8s-final arm timing): `replica:entries/bytes/ms`; a read-only root
+    // the replica kept is `replica:kept`, one it could have kept and did not says why
+    // (core#1747: `:re-read:no-stamp|changed|writer|unsigned`).
     super::clock::mark_with(
         "copy_in_read",
-        Some(
-            stream
-                .iter()
-                .map(|r| {
-                    let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
-                    let ms = took.get(&r.replica).copied().unwrap_or(0);
-                    format!("{}:{}/{}/{}ms", r.replica, r.entries.len(), bytes, ms)
-                })
-                .chain(kept)
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
+        Some(read_detail(&stream, &took, &kept, &resent)),
     );
     Ok((sync::encode(&stream), plan, base, baseline, tracked))
+}
+
+/// The `copy_in_read` arm-timing detail: how many read-only roots the replica kept and re-read,
+/// then each root sent (`replica:entries/bytes/ms`, with why a keepable one was re-read) and
+/// each kept.
+pub(crate) fn read_detail(
+    stream: &[Root],
+    took: &HashMap<String, u128>,
+    kept: &[String],
+    resent: &HashMap<String, Resent>,
+) -> String {
+    let sent = stream.iter().map(|r| {
+        let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
+        let ms = took.get(&r.replica).copied().unwrap_or(0);
+        let why = resent
+            .get(&r.replica)
+            .map(|w| format!(":re-read:{}", w.as_str()))
+            .unwrap_or_default();
+        format!("{}:{}/{}/{}ms{why}", r.replica, r.entries.len(), bytes, ms)
+    });
+    std::iter::once(format!("kept {} re-read {};", kept.len(), resent.len()))
+        .chain(sent)
+        .chain(kept.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A seat cache's entries for its first copy into a replica; empty (with a note) when the caches
@@ -2354,13 +2453,10 @@ fn copy_in_fresh(
             .collect()
     };
     let mut stamps = RepoStamps::new(scope, roots).map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
-    if roots.iter().any(|r| r.repo) {
-        let paths: Vec<String> = roots
-            .iter()
-            .filter(|r| r.repo)
-            .map(|r| replica_of(scope, &r.host))
-            .collect::<Result<_, _>>()
-            .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
+    // Only a root signed now can be kept: with none, the replica's stamps are not asked for.
+    if !stamps.keys.is_empty() {
+        let mut paths: Vec<&String> = stamps.keys.keys().collect();
+        paths.sort();
         let request = serde_json::json!(paths).to_string();
         let got = codec(kube, ns, &["stamps", &request], None, CALL);
         if !got.ok() {
