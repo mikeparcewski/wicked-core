@@ -8461,9 +8461,9 @@ pub(crate) fn stdin_prompt_argv(
         ));
     };
     if seat == SeatCli::Codex {
-        // A template that already reads stdin (`codex exec -`, no placeholder): the appended slot
-        // goes, with the guard `build_argv` put before it.
-        if argv[..at].iter().any(|a| a == "-") {
+        // A template that already reads stdin (`codex exec -`, with the slot appended after it, or
+        // `codex exec {PROMPT} -`): the slot goes, with a guard `build_argv` put before it.
+        if argv.iter().enumerate().any(|(i, a)| i != at && a == "-") {
             argv.remove(at);
             if at == argv.len() && argv.last().is_some_and(|a| a == "--") {
                 argv.pop();
@@ -8651,7 +8651,15 @@ pub(crate) fn run_bounded_fed(
     let mut child = cmd.spawn()?;
     let feed = match (stdin, child.stdin.take()) {
         (Some(body), Some(pipe)) => Some(PromptFeed::start(pipe, body)),
-        (_, pipe) => {
+        (Some(_), None) => {
+            // Unreachable (`piped_stdin` above): the prompt is never dropped silently.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(
+                "the seat was launched without the stdin pipe its prompt needs",
+            ));
+        }
+        (None, pipe) => {
             drop(pipe);
             None
         }
@@ -8855,8 +8863,10 @@ pub(crate) fn run_bounded_fed(
         }
         k => k,
     };
-    // (C0a) The child has ended: a prompt it did not read whole is stopped here, never left
-    // blocked on a pipe a descendant holds, and an exit 0 that did not read it is no answer.
+    // (C0a) The child has ended: a prompt its stdin did not take whole is stopped here, never
+    // left blocked on a pipe a descendant holds, and an exit 0 that did not take it is no answer.
+    // (A pipe that took every byte cannot say the seat read them, any more than argv can: the
+    // short feed is the failure this can see. Every return above drops `feed`, which stops it.)
     let unfed = feed.and_then(PromptFeed::finish);
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
@@ -8877,12 +8887,17 @@ pub(crate) fn run_bounded_fed(
 
 /// (DES-j6-build C0a) A prompt written to a child's stdin by its own thread, so a CLI that prints
 /// before it has read all of its input never deadlocks the pipes. On unix the write end is
-/// non-blocking and the thread stops when asked, so it never outlives the launch on a pipe that a
-/// descendant holds open without reading.
+/// non-blocking and the thread stops when asked. Ending the feed (`finish`, or a drop on any
+/// early return) never waits more than [`FEED_GRACE`] for the thread: where a write can block (no
+/// non-blocking pipe: Windows) on a pipe a descendant holds open without reading, the thread is
+/// left to end with that pipe and the launch is not held.
 struct PromptFeed {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: std::thread::JoinHandle<Result<(), String>>,
+    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
 }
+
+/// How long ending a feed waits for its thread to see the stop.
+const FEED_GRACE: Duration = Duration::from_secs(2);
 
 impl PromptFeed {
     fn start(mut pipe: std::process::ChildStdin, body: Vec<u8>) -> Self {
@@ -8923,22 +8938,47 @@ impl PromptFeed {
                 Ok(())
             } else {
                 Err(format!(
-                    "the seat ended before it read its whole prompt on stdin ({at} of {} bytes)",
+                    "the seat ended before it took its whole prompt on stdin ({at} of {} bytes)",
                     body.len()
                 ))
             }
         });
-        PromptFeed { stop, handle }
+        PromptFeed {
+            stop,
+            handle: Some(handle),
+        }
     }
 
-    /// Stop the feed (the child has ended) and say why the prompt was not delivered whole, if not.
-    fn finish(self) -> Option<String> {
+    /// Stop the feed (the child has ended) and say why the prompt was not handed over whole, if not.
+    fn finish(mut self) -> Option<String> {
+        self.end()
+    }
+
+    fn end(&mut self) -> Option<String> {
+        let handle = self.handle.take()?;
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        match self.handle.join() {
+        let deadline = Instant::now() + FEED_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !handle.is_finished() {
+            return Some(
+                "the seat ended before it took its whole prompt on stdin (its feed is blocked on \
+                 a pipe a descendant holds)"
+                    .to_string(),
+            );
+        }
+        match handle.join() {
             Ok(Ok(())) => None,
             Ok(Err(why)) => Some(why),
             Err(_) => Some("the prompt's stdin feed panicked".to_string()),
         }
+    }
+}
+
+impl Drop for PromptFeed {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 

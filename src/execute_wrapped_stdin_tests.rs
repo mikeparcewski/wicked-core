@@ -65,6 +65,10 @@ fn a_stdin_prompt_leaves_no_prompt_argument_for_claude_and_a_dash_for_codex() {
         conv("codex exec -", SeatCli::Codex),
         Ok((s(&["codex", "exec", "-"]), dash))
     );
+    // ... and so does one that states its `-` after the placeholder (never two positionals).
+    let (argv, _) = conv("codex exec {PROMPT} -", SeatCli::Codex).unwrap();
+    assert_eq!(argv.iter().filter(|a| *a == "-").count(), 1, "{argv:?}");
+    assert_eq!(argv.last().map(String::as_str), Some("-"), "{argv:?}");
     // Refused: a prompt joined to other text, a prompt placed twice, and every other seat.
     let refused = |template: &str, seat| conv(template, seat).unwrap_err();
     assert!(refused("claude --prompt={PROMPT}", SeatCli::Claude).contains("own argument"));
@@ -325,13 +329,16 @@ fn a_seat_that_does_not_read_its_whole_prompt_fails_and_the_feed_ends_with_it() 
     };
     let (code, err, _) = feed("head -c 100 >/dev/null; echo answered; exit 0");
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("before it read its whole prompt"), "{err}");
+    assert!(err.contains("before it took its whole prompt"), "{err}");
     let (code, err, took) = feed(
-        "python3 -c 'import os,sys,time\nif os.fork():\n    sys.exit(0)\nos.setsid()\n\
-         n=os.open(os.devnull,os.O_WRONLY)\nos.dup2(n,1)\nos.dup2(n,2)\ntime.sleep(30)'",
+        // The parent exits only once the descendant is in its own session with stdout and stderr
+        // let go (a handshake on a pipe), so the group kill cannot be what ends the feed.
+        "python3 -c 'import os,sys,time\nr,w=os.pipe()\nif os.fork():\n    os.close(w)\n\
+         \x20   os.read(r,1)\n    sys.exit(0)\nos.setsid()\nn=os.open(os.devnull,os.O_WRONLY)\n\
+         os.dup2(n,1)\nos.dup2(n,2)\nos.write(w,b\"k\")\ntime.sleep(30)'",
     );
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("before it read its whole prompt"), "{err}");
+    assert!(err.contains("before it took its whole prompt"), "{err}");
     assert!(
         took < Duration::from_secs(20),
         "the feed outlived its seat: {took:?}"
@@ -453,4 +460,32 @@ fn a_150_kb_prompt_rides_a_seat_pods_exec_stdin_byte_exact() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A feed ended by a drop (every early return of the launch, a settlement failure among them) is
+/// stopped there, never left polling a pipe that a process holds open without reading.
+#[cfg(unix)]
+#[test]
+fn a_dropped_feed_stops_on_a_pipe_held_unread() {
+    // spawn-audit: test-only — a process that holds its stdin open and never reads it.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let feed = PromptFeed::start(child.stdin.take().expect("pipe"), big_prompt().into_bytes());
+    std::thread::sleep(Duration::from_millis(100));
+    let (stop, start) = (feed.stop.clone(), Instant::now());
+    drop(feed);
+    let took = start.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(stop.load(std::sync::atomic::Ordering::SeqCst));
+    // Under the grace: the thread saw the stop and was joined, not waited out and left behind.
+    assert!(
+        took < FEED_GRACE,
+        "the dropped feed was not stopped: {took:?}"
+    );
 }
