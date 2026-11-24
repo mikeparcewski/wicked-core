@@ -1357,13 +1357,19 @@ pub(crate) fn apply_and_finish_unit(
     // it was (a judge-only re-run, a retry with no edit): the floor still did not run on this tree,
     // so it is disclosed again, never turned into a denial on the re-run. Without this a re-judge
     // on a host with no OS write boundary denied `repo_checks` where the attempt that ran did not.
+    // (core#1854 D1) Only the MISSING-BOUNDARY refusal is carried as a disclosure. Any other
+    // refusal (no disk, a stop, a runner that could not start) of an operator retry, extend or
+    // targeted run overwrites a failed report on the same tree; carrying it as a disclosure would
+    // pass a tree whose checks failed.
     let default_floor_refused_unsandboxed = !unit.repo_checks_floor
         && ((evidence.tree_changed == Some(true)
             && evidence
                 .repo_checks
                 .as_ref()
                 .is_some_and(refused_unsandboxed))
-            || carried.as_ref().is_some_and(refused_unsandboxed));
+            || carried
+                .as_ref()
+                .is_some_and(crate::repo_checks::RepoChecksReport::missing_boundary_refusal));
     // (DES-QE-EVERY-SEAT §3.2, codex r1 on the code) A floor-fix attempt's fixing seat, read
     // BEFORE a fresh floor report replaces the request that names it.
     let floor_fixer: Option<String> = unit
@@ -6519,7 +6525,10 @@ mod judge_bench_tests {
     fn a_carried_unsandboxed_refusal_of_the_default_floor_is_disclosed_not_denied() {
         let refused = serde_json::json!({
             "detected": [], "skipped": [], "passed": false, "sandbox_level": "none",
-            "sandbox_error": "no OS write boundary could be armed for the checks (Windows)",
+            "sandbox_error": format!(
+                "{} (no OS-sandbox tool on PATH)",
+                crate::repo_checks::NO_BOUNDARY_REFUSAL_PREFIX
+            ),
             "tree": "t1", "checks": [],
         });
         assert_ne!(
@@ -6542,26 +6551,38 @@ mod judge_bench_tests {
     }
 
     /// (core#1854 D1) Only the missing-boundary refusal is carried as a disclosure. An ENVIRONMENT
-    /// refusal (no disk, a stop) of an operator retry, extend or targeted run overwrites the
+    /// refusal (no disk) or a stop of an operator retry, extend or targeted run overwrites the
     /// failed report on the same tree; carried to a rework that left that tree unchanged, it still
     /// denies, or a tree whose checks failed would pass the machine gate.
     #[test]
     fn a_carried_environment_refusal_of_the_default_floor_still_denies() {
         // The writer's shape: the admission refusal (repo_checks.rs `FloorSlot::admit` →
-        // `runner_refused`) with the disk guard's own text, stamped with the tree it was asked to
-        // judge (cli_runner.rs `FloorPlan::finish`).
-        let why = crate::repo_checks::disk_guard(Some(1 << 30), 15).expect("refused");
-        assert!(crate::repo_checks::is_environment_refusal(&why));
-        let refused = serde_json::json!({
-            "detected": [], "skipped": [], "passed": false,
-            "sandbox_level": crate::validator::SandboxLevel::BestEffort.as_wire(),
-            "sandbox_error": why, "tree": "t1", "checks": [],
-        });
-        assert_eq!(
-            fold_unchanged_tree("carry-environment", refused).as_deref(),
-            Some(crate::repo_checks::DENIAL_SOURCE),
-            "a carried environment refusal denies"
-        );
+        // `runner_refused`) with the disk guard's own text, or a stop's (`floor_stop_text` + ": its
+        // floor does not start"), stamped with the tree it was asked to judge (cli_runner.rs
+        // `FloorPlan::finish`).
+        let disk = crate::repo_checks::disk_guard(Some(1 << 30), 15).expect("refused");
+        assert!(crate::repo_checks::is_environment_refusal(&disk));
+        for (sid, why) in [
+            ("carry-environment", disk),
+            (
+                "carry-stopped",
+                "the run was cancelled: its floor does not start".to_string(),
+            ),
+        ] {
+            let refused = serde_json::json!({
+                "detected": [], "skipped": [], "passed": false,
+                "sandbox_level": crate::validator::SandboxLevel::BestEffort.as_wire(),
+                "sandbox_error": why, "tree": "t1", "checks": [],
+            });
+            let report: crate::repo_checks::RepoChecksReport =
+                serde_json::from_value(refused.clone()).unwrap();
+            assert!(!report.missing_boundary_refusal(), "{sid}");
+            assert_eq!(
+                fold_unchanged_tree(sid, refused).as_deref(),
+                Some(crate::repo_checks::DENIAL_SOURCE),
+                "{sid}: a carried refusal that is not a missing boundary denies"
+            );
+        }
     }
 
     /// (core#1186) On an unchanged tree the floor's last result stands; when the operator already

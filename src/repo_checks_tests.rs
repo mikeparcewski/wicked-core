@@ -1813,6 +1813,10 @@ fn without_a_write_boundary_the_floor_fails_closed_and_runs_nothing() {
             ),
             "{report:?}"
         );
+    assert!(
+        report.missing_boundary_refusal(),
+        "the default floor's carry keys on this writer's text (core#1854 D1): {report:?}"
+    );
     assert_eq!(
         report
             .detected

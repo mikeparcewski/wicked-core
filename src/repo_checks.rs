@@ -1766,6 +1766,18 @@ impl RepoChecksReport {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// (F-7R2-005) The floor refused to run for want of an OS write boundary, and for nothing
+    /// else: not an environment refusal (no disk), a stop (cancel, shutdown, superseded) or a
+    /// runner that could not start. Keyed on the one writer's own text.
+    pub fn missing_boundary_refusal(&self) -> bool {
+        !self.passed
+            && self.checks.is_empty()
+            && self
+                .sandbox_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(NO_BOUNDARY_REFUSAL_PREFIX))
+    }
+
     /// An environment refusal carries its own cause and advice, distinct from a missing boundary.
     pub fn environment_refusal(&self) -> Option<&str> {
         self.sandbox_error
@@ -5481,6 +5493,11 @@ thread_local! {
 /// The wire prefix for a floor's environment refusal, whose text carries its own advice.
 pub const ENVIRONMENT_REFUSAL_PREFIX: &str = "environment:";
 
+/// How the floor's refusal for want of an OS write boundary begins (F-7R2-005): the default floor
+/// discloses that refusal rather than denying it, also when carried to an unchanged tree.
+pub(crate) const NO_BOUNDARY_REFUSAL_PREFIX: &str =
+    "no OS write boundary could be armed for the checks";
+
 /// Whether a refusal describes the environment rather than a missing OS write boundary.
 pub fn is_environment_refusal(error: &str) -> bool {
     error.starts_with(ENVIRONMENT_REFUSAL_PREFIX)
@@ -6111,7 +6128,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     sandbox_level,
                     sandbox_note: sandbox_note.clone(),
                     sandbox_error: Some(format!(
-                        "no OS write boundary could be armed for the checks ({}). On this host the \
+                        "{NO_BOUNDARY_REFUSAL_PREFIX} ({}). On this host the \
                          verify floor cannot run: install `bwrap` (Linux), or set \
                          {UNSANDBOXED_OPT_IN_ENV}=1 to run the repository's own scripts with NO \
                          write boundary, disclosed on every report",
