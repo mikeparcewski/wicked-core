@@ -2113,21 +2113,13 @@ pub fn create_worktree_based(
         // registered". Prune drops exactly those dangling entries and touches no live worktree.
         let _ = git(repo_root, &["worktree", "prune"]);
     }
-    if let Some(parent) = wt.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "could not create the folder for this run's working copy, {}: {e}. Runs on this \
-                 repository need to create folders beside its checkout; make {} writable for this \
-                 computer's user",
-                parent.display(),
-                parent
-                    .ancestors()
-                    .find(|dir| dir.is_dir())
-                    .unwrap_or(parent)
-                    .display()
-            )
-        })?;
-    }
+    let wt = match wt.parent() {
+        Some(parent) => match create_writable_dir(parent) {
+            Ok(()) => wt,
+            Err(e) => in_clone_fallback(repo_root, &wt, parent, e)?,
+        },
+        None => wt,
+    };
     let branch = worktree_branch(run_id);
     let wt_str = wt.to_string_lossy().to_string();
     // core#431 (F-3R2-013): the base is the remote default branch's CURRENT tip when the clone
@@ -2170,6 +2162,120 @@ pub fn create_worktree_based(
     stamp_worktree_owner(&wt, run_id);
     claim_fresh_mint(&wt, run_id)?;
     Ok((wt, Some(base)))
+}
+
+/// (core#1860) `create_dir_all(dir)`, then proof that this computer's user can create an entry
+/// in it: a folder another user owns, or one on a read-only mount, passes `create_dir_all`.
+fn create_writable_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".wicked-probe-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&probe)?;
+    let _ = std::fs::remove_dir(&probe);
+    Ok(())
+}
+
+/// (core#1860) The folder beside the checkout could not be made (a checkout at a volume root,
+/// bind-mounted at `/repo`, or in a folder another user owns): the run's tree is minted inside the
+/// checkout instead, where trees lived before core#1109. Every path that finds a run's tree
+/// ([`worktree_path`], the reapers' [`all_worktrees_roots`], the sibling-tree fence) still knows
+/// that layout, and the checkout's own `info/exclude` keeps it out of the checkout's status. A
+/// `wicked-worktrees` the repository itself holds (a tracked link or file) is never followed or
+/// used: the run is refused with words that say so. Such a checkout's runs keep the one limit
+/// trees inside it always had: cargo's workspace walk from an excluded crate reaches the
+/// checkout's `Cargo.toml` (the reason for core#1109).
+fn in_clone_fallback(
+    repo_root: &str,
+    wt: &Path,
+    parent: &Path,
+    beside_error: std::io::Error,
+) -> anyhow::Result<PathBuf> {
+    let inside = in_clone_worktrees_root(repo_root);
+    let Some(fallback) = wt
+        .file_name()
+        .map(|name| inside.join(name))
+        .filter(|_| parent != inside)
+    else {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy, {}: {beside_error}. Make \
+             {} writable for this computer's user",
+            parent.display(),
+            parent
+                .ancestors()
+                .find(|dir| dir.is_dir())
+                .unwrap_or(parent)
+                .display()
+        );
+    };
+    if std::fs::symlink_metadata(&inside).is_ok_and(|m| !m.is_dir()) {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy beside the checkout, {} \
+             ({beside_error}), and {} inside it is a link or a file of the repository's own. \
+             Make {} writable for this computer's user",
+            parent.display(),
+            inside.display(),
+            parent
+                .ancestors()
+                .find(|dir| dir.is_dir())
+                .unwrap_or(parent)
+                .display()
+        );
+    }
+    if let Err(e) = create_writable_dir(&inside) {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy beside the checkout, {} \
+             ({beside_error}), nor inside it, {} ({e}). Make the checkout {repo_root} writable \
+             for this computer's user",
+            parent.display(),
+            inside.display()
+        );
+    }
+    eprintln!(
+        "wicked-core: cannot create {} beside the checkout ({beside_error}); this run's tree is \
+         made inside the checkout, at {}",
+        parent.display(),
+        fallback.display()
+    );
+    exclude_in_clone_trees(repo_root);
+    Ok(fallback)
+}
+
+/// (core#1860) Keep the in-checkout trees folder out of the checkout's status: one
+/// `wicked-worktrees/` line appended to the repository's own `info/exclude` (never the tracked
+/// `.gitignore`). The file is only ever appended to, never rewritten, so its other rules (in any
+/// encoding) survive concurrent launches; a file that cannot be read is left alone. Best-effort:
+/// a failure to write it is cosmetic.
+fn exclude_in_clone_trees(repo_root: &str) {
+    use std::io::Write;
+    const ENTRY: &[u8] = b"wicked-worktrees/";
+    let Ok((true, path, _)) = git(repo_root, &["rev-parse", "--git-path", "info/exclude"]) else {
+        return;
+    };
+    let exclude = Path::new(repo_root).join(path.trim());
+    let existing = match std::fs::read(&exclude) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return,
+    };
+    if existing
+        .split(|b| *b == b'\n')
+        .any(|line| line.trim_ascii() == ENTRY)
+    {
+        return;
+    }
+    if let Some(dir) = exclude.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut line = Vec::new();
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        line.push(b'\n');
+    }
+    line.extend_from_slice(ENTRY);
+    line.push(b'\n');
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+        .and_then(|mut f| f.write_all(&line));
 }
 
 /// Remove a run's worktree unconditionally (best-effort — a failure to clean up is logged, not
