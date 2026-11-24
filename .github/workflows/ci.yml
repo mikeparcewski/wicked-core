@@ -240,6 +240,69 @@ jobs:
           TEST_POSTGRES_URL: postgres://wicked:wicked@localhost:5432/estate_test
         run: cargo test --manifest-path crates/wicked-apps-core/Cargo.toml --features postgres
 
+  # core#1406: a seat's declared native addon (crew: better-sqlite3) is built in the seat's own claim
+  # by the engine's build-pod script (tests/fixtures/native-build/better-sqlite3.sh, asserted byte
+  # for byte against checks_container::native_build_script): offline, under the floor's own landrun
+  # with only the addon's build/ writable. The seat then loads it from the claim mounted read-only.
+  seat-native-addon:
+    name: seat native addon build (ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout wicked-core
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build the checks floor image and the floor image
+        run: |
+          docker build -t wicked-checks-floor:ci - < containers/checks/node22-rust.Dockerfile
+          docker build -t wicked-floor:ci - < containers/floor.Dockerfile
+
+      - name: better-sqlite3 builds in its claim offline and confined, and the seat loads it read-only
+        run: |
+          set -eu
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/t" "$dir/floor"
+          cid="$(docker create wicked-floor:ci /busybox true)"
+          docker cp "$cid:/landrun" "$dir/floor/landrun"
+          docker rm "$cid" >/dev/null
+          printf '%s\n' '{"name":"t","version":"0.0.0","private":true,"dependencies":{"better-sqlite3":"^12.0.0"}}' > "$dir/t/package.json"
+          chmod -R a+rwX "$dir"
+          image=wicked-checks-floor:ci
+          debian=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          # The fill: scripts off, so no binding; the addon's build/ is the mount point it makes.
+          docker run --rm --user 1000:1000 -v "$dir/t:/work/t" -w /work/t --entrypoint /usr/bin/env \
+            "$image" -i "$debian" HOME=/tmp sh -euc '
+              npm install --ignore-scripts --no-audit --no-fund
+              mkdir -p node_modules/better-sqlite3/build
+              if ls node_modules/better-sqlite3/build/Release/*.node 2>/dev/null; then
+                echo "the install built a binding with scripts off" >&2; exit 1
+              fi
+              # A file outside build/ proves the confinement: the build cannot touch it.
+              echo untouched > node_modules/.probe'
+          # The claim's build pod: no network, the claim at /wicked/vol, the engine's own script.
+          docker run --rm --network none --read-only --user 1000:1000 \
+            --security-opt no-new-privileges --cap-drop ALL \
+            --tmpfs /tmp:exec --tmpfs /home/floor -v "$dir/floor:/floor:ro" \
+            -v "$dir/t/node_modules:/wicked/vol" \
+            -v "$PWD/tests/fixtures/native-build/better-sqlite3.sh:/work/native-build.sh:ro" \
+            --entrypoint /usr/bin/env "$image" -i "$debian" HOME=/home/floor TMPDIR=/tmp \
+            sh -euc 'sh /work/native-build.sh
+              # Landlock holds: a confined process writes its scratch, never the claim outside build/.
+              /floor/landrun --best-effort --ignore-missing --rox /usr --rox /bin --rox /lib --rox /lib64 \
+                  --rox /etc --rox /wicked/vol --rwx /tmp -- \
+                  /bin/sh -c "touch /tmp/granted && ! (echo changed > /wicked/vol/.probe) 2>/dev/null" || {
+                echo "Landlock is not enforced here; this check would prove nothing" >&2; exit 1; }
+              test ! -e /wicked/vol/.wicked-jail-probe'
+          test "$(cat "$dir/t/node_modules/.probe")" = untouched
+          test -f "$dir/t/node_modules/.wicked-native-built"
+          # The seat: no network, the claim read-only.
+          docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
+            --security-opt no-new-privileges --cap-drop ALL -v "$dir/t:/work/t:ro" \
+            -w /work/t --entrypoint /usr/bin/env "$image" -i "$debian" HOME=/tmp TMPDIR=/tmp sh -euc '
+              got="$(node -e "const D = require(\"better-sqlite3\"); console.log(new D(\":memory:\").prepare(\"select 41 + 1 as x\").get().x)")"
+              echo "better-sqlite3 loaded in the seat: select 41 + 1 = $got"
+              [ "$got" = 42 ]'
+
   # core#1476: the checks floor image and a seat image built on it carry the pinned Rust toolchain on
   # the default PATH, so a repository whose rust-toolchain.toml names `channel = "stable"` builds
   # with the image's own binaries (rustup would otherwise try to install `stable` into a read-only

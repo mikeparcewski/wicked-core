@@ -1460,10 +1460,12 @@ pub(crate) fn admit_dependency_claim(
             if kube.delete_owned(Some(ns), "pvc", &victim, true).is_ok() {
                 count -= 1;
                 let key = format!("{ns}/{victim}");
+                // Its native build's completion too (core#1406): a claim filled again is unbuilt.
+                let under = format!("{key}/");
                 FILLED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .retain(|k| k != &key);
+                    .retain(|k| k != &key && !k.starts_with(&under));
                 if let Some(used) = DEPENDENCY_USED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2893,6 +2895,69 @@ impl Filler<'_> {
         Ok(got)
     }
 
+    /// (core#1406) Build `native` in the seat claim `volume` (filled, each addon's `build/` empty):
+    /// in a pod with NO network (a floor pod, proven offline before anything runs), the claim
+    /// read-write, running [`native_build_script`] in the checks image, whose node is the default
+    /// seat image's own. The build runs repository-installed code with exactly the trust the
+    /// floor's own native-build step gives it, confined to the addons' `build/` in the seat's claim.
+    /// Once per claim and run; the pod goes on every path. `Ok(true)` = built now, `Ok(false)` =
+    /// built before; `Err` (failed, cut short, or its pod not confirmed gone) = the claim must not
+    /// reach a seat.
+    fn build_native(&self, volume: &str, native: &[&str]) -> Result<bool, String> {
+        let key = format!("{}/{volume}/{NATIVE_BUILT}", self.place.ns);
+        let _lock = lock_volume(&format!("{}-{volume}", self.place.ns))?;
+        if filled(&key) {
+            return Ok(false);
+        }
+        let name = format!("build-{volume}");
+        // An earlier build of this claim that outlived its client may still write it: confirmed
+        // gone first, or no build now (the seat then starts without the binding).
+        self.place
+            .kube
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+            .map_err(|e| format!("an earlier build of {volume} could not be ended: {e}"))?;
+        let mut pod = self.place.pod(&name, "floor", self.tag, self.floor_image);
+        pod.memory_limit = crate::container_floor::k8s_memory(self.memory);
+        pod.memory_request = "512Mi".into();
+        pod.empty = vec![("/tmp".into(), "4Gi".into()), (HOME.into(), "2Gi".into())];
+        pod.claims = vec![(volume.to_string(), FILL_DIR.into(), false)];
+        pod.env = [("HOME", HOME), ("TMPDIR", "/tmp"), ("CI", "1")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.place
+            .start(&pod)
+            .map_err(|e| format!("the build pod: {e}"))?;
+        struct Gone<'a>(&'a crate::k8s::floor::Place, &'a str);
+        impl Drop for Gone<'_> {
+            fn drop(&mut self) {
+                self.0.delete(self.1);
+            }
+        }
+        let gone = Gone(self.place, &name);
+        self.place.prove_offline(&name)?;
+        let script = native_build_script(native);
+        let out = self
+            .place
+            .run(&name, &["sh", "-c", &script], FILL)
+            .map_err(|e| {
+                let last = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+                last.chars().take(300).collect::<String>()
+            })?;
+        // Published only once the pod (and anything the build left running in it) is confirmed
+        // gone: until then the claim is not handed to a seat as built.
+        std::mem::forget(gone);
+        self.place
+            .kube
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+            .map_err(|e| {
+                self.place.delete(&name);
+                format!("the build pod is not confirmed gone: {e}")
+            })?;
+        mark_filled(&key);
+        Ok(!out.lines().any(|l| l.trim() == "WICKED-HIT"))
+    }
+
     /// Run a fill pod (the network, the claim `claim` read-write at [`FILL_DIR`]) over `entries`
     /// with `script`, the tree streamed in: `Hit` when the claim was already complete, `Filled`
     /// on success, `Failed(log)` when the install itself failed (the script's exit 3, after its
@@ -3054,8 +3119,13 @@ fn remember_seat_claim(run_id: &str, tree: &Path, claim: Option<String>) {
 /// What a seat tree's `node_modules` fill decided.
 #[derive(Debug)]
 pub(crate) enum SeatNm {
-    /// The run's claim holds this tree's install (`hit`: already filled).
-    Claim { claim: String, hit: bool },
+    /// The run's claim holds this tree's install (`hit`: already filled), and, when the tree
+    /// declares native addons, what their build said (`native`, core#1406).
+    Claim {
+        claim: String,
+        hit: bool,
+        native: Option<String>,
+    },
     /// Not filled, on purpose (the reason).
     Skip(String),
     /// The repository's own install failed (its log).
@@ -3108,6 +3178,7 @@ pub(crate) fn seat_node_modules(
     }
     let lock =
         read_blob(git_dir, &snap.tree, &lock_name).ok_or("the lockfile could not be read")?;
+    let native = declared_native_in(git_dir, &snap.tree)?;
     if let Some(dep) = git_dependency(&lock) {
         return Ok(SeatNm::Skip(format!(
             "the lockfile installs a git dependency ({dep}), whose `prepare` npm runs even with \
@@ -3139,15 +3210,8 @@ pub(crate) fn seat_node_modules(
         std::env::var(MEMORY_ENV).ok().as_deref(),
         crate::container_floor::seat_cpus(),
     )?;
-    // A declared native addon is built per floor (core#1393); a seat's copy has it unbuilt
-    // (core#1406), so its claim is the plain install's.
-    let volume = nm_volume(
-        &tag,
-        "",
-        &lock,
-        &npm_inputs(&entries, &lock, &snap.tree),
-        &[],
-    );
+    let inputs = npm_inputs(&entries, &lock, &snap.tree);
+    let volume = seat_nm_volume(&tag, &lock, &inputs, &native);
     let filler = Filler {
         place: &place,
         tag: &tag,
@@ -3155,18 +3219,164 @@ pub(crate) fn seat_node_modules(
         memory: &memory,
         git_dir,
     };
-    Ok(
-        match filler.fill_nm(&snap.tree, &entries, "", &volume, &[])? {
-            Fill::Hit => SeatNm::Claim {
-                claim: volume,
-                hit: true,
-            },
-            Fill::Filled => SeatNm::Claim {
-                claim: volume,
-                hit: false,
-            },
-            Fill::Failed(log) => SeatNm::Failed(log),
-        },
+    let hit = match filler.fill_nm(&snap.tree, &entries, "", &volume, &native)? {
+        Fill::Hit => true,
+        Fill::Filled => false,
+        Fill::Failed(log) => return Ok(SeatNm::Failed(log)),
+    };
+    if native.is_empty() {
+        return Ok(SeatNm::Claim {
+            claim: volume,
+            hit,
+            native: None,
+        });
+    }
+    let names = native.join(", ");
+    match filler.build_native(&volume, &native) {
+        Ok(now) => Ok(SeatNm::Claim {
+            claim: volume,
+            hit: hit && !now,
+            native: Some(if now {
+                format!("{names} built natively just now")
+            } else {
+                format!("{names} built natively")
+            }),
+        }),
+        // A build that failed, was cut short or whose pod is not confirmed gone: its claim is
+        // never handed to the seat. The seat gets the plain install instead (the addon unbuilt,
+        // as before core#1406), so it still starts.
+        Err(e) => {
+            let plain = nm_volume(&tag, "", &lock, &inputs, &[]);
+            let hit = match filler.fill_nm(&snap.tree, &entries, "", &plain, &[])? {
+                Fill::Hit => true,
+                Fill::Filled => false,
+                Fill::Failed(log) => return Ok(SeatNm::Failed(log)),
+            };
+            Ok(SeatNm::Claim {
+                claim: plain,
+                hit,
+                native: Some(format!(
+                    "{names} did not build natively ({e}), so a test that loads it fails in this \
+                     seat"
+                )),
+            })
+        }
+    }
+}
+
+/// (core#1406) The native addons the tree `tree` (a snapshot) declares in its root
+/// `.wicked/checks.json`, read from the blob as the floor reads its tree: validated against the
+/// floor's allowlist, so the names are the engine's own spelling; a config that does not parse is
+/// an error, never "none".
+pub(crate) fn declared_native_in(git_dir: &Path, tree: &str) -> Result<Vec<&'static str>, String> {
+    match read_blob(git_dir, tree, crate::repo_checks::CONFIG_PATH) {
+        Some(raw) => crate::repo_checks::native_rebuild_in(&String::from_utf8_lossy(&raw)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The seats' `node_modules` claim for a tree (B14). With no native addon declared it IS the
+/// floor's own claim for the tree (one install, shared). With some (core#1406) it is the seat's
+/// own, beside it: filled as the floor's (each addon's `build/` made empty) and then built in
+/// place by an offline pod, so the floor's shared claim never holds anything the repository's
+/// build wrote, and the seat's read-only claim holds the bindings.
+pub(crate) fn seat_nm_volume(tag: &str, lock: &[u8], inputs: &[u8], native: &[&str]) -> String {
+    let floor = nm_volume(tag, "", lock, inputs, native);
+    if native.is_empty() {
+        floor
+    } else {
+        format!("{floor}-seat")
+    }
+}
+
+/// (core#1406) The marker a seat claim's native build leaves at its top once every binding built.
+const NATIVE_BUILT: &str = ".wicked-native-built";
+
+/// (core#1406) The canary the engine writes at a claim's top for a native build's jail proof.
+const JAIL_PROBE: &str = ".wicked-jail-probe";
+
+/// (core#1406) The confined half of a native build's jail proof (`python3 -I -c`, the canary as
+/// its argument): a write-open and a `truncate(2)` of the canary must each fail with `EACCES`,
+/// Landlock's denial (any other error, such as a full or read-only claim, proves nothing).
+const JAIL_PROOF: &str = "import errno, os, sys
+def denied(f):
+    try:
+        f()
+    except OSError as e:
+        return e.errno == errno.EACCES
+    return False
+p = sys.argv[1]
+sys.exit(0 if denied(lambda: open(p, \"a\").close()) and denied(lambda: os.truncate(p, 0)) else 4)";
+
+/// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`].
+/// Trusted engine steps first: a claim already marked answers `WICKED-HIT`; otherwise each
+/// addon's `build/` is emptied (nothing a package shipped there, or an earlier attempt left, is
+/// reused). Then the floor's own native-build step ([`crate::repo_checks::native_build_argv`]:
+/// node-gyp beside the image's npm, its own node's headers, no download, no npm lifecycle) runs
+/// under the floor's landrun: the claim and the system are read-only to it, and only each addon's
+/// `build/`, the scratch and the home are writable, so the repository-installed build (gyp
+/// actions) can change nothing else in the claim (the installed packages, the nested archive, the
+/// marker). The launcher runs `--best-effort` (the ABI the kernel has; without it landrun refuses
+/// any kernel below its newest ABI) and, like the sync pod's jail, the jail is PROVEN in force
+/// before the build ([`JAIL_PROOF`]): the engine writes a canary at the claim's top (so the
+/// claim is writable outside the jail), and under the same policy a scratch write succeeds while
+/// opening the canary for writing and truncating it both fail with `EACCES` (truncation is
+/// Landlock ABI v3, so an older kernel builds nothing), and the canary is unchanged after. Any
+/// other outcome (no Landlock, a launcher that cannot start, a full or read-only claim) builds
+/// nothing. The engine marks the claim only after the build succeeded, and empties the build
+/// dirs again when it failed.
+pub(crate) fn native_build_script(native: &[&str]) -> String {
+    let argv = crate::repo_checks::native_build_argv(native);
+    let builds: Vec<String> = native
+        .iter()
+        .map(|n| sh_quote(&format!("{FILL_DIR}/{n}/build")))
+        .collect();
+    let clean = builds
+        .iter()
+        .map(|b| format!("rm -rf {b} && mkdir {b}; "))
+        .collect::<String>();
+    let mut policy: Vec<String> = vec![
+        "/floor/landrun".into(),
+        "--best-effort".into(),
+        "--ignore-missing".into(),
+    ];
+    for d in [
+        "/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc", FILL_DIR,
+    ] {
+        policy.extend(["--rox".into(), d.into()]);
+    }
+    for d in ["/proc", "/dev"] {
+        policy.extend(["--ro".into(), d.into()]);
+    }
+    policy.extend(["--rw".into(), "/dev/null".into()]);
+    for d in ["/tmp", HOME] {
+        policy.extend(["--rwx".into(), d.into()]);
+    }
+    for b in &builds {
+        policy.extend(["--rwx".into(), b.clone()]);
+    }
+    for v in ["PATH", "HOME", "TMPDIR"] {
+        policy.extend(["--env".into(), v.into()]);
+    }
+    let policy = policy.join(" ");
+    let probe = format!("{FILL_DIR}/{JAIL_PROBE}");
+    let prove = sh_quote(&format!(
+        "touch /tmp/wicked-native/.jail-granted && python3 -I -c {} {probe}",
+        sh_quote(JAIL_PROOF)
+    ));
+    format!(
+        "set -e; if [ -f {FILL_DIR}/{NATIVE_BUILT} ]; then echo WICKED-HIT; exit 0; fi; \
+         {clean}rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
+         ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
+         trap 'rm -f {probe}' EXIT; rm -f {probe}; \
+         printf x > {probe} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
+         exit 1; }}; \
+         if ! {policy} -- /bin/sh -c {prove} || [ \"$(cat {probe})\" != x ]; then \
+         echo 'wicked-core: Landlock is not in force in the build pod; nothing is built' >&2; \
+         exit 1; fi; rm -f {probe}; trap - EXIT; \
+         if {policy} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
+         else {clean}exit 1; fi",
+        sh_quote(&argv[2])
     )
 }
 
@@ -3194,8 +3404,11 @@ pub(crate) fn provision_seat_node_modules(
     };
     let started = Instant::now();
     match seat_node_modules(run_id, tree, git_dir) {
-        Ok(SeatNm::Claim { claim, hit }) => {
-            let platform = format!("linux pods, the run's read-only cache {claim}");
+        Ok(SeatNm::Claim { claim, hit, native }) => {
+            let mut platform = format!("linux pods, the run's read-only cache {claim}");
+            if let Some(n) = native {
+                platform.push_str(&format!("; {n}"));
+            }
             remember_seat_claim(run_id, tree, Some(claim));
             if hit {
                 Provisioned::AlreadyFor(platform)

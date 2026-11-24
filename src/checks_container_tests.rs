@@ -1806,3 +1806,302 @@ fn the_floor_path_has_no_rustup_proxies_and_the_image_links_the_pinned_toolchain
         "built with the floor's pinned Rust toolchain; a repository rust-toolchain file is not applied"
     ));
 }
+
+/// core#1406: a tree that declares no native addon keeps sharing the floor's own claim; one that
+/// declares some gets the seat's own claim beside the floor's (filled as the floor's, then built
+/// in place), so nothing the repository's build writes reaches the floor's shared claim.
+#[test]
+fn a_seat_claim_with_native_addons_is_its_own_beside_the_floors() {
+    let (tag, lock, inputs) = (
+        "wicked-checks-floor:abc",
+        b"lock".as_slice(),
+        b"in".as_slice(),
+    );
+    let plain = seat_nm_volume(tag, lock, inputs, &[]);
+    assert_eq!(plain, nm_volume(tag, "", lock, inputs, &[]));
+    let native = seat_nm_volume(tag, lock, inputs, &["better-sqlite3"]);
+    let floor = nm_volume(tag, "", lock, inputs, &["better-sqlite3"]);
+    assert_eq!(native, format!("{floor}-seat"));
+    assert_ne!(native, plain);
+    assert!(native.starts_with(DEPENDENCY_PREFIX), "{native}");
+    assert!(
+        format!("build-{native}").len() <= 63,
+        "a pod name of it fits: build-{native}"
+    );
+}
+
+/// core#1406: the seat claim's offline build is the floor's own native-build step, verbatim, run
+/// under the floor's landrun with ONLY each addon's `build/`, the scratch and the home writable
+/// (the claim itself read-only to it, and no best effort: a kernel without Landlock builds
+/// nothing). The engine empties each `build/` before (a shipped binding is never reused) and after
+/// a failed build, and marks the claim only after success; a marked claim is a hit.
+#[cfg(unix)]
+#[test]
+fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_success() {
+    let script = native_build_script(&["better-sqlite3"]);
+    let argv = crate::repo_checks::native_build_argv(&["better-sqlite3"]);
+    assert!(
+        script.contains(&format!("-- /bin/sh -c {}; then", sh_quote(&argv[2]))),
+        "{script}"
+    );
+    let policy = script
+        .split("if /floor/landrun ")
+        .nth(1)
+        .and_then(|r| r.split(" -- /bin/sh").next())
+        .unwrap_or_else(|| panic!("{script}"));
+    // The launcher takes the ABI the kernel has, so the jail is proven in force first, under the
+    // same policy, against a canary the engine wrote: a scratch write succeeds, and a write-open
+    // and a truncate of the canary are refused (EACCES) and leave it unchanged.
+    assert!(
+        policy.starts_with("--best-effort --ignore-missing "),
+        "{policy}"
+    );
+    let canary = format!("{FILL_DIR}/{JAIL_PROBE}");
+    let prove = format!(
+        "printf x > {canary} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
+         exit 1; }}; if ! /floor/landrun {policy} -- /bin/sh -c {} || [ \"$(cat {canary})\" != x ]; then",
+        sh_quote(&format!(
+            "touch /tmp/wicked-native/.jail-granted && python3 -I -c {} {canary}",
+            sh_quote(JAIL_PROOF)
+        ))
+    );
+    assert!(
+        script.find(&prove).unwrap_or_else(|| panic!("{script}"))
+            < script.find("if /floor/landrun ").unwrap()
+    );
+    assert!(JAIL_PROOF.contains("os.truncate(p, 0)") && JAIL_PROOF.contains("errno.EACCES"));
+    assert!(policy.contains(&format!("--rox {FILL_DIR} ")), "{policy}");
+    assert!(policy.contains(&format!("--rwx '{FILL_DIR}/better-sqlite3/build'")));
+    let writable: Vec<&str> = policy
+        .split(" --")
+        .filter_map(|g| g.strip_prefix("rwx ").or_else(|| g.strip_prefix("rw ")))
+        .collect();
+    assert_eq!(
+        writable,
+        [
+            "/dev/null",
+            "/tmp",
+            HOME,
+            format!("'{FILL_DIR}/better-sqlite3/build'").as_str()
+        ],
+        "{policy}"
+    );
+    // The clean comes before the build, under the engine (outside landrun).
+    let clean = format!(
+        "rm -rf '{FILL_DIR}/better-sqlite3/build' && mkdir '{FILL_DIR}/better-sqlite3/build';"
+    );
+    assert!(script.find(&clean).unwrap() < script.find("/floor/landrun").unwrap());
+
+    // Run it for real against a stand-in claim: FILL_DIR and /tmp are re-pointed into a scratch
+    // dir, landrun is a stand-in that runs the command, and `node`/`npm` are stubs that "build"
+    // when asked (or leave a partial binding and fail).
+    let root = std::env::temp_dir().join(format!("native-claim-{}", uuid::Uuid::new_v4()));
+    let claim = root.join("vol");
+    let bin = root.join("bin");
+    let gyp = root.join("lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js");
+    std::fs::create_dir_all(claim.join("better-sqlite3/build/Release")).unwrap();
+    std::fs::write(claim.join("better-sqlite3/build/Release/shipped.node"), "").unwrap();
+    std::fs::write(claim.join("better-sqlite3/package.json"), "{}").unwrap();
+    std::fs::create_dir_all(gyp.parent().unwrap()).unwrap();
+    std::fs::write(&gyp, "").unwrap();
+    std::fs::create_dir_all(root.join("lib/node_modules/npm/bin")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let npm = root.join("lib/node_modules/npm/bin/npm-cli.js");
+    crate::test_env::install_stub(&npm, "#!/bin/sh\nexit 0\n");
+    std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
+    crate::test_env::install_stub(
+        &bin.join("node"),
+        "#!/bin/sh\nif [ -n \"$GYP_FAILS\" ]; then mkdir -p build/Release && : > build/Release/partial.node; exit 7; fi\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
+    );
+    // The stand-in launcher "enforces" by making the claim's top and the canary unwritable while
+    // its command runs (each addon's build/ stays writable). With JAIL_OPEN set it confines
+    // nothing, as a kernel without Landlock under `--best-effort` would; with CANARY_OPEN only the
+    // top is closed (new files refused, an existing one still truncatable), as an ABI that does
+    // not cover truncation would leave it.
+    let landrun = root.join("landrun");
+    crate::test_env::install_stub(
+        &landrun,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\n\
+         if [ -n \"$JAIL_OPEN\" ]; then exec \"$@\"; fi\n\
+         c=\"$CLAIM/.wicked-jail-probe\"; [ -n \"$CANARY_OPEN\" ] || ! [ -e \"$c\" ] || chmod a-w \"$c\"\n\
+         chmod a-w \"$CLAIM\"; \"$@\"; rc=$?; chmod u+w \"$CLAIM\"\n\
+         ! [ -e \"$c\" ] || chmod u+w \"$c\"; exit $rc\n",
+    );
+    let local = script
+        .replace(FILL_DIR, &claim.display().to_string())
+        .replace("/tmp/wicked-native", &root.join("t").display().to_string())
+        .replace("/floor/landrun", &landrun.display().to_string());
+    let run = |env: &[(&str, &str)]| {
+        // spawn-audit: test-only — runs the engine's build script against a stand-in claim, with
+        // the environment cleared and only the stand-ins' variables set.
+        let mut c = std::process::Command::new("sh");
+        c.hardened()
+            .args(["-c", &local])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("CLAIM", &claim);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let build = claim.join("better-sqlite3/build");
+    // A jail not in force: nothing is built (the stub node never runs), no marker, no probe left.
+    let refused = |env: &[(&str, &str)], why: &str| {
+        let (ok, out) = run(env);
+        assert!(!ok && out.contains(why), "{env:?}: {out}");
+        assert!(!claim.join(NATIVE_BUILT).exists(), "{env:?}");
+        assert!(
+            !claim.join(JAIL_PROBE).exists(),
+            "{env:?}: the canary is left"
+        );
+        assert_eq!(
+            std::fs::read_dir(&build).unwrap().count(),
+            0,
+            "{env:?}: {out}"
+        );
+    };
+    refused(&[("JAIL_OPEN", "1")], "Landlock is not in force");
+    // An existing file at the claim's top still truncatable under the jail: refused.
+    refused(&[("CANARY_OPEN", "1")], "Landlock is not in force");
+    // A claim the engine cannot write (full, read-only): the confined refusal would prove nothing.
+    let mut ro = std::fs::metadata(&claim).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut ro, 0o555);
+    std::fs::set_permissions(&claim, ro).unwrap();
+    refused(&[("JAIL_OPEN", "1")], "the claim is not writable");
+    let mut rw = std::fs::metadata(&claim).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut rw, 0o755);
+    std::fs::set_permissions(&claim, rw).unwrap();
+    let (ok, _) = run(&[("GYP_FAILS", "1")]);
+    assert!(!ok);
+    assert!(
+        !claim.join(NATIVE_BUILT).exists(),
+        "a failed build leaves no marker"
+    );
+    assert_eq!(
+        std::fs::read_dir(&build).unwrap().count(),
+        0,
+        "nor any output"
+    );
+    let (ok, out) = run(&[]);
+    assert!(ok, "{out}");
+    assert!(build.join("Release/x.node").is_file());
+    assert!(!build.join("Release/shipped.node").exists());
+    assert!(claim.join(NATIVE_BUILT).is_file());
+    let (ok, out) = run(&[("GYP_FAILS", "1")]);
+    assert!(ok && out.contains("WICKED-HIT"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// core#1406: the confined half of the jail proof passes only when a write-open AND a
+/// `truncate(2)` of the canary each fail with `EACCES`. Landlock ABI v1/v2 deny the open but not
+/// the truncate, and another error (a full claim) is no denial; both must fail the proof. The
+/// denials are injected into the proof's own code (an interpreter prelude) so each is exercised
+/// on its own, which a filesystem stand-in cannot do.
+#[cfg(unix)]
+#[test]
+fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
+    let root = std::env::temp_dir().join(format!("jail-proof-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let canary = root.join(JAIL_PROBE);
+    let proof = |open: &str, truncate: &str| -> (i32, u64) {
+        std::fs::write(&canary, "x").unwrap();
+        let prelude = format!(
+            "import builtins, errno, os\n\
+             real_open, real_truncate = builtins.open, os.truncate\n\
+             def fail(e):\n    raise OSError(e, os.strerror(e))\n\
+             builtins.open = lambda *a, **k: fail({open}) if {open} else real_open(*a, **k)\n\
+             os.truncate = lambda p, n: fail({truncate}) if {truncate} else real_truncate(p, n)\n\
+             exec(compile({:?}, \"proof\", \"exec\"))\n",
+            JAIL_PROOF
+        );
+        // spawn-audit: test-only — runs the jail proof's own code with injected denials.
+        let o = std::process::Command::new("python3")
+            .hardened()
+            .args(["-I", "-c", &prelude])
+            .arg(&canary)
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap_or(-1),
+            std::fs::metadata(&canary).unwrap().len(),
+        )
+    };
+    let (eacces, enospc) = ("errno.EACCES", "errno.ENOSPC");
+    assert_eq!(
+        proof(eacces, eacces),
+        (0, 1),
+        "both refused by Landlock: proven"
+    );
+    // ABI v1/v2: the open refused, the truncate allowed (it ran: the canary is empty).
+    assert_eq!(proof(eacces, "0"), (4, 0));
+    assert_eq!(proof("0", eacces).0, 4, "a writable canary");
+    assert_eq!(proof(enospc, eacces).0, 4, "a full claim is no denial");
+    assert_eq!(proof(eacces, enospc).0, 4);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// core#1406: the native addons a seat's claim is built for come from the snapshot tree's own
+/// `.wicked/checks.json` blob (never the worktree's file), validated as the floor validates them.
+#[cfg(unix)]
+#[test]
+fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
+    let root = std::env::temp_dir().join(format!("native-decl-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join(".wicked")).unwrap();
+    let git = |args: &[&str]| -> String {
+        // spawn-audit: test-only — builds the fixture repository.
+        let o = std::process::Command::new("git")
+            .hardened()
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("README.md"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "none"]);
+    let gd = root.join(".git");
+    let none = git(&["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(declared_native_in(&gd, &none).unwrap(), Vec::<&str>::new());
+    std::fs::write(
+        root.join(crate::repo_checks::CONFIG_PATH),
+        r#"{"native_rebuild":["better-sqlite3"]}"#,
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "declares"]);
+    let declares = git(&["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(
+        declared_native_in(&gd, &declares).unwrap(),
+        ["better-sqlite3"]
+    );
+    // The worktree's own edit is not the snapshot's.
+    std::fs::write(
+        root.join(crate::repo_checks::CONFIG_PATH),
+        r#"{"native_rebuild":["leftpad"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        declared_native_in(&gd, &declares).unwrap(),
+        ["better-sqlite3"]
+    );
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "bad"]);
+    let bad = git(&["rev-parse", "HEAD^{tree}"]);
+    assert!(declared_native_in(&gd, &bad)
+        .unwrap_err()
+        .contains("leftpad"));
+    let _ = std::fs::remove_dir_all(&root);
+}
