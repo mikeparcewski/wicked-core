@@ -20932,16 +20932,15 @@ pub(crate) struct FloorNotRun<'a> {
 /// (core#1846) Whether `unit`'s gate is ONLY its floor stopped by the machine: a repo-checks denial
 /// whose report carries the floor's environment refusal
 /// ([`crate::repo_checks::RepoChecksReport::environment_refusal`]), where no check that ran
-/// denied the work and no other layer denied the attempt. `None` for every other gate (a check
+/// denied the work and the gate's record says no other layer denied the attempt. `None` for every other gate (a check
 /// that failed or timed out before the stop, or a denial behind the floor, keeps the floor gate's
 /// own answers). Its gate is a retry once the machine is fixed: no seat, send-back or override
 /// answers it, since nothing said anything against the work.
 pub(crate) fn floor_not_run(unit: &crate::domain::WorkUnit) -> Option<FloorNotRun<'_>> {
+    // `None` behind the floor is an unknown record, not an empty one: another layer may have
+    // denied the attempt.
     if unit.denial.as_ref()?.source != crate::repo_checks::DENIAL_SOURCE
-        || unit
-            .denials_behind
-            .as_deref()
-            .is_some_and(|b| !b.is_empty())
+        || !unit.denials_behind.as_deref().is_some_and(|b| b.is_empty())
     {
         return None;
     }
@@ -35994,11 +35993,19 @@ mod request_changes_tests {
             .push(check(1));
         assert!(floor_not_run(&failed_first).is_none());
         assert!(floor_fix_applies(&failed_first));
-        let mut behind = verify.clone();
-        behind.denials_behind = Some(vec![UnitDenial::new("evaluator_verdict", "FAIL")]);
-        assert!(floor_not_run(&behind).is_none());
-        let p = denial_gate_prompt(&behind, "floor_failed", "x", None, "");
-        assert!(p.contains("failed its deterministic floor"), "{p}");
+        // xreview r2: an unknown record (`None`, from before the record existed or a same-tree
+        // retry that did not ask every layer) is not "nothing else denied".
+        for record in [
+            Some(vec![UnitDenial::new("evaluator_verdict", "FAIL")]),
+            None,
+        ] {
+            let mut behind = verify.clone();
+            behind.denials_behind = record;
+            assert!(floor_not_run(&behind).is_none());
+            assert!(floor_fix_applies(&behind));
+            let p = denial_gate_prompt(&behind, "floor_failed", "x", None, "");
+            assert!(p.contains("failed its deterministic floor"), "{p}");
+        }
     }
 
     /// (core#1846) The gate's published answers are a retry and a stop: no floor fix on the noted
