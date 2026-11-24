@@ -1236,7 +1236,8 @@ fn boundary_denial_judged(
                     advisory.get_or_insert(format!(
                         "{READ_ROOT_CD_REASON_PREFIX} {} is read-only to this job, and the command \
                          also runs a program whose writes there cannot be checked (python, \
-                         node or a shell script), so it was not run. Run it from your \
+                         node, a shell script, or a git command with a word the shell or xargs \
+                         fills in), so it was not run. Run it from your \
                          working folder and name the folder in the command instead, for \
                          example `git -C <folder> log -5` or `ls <folder>`",
                         d.resolved.display()
@@ -1698,20 +1699,14 @@ pub(crate) fn bash_write_phase_scope(
 /// The redirect spellings `>&`, `<&`, `>|` and `&>` stay inside their word, as the redirect scans
 /// read them. Comments are not modelled: a `#` and the words after it stay tokens, so a comment
 /// can add a refused target but never hide one; a glued operator inside a comment is split too,
-/// an accepted false refusal. A command holding `${`, `$[`, a backtick or `$'` keeps the
-/// whitespace-only reading of line breaks and glued operators: those contexts may hold either as
-/// data, and this lexer does not track them.
+/// an accepted false refusal. A command holding `${`, `$[`, a backtick or `$'` is read both ways
+/// ([`shell_token_readings`]): those contexts may hold either as data, and this lexer does not
+/// track them (core#1857 item 3).
 ///
 /// The tokens keep their quotes and escapes: they are WORDS as spelled. A write target taken from
 /// them is judged only after [`resolve_shell_word`] reads it as the shell will (core#922).
 fn shell_tokens(command: &str) -> Vec<String> {
-    lex_shell_tokens(command, false, &heredoc_lines(command))
-}
-
-/// [`shell_tokens`] of a `command` whose heredoc bodies were blanked from `original` (same lines):
-/// the heredoc lines are found in `original`, where the closing delimiter is still spelled.
-fn shell_tokens_blanked(command: &str, original: &str) -> Vec<String> {
-    lex_shell_tokens(command, false, &heredoc_lines(original))
+    shell_token_readings(command, command)
 }
 
 /// Reads need argument boundaries even beside glued input redirects and sequence operators.
@@ -1725,6 +1720,36 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
 /// command ends; it is read only when `split_operators` is false. A shell's body is not listed:
 /// its line breaks separate its commands (core#1470).
 fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> Vec<String> {
+    lex_shell_tokens_reading(command, split_operators, heredoc, true)
+}
+
+/// (core#1857 item 3) The tokens the write scans read, of a `command` whose heredoc bodies may have
+/// been blanked from `original` (same lines: the heredoc lines are found in `original`, where the
+/// closing delimiter is still spelled). A command holding `${`, `$[`, a backtick or
+/// `$'` is read twice: as [`shell_tokens`] reads it (a glued operator or a line break there kept
+/// as data, which it may be: `rm -- -${X:-a|| ../f}`), and with both split, as they are when they
+/// stand outside those contexts (`echo ${HOME}&&git -C <dir> branch -D x`). The readings are
+/// joined by a `;`: a target or a program either reading shows is judged, so neither hides one;
+/// a false refusal is the accepted cost.
+fn shell_token_readings(command: &str, original: &str) -> Vec<String> {
+    let heredoc = heredoc_lines(original);
+    let mut toks = lex_shell_tokens_reading(command, false, &heredoc, true);
+    let split = lex_shell_tokens_reading(command, false, &heredoc, false);
+    if split != toks {
+        toks.push(";".to_string());
+        toks.extend(split);
+    }
+    toks
+}
+
+/// [`lex_shell_tokens`]; `expansion_contexts` false reads a glued operator or a line break as a
+/// separator even in a command holding `${`, `$[`, a backtick or `$'`.
+fn lex_shell_tokens_reading(
+    command: &str,
+    split_operators: bool,
+    heredoc: &[usize],
+    expansion_contexts: bool,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     // (core#1465) Which line a line break ends: its index among all of them.
@@ -1751,7 +1776,9 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
     // line break or `||` that is not a separator of the outer command (`rm -- -${X:-a|| ../f}`
     // removes `../f`), and this lexer does not track those contexts: a command holding any of
     // them keeps the whitespace-only reading of both (codex r5, r6).
-    let expansion = !split_operators && ["${", "$[", "`", "$'"].iter().any(|t| command.contains(t));
+    let expansion = expansion_contexts
+        && !split_operators
+        && ["${", "$[", "`", "$'"].iter().any(|t| command.contains(t));
     let mut chars = command.char_indices().map(|(at, c)| (c, at)).peekable();
     let mut in_single = false;
     let mut in_double = false;
@@ -2740,6 +2767,80 @@ impl Drop for ShellScanGuard {
     }
 }
 
+/// (core#1868) The commands `find` runs for its `-exec`, `-execdir`, `-ok` and `-okdir` actions,
+/// each up to its `;` or `+`, as segments of their own, so a write there is judged like any other
+/// (`find <dir> -exec git -C <dir> branch -D x \;`, `-exec rm {} +`). `{}` is a path the walk
+/// finds below a start point, so it stands as that start point (one command per start point).
+fn find_exec_commands(segments: &[Vec<&str>]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for words in segments {
+        let Unwrapped::Program { idx, .. } = unwrap_program_with_reads(words, false, |_| {}) else {
+            continue;
+        };
+        if !words
+            .get(idx)
+            .is_some_and(|p| matches!(program_basename(p), "find" | "gfind"))
+        {
+            continue;
+        }
+        let (starts, expr) = find_start_points(&words[idx + 1..]);
+        let mut k = 0;
+        while k < expr.len() {
+            if matches!(
+                strip_one_quote_layer(expr[k]),
+                "-exec" | "-execdir" | "-ok" | "-okdir"
+            ) {
+                let mut command: Vec<&str> = Vec::new();
+                k += 1;
+                while k < expr.len() && !find_exec_ends(expr[k], command.last().copied()) {
+                    command.push(expr[k]);
+                    k += 1;
+                }
+                for start in starts.iter().take(8) {
+                    out.push(command.iter().map(|w| w.replace("{}", start)).collect());
+                }
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+/// Whether `word` ends a `find -exec` command: `;` (spelled so the shell passes it) or a `+`
+/// right after `{}`.
+fn find_exec_ends(word: &str, before: Option<&str>) -> bool {
+    matches!(word, "\\;" | "';'" | "\";\"") || (word == "+" && before == Some("{}"))
+}
+
+/// `find`'s start points (the words after its own options `-H`, `-L`, `-P`, `-D <opts>`,
+/// `-O<n>`, up to the first expression word; `.` when there is none) and its expression.
+fn find_start_points<'a, 'w>(args: &'w [&'a str]) -> (Vec<&'a str>, &'w [&'a str]) {
+    let mut k = 0;
+    while let Some(w) = args.get(k) {
+        match *w {
+            "-H" | "-L" | "-P" => k += 1,
+            "-D" => k += 2,
+            w if w.starts_with("-O") => k += 1,
+            _ => break,
+        }
+    }
+    let begin = k.min(args.len());
+    let mut end = begin;
+    while end < args.len() {
+        let w = strip_one_quote_layer(args[end]);
+        if w.starts_with('-') || matches!(w, "(" | ")" | "!" | "," | "\\(" | "\\)" | "\\!") {
+            break;
+        }
+        end += 1;
+    }
+    let starts = if end > begin {
+        args[begin..end].to_vec()
+    } else {
+        vec!["."]
+    };
+    (starts, &args[end..])
+}
+
 /// Literal operands and directory destinations, collected before any path is judged. We do not
 /// simulate shell control flow: pipelines, directory stacks and eval can leave the shell at
 /// an earlier directory. File operands are checked against every candidate; directory operands
@@ -2820,6 +2921,16 @@ fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOpe
                 let mut skip_pattern = false;
                 let mut in_find_exec = false;
                 let is_find = matches!(program, "find" | "gfind");
+                // (core#1868) `-execdir`/`-okdir` run their command in the folder of each path
+                // found, below a start point: the start points are where its writes land.
+                if is_find
+                    && words[idx + 1..]
+                        .iter()
+                        .any(|w| matches!(strip_one_quote_layer(w), "-execdir" | "-okdir"))
+                {
+                    let (starts, _) = find_start_points(&words[idx + 1..]);
+                    out.cwds.extend(starts.into_iter().map(str::to_string));
+                }
                 for word in words
                     .iter()
                     .skip(idx + 1)
@@ -3440,7 +3551,7 @@ fn collect_bash_write_targets(
         collect_bash_write_targets(&script, unwrap_inline, home, targets);
     }
     let command = &strip_quoted_heredoc_bodies(&outer);
-    let owned = shell_tokens_blanked(command, original);
+    let owned = shell_token_readings(command, original);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
@@ -3488,6 +3599,12 @@ fn collect_bash_write_targets(
     if !seg.is_empty() {
         segments.push(seg);
     }
+    let found = find_exec_commands(&segments);
+    segments.extend(
+        found
+            .iter()
+            .map(|c| c.iter().map(String::as_str).collect::<Vec<_>>()),
+    );
     for (words, unwrapped) in segments.iter().flat_map(|words| {
         unwrap_programs(words)
             .into_iter()
@@ -3496,8 +3613,12 @@ fn collect_bash_write_targets(
         // See through one wrapper level to the real program word (core #475). A shell `-c` string
         // is rescanned as its own command line — its redirects were quoted at this level, so the
         // redirect pass above could not see them.
-        let idx = match unwrapped {
-            Unwrapped::Program { idx, .. } => idx,
+        let (idx, assignments, feed) = match unwrapped {
+            Unwrapped::Program {
+                idx,
+                assignments,
+                feed,
+            } => (idx, assignments, feed),
             Unwrapped::Inline {
                 inner,
                 word,
@@ -3595,47 +3716,26 @@ fn collect_bash_write_targets(
                 }
             }
             // issue #540: `git -C <path> <write-subcommand>` writes to the repo at <path>, not the
-            // process cwd. Extract the -C path as a write target whenever the subcommand is not in
-            // the read-only allowlist, so boundary_denial_tracked catches out-of-bounds repos.
+            // process cwd. (core#1857, #1858, #1859, #1868) One judgement of the form,
+            // [`git_call`]: a git that is not an allow-listed read writes to its directories
+            // (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR=`); one whose words the text does not
+            // settle writes where no text says, so it is refused ADVISORY there; and the files
+            // its output options name are written wherever it runs, from the seat's own folder
+            // too, judged like a redirect.
             "git" => {
-                let args = &words[idx + 1..];
-                let mut c_paths: Vec<String> = Vec::new();
-                let mut j = 0;
-                // (crew#1795 round 2, F1) Judged with the words an `xargs` before git feeds it,
-                // including when no subcommand is written (`… | xargs git -C <dir>`: the fed
-                // words are the subcommand).
-                let mut subcommand_reads = git_reads_after(&words[..idx], &[]);
-                while j < args.len() {
-                    if (args[j] == "-c" || args[j] == "--config") && j + 1 < args.len() {
-                        // INDEPENDENT REVIEW item 6 (site 1): skip -c key=value so the value
-                        // is not mistaken for the git subcommand verb.
-                        j += 2;
-                    } else if args[j] == "-C" && j + 1 < args.len() {
-                        c_paths.push(args[j + 1].to_string());
-                        j += 2;
-                    } else if let Some(p) = args[j]
-                        .strip_prefix("--git-dir=")
-                        .or_else(|| args[j].strip_prefix("--work-tree="))
-                    {
-                        c_paths.push(p.to_string());
-                        j += 1;
-                    } else if (args[j] == "--git-dir" || args[j] == "--work-tree")
-                        && j + 1 < args.len()
-                    {
-                        c_paths.push(args[j + 1].to_string());
-                        j += 2;
-                    } else if args[j].starts_with('-') {
-                        j += 1;
-                    } else {
-                        // First non-flag word is the git subcommand.
-                        subcommand_reads = git_reads_after(&words[..idx], &args[j..]);
-                        break;
+                let call = git_call(&words[idx + 1..], &feed, &assignments);
+                match call.form {
+                    GitForm::Writes => targets.extend(call.dirs),
+                    GitForm::Unsettled if !call.dirs.is_empty() => {
+                        targets.push(format!("$(git {})", words[idx + 1..].join(" ")));
                     }
+                    GitForm::Unsettled | GitForm::Reads => {}
                 }
-                if !subcommand_reads {
-                    targets.extend(c_paths);
-                }
+                targets.extend(call.outputs);
             }
+            // (core#1868) GNU `parallel` runs its command line through a shell, with words of its
+            // own in it: where that writes is not in the text, so it is refused ADVISORY.
+            "parallel" | "sem" => targets.push(format!("$({})", words[idx..].join(" "))),
             // issue #540: `ln <src> <dest>` — the last non-flag argument is the destination.
             // `ln` can create hard or symbolic links outside the worktree, which counts as a
             // write target for boundary judgement.
@@ -3705,210 +3805,21 @@ fn collect_bash_write_targets(
     }
 }
 
-/// Git subcommands that only READ the repository — `git -C <path>` paired with any of these is
-/// NOT a write target (issue #540). Fail-closed: an unrecognised subcommand is treated as a write,
-/// so a newly-added write verb is blocked rather than silently admitted.
-const GIT_READ_VERBS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "blame",
-    "ls-files",
-    "ls-tree",
-    "rev-parse",
-    "rev-list",
-    "for-each-ref",
-    "describe",
-    "shortlog",
-    "grep",
-    "cat-file",
-    "verify-commit",
-    "verify-tag",
-    "check-ignore",
-    "archive",
-    "diff-tree",
-    "diff-index",
-    "diff-files",
-    "name-rev",
-    "merge-base",
-    "count-objects",
-    "fsck",
-];
-
-/// Whether a git invocation only reads, given its words from the subcommand on (`args[0]` is the
-/// verb). Every [`GIT_READ_VERBS`] verb reads; (crew#1795) so do the LISTING forms of verbs that
-/// otherwise write — `git branch -a`, `git remote -v`, `git tag -l`, `git stash list`, `git worktree
-/// list`, `git reflog` — the forms a seat reaches for when it is asked about a repository. Any other
-/// word (a branch or tag name to create, an option this list does not know) is a write, as before.
-fn git_subcommand_reads(args: &[&str]) -> bool {
-    let Some((&verb, rest)) = args.split_first() else {
-        return true;
-    };
-    // (crew#1795 review r2) Judged as git receives each word, after the shell's quote removal:
-    // `'-m'` is the option `-m`, `$'--output=f'` is `--output=f`. A word the text cannot settle
-    // (an expansion, ANSI-C quoting) keeps only its literal start ([`GitWord::Lead`]).
-    let words: Vec<GitWord> = rest.iter().map(|a| GitWord::of(a)).collect();
-    let end_of_options = GitWord::Known("--".to_string());
-    // (crew#1795 round 2, F2; core#1859 B) `git stash list` consumes the `--` itself and hands
-    // the words after it to `git log` as options, so `stash list -- --output=f` writes `f`: a
-    // `stash` form is judged on every word.
-    let cut_at_dashdash = verb != "stash";
-    if words
-        .iter()
-        .take_while(|w| !cut_at_dashdash || **w != end_of_options)
-        .any(|w| git_option_writes(verb, w))
-    {
-        return false;
-    }
-    if GIT_READ_VERBS.contains(&verb) {
-        return true;
-    }
-    // A listing form is admitted only on words it can read in full, and on a glob that can only
-    // name operands (`git tag -l v*`; spelled so it matches no keyword).
-    let Some(rest) = words
-        .iter()
-        .map(|w| match w {
-            GitWord::Known(a) => Some(a.as_str()),
-            GitWord::Pattern(l) if !l.is_empty() && !l.starts_with('-') => Some("\0pattern"),
-            GitWord::Pattern(_) | GitWord::Lead(_) => None,
-        })
-        .collect::<Option<Vec<&str>>>()
-    else {
-        return false;
-    };
-    let only = |allowed: &[&str]| rest.iter().all(|a| allowed.contains(a));
-    match verb {
-        // No operand: a name would create a branch. `-l` is left out (old git read it as
-        // `--create-reflog`).
-        "branch" => only(&[
-            "-a",
-            "--all",
-            "-r",
-            "--remotes",
-            "-v",
-            "-vv",
-            "--verbose",
-            "--list",
-            "--show-current",
-            "--no-color",
-        ]),
-        // Bare, or `-l`/`--list` with patterns only: any other option (`-d`, `-a`, `-f`, `-m`
-        // whose message would be the next word) writes.
-        "tag" => {
-            rest.is_empty()
-                || (rest.iter().any(|a| matches!(*a, "-l" | "--list"))
-                    && rest
-                        .iter()
-                        .all(|a| !a.starts_with('-') || matches!(*a, "-l" | "--list")))
-        }
-        "remote" => {
-            only(&["-v", "--verbose"]) || matches!(rest.first(), Some(&("get-url" | "show")))
-        }
-        "stash" => matches!(rest.first(), Some(&("list" | "show"))),
-        "worktree" => matches!(rest.first(), Some(&"list")),
-        // Git takes the first word that is not an option as the subcommand, wherever the options
-        // stand (`git reflog --all expire` expires, agy r1 on #1849): `show`, `exists`, or none
-        // at all reads; anything else (`expire`, `delete`, a ref name) is judged a write.
-        "reflog" => rest
-            .iter()
-            .find(|a| !a.starts_with('-'))
-            .is_none_or(|a| matches!(*a, "show" | "exists")),
-        _ => false,
-    }
-}
-
-/// The word [`git_reads_after`] puts where `xargs` adds words of its own: an expansion, so git
-/// receives words of any spelling there ([`GitWord::Lead`] with no literal start).
-const XARGS_FED_WORD: &str = "\"$XARGS\"";
-
-/// (crew#1795 round 2, F1) [`git_subcommand_reads`] for a git program reached through the wrapper
-/// words `prefix` (`words[..idx]` of an [`Unwrapped::Program`]), given git's words from the
-/// subcommand on (empty when no subcommand is written). An `xargs` in the prefix runs git with
-/// words read from stdin that the command text never shows: appended after the last word, or, with
-/// a replace string (`-I R`, `-iR`, `-i`, `--replace[=R]`), in place of every word that holds it.
-/// Those words are judged as an expansion, which is a write unless git only takes them as
-/// pathspecs after `--`: `… | xargs git remote` runs `git remote set-url origin <url>`.
-fn git_reads_after(prefix: &[&str], args: &[&str]) -> bool {
-    let mut replace: Vec<String> = Vec::new();
-    let mut append = false;
-    let mut fed_at_all = false;
-    for at in (0..prefix.len()).filter(|&i| program_basename(prefix[i]) == "xargs") {
-        fed_at_all = true;
-        // This `xargs`'s own options only: they end at `--` or at the first word that is not an
-        // option or an option's value (the next wrapper or the program).
-        let mut own: Vec<String> = Vec::new();
-        let mut words = prefix[at + 1..].iter().map(|w| strip_one_quote_layer(w));
-        while let Some(flag) = words.next() {
-            if flag == "--" || !flag.starts_with('-') {
-                break;
-            }
-            let value_next = matches!(
-                flag,
-                "-a" | "--arg-file"
-                    | "-L"
-                    | "--max-lines"
-                    | "-n"
-                    | "--max-args"
-                    | "-d"
-                    | "--delimiter"
-                    | "-P"
-                    | "--max-procs"
-                    | "-s"
-                    | "--max-chars"
-                    | "-E"
-                    | "--eof"
-            );
-            if flag == "-I" {
-                own.extend(words.next().map(str::to_string));
-            } else if flag == "-i" || flag == "--replace" {
-                own.push("{}".to_string());
-            } else if let Some(r) = flag
-                .strip_prefix("--replace=")
-                .or_else(|| flag.strip_prefix("-I"))
-                .or_else(|| flag.strip_prefix("-i"))
-            {
-                own.push(r.to_string());
-            } else if value_next {
-                words.next();
-            }
-        }
-        own.retain(|r| !r.is_empty());
-        // Without a replace string this `xargs` appends; with one it substitutes. An outer
-        // `xargs` feeding an inner one appends to the inner one's words, so to git's.
-        append |= own.is_empty();
-        replace.extend(own);
-    }
-    if !fed_at_all {
-        return git_subcommand_reads(args);
-    }
-    let mut fed: Vec<&str> = args
-        .iter()
-        .map(|w| {
-            if replace.iter().any(|r| w.contains(r.as_str())) {
-                XARGS_FED_WORD
-            } else {
-                *w
-            }
-        })
-        .collect();
-    if append {
-        fed.push(XARGS_FED_WORD);
-    }
-    git_subcommand_reads(&fed)
-}
-
 /// One git argument as the shell hands it to git.
 #[derive(Debug, PartialEq)]
 enum GitWord {
-    /// The exact word, quotes removed and escapes applied.
+    /// The exact word, quotes removed and escapes applied (ANSI-C `$'…'` quoting included when
+    /// it holds only plain escapes).
     Known(String),
     /// A glob or a brace list (`v*`, `v{1,2}`): one or more words, each starting with this
     /// literal text.
     Pattern(String),
-    /// A word holding something the text cannot settle — an expansion (`"$x"`, `$(…)`) or ANSI-C
-    /// quoting (`$'…'`) — kept as the literal text before it. Unquoted, its value can split
-    /// into more words of any spelling.
+    /// ONE word: this literal text, then an expansion inside double quotes (`"$sha"`,
+    /// `HEAD:"$path"`, `--grep="$x"`), whose value cannot split it into more words.
+    One(String),
+    /// A word holding something the text cannot settle that may also split it into more words
+    /// of any spelling — an unquoted expansion (`$x`, `$(…)`), a command substitution, ANSI-C
+    /// quoting this decoding does not settle — kept as the literal text before it.
     Lead(String),
 }
 
@@ -3917,6 +3828,9 @@ impl GitWord {
         let chars: Vec<char> = raw.chars().collect();
         let mut out = String::new();
         let (mut single, mut double) = (false, false);
+        // The literal text before the first word part the text does not settle.
+        let mut lead: Option<String> = None;
+        let (mut glob, mut quoted) = (false, false);
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
@@ -3930,8 +3844,58 @@ impl GitWord {
                 continue;
             }
             match c {
+                // ANSI-C quoting with plain escapes only is a literal (`$'--output=f'`).
+                '$' if !double && chars.get(i) == Some(&'\'') => {
+                    let mut j = i + 1;
+                    let mut text = String::new();
+                    let closed = loop {
+                        match chars.get(j) {
+                            None => break false,
+                            Some('\'') => break true,
+                            Some('\\') => match chars.get(j + 1) {
+                                Some(&e @ ('\\' | '\'' | '"')) => {
+                                    text.push(e);
+                                    j += 2;
+                                }
+                                _ => return Self::Lead(lead.unwrap_or(out)),
+                            },
+                            Some(&ch) => {
+                                text.push(ch);
+                                j += 1;
+                            }
+                        }
+                    };
+                    if !closed {
+                        return Self::Lead(lead.unwrap_or(out));
+                    }
+                    out.push_str(&text);
+                    i = j + 1;
+                }
+                // A variable inside double quotes is one word; a command substitution there may
+                // hold quotes this reading does not follow, so it is judged as splitting.
+                '$' if double
+                    && chars
+                        .get(i)
+                        .is_some_and(|n| *n == '{' || *n == '_' || n.is_ascii_alphanumeric()) =>
+                {
+                    lead.get_or_insert_with(|| out.clone());
+                    quoted = true;
+                    if chars[i] == '{' {
+                        while i < chars.len() && chars[i] != '}' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        while chars
+                            .get(i)
+                            .is_some_and(|n| *n == '_' || n.is_ascii_alphanumeric())
+                        {
+                            i += 1;
+                        }
+                    }
+                }
                 // An expansion here, or one the outer shell made of a `-c` word.
-                '$' | '`' | OPAQUE_EXPANSION => return Self::Lead(out),
+                '$' | '`' | OPAQUE_EXPANSION => return Self::Lead(lead.unwrap_or(out)),
                 '\\' if !cfg!(windows) => match chars.get(i) {
                     Some(&n) if !double || matches!(n, '$' | '`' | '"' | '\\') => {
                         out.push(n);
@@ -3939,16 +3903,20 @@ impl GitWord {
                     }
                     Some('\n') => i += 1,
                     Some(_) => out.push('\\'),
-                    None => return Self::Lead(out),
+                    None => return Self::Lead(lead.unwrap_or(out)),
                 },
                 '"' => double = !double,
                 '\'' if !double => single = true,
-                '*' | '?' | '[' if !double => return Self::Pattern(out),
+                '*' | '?' | '[' if !double => {
+                    lead.get_or_insert_with(|| out.clone());
+                    glob = true;
+                }
                 // A brace LIST (`{a,b}`, `{1..3}`) expands to several words; `stash@{0}` is one.
                 '{' if !double => {
                     let body: String = chars[i..].iter().take_while(|&&n| n != '}').collect();
                     if body.contains(',') || body.contains("..") {
-                        return Self::Pattern(out);
+                        lead.get_or_insert_with(|| out.clone());
+                        glob = true;
                     }
                     out.push(c);
                 }
@@ -3956,38 +3924,766 @@ impl GitWord {
             }
         }
         if single || double {
-            return Self::Lead(out);
+            return Self::Lead(lead.unwrap_or(out));
         }
-        Self::Known(out)
+        match lead {
+            Some(l) if glob => Self::Pattern(l),
+            Some(l) if quoted => Self::One(l),
+            _ => Self::Known(out),
+        }
     }
 }
 
-/// (crew#1795 review) Whether one word of a reading git invocation may still write a file or run
-/// a program: `--output` (log, diff, show, and the verbs that take their options, `stash show` and
-/// `reflog`) and every abbreviation git accepts for it, `archive -o`, `fsck --lost-found`, `grep
-/// -O` / `--open-files-in-pager`. `--output-indicator-new`/`-old`/`-context` only change patch
-/// characters and read. A [`GitWord::Lead`] writes when the word it starts could still become one
-/// of these (`"$x"`, `--out$x`, `-$x`).
-fn git_option_writes(verb: &str, word: &GitWord) -> bool {
-    let (a, lead) = match word {
-        GitWord::Known(a) => (a.as_str(), false),
-        GitWord::Pattern(l) | GitWord::Lead(l) => (l.as_str(), true),
-    };
-    if lead && matches!(a, "" | "-") {
-        return true;
+/// What one git invocation may do, judged on its words as the shell hands them to git
+/// (core#1857, #1858, #1859, #1868). An ALLOW-LIST: the form READS only when its verb and every
+/// option are allow-listed read forms ([`git_verb_options`]) and the text settles every word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitForm {
+    /// An allow-listed read form, every word settled by the text.
+    Reads,
+    /// The words the text shows are an allow-listed read form, but at least one word is filled
+    /// in at run time (a shell expansion, a word `xargs` feeds) and could be any option. Refused
+    /// ADVISORY against a folder the seat may not write (core#1859 A): the gate's rule for a
+    /// target the text cannot settle (core#922), so a question about a repository never ends at
+    /// a rules card over `git show $sha`.
+    Unsettled,
+    /// Every other form: a verb or option that is not an allow-listed read.
+    Writes,
+}
+
+/// What wrappers before a program hand it on top of the words the text shows (`xargs`): the
+/// program receives words of any spelling, appended after its last word, or in place of every
+/// word holding a replace string (`-I R`, `-iR`, `-i`, `--replace[=R]`, BSD `-J R`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Feed {
+    append: bool,
+    replace: Vec<String>,
+}
+
+/// The replace strings of one `xargs`, read from its own options (`rest` = the words after
+/// `xargs`), which end at `--` or at the first word that is not an option or an option's value.
+fn xargs_replace_strings(rest: &[&str]) -> Vec<String> {
+    let mut own: Vec<String> = Vec::new();
+    let mut words = rest.iter().map(|w| strip_one_quote_layer(w));
+    while let Some(flag) = words.next() {
+        if flag == "--" || !flag.starts_with('-') {
+            break;
+        }
+        if matches!(flag, "-I" | "-J") {
+            own.extend(words.next().map(str::to_string));
+        } else if matches!(flag, "-i" | "--replace") {
+            own.push("{}".to_string());
+        } else if let Some(r) = flag
+            .strip_prefix("--replace=")
+            .or_else(|| flag.strip_prefix("-I"))
+            .or_else(|| flag.strip_prefix("-J"))
+            .or_else(|| flag.strip_prefix("-i"))
+        {
+            own.push(r.to_string());
+        } else if XARGS_VALUE_OPTIONS.contains(&flag) {
+            words.next();
+        }
     }
-    // The long option `full`, or an abbreviation of it at least `min` long; for a lead with no
-    // `=` yet, any start the rest of the word could complete into one.
-    let long = |full: &str, min: &str| match a.split_once('=') {
-        Some((name, _)) => name.starts_with(min) && full.starts_with(name),
-        None => (a.starts_with(min) || lead) && a.starts_with("--") && full.starts_with(a),
+    own.retain(|r| !r.is_empty());
+    own
+}
+
+/// `xargs` options (GNU and BSD) whose value is the next word. BSD's `-J R` (a replace string)
+/// and `-R N` / `-S N` take one too (core#1868); GNU's `--replace[=R]` never does.
+#[rustfmt::skip]
+const XARGS_VALUE_OPTIONS: &[&str] = &[
+    "-a", "--arg-file", "-I", "-J", "-R", "-S", "-L", "--max-lines", "-n",
+    "--max-args", "-d", "--delimiter", "-P", "--max-procs", "-s", "--max-chars", "-E", "--eof",
+];
+
+/// How an allow-listed git option takes a value, spelled at the end of its table entry: no
+/// suffix, none; `=`, only glued (`--stat=50`, `-U3`; git never takes the next word, or this
+/// list is not sure it does); `=+`, glued or the NEXT word, which git always takes as the value
+/// whatever it spells (`-e --`, `-n 5`). Marking `=+` where git does not take the next word would
+/// leave that word unjudged, so it is used only where git's parser is known to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitValue {
+    None,
+    Glued,
+    Next,
+}
+
+fn git_option_entry(entry: &str) -> (&str, GitValue) {
+    if let Some(name) = entry.strip_suffix("=+") {
+        (name, GitValue::Next)
+    } else if let Some(name) = entry.strip_suffix('=') {
+        (name, GitValue::Glued)
+    } else {
+        (entry, GitValue::None)
+    }
+}
+
+/// The options of the log / show / diff family (diff, revision and pretty options), all of which
+/// only read. Not here, so not reads: `--output` (writes a file), `--stdin`.
+#[rustfmt::skip]
+const GIT_REV_OPTIONS: &[&str] = &[
+    "-p", "-u", "--patch", "-s", "--no-patch", "--raw", "--patch-with-raw", "-t",
+    "--indent-heuristic", "--no-indent-heuristic", "--minimal", "--patience", "--histogram",
+    "--anchored=", "--diff-algorithm=", "--stat=", "--stat-width=", "--stat-name-width=",
+    "--stat-count=", "--stat-graph-width=", "--compact-summary", "--numstat", "--shortstat", "-X=",
+    "--dirstat=", "--cumulative", "--dirstat-by-file=", "--summary", "--patch-with-stat", "-z",
+    "--name-only", "--name-status", "--submodule=", "--color=", "--no-color", "--color-moved=",
+    "--no-color-moved", "--color-moved-ws=", "--no-color-moved-ws", "--word-diff=",
+    "--word-diff-regex=", "--color-words=", "--no-renames", "--rename-empty", "--no-rename-empty",
+    "--check", "--ws-error-highlight=", "--full-index", "--binary", "--abbrev=", "--no-abbrev",
+    "-B=", "--break-rewrites=", "-M=", "--find-renames=", "-C=", "--find-copies=",
+    "--find-copies-harder", "-D", "--irreversible-delete", "-l=", "--diff-filter=", "-S=+", "-G=+",
+    "--find-object=", "--pickaxe-all", "--pickaxe-regex", "-O=+", "--skip-to=", "--rotate-to=",
+    "-R", "--relative=", "--no-relative", "-a", "--text", "--ignore-cr-at-eol",
+    "--ignore-space-at-eol", "-b", "--ignore-space-change", "-w", "--ignore-all-space",
+    "--ignore-blank-lines", "-I=", "--ignore-matching-lines=", "--inter-hunk-context=", "-W",
+    "--function-context", "--exit-code", "--quiet", "--ext-diff", "--no-ext-diff", "--textconv",
+    "--no-textconv", "--ignore-submodules=", "--src-prefix=", "--dst-prefix=", "--no-prefix",
+    "--default-prefix", "--line-prefix=", "--ita-invisible-in-index", "--ita-visible-in-index",
+    "-U=", "--unified=", "--output-indicator-new=", "--output-indicator-old=",
+    "--output-indicator-context=", "--cached", "--staged", "--merge-base", "--no-index", "--base",
+    "--ours", "--theirs", "--cc", "-c", "-m", "--dd", "--remerge-diff", "--combined-all-paths",
+    "--diff-merges=", "--no-diff-merges", "-r", "--root", "--no-commit-id", "--always",
+    // Revision walking and limiting.
+    "-n=+", "--max-count=+", "--skip=+", "--since=+", "--after=+", "--until=+", "--before=+",
+    "--since-as-filter=", "--max-age=", "--min-age=", "--author=+", "--committer=+",
+    "--grep-reflog=+", "--grep=+", "--all-match", "--invert-grep", "-i", "--regexp-ignore-case",
+    "--basic-regexp", "-E", "--extended-regexp", "-F", "--fixed-strings", "-P", "--perl-regexp",
+    "--remove-empty", "--merges", "--no-merges", "--min-parents=", "--max-parents=",
+    "--no-min-parents", "--no-max-parents", "--first-parent", "--exclude-first-parent-only",
+    "--not", "--all", "--branches=", "--tags=", "--remotes=", "--glob=", "--exclude=",
+    "--exclude-hidden=", "--reflog", "--alternate-refs", "--single-worktree", "--ignore-missing",
+    "--bisect", "--cherry-mark", "--cherry-pick", "--left-only", "--right-only", "--cherry", "-g",
+    "--walk-reflogs", "--merge", "--boundary", "--simplify-by-decoration", "--show-pulls",
+    "--full-history", "--dense", "--sparse", "--simplify-merges", "--ancestry-path=",
+    "--date-order", "--author-date-order", "--topo-order", "--reverse", "--no-walk=", "--do-walk",
+    "-L=+",
+    // Formatting.
+    "--pretty=", "--format=", "--abbrev-commit", "--no-abbrev-commit", "--oneline", "--encoding=",
+    "--expand-tabs=", "--no-expand-tabs", "--notes=", "--no-notes", "--show-notes=",
+    "--show-notes-by-default", "--show-signature", "--relative-date", "--date=", "--parents",
+    "--children", "--left-right", "--graph", "--show-linear-break=", "--follow", "--decorate=",
+    "--no-decorate", "--decorate-refs=", "--decorate-refs-exclude=", "--clear-decorations",
+    "--source", "--mailmap", "--no-mailmap", "--use-mailmap", "--no-use-mailmap", "--full-diff",
+    "--log-size", "--no-color-moved",
+];
+
+/// `rev-list`'s own options, on top of [`GIT_REV_OPTIONS`].
+#[rustfmt::skip]
+const GIT_REV_LIST_OPTIONS: &[&str] = &[
+    "--count", "--objects", "--objects-edge", "--objects-edge-aggressive", "--unpacked",
+    "--object-names", "--no-object-names", "--filter=", "--no-filter", "--filter-print-omitted",
+    "--missing=", "--exclude-promisor-objects", "--indexed-objects", "--timestamp", "--bisect-vars",
+    "--bisect-all", "--header", "--disk-usage=", "--in-commit-order",
+];
+
+/// `shortlog`'s own options, on top of [`GIT_REV_OPTIONS`].
+#[rustfmt::skip]
+const GIT_SHORTLOG_OPTIONS: &[&str] = &[
+    "-n", "--numbered", "-s", "--summary", "-e", "--email", "--group=", "--committer", "-w=",
+];
+
+#[rustfmt::skip]
+const GIT_STATUS_OPTIONS: &[&str] = &[
+    "-s", "--short", "-b", "--branch", "--show-stash", "--porcelain=", "--long", "-v", "--verbose",
+    "-u=", "--untracked-files=", "--ignore-submodules=", "--ignored=", "-z", "--column=",
+    "--no-column", "--ahead-behind", "--no-ahead-behind", "--renames", "--no-renames",
+    "--find-renames=", "-M=",
+];
+
+#[rustfmt::skip]
+const GIT_LS_FILES_OPTIONS: &[&str] = &[
+    "-c", "--cached", "-d", "--deleted", "-m", "--modified", "-o", "--others", "-i", "--ignored",
+    "-s", "--stage", "--directory", "--no-empty-directory", "-u", "--unmerged", "-k", "--killed",
+    "--resolve-undo", "-z", "--eol", "-x=+", "--exclude=+", "-X=+", "--exclude-from=+",
+    "--exclude-per-directory=+", "--exclude-standard", "--error-unmatch", "--with-tree=+", "-t",
+    "-v", "-f", "--full-name", "--recurse-submodules", "--abbrev=", "--debug", "--deduplicate",
+    "--sparse", "--format=+",
+];
+
+#[rustfmt::skip]
+const GIT_LS_TREE_OPTIONS: &[&str] = &[
+    "-d", "-r", "-t", "-l", "--long", "-z", "--name-only", "--name-status", "--object-only",
+    "--full-name", "--full-tree", "--abbrev=", "--format=+",
+];
+
+#[rustfmt::skip]
+const GIT_REV_PARSE_OPTIONS: &[&str] = &[
+    "--parseopt", "--sq-quote", "--keep-dashdash", "--stop-at-non-option", "--stuck-long",
+    "--revs-only", "--no-revs", "--flags", "--no-flags", "--default=+", "--prefix=+", "--verify",
+    "-q", "--quiet", "--sq", "--short=", "--not", "--abbrev-ref=", "--symbolic",
+    "--symbolic-full-name", "--output-object-format=", "--all", "--branches=", "--tags=",
+    "--remotes=", "--glob=", "--exclude=", "--exclude-hidden=", "--disambiguate=",
+    "--local-env-vars", "--path-format=", "--git-dir", "--git-common-dir", "--resolve-git-dir=+",
+    "--git-path=+", "--show-toplevel", "--show-superproject-working-tree", "--shared-index-path",
+    "--absolute-git-dir", "--is-inside-git-dir", "--is-inside-work-tree", "--is-bare-repository",
+    "--is-shallow-repository", "--show-cdup", "--show-prefix", "--show-object-format=",
+    "--show-ref-format", "--since=", "--after=", "--until=", "--before=", "--end-of-options",
+];
+
+#[rustfmt::skip]
+const GIT_CAT_FILE_OPTIONS: &[&str] = &[
+    "-t", "-s", "-e", "-p", "--textconv", "--filters", "--path=+", "--batch=", "--batch-check=",
+    "--batch-command=", "--batch-all-objects", "--buffer", "--unordered", "--follow-symlinks",
+    "--allow-unknown-type", "-Z", "-z", "--mailmap", "--no-mailmap", "--use-mailmap",
+    "--no-use-mailmap",
+];
+
+#[rustfmt::skip]
+const GIT_BLAME_OPTIONS: &[&str] = &[
+    "-b", "--root", "--show-stats", "--progress", "--no-progress", "--score-debug", "-f",
+    "--show-name", "-n", "--show-number", "-p", "--porcelain", "--line-porcelain", "-l", "-s", "-t",
+    "-e", "--show-email", "-w", "--ignore-whitespace", "-L=+", "--reverse", "--first-parent",
+    "--incremental", "--encoding=+", "--contents=+", "--date=+", "--minimal", "-S=+",
+    "--ignore-rev=+", "--ignore-revs-file=+", "--color-lines", "--color-by-age", "-M=", "-C=",
+    "--abbrev=", "-c",
+];
+
+/// `grep`. Not here, so not reads: `-O` / `--open-files-in-pager` (runs a program).
+#[rustfmt::skip]
+const GIT_GREP_OPTIONS: &[&str] = &[
+    "--cached", "--no-index", "--untracked", "--no-exclude-standard", "--exclude-standard",
+    "--recurse-submodules", "-a", "--text", "--textconv", "--no-textconv", "-i", "--ignore-case",
+    "-I", "--max-depth=+", "-r", "--recursive", "--no-recursive", "-w", "--word-regexp", "-v",
+    "--invert-match", "-h", "-H", "--full-name", "-E", "--extended-regexp", "-G", "--basic-regexp",
+    "-F", "--fixed-strings", "-P", "--perl-regexp", "-n", "--line-number", "--column", "-l",
+    "--files-with-matches", "--name-only", "-L", "--files-without-match", "-z", "--null", "-o",
+    "--only-matching", "-c", "--count", "--color=", "--no-color", "--break", "--heading", "-p",
+    "--show-function", "-C=+", "--context=+", "-A=+", "--after-context=+", "-B=+",
+    "--before-context=+", "-W", "--function-context", "--threads=+", "-f=+", "-e=+", "--and",
+    "--or", "--not", "--all-match", "-q", "--quiet", "-m=+", "--max-count=+",
+];
+
+/// `archive`. Not here, so not reads: `-o` / `--output` (writes a file), `--remote`, `--exec`.
+#[rustfmt::skip]
+const GIT_ARCHIVE_OPTIONS: &[&str] = &[
+    "--format=+", "-l", "--list", "-v", "--verbose", "--prefix=+", "--add-file=+",
+    "--add-virtual-file=+", "--worktree-attributes", "--mtime=+",
+];
+
+/// `fsck`. Not here, so not reads: `--lost-found` (writes into the repository).
+#[rustfmt::skip]
+const GIT_FSCK_OPTIONS: &[&str] = &[
+    "--unreachable", "--dangling", "--no-dangling", "--root", "--tags", "--cache", "--no-reflogs",
+    "--full", "--no-full", "--connectivity-only", "--strict", "-v", "--verbose", "--name-objects",
+    "--progress", "--no-progress", "--references", "--no-references",
+];
+
+#[rustfmt::skip]
+const GIT_DESCRIBE_OPTIONS: &[&str] = &[
+    "--dirty=", "--broken=", "--all", "--tags", "--contains", "--abbrev=", "--candidates=+",
+    "--exact-match", "--debug", "--long", "--match=+", "--exclude=+", "--always", "--first-parent",
+];
+
+#[rustfmt::skip]
+const GIT_FOR_EACH_REF_OPTIONS: &[&str] = &[
+    "--count=+", "--sort=+", "--format=+", "--color=", "-s", "--shell", "-p", "--perl", "--python",
+    "--tcl", "--points-at=+", "--merged=", "--no-merged=", "--contains=", "--no-contains=",
+    "--ignore-case", "--omit-empty", "--exclude=+", "--include-root-refs",
+];
+
+#[rustfmt::skip]
+const GIT_MERGE_BASE_OPTIONS: &[&str] = &[
+    "-a", "--all", "--octopus", "--independent", "--is-ancestor", "--fork-point",
+];
+
+#[rustfmt::skip]
+const GIT_NAME_REV_OPTIONS: &[&str] = &[
+    "--tags", "--refs=+", "--exclude=+", "--all", "--annotate-stdin", "--stdin", "--name-only",
+    "--no-undefined", "--always",
+];
+
+#[rustfmt::skip]
+const GIT_COUNT_OBJECTS_OPTIONS: &[&str] = &[
+    "-v", "--verbose", "-H", "--human-readable",
+];
+
+#[rustfmt::skip]
+const GIT_CHECK_IGNORE_OPTIONS: &[&str] = &[
+    "-q", "--quiet", "-v", "--verbose", "--stdin", "-z", "-n", "--non-matching", "--no-index",
+];
+
+#[rustfmt::skip]
+const GIT_VERIFY_OPTIONS: &[&str] = &[
+    "-v", "--verbose", "--raw", "--format=+",
+];
+
+/// `branch`'s listing options (crew#1795; `--sort`, `--format`: core#1858). `-l` is left out (old
+/// git read it as `--create-reflog`).
+#[rustfmt::skip]
+const GIT_BRANCH_LIST_OPTIONS: &[&str] = &[
+    "-a", "--all", "-r", "--remotes", "-v", "--verbose", "--list", "--show-current", "--color=",
+    "--no-color", "--column=", "--no-column", "--sort=+", "--format=+", "--abbrev=", "--no-abbrev",
+    "-i", "--ignore-case", "--omit-empty",
+];
+
+/// `tag`'s listing options. `-l` / `--list` turns the operands into patterns.
+#[rustfmt::skip]
+const GIT_TAG_LIST_OPTIONS: &[&str] = &[
+    "-l", "--list", "-n=", "--sort=+", "--format=+", "--column=", "--no-column", "--color=", "-i",
+    "--ignore-case", "--omit-empty", "--contains=", "--no-contains=", "--merged=", "--no-merged=",
+];
+
+/// `config`'s read options (core#1858). A read needs a get or list mode; without one, `config
+/// <key> <value>` sets.
+#[rustfmt::skip]
+const GIT_CONFIG_READ_OPTIONS: &[&str] = &[
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "-l",
+    "--list", "--show-origin", "--show-scope", "--name-only", "-z", "--null", "--type=+", "--bool",
+    "--int", "--bool-or-int", "--path", "--expiry-date", "--default=+", "--local", "--global",
+    "--system", "--worktree", "-f=+", "--file=+", "--blob=+", "--includes", "--no-includes",
+    "--fixed-value",
+];
+
+#[rustfmt::skip]
+const GIT_CONFIG_MODES: &[&str] = &[
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "-l",
+    "--list",
+];
+
+#[rustfmt::skip]
+const GIT_WORKTREE_LIST_OPTIONS: &[&str] = &[
+    "-v", "--verbose", "--porcelain", "-z",
+];
+
+/// The option tables a git verb reads with, or `None` for a verb that is not an allow-listed
+/// read (`commit`, `fetch`, `push`, `notes`, `hash-object`, …: a write).
+fn git_verb_options(verb: &str) -> Option<&'static [&'static [&'static str]]> {
+    Some(match verb {
+        "log" | "show" | "whatchanged" | "diff" | "diff-tree" | "diff-index" | "diff-files"
+        | "reflog" | "stash" => &[GIT_REV_OPTIONS],
+        "rev-list" => &[GIT_REV_OPTIONS, GIT_REV_LIST_OPTIONS],
+        "shortlog" => &[GIT_SHORTLOG_OPTIONS, GIT_REV_OPTIONS],
+        "status" => &[GIT_STATUS_OPTIONS],
+        "ls-files" => &[GIT_LS_FILES_OPTIONS],
+        "ls-tree" => &[GIT_LS_TREE_OPTIONS],
+        "rev-parse" => &[GIT_REV_PARSE_OPTIONS],
+        "cat-file" => &[GIT_CAT_FILE_OPTIONS],
+        "blame" => &[GIT_BLAME_OPTIONS],
+        "grep" => &[GIT_GREP_OPTIONS],
+        "archive" => &[GIT_ARCHIVE_OPTIONS],
+        "fsck" => &[GIT_FSCK_OPTIONS],
+        "describe" => &[GIT_DESCRIBE_OPTIONS],
+        "for-each-ref" => &[GIT_FOR_EACH_REF_OPTIONS],
+        "merge-base" => &[GIT_MERGE_BASE_OPTIONS],
+        "name-rev" => &[GIT_NAME_REV_OPTIONS],
+        "count-objects" => &[GIT_COUNT_OBJECTS_OPTIONS],
+        "check-ignore" => &[GIT_CHECK_IGNORE_OPTIONS],
+        "verify-commit" | "verify-tag" => &[GIT_VERIFY_OPTIONS],
+        "branch" => &[GIT_BRANCH_LIST_OPTIONS],
+        "tag" => &[GIT_TAG_LIST_OPTIONS],
+        "config" => &[GIT_CONFIG_READ_OPTIONS],
+        "worktree" => &[GIT_WORKTREE_LIST_OPTIONS],
+        "remote" => &[&["-v", "--verbose", "-n", "--push", "--all"]],
+        _ => return None,
+    })
+}
+
+/// git's options before the verb that only read: they need no value.
+#[rustfmt::skip]
+const GIT_GLOBAL_FLAGS: &[&str] = &[
+    "--no-pager", "-P", "-p", "--paginate", "--no-optional-locks", "--literal-pathspecs",
+    "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-replace-objects", "--no-lazy-fetch",
+    "--no-advice", "--bare", "--version", "--help", "-h", "--html-path", "--man-path",
+    "--info-path", "--exec-path",
+];
+
+/// `-c <key>=<value>` keys that only change how git prints (case-insensitive). Any other key may
+/// run a program or move where git writes (`core.fsmonitor`, `core.hooksPath`, `alias.*`,
+/// `diff.external`), so it is not a read.
+fn git_config_key_inert(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["color.", "advice.", "column.", "pager."]
+        .iter()
+        .any(|p| key.starts_with(p))
+        || matches!(
+            key.as_str(),
+            "core.quotepath"
+                | "core.pager"
+                | "core.abbrev"
+                | "safe.directory"
+                | "user.name"
+                | "user.email"
+                | "i18n.logoutputencoding"
+                | "log.showroot"
+                | "log.date"
+                | "log.decorate"
+                | "log.abbrevcommit"
+                | "log.follow"
+                | "log.mailmap"
+                | "diff.renames"
+                | "diff.noprefix"
+                | "diff.mnemonicprefix"
+        )
+}
+
+/// Environment assignments before git (`GIT_DIR=… git …`, `env GIT_WORK_TREE=… git …`): the
+/// variables that name where git writes are its directories, like `-C`; the inert ones change
+/// nothing; any other `GIT_*` variable may run a program or redirect git (`GIT_EXTERNAL_DIFF`,
+/// `GIT_CONFIG_COUNT`), so the form is not a read.
+#[rustfmt::skip]
+const GIT_DIR_VARIABLES: &[&str] = &[
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+];
+
+#[rustfmt::skip]
+const GIT_INERT_VARIABLES: &[&str] = &[
+    "GIT_PAGER", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_NO_REPLACE_OBJECTS",
+    "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+    "GIT_CONFIG_NOSYSTEM", "GIT_ADVICE", "GIT_FLUSH", "GIT_NO_LAZY_FETCH",
+];
+
+/// One judged git invocation.
+#[derive(Debug, PartialEq, Eq)]
+struct GitCall {
+    form: GitForm,
+    /// The directories git works in or writes to (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR=`),
+    /// as spelled; an unresolvable stand-in when a wrapper feeds the value.
+    dirs: Vec<String>,
+    /// Files an output option writes, as spelled (joined onto `-C` when relative), and an
+    /// unresolvable stand-in for an option that runs a program (`grep -O`).
+    outputs: Vec<String>,
+}
+
+/// Stands in for a word `xargs` feeds where a path is read: no text resolves it.
+const FED_PATH: &str = "$(xargs)";
+
+/// Judge one git invocation: `args` are git's words after the program word, as spelled; `feed`
+/// what wrappers add to them; `assignments` the `NAME=value` words before the program.
+fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
+    let mut dirs: Vec<String> = Vec::new();
+    let (mut writes, mut unsettled) = (false, false);
+    for a in assignments {
+        let Some((name, _)) = a.split_once('=') else {
+            continue;
+        };
+        if GIT_DIR_VARIABLES.contains(&name) {
+            dirs.extend(strip_shell_prefix(a, &format!("{name}=")));
+        } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
+            writes = true;
+        }
+    }
+    // Each word as git receives it; a word holding a replace string is one fed word of any
+    // spelling, and appended words are any number of them.
+    let fed = |raw: &str| feed.replace.iter().any(|r| raw.contains(r.as_str()));
+    let mut raw: Vec<&str> = args.to_vec();
+    let mut words: Vec<GitWord> = args
+        .iter()
+        .map(|a| {
+            if fed(a) {
+                GitWord::One(String::new())
+            } else {
+                GitWord::of(a)
+            }
+        })
+        .collect();
+    if feed.append {
+        raw.push(FED_PATH);
+        words.push(GitWord::Lead(String::new()));
+    }
+    let path = |k: usize| -> Option<String> {
+        raw.get(k)
+            .map(|v| if fed(v) { FED_PATH } else { v })
+            .map(str::to_string)
     };
-    let short = a.starts_with('-') && !a.starts_with("--");
-    long("--output", "--out")
-        || (verb == "archive" && short && (lead || a.contains('o')))
-        || (verb == "fsck" && long("--lost-found", "--lo"))
-        || (verb == "grep"
-            && ((short && (lead || a.contains('O'))) || long("--open-files-in-pager", "--op")))
+    // git's own options, up to the verb.
+    let mut cwd: Vec<String> = Vec::new();
+    let mut j = 0;
+    let verb: Option<String> = loop {
+        let Some(word) = words.get(j) else {
+            break None;
+        };
+        let GitWord::Known(w) = word else {
+            // A word filled in where the verb or a global option stands: anything.
+            unsettled = true;
+            break None;
+        };
+        let w = w.as_str();
+        if w == "-C" {
+            cwd.extend(path(j + 1));
+            dirs.extend(path(j + 1));
+            j += 2;
+        } else if matches!(w, "--git-dir" | "--work-tree") {
+            dirs.extend(path(j + 1));
+            j += 2;
+        } else if let Some(name) = ["--git-dir=", "--work-tree="]
+            .into_iter()
+            .find(|n| w.starts_with(n))
+        {
+            dirs.extend(strip_shell_prefix(raw[j], name));
+            j += 1;
+        } else if w == "-c" {
+            match words.get(j + 1) {
+                Some(GitWord::Known(kv)) => {
+                    writes |=
+                        !git_config_key_inert(kv.split_once('=').map_or(kv.as_str(), |p| p.0));
+                }
+                _ => unsettled = true,
+            }
+            j += 2;
+        } else if w == "--namespace" {
+            j += 2;
+        } else if w.starts_with("--namespace=") || GIT_GLOBAL_FLAGS.contains(&w) {
+            j += 1;
+        } else if w.starts_with('-') {
+            // Any other option of git's own (`--exec-path=<dir>`, `--config-env`): not a read.
+            writes = true;
+            j += 1;
+        } else {
+            break Some(w.to_string());
+        }
+    };
+    let mut outputs = Vec::new();
+    if let Some(verb) = verb.as_deref() {
+        let at = (j + 1).min(words.len());
+        outputs = git_output_targets(verb, &words[at..], &raw[at..], &cwd);
+        match git_verb_options(verb) {
+            None => writes = true,
+            Some(tables) => {
+                let (w, u) = git_rest_reads(verb, tables, &words[at..]);
+                writes |= w;
+                unsettled |= u;
+            }
+        }
+    }
+    let form = if writes {
+        GitForm::Writes
+    } else if unsettled {
+        GitForm::Unsettled
+    } else {
+        GitForm::Reads
+    };
+    GitCall {
+        form,
+        dirs,
+        outputs,
+    }
+}
+
+/// One option word of `verb` against its tables: its name and how it takes a value — `None` (no
+/// value, or a glued one), `Some(true)` (the next word is its value), `Some(false)` (it may take
+/// a value it does not carry). `None` overall when the word is not an allow-listed option.
+fn git_option(verb: &str, tables: &[&[&str]], w: &str) -> Option<(String, Option<bool>)> {
+    let lookup = |name: &str| {
+        tables
+            .iter()
+            .flat_map(|t| t.iter())
+            .map(|e| git_option_entry(e))
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v)
+    };
+    if let Some(long) = w.strip_prefix("--") {
+        let (name, glued) = match long.split_once('=') {
+            Some((n, _)) => (format!("--{n}"), true),
+            None => (w.to_string(), false),
+        };
+        return match lookup(&name)? {
+            GitValue::None if glued => None,
+            GitValue::None => Some((name, None)),
+            GitValue::Glued => Some((name, (!glued).then_some(false))),
+            GitValue::Next => Some((name, (!glued).then_some(true))),
+        };
+    }
+    let short = w.strip_prefix('-')?;
+    // `-<n>`: a count (`log -5`), diff's `-0`..`-3`, grep's context, archive's level.
+    let counts = matches!(
+        verb,
+        "log"
+            | "show"
+            | "whatchanged"
+            | "diff"
+            | "diff-tree"
+            | "diff-index"
+            | "diff-files"
+            | "reflog"
+            | "stash"
+            | "rev-list"
+            | "shortlog"
+            | "grep"
+            | "archive"
+    );
+    if counts && !short.is_empty() && short.chars().all(|c| c.is_ascii_digit()) {
+        return Some((w.to_string(), None));
+    }
+    // A cluster: flags, then at most one option that takes the rest of the word (or the next
+    // word, when it ends the cluster).
+    let chars: Vec<char> = short.chars().collect();
+    let first = format!("-{}", chars.first()?);
+    for (k, c) in chars.iter().enumerate() {
+        match lookup(&format!("-{c}"))? {
+            GitValue::None => {}
+            v => {
+                let bare = k + 1 == chars.len();
+                return Some((first, bare.then_some(v == GitValue::Next)));
+            }
+        }
+    }
+    Some((first, None))
+}
+
+/// Judge a verb's words (after the verb) against its option tables and operand rule: (a word or
+/// the operands make it a write, a word the text does not settle).
+fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, bool) {
+    let (mut writes, mut unsettled) = (false, false);
+    let mut opts: Vec<String> = Vec::new();
+    // The operands the text settles, in order.
+    let mut operands: Vec<String> = Vec::new();
+    // `next_value`: the option before takes this word. `pending`: the option before may take it.
+    let (mut end, mut next_value, mut pending) = (false, false, false);
+    for word in words {
+        if std::mem::take(&mut next_value) {
+            // The value, whatever it spells; one that may split into more words may add options.
+            unsettled |= matches!(word, GitWord::Lead(_));
+            continue;
+        }
+        if end {
+            // After `--`: pathspecs and operands, whatever they spell.
+            if let GitWord::Known(a) = word {
+                operands.push(a.clone());
+            } else {
+                operands.push("\0operand".to_string());
+            }
+            continue;
+        }
+        let may_be_value = std::mem::take(&mut pending);
+        match word {
+            GitWord::Known(a) if a == "--" => {
+                // `stash list|show` hands what follows `--` to `git log`/`git diff` as options
+                // (core#1859 B); after an option that may take it as its value (`grep -e --`)
+                // it is no end of options either (core#1857 item 2).
+                end = verb != "stash" && !may_be_value;
+            }
+            GitWord::Known(a) if a.starts_with('-') && a != "-" => {
+                match git_option(verb, tables, a) {
+                    Some((name, value)) => {
+                        opts.push(name);
+                        next_value = value == Some(true);
+                        pending = value == Some(false);
+                    }
+                    None => writes = true,
+                }
+            }
+            GitWord::Known(a) => operands.push(a.clone()),
+            GitWord::Pattern(l) | GitWord::One(l) if !l.is_empty() && !l.starts_with('-') => {
+                operands.push("\0operand".to_string());
+            }
+            // One word whose glued value the text does not settle (`--grep="$x"`, `-S"$x"`).
+            GitWord::One(l) if git_glued_value_lead(verb, tables, l) => {}
+            _ => unsettled = true,
+        }
+    }
+    let has = |o: &str| opts.iter().any(|n| n == o);
+    let first = operands.first().map(String::as_str);
+    let reads = match verb {
+        // No operand: a name would create a branch.
+        "branch" => operands.is_empty(),
+        // Bare (it lists), or `-l`/`--list` with patterns.
+        "tag" => operands.is_empty() || has("-l") || has("--list"),
+        "remote" => match first {
+            None => opts
+                .iter()
+                .all(|o| matches!(o.as_str(), "-v" | "--verbose")),
+            Some("show") => opts
+                .iter()
+                .all(|o| matches!(o.as_str(), "-v" | "--verbose" | "-n")),
+            Some("get-url") => opts
+                .iter()
+                .all(|o| matches!(o.as_str(), "-v" | "--verbose" | "--push" | "--all")),
+            Some(_) => false,
+        },
+        "stash" => matches!(first, Some("list" | "show")),
+        "worktree" => first == Some("list"),
+        // `show`, `exists`, or no subcommand reads; `expire`, `delete` or a ref name does not.
+        "reflog" => matches!(first, None | Some("show" | "exists")),
+        "config" => {
+            GIT_CONFIG_MODES.iter().any(|m| has(m)) || matches!(first, Some("list" | "get"))
+        }
+        _ => true,
+    };
+    (writes || !reads, unsettled)
+}
+
+/// Whether `lead`, the literal start of one word whose rest the text does not settle, is an
+/// allow-listed option whose glued value has begun: `--grep=`, `-S`, `-n`.
+fn git_glued_value_lead(verb: &str, tables: &[&[&str]], lead: &str) -> bool {
+    if lead.starts_with("--") {
+        return lead.contains('=') && git_option(verb, tables, lead).is_some();
+    }
+    lead.len() >= 2
+        && lead.starts_with('-')
+        && matches!(git_option(verb, tables, lead), Some((_, Some(_))))
+}
+
+/// The files git's output options write, as spelled (core#1859 C): `--output` and every
+/// abbreviation git accepts for it (log, diff, show and the forms that take their options;
+/// `stash` judged past its `--`) and `archive -o`. A relative file is joined onto the `-C`
+/// directories, where git resolves it. `grep -O` / `--open-files-in-pager` runs a program, so it
+/// adds a target no text resolves. Read on every word: a word after `--` that spells one is a
+/// rare false refusal, never a missed write.
+fn git_output_targets(verb: &str, words: &[GitWord], raw: &[&str], cwd: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // A file as spelled, joined onto `-C` when the text shows it is relative.
+    let mut file = |spelled: String| {
+        let relative = matches!(GitWord::of(&spelled), GitWord::Known(p)
+            if !p.starts_with('~') && !Path::new(&p).is_absolute());
+        out.push(if relative && !cwd.is_empty() {
+            format!("{}/{spelled}", cwd.join("/"))
+        } else {
+            spelled
+        });
+    };
+    let runs_program = |k: usize| format!("$(git {verb} {})", raw[k]);
+    let mut k = 0;
+    while k < words.len() {
+        let (text, settled) = match &words[k] {
+            GitWord::Known(a) => (a.as_str(), true),
+            GitWord::One(l) | GitWord::Lead(l) | GitWord::Pattern(l) => (l.as_str(), false),
+        };
+        let next = raw.get(k + 1).map(|v| (*v).to_string());
+        if let Some(long) = text.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if verb == "grep" && name.len() >= 2 && "open-files-in-pager".starts_with(name) {
+                file(runs_program(k));
+            } else if name.len() >= 3 && "output".starts_with(name) {
+                match (value, settled) {
+                    (Some(_), true) => file(
+                        strip_shell_prefix(raw[k], &format!("--{name}="))
+                            .unwrap_or_else(|| raw[k].to_string()),
+                    ),
+                    (None, true) => {
+                        if let Some(v) = next {
+                            file(v);
+                            k += 1;
+                        }
+                    }
+                    // `--output="$f"`, `--out$x`: where it writes is not in the text.
+                    (_, false) => file(raw[k].to_string()),
+                }
+            }
+        } else if let Some(short) = text.strip_prefix('-').filter(|s| !s.is_empty()) {
+            if verb == "grep" && short.contains('O') {
+                file(runs_program(k));
+            } else if let Some(at) = short.find('o').filter(|_| verb == "archive") {
+                let glued = &short[at + 1..];
+                if !settled {
+                    file(raw[k].to_string());
+                } else if !glued.is_empty() {
+                    file(
+                        strip_shell_prefix(raw[k], &format!("-{}", &short[..=at]))
+                            .unwrap_or_else(|| raw[k].to_string()),
+                    );
+                } else if let Some(v) = next {
+                    file(v);
+                    k += 1;
+                }
+            }
+        }
+        k += 1;
+    }
+    out
 }
 
 /// Interpreter programs that can write files with unresolvable targets when invoked with inline
@@ -4048,6 +4744,12 @@ fn command_write_capability(command: &str) -> (WriteCapability, bool) {
     if !seg.is_empty() {
         segments.push(seg);
     }
+    let found = find_exec_commands(&segments);
+    segments.extend(
+        found
+            .iter()
+            .map(|c| c.iter().map(String::as_str).collect::<Vec<_>>()),
+    );
     let mut strongest = WriteCapability::None;
     for (words, unwrapped) in segments.iter().flat_map(|words| {
         unwrap_programs(words)
@@ -4075,40 +4777,27 @@ fn command_write_capability(command: &str) -> (WriteCapability, bool) {
                 }
                 strongest = strongest.max(WriteCapability::Opaque);
             }
-            Unwrapped::Program { idx, .. } => {
+            Unwrapped::Program {
+                idx,
+                assignments,
+                feed,
+            } => {
                 let Some(prog) = words.get(idx) else { continue };
                 let basename = program_basename(prog);
-                if OPAQUE_WRITER_PROGRAMS.contains(&basename) {
+                if OPAQUE_WRITER_PROGRAMS.contains(&basename)
+                    || matches!(basename, "parallel" | "sem")
+                {
                     strongest = strongest.max(WriteCapability::Opaque);
                     continue;
                 }
+                // (core#1857, #1859) The same judgement as the write-target site: a git whose
+                // words the text does not settle may write unseen (advisory after a `cd` into a
+                // read root); a git that is not an allow-listed read writes.
                 if basename == "git" {
-                    let args = &words[idx + 1..];
-                    let mut j = 0;
-                    // (crew#1795 round 2, F1) As at the write-target site: the words an `xargs`
-                    // feeds git count, even with no subcommand written.
-                    let mut subcommand_reads = git_reads_after(&words[..idx], &[]);
-                    while j < args.len() {
-                        // INDEPENDENT REVIEW item 6 (site 2): skip the value of flags that
-                        // take a separate-token argument so the value is never mistaken for
-                        // the subcommand verb (over-deny) or causes a verb-position miss.
-                        if (args[j] == "-c"
-                            || args[j] == "--config"
-                            || args[j] == "-C"
-                            || args[j] == "--git-dir"
-                            || args[j] == "--work-tree")
-                            && j + 1 < args.len()
-                        {
-                            j += 2;
-                        } else if args[j].starts_with('-') {
-                            j += 1;
-                        } else {
-                            subcommand_reads = git_reads_after(&words[..idx], &args[j..]);
-                            break;
-                        }
-                    }
-                    if !subcommand_reads {
-                        return (WriteCapability::Writes, extended);
+                    match git_call(&words[idx + 1..], &feed, &assignments).form {
+                        GitForm::Writes => return (WriteCapability::Writes, extended),
+                        GitForm::Unsettled => strongest = strongest.max(WriteCapability::Opaque),
+                        GitForm::Reads => {}
                     }
                 }
                 // `cp`/`mv`/`install` write wherever their destination is, and the target scan
@@ -4728,6 +5417,8 @@ enum Unwrapped<'a> {
     Program {
         idx: usize,
         assignments: Vec<&'a str>,
+        /// What the `xargs` wrappers before the program feed it (core#1868).
+        feed: Feed,
     },
     /// A shell `-c`, eval, or env split-string wrapper: the inner command string with one layer of quotes stripped, for
     /// the caller to `shell_tokens` and rescan as its own command line, and the `-c` `word` as
@@ -4810,6 +5501,7 @@ fn unwrap_program_with_reads<'a>(
     };
     let mut idx = 0;
     let mut assignments: Vec<&'a str> = Vec::new();
+    let mut feed = Feed::default();
     // Every iteration consumes at least one word or returns, so the loop is bounded by `words.len()`.
     loop {
         while idx < words.len() && assignment(words[idx]) {
@@ -4820,7 +5512,11 @@ fn unwrap_program_with_reads<'a>(
             idx += 1;
         }
         let Some(prog) = words.get(idx) else {
-            return Unwrapped::Program { idx, assignments };
+            return Unwrapped::Program {
+                idx,
+                assignments,
+                feed,
+            };
         };
         match program_basename(prog) {
             "exec" | "builtin" | "command" => {
@@ -4853,10 +5549,20 @@ fn unwrap_program_with_reads<'a>(
                         argv_tail: String::new(),
                     }
                 } else {
-                    Unwrapped::Program { idx, assignments }
+                    Unwrapped::Program {
+                        idx,
+                        assignments,
+                        feed,
+                    }
                 };
             }
             "xargs" => {
+                // (crew#1795 round 2, core#1868) What this `xargs` hands the program: words in
+                // place of a replace string, else appended. An outer `xargs` feeding an inner one
+                // appends to the inner one's words, so to the program's.
+                let own = xargs_replace_strings(&words[idx + 1..]);
+                feed.append |= own.is_empty();
+                feed.replace.extend(own);
                 idx += 1;
                 while idx < words.len() && words[idx].starts_with('-') {
                     let flag = words[idx];
@@ -4864,25 +5570,7 @@ fn unwrap_program_with_reads<'a>(
                     if flag == "--" && !preserve_legacy {
                         break;
                     }
-                    let takes_value = !preserve_legacy
-                        && matches!(
-                            flag,
-                            "-a" | "--arg-file"
-                                | "-I"
-                                | "--replace"
-                                | "-L"
-                                | "--max-lines"
-                                | "-n"
-                                | "--max-args"
-                                | "-d"
-                                | "--delimiter"
-                                | "-P"
-                                | "--max-procs"
-                                | "-s"
-                                | "--max-chars"
-                                | "-E"
-                                | "--eof"
-                        );
+                    let takes_value = !preserve_legacy && XARGS_VALUE_OPTIONS.contains(&flag);
                     if takes_value {
                         if matches!(flag, "-a" | "--arg-file") {
                             if let Some(&file) = words.get(idx) {
@@ -5006,7 +5694,11 @@ fn unwrap_program_with_reads<'a>(
                             }
                         }
                     }
-                    return Unwrapped::Program { idx, assignments };
+                    return Unwrapped::Program {
+                        idx,
+                        assignments,
+                        feed,
+                    };
                 }
                 let mut j = idx + 1;
                 while j < words.len() {
@@ -5044,13 +5736,27 @@ fn unwrap_program_with_reads<'a>(
                                 argv_expansion: false,
                                 argv_tail: String::new(),
                             },
-                            None => Unwrapped::Program { idx, assignments },
+                            None => Unwrapped::Program {
+                                idx,
+                                assignments,
+                                feed,
+                            },
                         };
                     }
                 }
-                return Unwrapped::Program { idx, assignments };
+                return Unwrapped::Program {
+                    idx,
+                    assignments,
+                    feed,
+                };
             }
-            _ => return Unwrapped::Program { idx, assignments },
+            _ => {
+                return Unwrapped::Program {
+                    idx,
+                    assignments,
+                    feed,
+                }
+            }
         }
     }
 }
@@ -5683,7 +6389,9 @@ fn classify_estate_command_in(
         // stops EVERY form when the sandbox is armed. This scan is the secondary layer for
         // sandbox-less hosts.
         let (idx, prefix_assignments) = match unwrapped {
-            Unwrapped::Program { idx, assignments } => (idx, assignments),
+            Unwrapped::Program {
+                idx, assignments, ..
+            } => (idx, assignments),
             Unwrapped::Inline {
                 inner,
                 argv_expansion,
@@ -9225,7 +9933,6 @@ mod tests {
             format!("cd {r} && git tag '-m' -l injected"),
             format!("git -C {r} stash show $'--output={r}/victim'"),
             format!("cd {r} && git stash show $'--output=victim'"),
-            format!("git -C {r} log \"$out\""),
             format!("git -C {r} log --out\"put\"={r}/victim"),
             format!("cd {r} && python3 --version && cp -t . /dev/null"),
             format!("cd {r} && cp -t . /dev/null"),
@@ -9239,6 +9946,17 @@ mod tests {
                 check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
             assert!(fatal, "a write escape is fatal: {write}: {reason}");
         }
+        // core#1859 A: a git word the shell fills in may be any option (`--output=<file>`), so the
+        // call is refused, ADVISORY (core#922's rule for what the text cannot settle): the seat
+        // continues, the chat never ends at a rules card. #1849 pinned `log "$out"` fatal.
+        for maybe in [
+            format!("git -C {r} log \"$out\""),
+            format!("git -C {r} show $sha"),
+            format!("cd {r} && git show $sha"),
+        ] {
+            let (reason, fatal) = check(&maybe).unwrap_or_else(|| panic!("refused: {maybe}"));
+            assert!(!fatal, "advisory, never a rules card: {maybe}: {reason}");
+        }
         // Codex r1 on #1849: once the shared scan budget is spent, a rescan reads the command with
         // main's grammar and can miss the `env -S` wrapper; the one classification made while the
         // budget held decides, and the call stays blocked.
@@ -9251,6 +9969,23 @@ mod tests {
             "an exhausted scan never admits it"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Whether git's words from the verb on are an allow-listed read ([`git_call`], nothing fed):
+    /// the classifier rows of crew#1795, kept as they were written against the old classifier.
+    fn git_subcommand_reads(args: &[&str]) -> bool {
+        git_call(args, &Feed::default(), &[]).form == GitForm::Reads
+    }
+
+    /// The same, with what the wrapper words `prefix` before git feed it (`xargs -I {}`).
+    fn git_reads_after(prefix: &[&str], args: &[&str]) -> bool {
+        let mut words = prefix.to_vec();
+        words.push("git");
+        let Unwrapped::Program { feed, .. } = unwrap_program_with_reads(&words, false, |_| {})
+        else {
+            panic!("{prefix:?} hides git");
+        };
+        git_call(args, &feed, &[]).form == GitForm::Reads
     }
 
     #[test]
@@ -9414,7 +10149,9 @@ mod tests {
             Some((reason, false)) if reason.starts_with(READ_ROOT_CD_REASON_PREFIX) => {}
             other => failures.push(format!("not the advisory: {node}: {other:?}")),
         }
-        for write in [
+        // F1: the words `xargs` feeds git are words the text does not settle, so each call is
+        // refused; ADVISORY since core#1859 A (the seat continues), where #1849 made it fatal.
+        for fed in [
             // F1: the four commands of the review.
             format!(
                 "echo 'set-url origin https://attacker.example/x.git' | xargs git -C {r} remote"
@@ -9434,6 +10171,12 @@ mod tests {
             format!("echo 'branch -D wip' | xargs git -C {r}"),
             format!("cd {r} && echo --output=victim | xargs git log"),
             format!("cd {r} && echo --output=victim | xargs git stash list --"),
+        ] {
+            if check(&fed).is_none() {
+                failures.push(format!("allowed, but fed words may write: {fed}"));
+            }
+        }
+        for write in [
             // F2: `stash list` hands what follows its `--` to `git log`.
             format!("cd {r} && git stash list -- --output=victim"),
             format!("git -C {r} stash list --format='all:%n\techo INJECTED' -- --output=Makefile"),
@@ -9494,6 +10237,266 @@ mod tests {
         ] {
             assert_eq!(git_reads_after(prefix, args), reads, "{prefix:?} {args:?}");
         }
+    }
+
+    /// core#1857, #1858, #1859, #1868 (the gate_hook git read/write family): a git invocation is a
+    /// READ only on an allow-listed form, every word of it settled by the text. Each issue's
+    /// examples are rows here, beside a read of the same form that must stay allowed, and the
+    /// read forms seats really run (mined GET-only from run events on the proof and operator
+    /// daemons, the repository path replaced). Every row is checked and every failing row is
+    /// listed, so a red run proves each one.
+    /// - Read: no refusal. Advisory: refused, the seat continues (`fatal == false`). Fatal: a
+    ///   write escape (`fatal == true`). Refused: either refusal.
+    #[test]
+    fn git_reads_are_an_allow_list_and_everything_else_writes_core1857_1858_1859_1868() {
+        use crate::path_policy::AllowedRoots;
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Want {
+            Read,
+            Advisory,
+            Fatal,
+            Refused,
+        }
+        use Want::*;
+        // Outside the system temp, as a registered repository is: a refusal there is FATAL.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("git-allowlist-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("tiny-math");
+        let wt = repo.join("wicked-worktrees").join("own");
+        let outside = base.join("outside");
+        for d in [&wt, &outside, &repo.join("src")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(repo.join("src").join("math.js"), "x").unwrap();
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![repo.clone()],
+        };
+        let check = |cmd: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            )
+        };
+        let r = shell_read_951_path(&repo);
+        let w = shell_read_951_path(&wt);
+        let o = shell_read_951_path(&outside);
+        let rows: Vec<(&str, Want, String)> = vec![
+            // core#1857 item 1: an output option writes from the seat's own folder too.
+            ("1857.1", Fatal, format!("git log --output={o}/f")),
+            ("1857.1", Fatal, format!("git log --outp={o}/f -1")),
+            ("1857.1", Fatal, format!("git diff --output {o}/f HEAD")),
+            ("1857.1", Fatal, format!("git archive -o {o}/x.tar HEAD")),
+            ("1857.1", Fatal, format!("git archive --output={o}/x.tar HEAD")),
+            ("1857.1", Fatal, format!("git -C {r} log --output=notes.txt -1")),
+            ("1857.1", Refused, "git grep -Ovim median".to_string()),
+            ("1857.1", Refused, "git grep --open-files-in-pager=vim median".to_string()),
+            ("1857.1", Read, "git log --oneline -5".to_string()),
+            ("1857.1", Read, format!("git log --oneline -3 > {w}/notes.txt")),
+            ("1857.1", Read, "git archive --format=tar HEAD > x.tar".to_string()),
+            // core#1857 item 2: `-e --` is grep's pattern, not the end of its options.
+            ("1857.2", Fatal, format!("git -C {r} grep -e -- -Ovim median")),
+            ("1857.2", Fatal, format!("cd {r} && git grep -e -- -Ovim median")),
+            ("1857.2", Read, format!("git -C {r} grep -n -e median -- src")),
+            ("1857.2", Read, format!("cd {r} && git grep -n median -- src")),
+            // core#1857 item 3: a glued operator or a line break in a command holding `${`, a
+            // backtick or `$[` never hides the next program.
+            ("1857.3", Fatal, format!("echo ${{HOME}}&&git -C {r} branch -D wip")),
+            ("1857.3", Fatal, format!("echo ${{HOME}}\ngit -C {r} branch -D wip")),
+            ("1857.3", Fatal, format!("echo `date`||git -C {r} tag v9")),
+            ("1857.3", Fatal, format!("echo $[1+1]|git -C {r} branch -D wip")),
+            ("1857.3", Read, format!("echo ${{HOME}}&&git -C {r} log -1 --oneline")),
+            // core#1858: listing and get forms read; their write siblings stay writes.
+            ("1858", Read, format!("git -C {r} branch --sort=-committerdate")),
+            (
+                "1858",
+                Read,
+                format!("git -C {r} branch -a --sort=-committerdate --format='%(refname:short)'"),
+            ),
+            ("1858", Read, format!("git -C {r} config --get user.name")),
+            ("1858", Read, format!("git -C {r} config --get-all remote.origin.url")),
+            ("1858", Read, format!("git -C {r} config --get-regexp '^remote\\.'")),
+            ("1858", Read, format!("git -C {r} config --list --show-origin")),
+            ("1858", Read, format!("cd {r} && git config --get remote.origin.url")),
+            ("1858", Fatal, format!("git -C {r} branch -D main")),
+            ("1858", Fatal, format!("git -C {r} branch --sort=-committerdate wip")),
+            ("1858", Fatal, format!("git -C {r} config user.name x")),
+            ("1858", Fatal, format!("git -C {r} config --unset user.name")),
+            ("1858", Fatal, format!("git -C {r} config --add user.name x")),
+            ("1858", Fatal, format!("cd {r} && git config --replace-all user.name x")),
+            // core#1859 A: a word the shell fills in is refused ADVISORY against a read root (the
+            // seat continues; no rules card). In the seat's own folder it runs as on main.
+            ("1859.A", Advisory, format!("cd {r} && git show $sha")),
+            ("1859.A", Advisory, format!("cd {r} && git log $range --oneline")),
+            ("1859.A", Advisory, format!("git -C {r} show \"$sha\"")),
+            ("1859.A", Advisory, format!("git -C {r} log \"$out\"")),
+            ("1859.A", Read, "git show $sha".to_string()),
+            ("1859.A", Read, format!("git -C {r} log --oneline -- \"$f\"")),
+            ("1859.A", Read, format!("git -C {r} log --grep=\"$pat\" --oneline")),
+            ("1859.A", Read, format!("git -C {r} show HEAD:\"$path\"")),
+            ("1859.A", Read, format!("cd {r} && git log -1 --format=%H")),
+            // core#1859 C: an output option's value is a write target at every site, `stash`
+            // forms included (they hand the words after `--` to `git log`/`git diff`).
+            ("1859.C", Fatal, format!("git stash list -- --output={r}/f")),
+            ("1859.C", Fatal, format!("git stash show -- --output={o}/f")),
+            ("1859.C", Fatal, format!("git -C {r} stash show $'--output={r}/victim'")),
+            ("1859.C", Read, format!("git -C {r} stash list --")),
+            ("1859.C", Read, format!("git -C {r} stash show -p stash@{{0}}")),
+            // core#1868: wrappers that run git with words of their own.
+            ("1868", Refused, format!("echo -D | parallel git -C {r} branch {{}} wip")),
+            ("1868", Refused, format!("parallel git -C {r} log -1 ::: a")),
+            ("1868", Fatal, format!("find {r} -name x -exec git -C {r} branch -D wip \\;")),
+            ("1868", Fatal, format!("find {r} -name x -execdir git branch -D wip \\;")),
+            ("1868", Fatal, format!("find {r} -name '*.js' -exec rm {{}} \\;")),
+            ("1868", Fatal, format!("find {r} -name '*.js' -exec rm {{}} +")),
+            ("1868", Fatal, format!("find {r} -name '*.js' -ok cp {w}/x {{}} ';'")),
+            ("1868", Refused, format!("echo -- --output=x | xargs -J % git -C {r} log % -- f")),
+            ("1868", Refused, format!("echo -D | xargs -J % git -C {r} branch % wip")),
+            ("1868", Refused, format!("echo -D | xargs -R 1 -I % git -C {r} branch % wip")),
+            (
+                "1868",
+                Read,
+                format!("find {r} -name '*.js' -exec git -C {r} log -1 --oneline -- {{}} \\;"),
+            ),
+            ("1868", Read, format!("find {r} -name '*.js' -exec grep -n sum {{}} +")),
+            ("1868", Read, "find . -name '*.tmp' -exec rm {} +".to_string()),
+            (
+                "1868",
+                Read,
+                format!("git -C {r} ls-files | xargs -J % git -C {r} log -1 --oneline -- %"),
+            ),
+            (
+                "1868",
+                Read,
+                format!("git -C {r} ls-files | xargs -R 1 -I % git -C {r} log -1 --oneline -- %"),
+            ),
+            (
+                "1868",
+                Read,
+                format!("git -C {r} ls-files | xargs -n 1 git -C {r} log -1 --oneline --"),
+            ),
+            (
+                "1868",
+                Read,
+                format!("git -C {r} ls-files | xargs --replace git -C {r} log -1 -- {{}}"),
+            ),
+            // The family: what names the repository and git's own options are judged too.
+            ("family", Fatal, format!("GIT_DIR={r}/.git git branch wip")),
+            ("family", Fatal, format!("env GIT_WORK_TREE={r} git checkout -- src")),
+            ("family", Fatal, format!("git -c core.fsmonitor='touch x' -C {r} status")),
+            ("family", Refused, format!("git --exec-path={w} -C {r} log -1")),
+            ("family", Read, format!("GIT_DIR={r}/.git git log -1 --oneline")),
+            ("family", Read, format!("git -c color.ui=never -C {r} log -1")),
+            ("family", Read, format!("git --no-pager -C {r} log -3")),
+            ("family", Read, format!("git -p -C {r} log -3")),
+            ("family", Read, format!("git -C {r} --no-optional-locks status --short")),
+            // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
+            // read-root advisory (an interpreter after the `cd`).
+            (
+                "1795",
+                Read,
+                format!(
+                    "cd {r} && git status | head -5; git branch -a; git log --oneline --all | head -20; ls; grep -rn \"median\" --include=* -r . -l --exclude-dir=.git --exclude-dir=node_modules | head"
+                ),
+            ),
+            (
+                "1795",
+                Advisory,
+                format!(
+                    "cd {r} && node --test test/math.test.js 2>&1 | grep -E '^# |not ok|^ok' ; node -e 'import(\"./src/math.js\").then(m=>{{console.log(m.max([-0,0]),m.max([1,NaN,3]),m.max([NaN,1]),m.max([-Infinity]),m.mean([2,4]),m.sum([1,2,3]))}})'"
+                ),
+            ),
+        ];
+        // J3: the read forms seats run against a repository (mined from run events), through
+        // `git -C` and after a `cd`. Each must stay a read.
+        let mined = [
+            "status --short",
+            "status --porcelain=v1",
+            "status -sb",
+            "status --short --branch --untracked-files=all",
+            "log --oneline -15",
+            "log --oneline --all --graph --decorate",
+            "log -5 --format='%h %ad %s' --date=short",
+            "log --pretty=format:'%h %an %s' -10",
+            "log --since='2 weeks ago' --oneline",
+            "log --max-count=20 --no-merges --name-only",
+            "log -S median --oneline",
+            "log -p -1 -- src/math.js",
+            "log --follow --stat -- src/math.js",
+            "log -n 3 --reverse",
+            "log --no-renames --name-status -3",
+            "diff --stat HEAD~1",
+            "diff --name-only HEAD~2..HEAD",
+            "diff --check",
+            "diff --cached --numstat",
+            "diff -U0 HEAD~1 -- src",
+            "diff --exit-code --quiet",
+            "show --stat HEAD",
+            "show --no-patch --format=%H HEAD",
+            "show -s --oneline HEAD",
+            "show HEAD:src/math.js",
+            "rev-parse --short HEAD",
+            "rev-parse --show-toplevel",
+            "rev-parse --abbrev-ref HEAD",
+            "rev-parse --verify -q HEAD",
+            "rev-list --count HEAD",
+            "rev-list --since=2.weeks --count HEAD",
+            "ls-files --others --exclude-standard",
+            "ls-files -s src",
+            "ls-tree -r --name-only HEAD",
+            "cat-file -t HEAD",
+            "cat-file -p HEAD:src/math.js",
+            "merge-base --is-ancestor HEAD~1 HEAD",
+            "merge-base HEAD HEAD~1",
+            "for-each-ref --format='%(refname:short)' refs/heads",
+            "grep -n median",
+            "grep -nE 'sum|mean' -- src",
+            "blame -L 1,5 src/math.js",
+            "describe --tags --always",
+            "shortlog -sn",
+            "check-ignore -v src/math.js",
+            "count-objects -vH",
+            "branch -av",
+            "branch --show-current",
+            "remote -v",
+            "tag -l 'v*'",
+            "stash list",
+            "worktree list --porcelain",
+            "reflog -10",
+        ];
+        let mut all = rows;
+        for form in mined {
+            all.push(("J3", Read, format!("git -C {r} {form}")));
+            all.push(("J3", Read, format!("cd {r} && git {form} | head -40")));
+        }
+        let mut failures: Vec<String> = Vec::new();
+        for (issue, want, cmd) in &all {
+            let got = check(cmd);
+            let ok = match want {
+                Read => got.is_none(),
+                Advisory => matches!(got, Some((_, false))),
+                Fatal => matches!(got, Some((_, true))),
+                Refused => got.is_some(),
+            };
+            if !ok {
+                failures.push(format!("[{issue}] want {want:?}: {cmd}\n    got {got:?}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            failures.is_empty(),
+            "{} of {} rows:\n{}",
+            failures.len(),
+            all.len(),
+            failures.join("\n")
+        );
     }
 
     /// PRODUCT-WORKS J6 (run 6f11390c unit 4, a design step): `cd <skill dir> && ls && sed -n 1,40p
