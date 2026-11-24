@@ -1811,58 +1811,48 @@ pub const ADO_RAW_CREDENTIAL_ENV: &[&str] = &[
     "CREW_ADO_CLIENT_SECRET",
 ];
 
-/// Whether `cmd` runs git itself (`git`, `/usr/bin/git`, `git.exe`).
+/// Whether `cmd` runs git itself (`git`, a path to it, `git.exe`), by the last component of its
+/// program on either separator.
 fn is_git(cmd: &Command) -> bool {
-    std::path::Path::new(cmd.get_program())
-        .file_stem()
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
+    let program = cmd.get_program().to_string_lossy();
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("");
+    name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
+
+/// The `-c` entry every engine git carries (wicked-crew#1843), in `GIT_CONFIG_PARAMETERS`' quoting.
+const FSMONITOR_OFF_PARAMETER: &str = "'core.fsmonitor=false'";
 
 /// (wicked-crew#1843) Every engine git: no raw Azure DevOps credential, and `core.fsmonitor=false`.
 /// A host whose global config turns fsmonitor on would otherwise start a `git fsmonitor--daemon`
 /// for each worktree the engine reads, carrying the git's environment and outliving the daemon.
-/// The setting rides `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` (the precedence of `-c`, above every
-/// config file), APPENDED after any entries the command or the daemon already carries, so it
-/// composes with them. A site that later replaces `GIT_CONFIG_COUNT` wholesale replaces this too.
+///
+/// The setting rides `GIT_CONFIG_PARAMETERS`, the channel `git -c` uses: git reads it after every
+/// config file AND after the `GIT_CONFIG_COUNT` entries, and within it the last entry wins, so it is
+/// APPENDED to what the command would otherwise pass (its own value, else the daemon's). A site
+/// that sets its own `GIT_CONFIG_COUNT` entries before or after this keeps them and cannot undo it;
+/// only a later `env_remove`/`env_clear` of the variable, or a `-c core.fsmonitor=…` argument, does.
 fn harden_git(cmd: &mut Command) {
     for key in ADO_RAW_CREDENTIAL_ENV {
         cmd.env_remove(key);
     }
-    let explicit = cmd
-        .get_envs()
-        .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
-        .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string));
-    let inherited = explicit.is_none();
-    let count = match explicit {
-        Some(set) => set,
-        None => std::env::var_os("GIT_CONFIG_COUNT"),
-    };
-    let count = match count {
-        None => 0,
-        Some(v) if v.is_empty() => 0,
-        // git refuses an unreadable count on its own; leave it to say so.
-        Some(v) => match v.to_str().and_then(|v| v.parse::<usize>().ok()) {
-            Some(n) => n,
-            None => return,
-        },
-    };
-    if inherited {
-        // The daemon's own entries, carried explicitly: a command whose environment was cleared
-        // before this still gets every entry the count it is handed names.
-        for i in 0..count {
-            for name in [
-                format!("GIT_CONFIG_KEY_{i}"),
-                format!("GIT_CONFIG_VALUE_{i}"),
-            ] {
-                if let Some(v) = std::env::var_os(&name) {
-                    cmd.env(name, v);
-                }
-            }
+    let same = |k: &std::ffi::OsStr| {
+        if cfg!(windows) {
+            k.to_string_lossy()
+                .eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS")
+        } else {
+            k == "GIT_CONFIG_PARAMETERS"
         }
+    };
+    let current = match cmd.get_envs().find(|(k, _)| same(k)) {
+        Some((_, set)) => set.map(std::ffi::OsStr::to_os_string),
+        None => std::env::var_os("GIT_CONFIG_PARAMETERS"),
+    };
+    let mut value = current.unwrap_or_default();
+    if !value.to_string_lossy().trim().is_empty() {
+        value.push(" ");
     }
-    cmd.env(format!("GIT_CONFIG_KEY_{count}"), "core.fsmonitor")
-        .env(format!("GIT_CONFIG_VALUE_{count}"), "false")
-        .env("GIT_CONFIG_COUNT", (count + 1).to_string());
+    value.push(FSMONITOR_OFF_PARAMETER);
+    cmd.env("GIT_CONFIG_PARAMETERS", value);
 }
 
 /// Marker documenting where the rule is mechanically enforced.
@@ -1988,7 +1978,7 @@ mod tests {
     }
 
     /// (wicked-crew#1843) An engine git carries no raw Azure DevOps credential and runs with
-    /// `core.fsmonitor=false`, appended after the entries the command already carries.
+    /// `core.fsmonitor=false`, appended after the `-c` entries the command already carries.
     #[test]
     fn a_hardened_git_drops_the_ado_credential_and_turns_fsmonitor_off() {
         let envs = |cmd: &Command| -> std::collections::HashMap<String, Option<String>> {
@@ -2001,42 +1991,63 @@ mod tests {
                 })
                 .collect()
         };
-        for program in ["git", "/usr/bin/git", "git.exe"] {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            "git.exe",
+            r"C:\Program Files\Git\cmd\git.exe",
+        ] {
             let mut cmd = Command::new(program);
             for key in ADO_RAW_CREDENTIAL_ENV {
                 cmd.env(key, "made-up"); // ggignore: a made-up test value
             }
-            cmd.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.followRedirects")
-                .env("GIT_CONFIG_VALUE_0", "false");
+            cmd.env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'");
             cmd.hardened();
             let e = envs(&cmd);
             for key in ADO_RAW_CREDENTIAL_ENV {
                 assert_eq!(e.get(*key), Some(&None), "{program}: {key} is removed");
             }
-            assert_eq!(e["GIT_CONFIG_COUNT"].as_deref(), Some("2"), "{program}");
             assert_eq!(
-                e["GIT_CONFIG_KEY_0"].as_deref(),
-                Some("http.followRedirects")
+                e["GIT_CONFIG_PARAMETERS"].as_deref(),
+                Some("'core.fsmonitor=true' 'core.fsmonitor=false'"),
+                "{program}: appended, so it is the entry git reads last"
             );
-            assert_eq!(e["GIT_CONFIG_KEY_1"].as_deref(), Some("core.fsmonitor"));
-            assert_eq!(e["GIT_CONFIG_VALUE_1"].as_deref(), Some("false"));
         }
-        // Anything else keeps the credential: the deliver script mints its header from it.
-        let mut sh = Command::new("sh");
-        sh.env("AZURE_DEVOPS_EXT_PAT", "made-up"); // ggignore: a made-up test value
-        sh.hardened();
-        let e = envs(&sh);
-        assert_eq!(e["AZURE_DEVOPS_EXT_PAT"].as_deref(), Some("made-up"));
-        assert!(!e.contains_key("GIT_CONFIG_COUNT"));
+        // Nothing to append to: the entry alone.
+        let mut bare = Command::new("git");
+        bare.env_remove("GIT_CONFIG_PARAMETERS").hardened();
+        assert_eq!(
+            envs(&bare)["GIT_CONFIG_PARAMETERS"].as_deref(),
+            Some("'core.fsmonitor=false'")
+        );
+        // Anything else keeps the credential (the deliver script mints its header from it), and a
+        // program merely NAMED like git is not git.
+        for program in ["sh", "git.sh", "/usr/bin/gitk", "git-lfs"] {
+            let mut other = Command::new(program);
+            other.env("AZURE_DEVOPS_EXT_PAT", "made-up"); // ggignore: a made-up test value
+            other.hardened();
+            let e = envs(&other);
+            assert_eq!(
+                e["AZURE_DEVOPS_EXT_PAT"].as_deref(),
+                Some("made-up"),
+                "{program}"
+            );
+            assert!(!e.contains_key("GIT_CONFIG_PARAMETERS"), "{program}");
+        }
     }
 
-    /// (wicked-crew#1843) The same, observed by a real git: a host whose global config turns
-    /// fsmonitor on gets it off, and a command git runs sees no Azure DevOps credential.
+    /// (wicked-crew#1843) The same, observed by a real git: fsmonitor reads off over a global
+    /// config that turns it on, over an inherited `-c core.fsmonitor=true`, and over a
+    /// `GIT_CONFIG_COUNT` entry the site sets after hardening (as an authenticated fetch sets its
+    /// header entries); and a command git starts sees no Azure DevOps credential.
     #[cfg(unix)]
     #[test]
     fn a_real_hardened_git_reads_fsmonitor_off_and_passes_no_ado_credential_on() {
-        let dir = std::env::temp_dir().join(format!("wicked-1843-{}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("wicked-1843-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let global = dir.join("gitconfig");
         std::fs::write(&global, "[core]\n\tfsmonitor = true\n").unwrap();
@@ -2044,12 +2055,15 @@ mod tests {
             let mut cmd = Command::new("git");
             cmd.env("GIT_CONFIG_GLOBAL", &global)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'")
                 .env("AZURE_DEVOPS_EXT_PAT", "made-up") // ggignore: a made-up test value
                 .env("CREW_ADO_CLIENT_SECRET", "made-up") // ggignore: a made-up test value
-                .env_remove("GIT_CONFIG_COUNT")
                 .current_dir(&dir)
-                .args(args)
-                .hardened();
+                .hardened()
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+                .env("GIT_CONFIG_VALUE_0", "true")
+                .args(args);
             let out = cmd.output().expect("git runs");
             assert!(
                 out.status.success(),
