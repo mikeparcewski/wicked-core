@@ -6294,7 +6294,22 @@ fn k8s_a_follow_up_chat_turn_keeps_every_unchanged_read_only_root() {
     // Turn 4 keeps all three again.
     let (_, fourth) = chat_turn(&replica, &tree, &roots);
     assert!(fourth.starts_with("kept 3 re-read 0;"), "{fourth}");
-    for p in [host, replica] {
+
+    // Another replica of this daemon (another run's chat on the same roots): its first copy of
+    // the plain roots comes from the read cache, and is stamped all the same, so its next turn
+    // keeps them too.
+    let replica2 = tmp("chat-follow-up-replica-2");
+    let reads = seat::HOST_READS.with(|c| c.get());
+    let (_, other) = chat_turn(&replica2, &tree, &roots);
+    assert!(other.starts_with("kept 0 re-read 3;"), "{other}");
+    assert_eq!(
+        seat::HOST_READS.with(|c| c.get()),
+        reads + 1,
+        "only the repository is read from the host: {other}"
+    );
+    let (_, other_next) = chat_turn(&replica2, &tree, &roots);
+    assert!(other_next.starts_with("kept 3 re-read 0;"), "{other_next}");
+    for p in [host, replica, replica2] {
         let _ = std::fs::remove_dir_all(p);
     }
 }

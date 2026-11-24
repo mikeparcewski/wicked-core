@@ -2248,19 +2248,22 @@ fn copy_in_stream_with(
         }
         // Signed again after the read, once for the read cache and the stamp alike: what was read
         // is the state both name only when the signature did not move under the read.
-        let signs = stamps.sigs.get(&replica);
-        let after = (read_now
-            && (matches!(&cached, Some((_, None))) || (r.stamped() && signs.is_some())))
-        .then(|| root_signature(r))
-        .flatten();
+        // A root a live writer bars is never stamped, so it is not signed again for one.
+        let signs = stamps
+            .sigs
+            .get(&replica)
+            .filter(|_| r.stamped() && !stamps.blocked(&replica));
+        let after = (read_now && (matches!(&cached, Some((_, None))) || signs.is_some()))
+            .then(|| root_signature(r))
+            .flatten();
         if let Some((sig, None)) = &cached {
             if after.as_ref() == Some(sig) {
                 read_cache_put(&r.host, sig, &entries);
             }
         }
         // A cache hit holds exactly the state its signature names, the one the key was made from.
-        if r.stamped() && !stamps.blocked(&replica) {
-            if let (Some(key), Some(before)) = (stamps.keys.get(&replica), signs) {
+        if let Some(before) = signs {
+            if let Some(key) = stamps.keys.get(&replica) {
                 if !read_now || after.as_ref() == Some(before) {
                     signed.insert(replica.clone(), key.clone());
                 }
