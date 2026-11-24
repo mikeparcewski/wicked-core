@@ -428,6 +428,18 @@ export interface RepoCheckRunJson {
    * floor's result of the same tree and base, so \`durationMs\`, the exit and the retries are that floor's.
    * \`phase\` is null when the creator unit's phase is unknown. */
   reusedFrom?: { phase: string | null; ord: number; attempt: number }
+  /** (core#1208) Present only on a hand-off round's creator check that ran just the tests the
+   * round's change reaches: the earlier round's floor of the same unit whose pass stands for the
+   * rest of the check (\`fromTree\`, \`ord\`, \`attempt\`; \`phase\` null when unknown), and the files
+   * changed since it (the first 20 in \`changed\`; \`changedCount\` is whole). */
+  delta?: {
+    fromTree: string
+    phase: string | null
+    ord: number
+    attempt: number
+    changed: string[]
+    changedCount: number
+  }
 }
 
 /** (core#1187) The engine's affected-set selection for one cargo workspace test check. */
