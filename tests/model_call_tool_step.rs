@@ -202,3 +202,38 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// (coord round 2 on garden#1557, W24) `--max-output-tokens` is a value in 1..=128000: anything
+/// else is bad input (exit 1, before any channel is reached); a good value is accepted and the
+/// client goes on to the channel (here: none armed, exit 2).
+#[test]
+fn the_client_reads_its_answer_cap_as_bad_input_or_a_value() {
+    let dir = scratch("cap");
+    let input = dir.join("p.txt");
+    std::fs::write(&input, "p").unwrap();
+    let run = |cap: &str| {
+        std::process::Command::new(BIN)
+            .args(["model-call", "--family", "claude", "--in"])
+            .arg(&input)
+            .arg("--out")
+            .arg(dir.join("o.txt"))
+            .args(["--max-output-tokens", cap])
+            .env_remove("WICKED_MODEL_CALL_SOCK")
+            .env_remove("WICKED_MODEL_CALL_TOKEN")
+            .output()
+            .unwrap()
+    };
+    for bad in ["0", "128001", "-1", "lots"] {
+        let out = run(bad);
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--max-output-tokens"),
+            "{bad}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let ok = run("64000");
+    assert_eq!(ok.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&ok.stderr).contains("WICKED_MODEL_CALL_SOCK is not set"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

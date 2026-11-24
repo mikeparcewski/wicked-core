@@ -13,6 +13,11 @@
 //! runner adds only its posture's instruction. The client is `wicked-core model-call`
 //! ([`call_from_env`]).
 //!
+//! The prompt reaches the seat on stdin (C0a, [`crate::execute_wrapped::with_prompt_on_stdin`]),
+//! byte-exact at any size on both floors. A claude call may cap its answer
+//! ([`Request::max_output_tokens`]): the seat runs with `CLAUDE_CODE_MAX_OUTPUT_TOKENS` set to it
+//! ([`crate::execute_wrapped::with_answer_cap`]), as the J6 v3 proof ran its writer.
+//!
 //! The wire is one JSON line each way: a [`Request`] in, a [`Reply`] out.
 //!
 //! Unix only: elsewhere [`arm`] refuses and the client says so.
@@ -39,6 +44,8 @@ pub const FAMILIES: &[&str] = &["claude", "codex"];
 pub const DEFAULT_TIMEOUT_S: u64 = 1500;
 /// The longest budget a request may ask for.
 pub const MAX_TIMEOUT_S: u64 = 3600;
+/// The largest answer cap a claude call may ask for, in output tokens.
+pub const MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// The most answer text one call keeps.
 const STDOUT_CAP: usize = 4 * 1024 * 1024;
 /// The largest request line the channel reads (the proof's largest prompt was 269 KB).
@@ -61,6 +68,10 @@ pub struct Request {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
+    /// A claude call's answer cap in output tokens (1..=[`MAX_OUTPUT_TOKENS`]); none = the seat's
+    /// own default. A codex call that names one is refused (codex has no such setting here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// The channel's answer: the seat's text, or why there is none.
@@ -126,16 +137,23 @@ impl Seats {
             .timeout_s
             .unwrap_or(DEFAULT_TIMEOUT_S)
             .clamp(1, MAX_TIMEOUT_S);
-        if let Some(why) = carried_prompt_refusal(
-            &cli.key,
-            req.prompt.len(),
-            crate::container_floor::container_mode(),
-        ) {
-            return Reply::refused(why);
+        if let Some(n) = req.max_output_tokens {
+            if cli.key != "claude" {
+                return Reply::refused(format!(
+                    "an answer cap (max_output_tokens) is a claude setting; the `{}` seat takes none",
+                    cli.key
+                ));
+            }
+            if !(1..=MAX_OUTPUT_TOKENS).contains(&n) {
+                return Reply::refused(format!(
+                    "max_output_tokens {n} is not 1..={MAX_OUTPUT_TOKENS}"
+                ));
+            }
         }
         use wicked_council::types::BallotCarrier;
         let carrier = crate::decision::SeatBallots::new(self.runner.clone(), Some(&self.run_id))
-            .model_calls();
+            .model_calls()
+            .answer_cap(req.max_output_tokens);
         let task = format!("model-call-{}-{}", self.run_id, self.ord);
         let out = carrier.run_ballot(
             cli,
@@ -263,22 +281,6 @@ pub(crate) fn tool_free(unit: &mut crate::domain::WorkUnit, family: &str) {
         unit.role = crate::workflow::PhaseRole::Evaluator;
         unit.worktree_guarded = true;
     }
-}
-
-/// Under the container floor a prompt over [`crate::container_floor::PROMPT_ARGV_MAX`] rides a
-/// mounted file the seat is told to read (core#1228). A tool-less claude cannot read it, so such a
-/// call is refused here rather than answered without its prompt. Codex reads the file.
-fn carried_prompt_refusal(family: &str, bytes: usize, container: bool) -> Option<String> {
-    (family == "claude" && container && bytes > crate::container_floor::PROMPT_ARGV_MAX).then(
-        || {
-            format!(
-            "a {bytes}-byte prompt is carried to a seat container in a file, which a tool-free \
-             claude cannot read; under the container floor a claude model call takes at most {} \
-             bytes",
-            crate::container_floor::PROMPT_ARGV_MAX
-        )
-        },
-    )
 }
 
 /// Compare two tokens without stopping at the first difference.
@@ -458,7 +460,12 @@ fn read_request(stream: &std::os::unix::net::UnixStream) -> Result<Request, Stri
 /// The client side (`wicked-core model-call`): send `prompt` to the `family` seat through the
 /// channel the Tool step was armed with, and return the seat's text.
 #[cfg(unix)]
-pub fn call_from_env(family: &str, prompt: &str, timeout_s: Option<u64>) -> Result<String, String> {
+pub fn call_from_env(
+    family: &str,
+    prompt: &str,
+    timeout_s: Option<u64>,
+    max_output_tokens: Option<u32>,
+) -> Result<String, String> {
     let sock = std::env::var(SOCK_ENV)
         .ok()
         .filter(|s| !s.is_empty())
@@ -469,7 +476,7 @@ pub fn call_from_env(family: &str, prompt: &str, timeout_s: Option<u64>) -> Resu
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{TOKEN_ENV} is not set"))?;
-    call_at(&sock, &token, family, prompt, timeout_s)
+    call_at(&sock, &token, family, prompt, timeout_s, max_output_tokens)
 }
 
 #[cfg(not(unix))]
@@ -477,6 +484,7 @@ pub fn call_from_env(
     _family: &str,
     _prompt: &str,
     _timeout_s: Option<u64>,
+    _max_output_tokens: Option<u32>,
 ) -> Result<String, String> {
     Err("model-call needs a unix socket".to_string())
 }
@@ -488,6 +496,7 @@ fn call_at(
     family: &str,
     prompt: &str,
     timeout_s: Option<u64>,
+    max_output_tokens: Option<u32>,
 ) -> Result<String, String> {
     use std::os::unix::net::UnixStream;
     let stream =
@@ -503,6 +512,7 @@ fn call_at(
         family: family.to_string(),
         prompt: prompt.to_string(),
         timeout_s,
+        max_output_tokens,
     };
     let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
     line.push('\n');
@@ -630,8 +640,8 @@ mod tests {
         .unwrap();
         let (sock, token) = sock_and_token(&ch);
         let long = format!("line one\nline \"two\"\n{}", "x".repeat(300 * 1024));
-        let a = call_at(&sock, &token, "claude", "write it", Some(30)).unwrap();
-        let b = call_at(&sock, &token, "codex", &long, Some(30)).unwrap();
+        let a = call_at(&sock, &token, "claude", "write it", Some(30), None).unwrap();
+        let b = call_at(&sock, &token, "codex", &long, Some(30), None).unwrap();
         assert_eq!(a, "claude: write it");
         assert_eq!(b, format!("codex: {long}"));
         let seen = echo.seen.lock().unwrap();
@@ -665,17 +675,6 @@ mod tests {
         let tools = argv.iter().position(|a| a == "--tools").unwrap();
         assert!(tools < guard && argv[tools + 1].is_empty(), "{argv:?}");
         assert_eq!(argv.iter().filter(|a| *a == "--tools").count(), 1);
-    }
-
-    /// Under the container floor a claude prompt too long for one argument would ride a file a
-    /// tool-less claude cannot read: refused. Codex, and every prompt on the host floor, pass.
-    #[test]
-    fn a_container_claude_prompt_that_would_ride_a_file_is_refused() {
-        let max = crate::container_floor::PROMPT_ARGV_MAX;
-        assert!(carried_prompt_refusal("claude", max + 1, true).is_some());
-        assert!(carried_prompt_refusal("claude", max, true).is_none());
-        assert!(carried_prompt_refusal("claude", max + 1, false).is_none());
-        assert!(carried_prompt_refusal("codex", max + 1, true).is_none());
     }
 
     fn unit(step: &str, cmd: &[String]) -> crate::domain::WorkUnit {
@@ -782,6 +781,7 @@ mod tests {
             family: "claude".into(),
             prompt: "late".into(),
             timeout_s: None,
+            max_output_tokens: None,
         };
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
@@ -805,13 +805,13 @@ mod tests {
         });
         let ch = arm(echo.clone(), vec![benched], "run-1", 2).unwrap();
         let (sock, token) = sock_and_token(&ch);
-        let bad_token = call_at(&sock, "nope", "codex", "p", None).unwrap_err();
+        let bad_token = call_at(&sock, "nope", "codex", "p", None, None).unwrap_err();
         assert!(bad_token.contains("token"), "{bad_token}");
-        let unknown = call_at(&sock, &token, "pi", "p", None).unwrap_err();
+        let unknown = call_at(&sock, &token, "pi", "p", None, None).unwrap_err();
         assert!(unknown.contains("not one of"), "{unknown}");
-        let missing = call_at(&sock, &token, "claude", "p", None).unwrap_err();
+        let missing = call_at(&sock, &token, "claude", "p", None, None).unwrap_err();
         assert!(missing.contains("no `claude` seat"), "{missing}");
-        let off = call_at(&sock, &token, "codex", "p", None).unwrap_err();
+        let off = call_at(&sock, &token, "codex", "p", None, None).unwrap_err();
         assert!(off.contains("signed out"), "{off}");
         assert!(echo.seen.lock().unwrap().is_empty());
     }
@@ -825,7 +825,7 @@ mod tests {
         });
         let ch = arm(echo, vec![seat("claude")], "run-1", 2).unwrap();
         let (sock, token) = sock_and_token(&ch);
-        let err = call_at(&sock, &token, "claude", "p", None).unwrap_err();
+        let err = call_at(&sock, &token, "claude", "p", None, None).unwrap_err();
         assert!(err.contains("the `claude` seat failed"), "{err}");
     }
 
@@ -843,7 +843,7 @@ mod tests {
         );
         drop(ch);
         assert!(!dir.exists());
-        assert!(call_at(&sock, &token, "claude", "p", None).is_err());
+        assert!(call_at(&sock, &token, "claude", "p", None, None).is_err());
     }
 
     /// The client outside a Tool step says so instead of hanging or guessing.

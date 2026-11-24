@@ -149,12 +149,14 @@ const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --p
 const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     (
         "model-call",
-        "wicked-core model-call --family claude|codex --in <prompt file> --out <answer file> [--timeout-s <N>]\n  \
+        "wicked-core model-call --family claude|codex --in <prompt file> --out <answer file> [--timeout-s <N>] [--max-output-tokens <N>]\n  \
          One model call from inside a Tool step of a run: the prompt goes, byte-exact, to the \
          daemon's own `claude` or `codex` seat (the seat container under the container floor) \
          through the channel the step was armed with ($WICKED_MODEL_CALL_SOCK), and the seat's \
          text is written to --out. Exit 0 = answered, 2 = refused or the seat failed (the reason \
-         on stderr), 1 = bad arguments or files. Budget: --timeout-s, default 1500, at most 3600.",
+         on stderr), 1 = bad arguments or files. Budget: --timeout-s, default 1500, at most 3600. \
+         --max-output-tokens caps a claude call's answer (1..128000; the seat's \
+         CLAUDE_CODE_MAX_OUTPUT_TOKENS); a codex call that names it is refused.",
     ),
     (
         "domain-graph",
@@ -1472,7 +1474,7 @@ fn min_coverage_pct_arg(
 /// step's channel. Opens no store and spawns no actor: the daemon that armed the step runs the seat.
 fn model_call_cmd(args: &[String]) {
     // A flag named with no value after it is bad input, never the default (codex r1 on #1894).
-    for name in ["--family", "--in", "--out", "--timeout-s"] {
+    for name in ["--family", "--in", "--out", "--timeout-s", "--max-output-tokens"] {
         if let Some(i) = args.iter().position(|a| a == name) {
             if args.get(i + 1).is_none_or(|v| v.starts_with("--")) {
                 return fail(&format!("model-call: {name} needs a value"));
@@ -1503,11 +1505,25 @@ fn model_call_cmd(args: &[String]) {
             }
         },
     };
+    // A claude call's answer cap (the seat's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`); the channel refuses
+    // it on a codex call.
+    let max_output_tokens = match flag(args, "--max-output-tokens") {
+        None => None,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if (1..=wicked_core::model_call::MAX_OUTPUT_TOKENS).contains(&n) => Some(n),
+            _ => {
+                return fail(&format!(
+                    "model-call: --max-output-tokens {v:?} is not 1..={}",
+                    wicked_core::model_call::MAX_OUTPUT_TOKENS
+                ))
+            }
+        },
+    };
     let prompt = match std::fs::read_to_string(&input) {
         Ok(p) => p,
         Err(e) => return fail(&format!("model-call: cannot read {input}: {e}")),
     };
-    match wicked_core::model_call::call_from_env(&family, &prompt, timeout_s) {
+    match wicked_core::model_call::call_from_env(&family, &prompt, timeout_s, max_output_tokens) {
         Ok(text) => {
             if let Err(e) = std::fs::write(&output, text) {
                 fail(&format!("model-call: cannot write {output}: {e}"));
