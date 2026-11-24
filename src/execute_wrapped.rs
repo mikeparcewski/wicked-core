@@ -4181,10 +4181,11 @@ impl WrappedCliStepRunner {
             let mut seat_files: Vec<(PathBuf, String)> = Vec::new();
             let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
-            let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             // (core#1848) The seat image pin the pod runs, held until the unit's pod is reaped so no
-            // other launch's pin cleanup removes it under this unit.
+            // other launch's pin cleanup removes it under this unit. Declared BEFORE `seat_cleanup`:
+            // on an early return or unwind, locals drop in reverse order, so the pod is reaped first.
             let mut seat_pin: Option<crate::container_floor::SeatPin> = None;
+            let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A long prompt's file (core#1228): kept until the seat has run.
             let mut prompt_guard: Option<crate::container_floor::CarriedPrompt> = None;
