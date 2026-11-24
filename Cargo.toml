@@ -137,3 +137,16 @@ wicked-council = { path = "crates/wicked-council" }
 # override is set before any test thread can emit — a per-test arming call can never guarantee
 # that (a parallel unarmed test could spool first). Enforced by `tests/harness_hygiene.rs`.
 ctor = "1.0.13"
+
+# DOWNSTREAM PROOF ONLY (do not merge): estate store fixes #571 + #573 + #588 at one rev.
+[patch.crates-io]
+wicked-estate-core = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-knowledge = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-memory = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-memory-api = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-memory-core = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-observe = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-overlay = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-rank = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-retrieve = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
+wicked-estate-store = { git = "https://github.com/mikeparcewski/wicked-estate", rev = "46fbb521652ff5008819c0118d59cead77b2e9bf" }
