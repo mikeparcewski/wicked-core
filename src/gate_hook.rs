@@ -16599,6 +16599,56 @@ mod boundary_tests {
         }
     }
 
+    /// core#1852: a redirect target ends at an unquoted control operator glued to it. In a command
+    /// holding `${…}` or a backtick the lexer keeps a glued `|`/`&` inside the word (core#1465), and
+    /// J6's `… 2>/dev/null|head` was refused as a write to `/dev/null|head`. The shell writes only
+    /// `/dev/null` there; `>/tmp/x|head` is still judged as `/tmp/x`, and an escaped or quoted `|`
+    /// stays part of the file's name.
+    #[test]
+    fn a_redirect_target_ends_at_a_glued_control_operator_1852() {
+        use ShellTarget::Path as P;
+        for cmd in [
+            "ls 2>/dev/null|head -5",
+            "ls 2>/dev/null||true",
+            "ls 2>/dev/null&&echo ok",
+            "ls 2>/dev/null;echo ok",
+            "for f in ${D}/*; do wc -l \"$f\"; done 2>/dev/null|head -5",
+            "ls `pwd` 2>/dev/null|head -5",
+            "ls ${D} 2> /dev/null|head -5",
+            "ls ${D} 2>/dev/null||true",
+            "ls ${D} 2>/dev/null&&echo ok",
+            "ls ${D} >/dev/null 2>&1&",
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
+            assert!(bash_write_targets(cmd).is_empty(), "{cmd:?}");
+        }
+        for (cmd, target) in [
+            ("echo x >/tmp/x|head", "/tmp/x"),
+            ("echo ${X} >/tmp/x|head", "/tmp/x"),
+            ("echo ${X} > /tmp/x&&true", "/tmp/x"),
+            ("echo `id` >>/tmp/x&", "/tmp/x"),
+            ("echo x >/tmp/a\\|b", "/tmp/a|b"),
+            ("echo ${X} >/tmp/a\\|b", "/tmp/a|b"),
+            ("echo ${X} >\"/tmp/a|b\"", "/tmp/a|b"),
+            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b"),
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(
+                !targets.is_empty() && targets.iter().all(|t| *t == P(target.into())),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        // A separator inside an expansion is no operator: the word stays whole (and unresolved).
+        let targets = resolved_bash_write_targets("echo x >${X:-/tmp/a|b}", None);
+        assert!(
+            targets
+                .iter()
+                .all(|t| matches!(t, ShellTarget::Unresolved(w) if w.contains("|b"))),
+            "{targets:?}"
+        );
+    }
+
     /// core#1465: the Bash write scan reads a command after a bare line break or a glued control
     /// operator as its own command, while a heredoc body stays the program's data and the
     /// redirect spellings `>&`, `&>`, `>|` stay whole.
