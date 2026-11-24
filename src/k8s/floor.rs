@@ -100,9 +100,9 @@ impl Place {
         self.run_coded(pod, argv, limit).map_err(|(_, e)| e)
     }
 
-    /// [`Place::run`], its failure with kubectl's own exit code: the command's, or `None` when the
-    /// call was cut at `limit` or ended by a signal (core#1887: only a completed exit is the
-    /// command's own answer).
+    /// [`Place::run`], its failure with kubectl's own exit code: `None` when the call was cut at
+    /// `limit`, `Some(-1)` when kubectl was ended by a signal (core#1887: only kubectl's own exit
+    /// can carry the command's answer).
     pub(crate) fn run_coded(
         &self,
         pod: &str,

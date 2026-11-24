@@ -1858,9 +1858,11 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     );
     let canary = format!("{FILL_DIR}/{JAIL_PROBE}");
     let prove = format!(
-        "printf x > {canary} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
+        "printf x > {canary} || {{ if [ -w {FILL_DIR} ]; then \
+         echo 'wicked-core: the jail proof canary could not be written; nothing is built' >&2; \
+         exit 1; fi; echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
          exit {NATIVE_REFUSED}; }}; jail=0; /floor/landrun {policy} -- /bin/sh -c {} || jail=$?; \
-         if [ \"$jail\" = 5 ]; then",
+         if [ \"$jail\" = 0 ]; then seen=$(cat {canary}) ||",
         sh_quote(&format!(
             "touch /tmp/wicked-native/.jail-granted && python3 -I -c {} {canary}",
             sh_quote(JAIL_PROOF)
@@ -1911,11 +1913,12 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     crate::test_env::install_stub(&npm, "#!/bin/sh\nexit 0\n");
     std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
     // With JAIL_ABI2 set, the jail proof answers as on a Landlock ABI v1/v2 kernel (core#1886):
-    // the open refused, the truncate allowed. With JAIL_CRASH set, it does not run to an answer.
+    // the open refused, the truncate allowed. With JAIL_CRASH set, it does not run to an answer;
+    // with JAIL_UNSURE set, it met an error that is not a denial.
     crate::test_env::install_stub(
         &bin.join("python3"),
         "#!/bin/sh\n[ -z \"$JAIL_ABI2\" ] || exit 5\n[ -z \"$JAIL_CRASH\" ] || exit 9\n\
-         PATH=/usr/bin:/bin exec python3 \"$@\"\n",
+         [ -z \"$JAIL_UNSURE\" ] || exit 6\nPATH=/usr/bin:/bin exec python3 \"$@\"\n",
     );
     crate::test_env::install_stub(
         &bin.join("node"),
@@ -1925,7 +1928,7 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     // its command runs (each addon's build/ stays writable). With JAIL_OPEN set it confines
     // nothing, as a kernel without Landlock under `--best-effort` would; with CANARY_OPEN only the
     // top is closed (new files refused, an existing one still truncatable), as an ABI that does
-    // not cover truncation would leave it.
+    // not cover truncation would leave it. With CANARY_LOCKED the canary is left unreadable.
     let landrun = root.join("landrun");
     crate::test_env::install_stub(
         &landrun,
@@ -1933,18 +1936,19 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
          if [ -n \"$JAIL_OPEN\" ]; then exec \"$@\"; fi\n\
          c=\"$CLAIM/.wicked-jail-probe\"; [ -n \"$CANARY_OPEN\" ] || ! [ -e \"$c\" ] || chmod a-w \"$c\"\n\
          chmod a-w \"$CLAIM\"; \"$@\"; rc=$?; chmod u+w \"$CLAIM\"\n\
-         ! [ -e \"$c\" ] || chmod u+w \"$c\"; exit $rc\n",
+         if [ -n \"$CANARY_LOCKED\" ] && [ -e \"$c\" ]; then chmod 000 \"$c\"; \
+         else ! [ -e \"$c\" ] || chmod u+w \"$c\"; fi; exit $rc\n",
     );
     let local = script
         .replace(FILL_DIR, &claim.display().to_string())
         .replace("/tmp/wicked-native", &root.join("t").display().to_string())
         .replace("/floor/landrun", &landrun.display().to_string());
-    let run_code = |env: &[(&str, &str)]| {
+    let run_script = |local: &str, env: &[(&str, &str)]| {
         // spawn-audit: test-only — runs the engine's build script against a stand-in claim, with
         // the environment cleared and only the stand-ins' variables set.
         let mut c = std::process::Command::new("sh");
         c.hardened()
-            .args(["-c", &local])
+            .args(["-c", local])
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("CLAIM", &claim);
@@ -1961,6 +1965,7 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
             ),
         )
     };
+    let run_code = |env: &[(&str, &str)]| run_script(&local, env);
     let run = |env: &[(&str, &str)]| {
         let (code, out) = run_code(env);
         (code == Some(0), out)
@@ -2004,11 +2009,34 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     // A failed build is no refusal: a later unit may build again.
     let (code, _) = run_code(&[("GYP_FAILS", "1")]);
     assert_eq!(code, Some(1));
-    // So is a proof that did not run to an answer (review r1): nothing is built, and a later unit
-    // may try again.
+    // So is a proof that gave no answer (review r1, r2): it did not run, it met an error that is
+    // not a denial, or its canary cannot be read back. Nothing is built, and a later unit may try
+    // again.
     let (code, out) = run_code(&[("JAIL_CRASH", "1")]);
     assert!(
-        code == Some(1) && out.contains("the jail proof did not run (exit 9)"),
+        code == Some(1) && out.contains("the jail proof gave no answer (exit 9)"),
+        "{code:?} {out}"
+    );
+    let (code, out) = run_code(&[("JAIL_UNSURE", "1")]);
+    assert!(
+        code == Some(1) && out.contains("the jail proof gave no answer (exit 6)"),
+        "{code:?} {out}"
+    );
+    let (code, out) = run_code(&[("CANARY_LOCKED", "1")]);
+    assert!(
+        code == Some(1) && out.contains("the jail proof canary could not be read back"),
+        "{code:?} {out}"
+    );
+    assert!(!claim.join(JAIL_PROBE).exists(), "the canary is left");
+    // And a canary write that failed on a claim the engine may write (here its folder is gone;
+    // a full claim fails the same way): space freed later lets a later unit build (review r2).
+    let probe = format!("{}/{JAIL_PROBE}", claim.display());
+    let (code, out) = run_script(
+        &local.replace(&probe, &format!("{}/gone/{JAIL_PROBE}", claim.display())),
+        &[],
+    );
+    assert!(
+        code == Some(1) && out.contains("the jail proof canary could not be written"),
         "{code:?} {out}"
     );
     assert!(!claim.join(NATIVE_BUILT).exists());
@@ -2075,8 +2103,10 @@ fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
     // code (core#1886), so the script says the kernel's Landlock is too old, not absent.
     assert_eq!(proof(eacces, "0"), (5, 0));
     assert_eq!(proof("0", eacces).0, 4, "a writable canary");
-    assert_eq!(proof(enospc, eacces).0, 4, "a full claim is no denial");
-    assert_eq!(proof(eacces, enospc).0, 4);
+    // Another error is no denial and no answer either (review r2): a later unit may ask again.
+    assert_eq!(proof(enospc, eacces).0, 6, "a full claim is no denial");
+    assert_eq!(proof(eacces, enospc).0, 6);
+    assert_eq!(proof("errno.EIO", eacces).0, 6);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2190,6 +2220,8 @@ elif args[0] == 'exec':
     with (base / 'builds').open('a') as f: f.write('build\n')
     for k, v in json.loads((base / 'paths.json').read_text()).items():
         script = script.replace(k, v)
+    if (base / 'canary-fails').exists():
+        script = script.replace('/.wicked-jail-probe', '/gone/.wicked-jail-probe')
     p = subprocess.run(['/bin/sh', '-c', script], capture_output=True,
         env={'PATH': str(base / 'bin') + ':/usr/bin:/bin'})
     sys.stdout.buffer.write(p.stdout)
@@ -2280,12 +2312,25 @@ else:
         );
         std::fs::remove_file(dir.join("refuse-apply")).unwrap();
 
+        // A canary write that failed on a claim the engine may write (a full claim, say) is
+        // transient too (review r2): space freed elsewhere lets the next unit build.
+        std::fs::write(dir.join("canary-fails"), "").unwrap();
+        let full = filler
+            .build_native(&volume, &["better-sqlite3"])
+            .expect_err("a canary that cannot be written builds nothing");
+        assert_eq!(
+            full,
+            "the jail proof canary could not be written; nothing is built"
+        );
+        assert_eq!(lines(&builds), 1);
+        std::fs::remove_file(dir.join("canary-fails")).unwrap();
+
         // core#1886: the note is the script's own reason, never kubectl's exit line; and on a
         // kernel whose Landlock cannot deny truncation it says so (not "not in force").
         let refused = filler
             .build_native(&volume, &["better-sqlite3"])
             .expect_err("the jail proof fails on this kernel");
-        assert_eq!(lines(&builds), 1, "the retry reached the build");
+        assert_eq!(lines(&builds), 2, "the retry reached the build");
         assert!(
             refused.contains("Landlock on this kernel is too old to confine truncation")
                 && refused.contains("ABI v3, Linux 6.2 or newer"),
@@ -2308,12 +2353,35 @@ else:
         let again = filler.build_native(&volume, &["better-sqlite3"]);
         assert_eq!(again.as_ref().err(), Some(&refused), "{again:?}");
         assert_eq!(lines(&calls), before, "no build pod, no kubectl call");
-        assert_eq!(lines(&builds), 1);
+        assert_eq!(lines(&builds), 2);
 
         forget_namespace(&place.ns);
         drop(runtime);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// core#1887 (review r2): a build that began before its namespace was deleted publishes no
+/// refusal: a namespace of the same name later is new storage, which that build never saw.
+#[test]
+fn a_refusal_from_before_its_namespace_was_deleted_is_not_kept() {
+    let ns = format!("nr-{}", uuid::Uuid::new_v4());
+    let key = format!("{ns}/claim/run");
+    let began = native_generation(&ns);
+    forget_namespace(&ns);
+    remember_native_refusal(&key, "Landlock is not in force", began);
+    assert_eq!(native_refusal(&key), None);
+    // A build that began after the deletion is kept; so is one that began before another
+    // namespace was deleted.
+    let began = native_generation(&ns);
+    forget_namespace(&format!("{ns}-other"));
+    remember_native_refusal(&key, "Landlock is not in force", began);
+    assert_eq!(
+        native_refusal(&key).as_deref(),
+        Some("Landlock is not in force")
+    );
+    forget_namespace(&ns);
+    assert_eq!(native_refusal(&key), None);
 }
 
 /// core#1406: the native addons a seat's claim is built for come from the snapshot tree's own

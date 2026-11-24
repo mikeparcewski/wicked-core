@@ -28,9 +28,9 @@ RUN apt-get update \
 # Chromium work there from /etc/chromium.d (headless, no Chromium sandbox, shared memory in /tmp).
 # Best effort only where the base's archive has no candidate for them (core#1888): an operator
 # base whose archive lacks them still builds, and its seats then have no browser. Any other failure
-# (a mirror error, a partial download, an apt-cache that cannot answer) is retried once and then
-# fails the build, because the image is tagged by this file, the pin and the base: a browserless
-# image would be reused until one of them changes. An index fetch that failed is a failed update,
+# fails the build: a mirror error or a partial download after one retry, an apt-cache that cannot
+# answer at once. The image is tagged by this file, the pin and the base, so a browserless image
+# would be reused until one of them changes. An index fetch that failed is a failed update,
 # never a missing candidate: apt 2.1.16 and later exit non-zero for it (APT::Update::Error-Mode=any;
 # an older apt ignores the setting), and an older apt's warning for it fails the update too.
 RUN set -e; \

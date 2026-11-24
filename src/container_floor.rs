@@ -4664,8 +4664,8 @@ esac
     }
 
     /// core#1888: the browser layer is best effort only where the base's archive has no candidate
-    /// for its packages. Any other failure (an index fetch, a partial download, an apt-cache that
-    /// cannot answer) is retried once and then fails the build, so a passing mirror error never
+    /// for its packages. Any other failure fails the build (an index fetch or a partial download
+    /// after one retry, an apt-cache that cannot answer at once), so a passing mirror error never
     /// bakes a browserless image that is reused until this file changes. The layer's own shell runs
     /// here, with `apt-get`, `apt-cache` and `sleep` stand-ins and its system paths re-pointed into
     /// a scratch dir.

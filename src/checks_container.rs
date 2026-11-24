@@ -1467,10 +1467,7 @@ pub(crate) fn admit_dependency_claim(
                     .unwrap_or_else(|p| p.into_inner())
                     .retain(|k| k != &key && !k.starts_with(&under));
                 // And a refusal of its build (core#1887): a claim made again is new storage.
-                NATIVE_REFUSALS
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .retain(|(k, _)| !k.starts_with(&under));
+                forget_native_refusals(ns, &under);
                 if let Some(used) = DEPENDENCY_USED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2919,6 +2916,9 @@ impl Filler<'_> {
         if let Some(note) = native_refusal(&refusal_key) {
             return Err(note);
         }
+        // Taken before any storage is touched: a namespace deleted while this build runs is new
+        // storage, which this build's refusal does not describe.
+        let generation = native_generation(&self.place.ns);
         let name = format!("build-{volume}");
         // An earlier build of this claim that outlived its client may still write it: confirmed
         // gone first, or no build now (the seat then starts without the binding).
@@ -2953,7 +2953,7 @@ impl Filler<'_> {
             .map_err(|(code, e)| {
                 let note = native_build_note(&e);
                 if native_build_refused(code, &e) {
-                    remember_native_refusal(&refusal_key, &note);
+                    remember_native_refusal(&refusal_key, &note, generation);
                 }
                 note
             })?;
@@ -3310,28 +3310,27 @@ const JAIL_PROBE: &str = ".wicked-jail-probe";
 
 /// (core#1406) The confined half of a native build's jail proof (`python3 -I -c`, the canary as
 /// its argument): a write-open and a `truncate(2)` of the canary must each fail with `EACCES`,
-/// Landlock's denial (any other error, such as a full or read-only claim, proves nothing). The
-/// open refused and the truncate done is Landlock below ABI v3 (core#1886): exit 5, said apart.
+/// Landlock's denial. An open that succeeds is no Landlock (exit 4); the open refused and the
+/// truncate done is Landlock below ABI v3 (core#1886, exit 5). Any other error (a full claim, an
+/// I/O error) proves neither: exit 6, an answer a later unit may ask for again.
 const JAIL_PROOF: &str = "import errno, os, sys
-def denied(f):
+def attempt(f):
     try:
         f()
     except OSError as e:
-        return e.errno == errno.EACCES
-    return False
-def truncated(p):
-    try:
-        os.truncate(p, 0)
-    except OSError as e:
-        return 0 if e.errno == errno.EACCES else 4
-    return 5
+        return \"denied\" if e.errno == errno.EACCES else \"unsure\"
+    return \"done\"
 p = sys.argv[1]
-sys.exit(truncated(p) if denied(lambda: open(p, \"a\").close()) else 4)";
+opened = attempt(lambda: open(p, \"a\").close())
+if opened != \"denied\":
+    sys.exit(4 if opened == \"done\" else 6)
+sys.exit({\"denied\": 0, \"done\": 5, \"unsure\": 6}[attempt(lambda: os.truncate(p, 0))])";
 
 /// (core#1887) The exit code of a native build script's refusals that no retry within the run
 /// changes: the claim is not writable, or the jail proof ran and showed no confinement (no
-/// Landlock, or one too old to confine truncation). A proof that did not run (its launcher or
-/// interpreter failed) and a build that failed exit 1.
+/// Landlock, or one too old to confine truncation). A canary write that failed on a writable
+/// claim, a proof that gave no answer (its launcher or interpreter failed, or an error that is
+/// not a denial), a canary that cannot be read back, and a build that failed exit 1.
 const NATIVE_REFUSED: i32 = 87;
 
 /// (core#1886) The note for a native build that failed, from the build pod's `kubectl exec`
@@ -3429,17 +3428,22 @@ pub(crate) fn native_build_script(native: &[&str]) -> String {
          {clean}rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
          ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
          trap 'rm -f {probe}' EXIT; rm -f {probe}; \
-         printf x > {probe} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
+         printf x > {probe} || {{ if [ -w {FILL_DIR} ]; then \
+         echo 'wicked-core: the jail proof canary could not be written; nothing is built' >&2; \
+         exit 1; fi; echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
          exit {NATIVE_REFUSED}; }}; \
          jail=0; {policy} -- /bin/sh -c {prove} || jail=$?; \
+         if [ \"$jail\" = 0 ]; then seen=$(cat {probe}) || {{ echo 'wicked-core: the jail proof \
+         canary could not be read back; nothing is built' >&2; exit 1; }}; \
+         [ \"$seen\" = x ] || jail=4; fi; \
          if [ \"$jail\" = 5 ]; then echo 'wicked-core: Landlock on this kernel is too old to confine \
          truncation (it needs ABI v3, Linux 6.2 or newer); nothing is built' >&2; \
          exit {NATIVE_REFUSED}; fi; \
-         if [ \"$jail\" = 4 ] || {{ [ \"$jail\" = 0 ] && [ \"$(cat {probe})\" != x ]; }}; then \
+         if [ \"$jail\" = 4 ]; then \
          echo 'wicked-core: Landlock is not in force in the build pod; nothing is built' >&2; \
          exit {NATIVE_REFUSED}; fi; \
          if [ \"$jail\" != 0 ]; then \
-         echo \"wicked-core: the jail proof did not run (exit $jail); nothing is built\" >&2; \
+         echo \"wicked-core: the jail proof gave no answer (exit $jail); nothing is built\" >&2; \
          exit 1; fi; rm -f {probe}; trap - EXIT; \
          if {policy} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
          else {clean}exit 1; fi",
@@ -3502,24 +3506,52 @@ static FILLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// (core#1887) The seat claims whose native build this process saw refused for a reason no retry
 /// within the run changes (`<ns>/<claim>/<run>`), with the note it gave: a later unit of the run
-/// gets the plain claim with that note, and starts no build pod.
-static NATIVE_REFUSALS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// gets the plain claim with that note, and starts no build pod. `cleared` counts, per namespace,
+/// how often its refusals were forgotten (its storage deleted): a build that began before that
+/// publishes nothing.
+struct NativeRefusals {
+    notes: Vec<(String, String)>,
+    cleared: std::collections::BTreeMap<String, u64>,
+}
+
+static NATIVE_REFUSALS: Mutex<NativeRefusals> = Mutex::new(NativeRefusals {
+    notes: Vec::new(),
+    cleared: std::collections::BTreeMap::new(),
+});
+
+fn native_refusals() -> std::sync::MutexGuard<'static, NativeRefusals> {
+    NATIVE_REFUSALS.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 fn native_refusal(key: &str) -> Option<String> {
-    NATIVE_REFUSALS
-        .lock()
-        .ok()?
+    native_refusals()
+        .notes
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, note)| note.clone())
 }
 
-fn remember_native_refusal(key: &str, note: &str) {
-    if let Ok(mut r) = NATIVE_REFUSALS.lock() {
-        if !r.iter().any(|(k, _)| k == key) {
-            r.push((key.to_string(), note.to_string()));
-        }
+/// How often namespace `ns`'s refusals were forgotten so far.
+fn native_generation(ns: &str) -> u64 {
+    native_refusals().cleared.get(ns).copied().unwrap_or(0)
+}
+
+/// Remember `key`'s refusal, unless its namespace's refusals were forgotten since `generation`.
+fn remember_native_refusal(key: &str, note: &str, generation: u64) {
+    let ns = key.split('/').next().unwrap_or(key);
+    let mut r = native_refusals();
+    if r.cleared.get(ns).copied().unwrap_or(0) == generation
+        && !r.notes.iter().any(|(k, _)| k == key)
+    {
+        r.notes.push((key.to_string(), note.to_string()));
     }
+}
+
+/// Forget the refusals of namespace `ns` whose keys start with `prefix`.
+fn forget_native_refusals(ns: &str, prefix: &str) {
+    let mut r = native_refusals();
+    r.notes.retain(|(k, _)| !k.starts_with(prefix));
+    *r.cleared.entry(ns.to_string()).or_default() += 1;
 }
 
 fn filled(key: &str) -> bool {
@@ -3551,10 +3583,7 @@ pub(crate) fn forget_namespace(ns: &str) {
         let pre = format!("{ns}/");
         f.retain(|k| !k.starts_with(&pre));
     }
-    if let Ok(mut r) = NATIVE_REFUSALS.lock() {
-        let pre = format!("{ns}/");
-        r.retain(|(k, _)| !k.starts_with(&pre));
-    }
+    forget_native_refusals(ns, &format!("{ns}/"));
 }
 
 #[cfg(test)]

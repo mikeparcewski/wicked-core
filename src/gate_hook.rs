@@ -3708,6 +3708,7 @@ fn collect_bash_write_targets(
                 word,
                 argv_expansion,
                 argv_tail,
+                assignments,
             } => {
                 // INDEPENDENT REVIEW item 3b: the raw token scan that was here produced FATAL
                 // false denials for read commands (`sh -c 'cat /etc/hosts'` → `/etc/hosts` as
@@ -3725,6 +3726,14 @@ fn collect_bash_write_targets(
                     // a redirect (`R='> /outside/f'; sh -c "echo x $R"`). So the `-c` word itself
                     // is unresolved whenever it carries one ([`OPAQUE_EXPANSION`]), whether or not
                     // the rest of the inner command writes.
+                    // (core#1882) A pager setting before the wrapper is in the environment of a git
+                    // the inner command runs, which its rescan judges without it.
+                    if let Some(a) = assignments
+                        .iter()
+                        .find(|a| pager_assignment_runs(a) == Some(true))
+                    {
+                        targets.push(format!("$({a} {word})"));
+                    }
                     match lex_shell_word(&word, home, true, !cfg!(windows)) {
                         Some((mut exact, opaque)) => {
                             exact.push_str(&argv_tail);
@@ -4513,6 +4522,20 @@ fn git_pager_harmless(value: &str) -> bool {
     matches!(value, "" | "cat")
 }
 
+/// (core#1882) Whether an assignment word sets the pager git runs (`GIT_PAGER`, `PAGER`) to one
+/// that is not harmless, or a command git's default pager (`less`) runs (`LESSOPEN`,
+/// `LESSCLOSE`); `None` when it sets neither. Bash's `NAME+=value` appends to a value this text
+/// cannot see, so it is never harmless.
+fn pager_assignment_runs(assignment: &str) -> Option<bool> {
+    let (name, value) = assignment.split_once('=')?;
+    let (name, appends) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+    match name {
+        "GIT_PAGER" | "PAGER" => Some(appends || !git_pager_harmless(strip_one_quote_layer(value))),
+        "LESSOPEN" | "LESSCLOSE" => Some(true),
+        _ => None,
+    }
+}
+
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder
 /// (`user.*` is inert; `core.hooksPath` is the remote-write fence's), on top of the inert ones.
 /// Any other key may carry a command git runs (`core.fsmonitor`, `core.sshCommand`,
@@ -4596,11 +4619,8 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
                 writes = true;
                 traces.extend(strip_shell_prefix(a, &format!("{name}=")));
             }
-        } else if name == "GIT_PAGER" || name == "PAGER" {
-            runs |= !git_pager_harmless(strip_one_quote_layer(value));
-        } else if name == "LESSOPEN" || name == "LESSCLOSE" {
-            // (core#1882) Commands git's default pager (`less`) runs.
-            runs = true;
+        } else if let Some(pager) = pager_assignment_runs(a) {
+            runs |= pager;
         } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
             runs = true;
         }
@@ -5867,6 +5887,9 @@ enum Unwrapped<'a> {
         // while preserving main's one-shell-level behavior for non-read callers.
         argv_expansion: bool,
         argv_tail: String,
+        /// The `NAME=value` words before the wrapper and `env`'s own: the environment of what
+        /// the inner command runs, which its rescan does not see (core#1882).
+        assignments: Vec<&'a str>,
     },
 }
 
@@ -5984,6 +6007,7 @@ fn unwrap_program_with_reads<'a>(
                         word: words[j..].join(" "),
                         argv_expansion: false,
                         argv_tail: String::new(),
+                        assignments,
                     }
                 } else {
                     Unwrapped::Program {
@@ -6064,6 +6088,7 @@ fn unwrap_program_with_reads<'a>(
                             word: word.to_string(),
                             argv_expansion: true,
                             argv_tail: tail,
+                            assignments,
                         };
                     }
                     if takes_value {
@@ -6123,6 +6148,7 @@ fn unwrap_program_with_reads<'a>(
                                     word: word.to_string(),
                                     argv_expansion: false,
                                     argv_tail: String::new(),
+                                    assignments,
                                 };
                             }
                         }
@@ -6168,6 +6194,7 @@ fn unwrap_program_with_reads<'a>(
                                 word: word.to_string(),
                                 argv_expansion: false,
                                 argv_tail: String::new(),
+                                assignments,
                             },
                             None => Unwrapped::Program {
                                 idx,
@@ -10929,6 +10956,15 @@ mod tests {
             ("i1882", Advisory, format!("GIT_PAGER=' cat ' git -C {r} log -1")),
             ("i1882", Advisory, format!("git -c 'core.pager= cat' -C {r} log -1")),
             ("i1882", Read, format!("PAGER=cat git -C {r} log -1")),
+            // (review r2) An append extends a value the text cannot see; and a wrapper's inner
+            // command runs with the assignments before it.
+            ("i1882", Advisory, format!("PAGER+=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("PAGER+=cat git -C {r} log -1")),
+            ("i1882", Advisory, format!("LESSOPEN+='|- touch {o}/victim' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("PAGER=less env -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("env PAGER=less -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' env -S 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("GIT_PAGER=less sh -c 'git -C {r} -p log -1'")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (
