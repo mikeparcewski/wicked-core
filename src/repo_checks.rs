@@ -1258,9 +1258,26 @@ pub const INVENTORY_CAP: usize = 20_000;
 /// floor pod's copy in a container floor) and returns its stdout.
 pub(crate) type GitAt<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u8>, String>;
 
+/// (core#1870) The caches tools write into the project on every run: pytest's (its cacheprovider
+/// is on by default), ruff's, mypy's and eslint's `--cache` file. Each only remembers or speeds up
+/// the tool's next run in that folder, which a later floor's fresh checkout does not have and does
+/// not need, so a check that left only these is still reused. Matched as a whole path component.
+const TOOL_CACHES: [&str; 4] = [
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".eslintcache",
+];
+
+/// (core#1870) Is `path` (a listing entry, `/`-separated) a tool cache or inside one?
+fn in_tool_cache(path: &str) -> bool {
+    path.split('/').any(|c| TOOL_CACHES.contains(&c))
+}
+
 /// (core#1157) Git's listing of every path outside the tree (untracked or ignored alike), an
 /// entirely untracked directory as one entry (`dir/`). The engine's own scratch (`tmp/`, where the
-/// base export lives) is not a check's output. A name that is not UTF-8 is kept, lossily.
+/// base export lives) is not a check's output, and neither is a tool's cache ([`TOOL_CACHES`],
+/// core#1870). A name that is not UTF-8 is kept, lossily.
 pub(crate) fn outside_tree(
     git: GitAt,
     under: &[String],
@@ -1281,6 +1298,7 @@ pub(crate) fn outside_tree(
         .filter(|path| {
             path.trim_end_matches('/') != scratch && !path.starts_with(&format!("{scratch}/"))
         })
+        .filter(|path| !in_tool_cache(path))
         .collect())
 }
 
