@@ -4574,6 +4574,57 @@ esac
         );
     }
 
+    /// core#1455, core#1614: every seat image (the default base and the self-contained default
+    /// build alike) carries a headless browser and ffmpeg/ffprobe from Debian's archive, never
+    /// Playwright's download host, and Chromium's launcher flags fit the seat floor: no display,
+    /// no user namespaces, and a read-only `/dev` (so no `/dev/shm` writes; [`landrun_prefix`]).
+    #[test]
+    fn every_seat_image_carries_a_headless_browser_and_ffmpeg() {
+        for (name, df) in [
+            ("seat", SEAT_DOCKERFILE.to_string()),
+            ("default seat build", default_seat_dockerfile()),
+        ] {
+            let layer = df
+                .lines()
+                .find(|l| l.contains("apt-get install") && l.contains("chromium"))
+                .unwrap_or_else(|| panic!("the {name} image installs chromium"));
+            for pkg in ["chromium", "fonts-liberation", "ffmpeg"] {
+                assert!(
+                    layer.split_whitespace().any(|w| w == pkg),
+                    "the {name} image installs {pkg}: {layer}"
+                );
+            }
+            for untrusted in ["playwright install", "cdn.playwright.dev", "ms-playwright"] {
+                assert!(
+                    !df.contains(untrusted),
+                    "the {name} image never uses {untrusted}"
+                );
+            }
+            let flags = df
+                .lines()
+                .find(|l| l.contains("/etc/chromium.d/wicked-seat"))
+                .unwrap_or_else(|| panic!("the {name} image sets Chromium's seat flags"));
+            for f in [
+                "--headless",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "\"$CHROMIUM_FLAGS ",
+            ] {
+                assert!(
+                    flags.contains(f),
+                    "the {name} seat flags carry {f}: {flags}"
+                );
+            }
+        }
+        // The floor really does deny /dev writes beyond /dev/null: the flag is needed.
+        let p = landrun_prefix(&[], &[], &[]);
+        let ro_dev = p.windows(2).any(|w| w[0] == "--ro" && w[1] == "/dev");
+        let rw_shm = p
+            .windows(2)
+            .any(|w| w[0].starts_with("--rw") && w[1] == "/dev/shm");
+        assert!(ro_dev && !rw_shm, "{p:?}");
+    }
+
     #[test]
     fn one_slow_runtime_answer_is_retried_not_final() {
         let mut calls = 0;

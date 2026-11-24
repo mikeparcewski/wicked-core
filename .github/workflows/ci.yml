@@ -244,9 +244,19 @@ jobs:
   # the default PATH, so a repository whose rust-toolchain.toml names `channel = "stable"` builds
   # with the image's own binaries (rustup would otherwise try to install `stable` into a read-only
   # RUSTUP_HOME). No other job builds images; the image tests are stubs or WICKED_CONTAINER_LIVE-gated.
+  # core#1455 / core#1614: both architectures the seats run on (Rancher Desktop on Apple silicon is
+  # arm64), since the browser and media layer comes from each architecture's own Debian archive.
   seat-toolchain:
-    name: floor + seat image toolchain (ubuntu x86_64)
-    runs-on: ubuntu-latest
+    name: floor + seat image toolchain (ubuntu ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
       - name: Checkout wicked-core
@@ -326,3 +336,55 @@ jobs:
               CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
               sh -euc 'cargo run && cargo clippy -- -D warnings && cargo fmt --check && cargo test'
           done
+
+      # core#1455, core#1614: the seat's own browser and media tools, run as a seat runs them: the
+      # operator's uid, a read-only root, HOME and /tmp tmpfs, no network and no /dev/shm (the
+      # floor grants /dev read-only). Screens at both sizes in both themes, then a still sampled at
+      # a named time from a video, as the demo review's contact sheet does (ffprobe, ffmpeg -ss).
+      - name: The seat takes screenshots and samples video stills offline
+        run: |
+          set -eu
+          dir="$(mktemp -d)"
+          cat > "$dir/page.html" <<'EOF'
+          <!doctype html><style>html,body{margin:0;height:100%;background:#fff}
+          @media (prefers-color-scheme: dark){html,body{background:#000}}</style><p>wicked seat</p>
+          EOF
+          cat > "$dir/shoot.sh" <<'EOF'
+          set -eu
+          out=/tmp/shots; mkdir -p "$out"
+          command -v chromium ffmpeg ffprobe
+          for size in 1440,700 390,844; do
+            for theme in light dark; do
+              f="$out/$theme-${size%,*}.png"
+              flag=; [ "$theme" = dark ] && flag=--force-dark-mode
+              timeout 60 chromium $flag --window-size="$size" --hide-scrollbars --screenshot="$f" file:///work/page.html 2>/tmp/chromium.err \
+                || { cat /tmp/chromium.err >&2; exit 1; }
+              dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$f")"
+              px="$(ffmpeg -v error -i "$f" -vf "crop=1:1:$(( ${size%,*} - 1 )):$(( ${size#*,} - 1 ))" -f rawvideo -pix_fmt rgb24 - | od -An -tu1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+              echo "$theme ${size}: $dims, corner pixel $px"
+              [ "$dims" = "$size" ] || { echo "the $theme shot is $dims, not $size" >&2; exit 1; }
+              want="255 255 255"; [ "$theme" = dark ] && want="0 0 0"
+              [ "$px" = "$want" ] || { echo "the $theme shot's background is $px, not $want" >&2; exit 1; }
+            done
+          done
+          ffmpeg -v error -f lavfi -i testsrc=duration=4:size=320x240:rate=10 -c:v mpeg4 /tmp/demo.mp4
+          dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/demo.mp4)"
+          ffmpeg -v error -ss 2.5 -i /tmp/demo.mp4 -frames:v 1 "$out/still-2.5.png"
+          echo "video ${dur}s; still: $(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$out/still-2.5.png")"
+          EOF
+          chmod -R a+rX "$dir"
+          docker run --rm --network none --ipc none --read-only --user 1000:1000 \
+            --tmpfs /tmp:exec --tmpfs /home/seat -v "$dir:/work:ro" --entrypoint /usr/bin/env \
+            wicked-seat-claude:ci -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/home/seat TMPDIR=/tmp LANG=C.UTF-8 sh /work/shoot.sh
+
+      - name: Record the seat image size and the browser and media layer's share
+        run: |
+          set -eu
+          total="$(docker image inspect -f '{{.Size}}' wicked-seat-claude:ci)"
+          layer="$(docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' wicked-seat-claude:ci \
+            | grep -m1 'chromium fonts-liberation ffmpeg' | cut -f1)"
+          test -n "$layer"
+          line="seat image (claude, ${{ matrix.arch }}): $(( total / 1000000 )) MB in total; the browser and media layer (chromium, fonts-liberation, ffmpeg) adds $layer"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"

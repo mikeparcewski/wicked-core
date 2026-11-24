@@ -28,6 +28,22 @@ RUN apt-get update \
       python3-pytest python3-yaml python3-zstandard python3-venv \
  && (command -v npm >/dev/null || apt-get install -y --no-install-recommends nodejs npm) \
  && rm -rf /var/lib/apt/lists/*
+# A headless browser and the media tools, from Debian's own archive (amd64 and arm64), in their own
+# layer: a UI job takes its own screenshot evidence (core#1455: `chromium --screenshot`, or
+# Playwright's `executablePath: '/usr/bin/chromium'`), and a demo review samples its own stills
+# (core#1614: ffmpeg, ffprobe). The seat's floor has no display, no user namespaces and a read-only
+# /dev (src/container_floor.rs landrun_prefix), so Debian's launcher reads the flags that make
+# Chromium work there from /etc/chromium.d (headless, no Chromium sandbox, shared memory in /tmp).
+# Best effort, like the ledger below: an operator base whose archive lacks them still builds, and
+# its seats then have no browser.
+RUN if apt-get update \
+     && apt-get install -y --no-install-recommends chromium fonts-liberation ffmpeg \
+     && test -d /etc/chromium.d; then \
+      printf '%s\n' 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --headless --no-sandbox --disable-dev-shm-usage --disable-gpu"' > /etc/chromium.d/wicked-seat; \
+    else \
+      echo "wicked-seat: chromium and ffmpeg did not install on this base; its seats cannot take screenshots or sample video stills" >&2; \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
 # wicked-ledger at the version wicked-crew's QE acceptance check reads (core#1009). The QE unit
 # records its verdict with it: the carrier hands that unit WICKED_LEDGER_PKG_DIR naming this copy
 # (src/qe_acceptance.rs SEAT_LEDGER_PKG_DIR). A seat never installs it itself (it is fenced, and an
