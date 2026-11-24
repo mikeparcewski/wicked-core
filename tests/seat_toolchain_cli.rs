@@ -118,7 +118,18 @@ fn toolchain_ci_keeps_an_executable_tmpfs_and_the_restricted_runtime() {
     let ci: serde_yaml::Value =
         serde_yaml::from_str(include_str!("../.github/workflows/ci.yml")).unwrap();
     let job = &ci["jobs"]["seat-toolchain"];
-    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+    // Both architectures a seat runs on (core#1455): the x86_64 runner and the arm64 one.
+    assert_eq!(job["runs-on"].as_str(), Some("${{ matrix.runner }}"));
+    let runners: Vec<(&str, &str)> = job["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|r| (r["arch"].as_str().unwrap(), r["runner"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        runners,
+        [("x86_64", "ubuntu-latest"), ("arm64", "ubuntu-24.04-arm")]
+    );
     let script = job["steps"]
         .as_sequence()
         .unwrap()
