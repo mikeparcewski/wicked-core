@@ -38,8 +38,9 @@ const FETCH_CAP: u64 = 512 * 1024;
 /// daemon that has no gateway yet (then nothing was ever signed in on this cluster).
 pub(crate) struct K8sIo {
     gw: Option<Gw>,
-    /// The seat image the login pod runs, built by [`BrokerIo::prepare_login`].
-    image: std::sync::Mutex<Option<String>>,
+    /// The seat image the login pod runs, built and pinned by [`BrokerIo::prepare_login`] (held
+    /// so no seat launch's pin cleanup removes it before the login pod starts, core#1848).
+    image: std::sync::Mutex<Option<crate::container_floor::SeatPin>>,
 }
 
 /// A refusal of the cluster, as the `seat-login` CLI reports it: the stable kind first (crew
@@ -384,7 +385,8 @@ impl BrokerIo for K8sIo {
             .image
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .as_ref()
+            .map(|pin| pin.tag().to_string())
             .ok_or("the login was not prepared")?;
         let rt = crate::container_floor::runtime().map_err(|w| w.describe().to_string())?;
         super::images::ensure_for(&gw.kube, &rt, &[&image]).map_err(described)?;

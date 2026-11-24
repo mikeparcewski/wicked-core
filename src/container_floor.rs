@@ -1122,8 +1122,46 @@ fn save_seat_archive(
     })
 }
 
+/// (core#1848) The seat image pins this daemon's launches still hold, with how many hold each. The
+/// one lock also orders every pin's `tag` against every cleanup's `image rm`: a cleanup checks and
+/// removes under it, a pin registers and tags under it, so no cleanup removes a pin between its
+/// launch tagging it and its pod starting on it.
+static SEAT_PINS_HELD: Mutex<std::collections::BTreeMap<String, usize>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn seat_pins_held() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, usize>> {
+    SEAT_PINS_HELD.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A seat launch's hold on its pinned seat image tag ([`pin_seat_image`]): while any launch holds
+/// a pin, no other launch's cleanup removes it. Held by the armed seat until the unit ends.
+#[derive(Debug)]
+pub(crate) struct SeatPin {
+    tag: String,
+}
+
+impl SeatPin {
+    /// The pinned tag the seat's pod runs.
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+impl Drop for SeatPin {
+    fn drop(&mut self) {
+        let mut held = seat_pins_held();
+        if let Some(n) = held.get_mut(&self.tag) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.tag);
+            }
+        }
+    }
+}
+
 /// A tag nobody builds to, bound to the inspected id, including registry ports and digest refs.
-pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<String, String> {
+/// The pin is held for the caller ([`SeatPin`]) until it drops it.
+pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<SeatPin, String> {
     let id = valid_image_id(id).ok_or("cannot pin seat image: invalid inspected id")?;
     let hex = id.strip_prefix("sha256:").unwrap_or(&id);
     let reference = if valid_image_id(image).is_some() {
@@ -1137,17 +1175,25 @@ pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<Stri
         _ => reference,
     };
     let pinned = format!("{repo}:id-{hex}");
-    let mut cmd = rt.cmd();
-    cmd.args(["tag", &id, &pinned]);
-    let result = crate::k8s::run_bounded(cmd, None, rt.bound(PROBE_TIMEOUT));
+    let result = {
+        let mut held = seat_pins_held();
+        let mut cmd = rt.cmd();
+        cmd.args(["tag", &id, &pinned]);
+        let result = crate::k8s::run_bounded(cmd, None, rt.bound(PROBE_TIMEOUT));
+        if result.ok() {
+            *held.entry(pinned.clone()).or_default() += 1;
+        }
+        result
+    };
     if !result.ok() {
         return Err(format!(
             "cannot pin inspected seat image: {}; make `tag {id} {pinned}` work",
             result.err_text()
         ));
     }
-    cleanup_seat_image_pins(rt, repo, &pinned);
-    Ok(pinned)
+    let pin = SeatPin { tag: pinned };
+    cleanup_seat_image_pins(rt, repo, pin.tag());
+    Ok(pin)
 }
 
 fn cleanup_seat_image_pins(rt: &Runtime, repo: &str, pinned: &str) {
@@ -1174,9 +1220,15 @@ fn cleanup_seat_image_pins(rt: &Runtime, repo: &str, pinned: &str) {
         {
             continue;
         }
+        // (core#1848) Another launch of this daemon still holds it: its pod may be starting on it.
+        let held = seat_pins_held();
+        if held.contains_key(tag) {
+            continue;
+        }
         let mut remove = rt.cmd();
         remove.args(["image", "rm", tag]);
         let result = crate::k8s::run_bounded(remove, None, rt.bound(PROBE_TIMEOUT));
+        drop(held);
         if !result.ok() {
             eprintln!(
                 "wicked-core: cannot remove older seat image pin {tag}: {}",
@@ -2201,6 +2253,9 @@ pub(crate) struct ArmedContainer {
     /// admits it to the seat's own read permissions) and its private directory, removed when the
     /// caller drops it at the end of the unit.
     pub(crate) prompt_file: Option<CarriedPrompt>,
+    /// (core#1848) The seat image pin the pod runs, held until the unit ends so no other launch's
+    /// cleanup removes it under this one.
+    pub(crate) seat_pin: SeatPin,
 }
 
 /// A long prompt carried in a file (core#1228): `file` is mounted read-only into the seat; the
@@ -2228,6 +2283,7 @@ impl std::fmt::Debug for ArmedContainer {
             .field("copilot_account", &self.copilot_account)
             .field("view", &self.view)
             .field("prompt_file", &self.prompt_file)
+            .field("seat_pin", &self.seat_pin)
             .finish()
     }
 }
@@ -2740,8 +2796,9 @@ pub(crate) fn arm_noting(
         .collect();
     let facts = inspect_seat_image(&rt, &image).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     check_seat_image(&facts, &dests).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    let image =
+    let seat_pin =
         pin_seat_image(&rt, &image, &facts.id).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let image = seat_pin.tag().to_string();
     // A warm judge pod is reused only for the same pinned seat image and floor image.
     let floor_id = image_id(&rt, &floor_image).ok_or_else(|| {
         (
@@ -2968,6 +3025,7 @@ pub(crate) fn arm_noting(
         lease,
         copilot_account,
         view,
+        seat_pin,
     })
 }
 
@@ -4103,7 +4161,9 @@ mod tests {
             );
             crate::test_env::install_stub(&rt.cli, &script);
             assert_eq!(
-                pin_seat_image(&rt, &format!("{repo}:build"), &id).unwrap(),
+                pin_seat_image(&rt, &format!("{repo}:build"), &id)
+                    .unwrap()
+                    .tag(),
                 pinned
             );
             let calls = std::fs::read_to_string(&log).unwrap();
@@ -4133,7 +4193,10 @@ mod tests {
             (format!("team/seat@{id}"), "team/seat"),
             (id.clone(), "wicked-seat"),
         ] {
-            let pinned = pin_seat_image(&rt, &reference, &id).unwrap();
+            let pinned = pin_seat_image(&rt, &reference, &id)
+                .unwrap()
+                .tag()
+                .to_string();
             assert_eq!(pinned, format!("{repo}:id-{}", &id[7..]));
             assert!(std::fs::read_to_string(&log)
                 .unwrap()
