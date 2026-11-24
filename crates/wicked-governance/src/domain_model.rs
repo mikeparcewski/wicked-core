@@ -2542,25 +2542,30 @@ pub struct RetiredRequirement {
 /// index is otherwise kept across re-maps and flagged unindexed until its unit returns (#1446), so
 /// a deleted feature's row stays listed for ever. Only such a row may be retired: one whose
 /// recorded code unit is still in the index (or that recorded none) is refused, since the next
-/// build would only map it again under a new id. In one batch it removes the requirement and its
-/// business-rule nodes, rewrites the domain's `Contains` edges without it, and moves the build
-/// record to a new generation with the retirement on its log. The next build carries no row
-/// (it carries only rows still in the store), and the id stays retired: the record's high-water
-/// mark already holds its number, so no later requirement of the domain is given it.
+/// build would only map it again under a new id. Every check and read happens before the write.
+/// Then, in one batch (refused, with nothing written, when another build or retire moved the
+/// generation since): the requirement and its business-rule nodes are removed; every graph node
+/// with an edge into them (its domain's `Contains`, another requirement's `References`) is
+/// rewritten without that edge, since the store removes a node's own edges but not the edges into
+/// it; and the build record moves to a new generation with the retirement on its log. The next
+/// build carries no row (it carries only rows still in the store), and the id stays retired: the
+/// record's high-water mark holds its number, so no later requirement of the domain is given it.
 pub fn retire_requirement(
     store: &mut dyn wicked_apps_core::GraphStore,
     domain: &str,
     req: &str,
 ) -> anyhow::Result<RetiredRequirement> {
-    use wicked_apps_core::{synthetic_symbol, Edge, EdgeKind, ResolutionTier, SymbolId};
-    store.begin_batch()?;
+    use wicked_apps_core::{synthetic_symbol, SymbolId};
+    use wicked_estate_core::Direction;
     let record = read_build_record(&*store)?;
     if !record.exists {
         anyhow::bail!("no requirements graph has been built for this repository yet");
     }
     let nodes = previous_graph_nodes(&*store)?;
-    let ids = requirement_ids(&nodes);
-    let Some((_, _, node)) = ids.iter().find(|(d, r, _)| *d == domain && *r == req) else {
+    let Some((_, _, node)) = requirement_ids(&nodes)
+        .into_iter()
+        .find(|(d, r, _)| *d == domain && *r == req)
+    else {
         anyhow::bail!("the requirements graph has no {domain}::{req}");
     };
     let Some(code) = node.metadata.get("code_symbol").and_then(|v| v.as_str()) else {
@@ -2577,41 +2582,44 @@ pub fn retire_requirement(
     }
     let code = code.to_string();
     let high = previous_req_high(&*store)?;
+    // What goes: the requirement and the rule nodes its id path owns.
+    let req_file = format!("{REQUIREMENT_FILE_PREFIX}{domain}/{req}");
     let rule_prefix = format!("{RULE_FILE_PREFIX}{domain}/{req}/");
-    let rules: Vec<String> = nodes
+    let gone: Vec<&wicked_apps_core::Node> = nodes
         .iter()
-        .map(|n| n.location.file.clone())
-        .filter(|f| f.starts_with(&rule_prefix))
+        .filter(|n| n.location.file == req_file || n.location.file.starts_with(&rule_prefix))
         .collect();
-    store.remove_file(&format!("{REQUIREMENT_FILE_PREFIX}{domain}/{req}"))?;
-    for file in &rules {
-        store.remove_file(file)?;
+    let gone_syms: std::collections::HashSet<&str> =
+        gone.iter().map(|n| n.symbol.as_str()).collect();
+    // What stays but points at it: each such graph node with every edge it keeps.
+    let mut sources: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for n in &gone {
+        for e in store.neighbors(&n.symbol, Direction::Dependents)? {
+            if !gone_syms.contains(e.source.as_str()) {
+                sources.insert(e.source.to_string());
+            }
+        }
     }
-    // The domain's own edges are the `Contains` to each requirement; an edge into a removed node
-    // would leave the read torn, so the domain is rewritten with the requirements it keeps.
-    let dnode = nodes
-        .iter()
-        .find(|n| n.location.file.starts_with(DOMAIN_FILE_PREFIX) && n.name == domain)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("domain {domain} has no node in the graph"))?;
-    store.remove_file(&dnode.location.file)?;
-    let edges: Vec<Edge> = ids
-        .iter()
-        .filter(|(d, r, _)| *d == domain && *r != req)
-        .map(|(_, _, n)| {
-            Edge::new(
-                dnode.symbol.clone(),
-                n.symbol.clone(),
-                EdgeKind::Contains,
-                ResolutionTier::Parsed,
-                "domain-graph",
-            )
-        })
-        .collect();
+    let mut rewrite = Vec::new();
+    let mut kept_edges = Vec::new();
+    for sym in &sources {
+        let Some(n) = nodes.iter().find(|n| n.symbol.as_str() == sym) else {
+            anyhow::bail!(
+                "{sym} points at {domain}::{req} but is not part of the requirements graph; \
+                 nothing was retired"
+            );
+        };
+        kept_edges.extend(
+            store
+                .neighbors(&n.symbol, Direction::Dependencies)?
+                .into_iter()
+                .filter(|e| !gone_syms.contains(e.target.as_str())),
+        );
+        rewrite.push(n.clone());
+    }
     let generation = record.generation + 1;
-    let build = synthetic_symbol(BUILD_SCHEME, BUILD_ID);
     let mut rnode = store
-        .get_node(&build)?
+        .get_node(&synthetic_symbol(BUILD_SCHEME, BUILD_ID))?
         .ok_or_else(|| anyhow::anyhow!("the requirements graph's build record is unreadable"))?;
     let mut log = record.retired.clone();
     log.push(serde_json::json!({
@@ -2632,12 +2640,32 @@ pub fn retire_requirement(
     rnode
         .metadata
         .insert(RETIRED_KEY.to_string(), serde_json::Value::Array(log));
-    store.upsert_nodes(&[dnode, rnode])?;
-    store.upsert_edges(&edges)?;
+    let files: Vec<String> = gone
+        .iter()
+        .map(|n| n.location.file.clone())
+        .chain(rewrite.iter().map(|n| n.location.file.clone()))
+        .collect();
+    rewrite.push(rnode);
+
+    store.begin_batch()?;
+    let now = read_build_record(&*store)?.generation;
+    if now != record.generation {
+        store.commit_batch()?; // nothing written: release the write lock
+        anyhow::bail!(
+            "the requirements graph changed while {domain}::{req} was being retired (generation \
+             {now}, expected {}); nothing was retired — try again",
+            record.generation
+        );
+    }
+    for file in &files {
+        store.remove_file(file)?;
+    }
+    store.upsert_nodes(&rewrite)?;
+    store.upsert_edges(&kept_edges)?;
     store.commit_batch()?;
     Ok(RetiredRequirement {
         code_symbol: code,
-        rules: rules.len(),
+        rules: gone.len() - 1,
         generation,
     })
 }
@@ -4174,6 +4202,22 @@ mod tests {
                     .unwrap()
             };
             let (gone, kept) = (id_of(&a.symbol), id_of(&b.symbol));
+            // The kept requirement depends on the one retired: its `References` edge must go too.
+            let mut first = first.clone();
+            first
+                .domains
+                .get_mut("billing")
+                .unwrap()
+                .requirements
+                .get_mut(&kept)
+                .unwrap()
+                .dependencies = vec![gone.clone()];
+            persist_domain_model(&mut s, &first).unwrap();
+            let gone_sym = synthetic_symbol("requirement", &format!("billing/{gone}"));
+            assert!(!s
+                .neighbors(&gone_sym, wicked_estate_core::Direction::Dependents)
+                .unwrap()
+                .is_empty());
             let err = retire_requirement(&mut s, "billing", &gone).unwrap_err();
             assert!(err.to_string().contains("is still in the index"), "{err}");
             s.remove_file("billing/charge.rs").unwrap();
@@ -4194,6 +4238,18 @@ mod tests {
                 !listed.contains_key(&gone) && listed.contains_key(&kept),
                 "{listed:?}"
             );
+            assert!(
+                s.neighbors(&gone_sym, wicked_estate_core::Direction::Dependents)
+                    .unwrap()
+                    .is_empty(),
+                "no edge into the retired requirement is left behind"
+            );
+            let kept_sym = synthetic_symbol("requirement", &format!("billing/{kept}"));
+            assert!(s
+                .neighbors(&kept_sym, wicked_estate_core::Direction::Dependencies)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == wicked_apps_core::EdgeKind::SatisfiedBy));
             // The next re-map does not carry it, and a second retire finds nothing.
             let mut rebuilt = build_at(&s, 100);
             stabilize_requirement_ids(&s, &mut rebuilt).unwrap();

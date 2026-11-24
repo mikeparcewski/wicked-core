@@ -1191,8 +1191,9 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
-    if let Some(target) = flag(args, "--retire") {
-        domain_graph_retire(args, &target);
+    // `--retire` with no target is refused, never read as a full build (review r1).
+    if args.iter().any(|a| a == "--retire") {
+        domain_graph_retire(args, &flag(args, "--retire").unwrap_or_default());
         return;
     }
     // `--repo-root` names the checkout the graph belongs to (`{repo_root}` in the preset): the
