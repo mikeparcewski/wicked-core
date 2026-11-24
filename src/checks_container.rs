@@ -1460,10 +1460,12 @@ pub(crate) fn admit_dependency_claim(
             if kube.delete_owned(Some(ns), "pvc", &victim, true).is_ok() {
                 count -= 1;
                 let key = format!("{ns}/{victim}");
+                // Its native build's completion too (core#1406): a claim filled again is unbuilt.
+                let under = format!("{key}/");
                 FILLED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .retain(|k| k != &key);
+                    .retain(|k| k != &key && !k.starts_with(&under));
                 if let Some(used) = DEPENDENCY_USED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2906,10 +2908,12 @@ impl Filler<'_> {
             return Ok(());
         }
         let name = format!("build-{volume}");
-        let _ = self
-            .place
+        // An earlier build of this claim that outlived its client may still write it: confirmed
+        // gone first, or no build now (the seat then starts without the binding).
+        self.place
             .kube
-            .delete_owned(Some(&self.place.ns), "pod", &name, true);
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+            .map_err(|e| format!("an earlier build of {volume} could not be ended: {e}"))?;
         let mut pod = self.place.pod(&name, "floor", self.tag, self.floor_image);
         pod.memory_limit = crate::container_floor::k8s_memory(self.memory);
         pod.memory_request = "512Mi".into();
@@ -2928,7 +2932,7 @@ impl Filler<'_> {
                 self.0.delete(self.1);
             }
         }
-        let _gone = Gone(self.place, &name);
+        let gone = Gone(self.place, &name);
         self.place.prove_offline(&name)?;
         let script = native_build_script(native);
         self.place
@@ -2936,6 +2940,16 @@ impl Filler<'_> {
             .map_err(|e| {
                 let last = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
                 last.chars().take(300).collect::<String>()
+            })?;
+        // Published only once the pod (and anything the build left running in it) is confirmed
+        // gone: until then the claim is not handed to a seat as built.
+        std::mem::forget(gone);
+        self.place
+            .kube
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+            .map_err(|e| {
+                self.place.delete(&name);
+                format!("the build pod is not confirmed gone: {e}")
             })?;
         mark_filled(&key);
         Ok(())
@@ -3214,7 +3228,7 @@ pub(crate) fn seat_node_modules(
     let native = (!native.is_empty()).then(|| {
         let names = native.join(", ");
         match filler.build_native(&volume, &native) {
-            Ok(()) => format!("{names} built natively in it"),
+            Ok(()) => format!("{names} built natively"),
             Err(e) => format!(
                 "{names} did not build natively ({e}), so a test that loads it fails in this seat"
             ),
@@ -3255,18 +3269,53 @@ pub(crate) fn seat_nm_volume(tag: &str, lock: &[u8], inputs: &[u8], native: &[&s
 /// (core#1406) The marker a seat claim's native build leaves at its top once every binding built.
 const NATIVE_BUILT: &str = ".wicked-native-built";
 
-/// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`]:
-/// the floor's own native-build step ([`crate::repo_checks::native_build_argv`]: node-gyp beside
-/// the image's npm, its own node's headers, no download, no npm lifecycle) in a scratch dir whose
-/// `node_modules` is the claim, then the marker. A claim already marked answers `WICKED-HIT`.
+/// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`].
+/// Trusted engine steps first: a claim already marked answers `WICKED-HIT`; otherwise each
+/// addon's `build/` is emptied (nothing a package shipped there, or an earlier attempt left, is
+/// reused). Then the floor's own native-build step ([`crate::repo_checks::native_build_argv`]:
+/// node-gyp beside the image's npm, its own node's headers, no download, no npm lifecycle) runs
+/// under the floor's landrun, which must enforce (no best effort): the claim and the system are
+/// read-only to it, and only each addon's `build/`, the scratch and the home are writable, so the
+/// repository-installed build (gyp actions) can change nothing else in the claim (the installed
+/// packages, the nested archive, the marker). The engine marks the claim only after that step
+/// succeeded, and empties the build dirs again when it failed.
 pub(crate) fn native_build_script(native: &[&str]) -> String {
     let argv = crate::repo_checks::native_build_argv(native);
+    let builds: Vec<String> = native
+        .iter()
+        .map(|n| sh_quote(&format!("{FILL_DIR}/{n}/build")))
+        .collect();
+    let clean = builds
+        .iter()
+        .map(|b| format!("rm -rf {b} && mkdir {b}; "))
+        .collect::<String>();
+    let mut policy: Vec<String> = vec!["/floor/landrun".into(), "--ignore-missing".into()];
+    for d in [
+        "/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc", FILL_DIR,
+    ] {
+        policy.extend(["--rox".into(), d.into()]);
+    }
+    for d in ["/proc", "/dev"] {
+        policy.extend(["--ro".into(), d.into()]);
+    }
+    policy.extend(["--rw".into(), "/dev/null".into()]);
+    for d in ["/tmp", HOME] {
+        policy.extend(["--rwx".into(), d.into()]);
+    }
+    for b in &builds {
+        policy.extend(["--rwx".into(), b.clone()]);
+    }
+    for v in ["PATH", "HOME", "TMPDIR"] {
+        policy.extend(["--env".into(), v.into()]);
+    }
     format!(
         "set -e; if [ -f {FILL_DIR}/{NATIVE_BUILT} ]; then echo WICKED-HIT; exit 0; fi; \
-         rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
+         {clean}rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
          ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
-         ( {} ); touch {FILL_DIR}/{NATIVE_BUILT}",
-        argv[2]
+         if {} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
+         else {clean}exit 1; fi",
+        policy.join(" "),
+        sh_quote(&argv[2])
     )
 }
 

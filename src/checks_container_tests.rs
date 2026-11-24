@@ -1824,29 +1824,63 @@ fn a_seat_claim_with_native_addons_is_its_own_beside_the_floors() {
     assert_eq!(native, format!("{floor}-seat"));
     assert_ne!(native, plain);
     assert!(native.starts_with(DEPENDENCY_PREFIX), "{native}");
-    assert!(native.len() <= 63, "a pod name of it fits: build-{native}");
+    assert!(
+        format!("build-{native}").len() <= 63,
+        "a pod name of it fits: build-{native}"
+    );
 }
 
 /// core#1406: the seat claim's offline build is the floor's own native-build step, verbatim, run
-/// in a scratch dir whose `node_modules` is the claim, marked once it succeeded (a marked claim
-/// is a hit); a failure leaves no marker.
+/// under the floor's landrun with ONLY each addon's `build/`, the scratch and the home writable
+/// (the claim itself read-only to it, and no best effort: a kernel without Landlock builds
+/// nothing). The engine empties each `build/` before (a shipped binding is never reused) and after
+/// a failed build, and marks the claim only after success; a marked claim is a hit.
 #[cfg(unix)]
 #[test]
-fn the_seat_claims_native_build_is_the_floors_step_and_marks_only_success() {
+fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_success() {
     let script = native_build_script(&["better-sqlite3"]);
     let argv = crate::repo_checks::native_build_argv(&["better-sqlite3"]);
     assert!(
-        script.contains(&format!("( {} ); touch", argv[2])),
+        script.contains(&format!("-- /bin/sh -c {}; then", sh_quote(&argv[2]))),
         "{script}"
     );
-    assert!(script.contains(&format!("ln -s {FILL_DIR} /tmp/wicked-native/node_modules")));
+    let policy = script
+        .split("if /floor/landrun ")
+        .nth(1)
+        .and_then(|r| r.split(" -- /bin/sh").next())
+        .unwrap_or_else(|| panic!("{script}"));
+    assert!(!policy.contains("--best-effort"), "{policy}");
+    assert!(policy.contains(&format!("--rox {FILL_DIR} ")), "{policy}");
+    assert!(policy.contains(&format!("--rwx '{FILL_DIR}/better-sqlite3/build'")));
+    let writable: Vec<&str> = policy
+        .split(" --")
+        .filter_map(|g| g.strip_prefix("rwx ").or_else(|| g.strip_prefix("rw ")))
+        .collect();
+    assert_eq!(
+        writable,
+        [
+            "/dev/null",
+            "/tmp",
+            HOME,
+            format!("'{FILL_DIR}/better-sqlite3/build'").as_str()
+        ],
+        "{policy}"
+    );
+    // The clean comes before the build, under the engine (outside landrun).
+    let clean = format!(
+        "rm -rf '{FILL_DIR}/better-sqlite3/build' && mkdir '{FILL_DIR}/better-sqlite3/build';"
+    );
+    assert!(script.find(&clean).unwrap() < script.find("/floor/landrun").unwrap());
+
     // Run it for real against a stand-in claim: FILL_DIR and /tmp are re-pointed into a scratch
-    // dir, and `node`/`npm` are stubs that "build" when asked (or fail).
+    // dir, landrun is a stand-in that runs the command, and `node`/`npm` are stubs that "build"
+    // when asked (or leave a partial binding and fail).
     let root = std::env::temp_dir().join(format!("native-claim-{}", uuid::Uuid::new_v4()));
     let claim = root.join("vol");
     let bin = root.join("bin");
     let gyp = root.join("lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js");
-    std::fs::create_dir_all(claim.join("better-sqlite3/build")).unwrap();
+    std::fs::create_dir_all(claim.join("better-sqlite3/build/Release")).unwrap();
+    std::fs::write(claim.join("better-sqlite3/build/Release/shipped.node"), "").unwrap();
     std::fs::write(claim.join("better-sqlite3/package.json"), "{}").unwrap();
     std::fs::create_dir_all(gyp.parent().unwrap()).unwrap();
     std::fs::write(&gyp, "").unwrap();
@@ -1857,11 +1891,17 @@ fn the_seat_claims_native_build_is_the_floors_step_and_marks_only_success() {
     std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
     crate::test_env::install_stub(
         &bin.join("node"),
-        "#!/bin/sh\n[ -n \"$GYP_FAILS\" ] && exit 7\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
+        "#!/bin/sh\nif [ -n \"$GYP_FAILS\" ]; then mkdir -p build/Release && : > build/Release/partial.node; exit 7; fi\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
+    );
+    let landrun = root.join("landrun");
+    crate::test_env::install_stub(
+        &landrun,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
     );
     let local = script
         .replace(FILL_DIR, &claim.display().to_string())
-        .replace("/tmp/wicked-native", &root.join("t").display().to_string());
+        .replace("/tmp/wicked-native", &root.join("t").display().to_string())
+        .replace("/floor/landrun", &landrun.display().to_string());
     let run = |env: &[(&str, &str)]| {
         let mut c = std::process::Command::new("sh");
         c.args(["-c", &local])
@@ -1880,15 +1920,22 @@ fn the_seat_claims_native_build_is_the_floors_step_and_marks_only_success() {
             ),
         )
     };
+    let build = claim.join("better-sqlite3/build");
     let (ok, _) = run(&[("GYP_FAILS", "1")]);
     assert!(!ok);
     assert!(
         !claim.join(NATIVE_BUILT).exists(),
         "a failed build leaves no marker"
     );
+    assert_eq!(
+        std::fs::read_dir(&build).unwrap().count(),
+        0,
+        "nor any output"
+    );
     let (ok, out) = run(&[]);
     assert!(ok, "{out}");
-    assert!(claim.join("better-sqlite3/build/Release/x.node").is_file());
+    assert!(build.join("Release/x.node").is_file());
+    assert!(!build.join("Release/shipped.node").exists());
     assert!(claim.join(NATIVE_BUILT).is_file());
     let (ok, out) = run(&[("GYP_FAILS", "1")]);
     assert!(ok && out.contains("WICKED-HIT"), "{out}");
