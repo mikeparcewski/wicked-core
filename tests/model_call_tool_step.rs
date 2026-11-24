@@ -22,6 +22,15 @@ use wicked_council::{AgenticCli, CouncilTask};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
+/// Every emission this binary triggers spools into the per-process test outbox (core#311, core#749).
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
+
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("wicked-core-mc-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
