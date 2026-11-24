@@ -5030,6 +5030,135 @@ mod tests {
         rm_repo(&root);
     }
 
+    /// core#1860 — a scratch folder holding one checkout, `app`, removed (permissions restored
+    /// first) when dropped. The folder's name never collides with [`git_repo`]'s.
+    #[cfg(unix)]
+    struct Holder(PathBuf);
+
+    #[cfg(unix)]
+    impl Holder {
+        fn new(tag: &str) -> (Self, PathBuf) {
+            let holder = std::env::temp_dir().join(format!(
+                "wicked-wt-holder-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            drop(Holder(holder.clone()));
+            std::fs::create_dir_all(&holder).unwrap();
+            std::fs::rename(git_repo(tag), holder.join("app")).unwrap();
+            let app = holder.join("app");
+            (Holder(holder), app)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [
+                self.0.clone(),
+                self.0.join("app.wicked"),
+                self.0.join("app.wicked").join(WORKTREES_DIR),
+            ] {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// core#1860 — the fallback's whole life: the tree is minted inside the checkout, a resume
+    /// finds it again, the checkout's own status stays clean, and a removal reaps it.
+    #[cfg(unix)]
+    fn assert_minted_inside(app: &Path, run_id: &str) {
+        let p = app.to_str().unwrap();
+        let wt = create_worktree(p, run_id).unwrap();
+        assert_eq!(wt, app.join(WORKTREES_DIR).join(run_id));
+        assert!(is_live_worktree(&wt), "{}", wt.display());
+        assert_eq!(
+            create_worktree(p, run_id).unwrap(),
+            wt,
+            "a resume reuses it"
+        );
+        let (ok, status, _) = git(p, &["status", "--porcelain"]).unwrap();
+        assert!(
+            ok && status.trim().is_empty(),
+            "the checkout stays clean: {status}"
+        );
+        remove_worktree(p, run_id);
+        assert!(!wt.exists(), "a removal reaps it");
+    }
+
+    /// core#1860 — a checkout whose parent folder cannot be written (a volume root, a bind mount
+    /// at `/repo`, a folder another user owns) still starts runs, and so does one whose folder
+    /// beside it exists but cannot be written (left by another user's daemon): the tree is minted
+    /// inside the checkout, where trees lived before core#1109.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_whose_parent_folder_cannot_be_written_still_mints_its_run_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let ro = |dir: &Path| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap()
+        };
+        let (holder, app) = Holder::new("ro-parent");
+        ro(&holder.0);
+        if std::fs::create_dir(holder.0.join("probe")).is_ok() {
+            eprintln!("this user writes a read-only folder (root): nothing to show here");
+            return;
+        }
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        assert_minted_inside(&app, "run-ro");
+
+        let (holder, app) = Holder::new("ro-beside");
+        let beside = holder.0.join("app.wicked").join(WORKTREES_DIR);
+        std::fs::create_dir_all(&beside).unwrap();
+        ro(&beside);
+        assert_minted_inside(&app, "run-ro-beside");
+        assert_eq!(
+            std::fs::read_dir(&beside).unwrap().count(),
+            0,
+            "no probe left"
+        );
+    }
+
+    /// core#1860 — the same fallback for any user (root included): a FILE where the folder beside
+    /// the checkout would go. The checkout's existing `info/exclude` rules, in any encoding and
+    /// without a final line break, are kept; its one line is added once. A `wicked-worktrees`
+    /// the repository itself holds as a link is never followed: the run is refused and nothing is
+    /// made through it.
+    #[cfg(unix)]
+    #[test]
+    fn the_in_checkout_fallback_keeps_the_excludes_and_never_follows_a_repository_link() {
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let (holder, app) = Holder::new("file-beside");
+        std::fs::write(holder.0.join("app.wicked"), "not a folder\n").unwrap();
+        let exclude = app.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let rules: &[u8] = b"# kept \xff rule\n*.log";
+        std::fs::write(&exclude, rules).unwrap();
+        assert_minted_inside(&app, "run-file");
+        assert_minted_inside(&app, "run-file-2");
+        assert_eq!(
+            std::fs::read(&exclude).unwrap(),
+            [rules, &b"\nwicked-worktrees/\n"[..]].concat()
+        );
+
+        let (holder, app) = Holder::new("link-inside");
+        std::fs::write(holder.0.join("app.wicked"), "not a folder\n").unwrap();
+        std::fs::create_dir_all(app.join("runs")).unwrap();
+        std::fs::write(app.join("runs").join("keep"), "k\n").unwrap();
+        std::os::unix::fs::symlink("runs", app.join(WORKTREES_DIR)).unwrap();
+        let p = app.to_str().unwrap();
+        assert!(git(p, &["add", "-A"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "link"]).unwrap().0);
+        let err = create_worktree(p, "run-link").unwrap_err().to_string();
+        assert!(err.contains("a link or a file of the repository"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(app.join("runs")).unwrap().count(),
+            1,
+            "nothing is made through the link"
+        );
+    }
+
     /// core#1109 — a tree an engine before the move minted INSIDE the checkout keeps working in
     /// place after the upgrade: a resume reuses it, and the startup reaper still finds it (a clean
     /// terminal leftover converges, an unknown one of this daemon's goes), while a new run's tree
