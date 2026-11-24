@@ -101,7 +101,9 @@ area. Judge each rule's `domain` pick, and each of the file's `assignments`, as 
 work: the area the rule serves, not its file's directory. A domain the code does not show, a \
 catalog of directory names, or picks that mostly follow the directory instead of the rule are \
 problems you list as `ITEM n: FAIL — business_domains — <why>`. Judge each stated rule: it \
-names a unit of the worklist, it states what the \
+names a unit of the worklist or one of its `off_page_ids` (the units off this page the host still \
+takes a rule for: a review that sent the run back about an earlier page's rule is answered there, \
+and that entry is judged like the page's own), it states what the \
 business requires rather than describing the code, it is grounded in that unit's source, and its \
 confidence is not inflated. An empty statement is right where the source supports no rule: pure \
 plumbing such as a re-export, a getter or a pass-through wrapper. Most product code does encode \
@@ -125,7 +127,7 @@ the PAGE: a weak or code-describing statement is a problem you list, and the hos
 statement under its confidence threshold as a risk, never as a validated requirement. End with \
 `VERDICT: PASS` when the page is sound as a whole (most stated rules are grounded in their \
 unit's source and name worklist units, and the units whose source shows a rule got one), or \
-`VERDICT: FAIL` when it is not: rules are invented, name symbols outside the worklist, were \
+`VERDICT: FAIL` when it is not: rules are invented, name symbols in neither the worklist nor its `off_page_ids`, were \
 composed by a script from names rather than read from the source, most of them describe code \
 instead of requirements, or most sourced product-code units were left empty while their source \
 shows a rule (a page that states almost nothing is not sound, however correct its few rules \
@@ -723,6 +725,27 @@ mod tests {
             r.contains("When the change touches any other file, list that file as a problem"),
             "{r}"
         );
+    }
+
+    /// wicked-garden#1535 (train 12, CardDemo): a coverage send-back about an earlier page's rule
+    /// is restated beside the current page's own entries, under a unit in the worklist's
+    /// `off_page_ids`. Falsifier: keep "name symbols outside the worklist" as a FAIL reason and the
+    /// page review fails every such send-back, so the run loops to the rework cap.
+    #[test]
+    fn the_page_review_accepts_a_restated_off_page_unit() {
+        let r = RULES_REVIEW_INSTRUCTIONS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            r.contains("names a unit of the worklist or one of its `off_page_ids`"),
+            "{r}"
+        );
+        assert!(
+            r.contains("name symbols in neither the worklist nor its `off_page_ids`"),
+            "{r}"
+        );
+        assert!(!r.contains("name symbols outside the worklist"), "{r}");
     }
 
     #[test]
