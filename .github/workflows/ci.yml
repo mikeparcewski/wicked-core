@@ -242,8 +242,8 @@ jobs:
 
   # core#1406: a seat's declared native addon (crew: better-sqlite3) is built by the engine's own
   # native-build step (tests/fixtures/native-build/better-sqlite3.sh, asserted byte for byte against
-  # repo_checks::native_build_argv) in the seat's base image, offline, over a read-only
-  # node_modules with only the addon's build/ writable (as a seat pod's init runs it), and loads.
+  # repo_checks::native_build_argv) in the checks image, offline, over the seat's own claim (as the
+  # claim's build pod runs it), and the seat then loads it from that claim mounted read-only.
   seat-native-addon:
     name: seat native addon build (ubuntu x86_64)
     runs-on: ubuntu-latest
@@ -252,10 +252,10 @@ jobs:
       - name: Checkout wicked-core
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Build the checks floor image (every seat image's default base)
+      - name: Build the checks floor image (the build pod's image and every seat's default base)
         run: docker build -t wicked-checks-floor:ci - < containers/checks/node22-rust.Dockerfile
 
-      - name: better-sqlite3 installs with scripts off, builds offline with the engine's step, and loads
+      - name: better-sqlite3 installs with scripts off, builds offline with the engine's step, and loads read-only
         run: |
           set -eu
           dir="$(mktemp -d)"
@@ -264,22 +264,23 @@ jobs:
           chmod -R a+rwX "$dir"
           image=wicked-checks-floor:ci
           debian=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-          # The install, as the fill does it: scripts off, so no binding; the addon's build/ is
-          # left empty as the mount point.
+          # The fill: scripts off, so no binding.
           docker run --rm --user 1000:1000 -v "$dir/t:/work/t" -w /work/t --entrypoint /usr/bin/env \
             "$image" -i "$debian" HOME=/tmp sh -euc '
               npm install --ignore-scripts --no-audit --no-fund
-              mkdir -p node_modules/better-sqlite3/build
               if ls node_modules/better-sqlite3/build/Release/*.node 2>/dev/null; then
                 echo "the install built a binding with scripts off" >&2; exit 1
               fi'
-          # The seat pod's init: no network, node_modules read-only, build/ its own.
+          # The build pod: no network, a read-only root, the claim writable.
           docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
             --security-opt no-new-privileges --cap-drop ALL \
-            -v "$dir/t:/work/t:ro" --tmpfs /work/t/node_modules/better-sqlite3/build:exec,mode=1777 \
-            -v "$PWD/tests/fixtures/native-build/better-sqlite3.sh:/work/native-build.sh:ro" \
+            -v "$dir/t:/work/t" -v "$PWD/tests/fixtures/native-build/better-sqlite3.sh:/work/native-build.sh:ro" \
+            -w /work/t --entrypoint /usr/bin/env "$image" -i "$debian" HOME=/tmp TMPDIR=/tmp \
+            sh /work/native-build.sh
+          # The seat: no network, the claim read-only.
+          docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
+            --security-opt no-new-privileges --cap-drop ALL -v "$dir/t:/work/t:ro" \
             -w /work/t --entrypoint /usr/bin/env "$image" -i "$debian" HOME=/tmp TMPDIR=/tmp sh -euc '
-              sh /work/native-build.sh
               got="$(node -e "const D = require(\"better-sqlite3\"); console.log(new D(\":memory:\").prepare(\"select 41 + 1 as x\").get().x)")"
               echo "better-sqlite3 loaded in the seat: select 41 + 1 = $got"
               [ "$got" = 42 ]'

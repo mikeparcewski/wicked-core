@@ -428,9 +428,11 @@ pub(crate) fn install_argv(platform: &SeatPlatform) -> Vec<String> {
 /// (core#1406) Once the dependencies are in place, the repository's declared native addons
 /// (`native_rebuild` in `.wicked/checks.json`) are built in the worktree's `node_modules` with the
 /// floor's own native-build step ([`crate::repo_checks::native_build_argv`]: offline, no npm
-/// lifecycle), under the floor's sandbox, unless their binding is there already. The install runs
-/// with scripts off, so without this a seat's `better-sqlite3` has no binding and its suite
-/// cannot load it. What happened is said in the platform label the seat and the stream read.
+/// lifecycle), under the floor's sandbox with ONLY each addon's `build/` (and the build's own
+/// scratch) writable, as a floor pod builds it, unless their binding is there already: the build
+/// cannot change the reviewed tree. The install runs with scripts off, so without this a seat's
+/// `better-sqlite3` has no binding and its suite cannot load it. What happened is said in the
+/// platform label the seat and the stream read.
 pub(crate) fn provision(
     worktree: &Path,
     git_dir: Option<&Path>,
@@ -511,15 +513,34 @@ fn with_native(worktree: &Path, run_id: &str, platform: &SeatPlatform, label: St
             platform.label()
         );
     }
+    // Each addon's build dir is the build's only writable place in the worktree: made here, under
+    // an installed package that is a real directory (a link is never followed).
+    let mut write_roots = Vec::new();
+    for n in &native {
+        let pkg = worktree.join("node_modules").join(n);
+        if !std::fs::symlink_metadata(&pkg).is_ok_and(|m| m.is_dir()) {
+            return format!(
+                "{label}; {names} not built: node_modules/{n} is not an installed package \
+                 directory"
+            );
+        }
+        let build = pkg.join("build");
+        if is_link(&build) || std::fs::create_dir_all(&build).is_err() {
+            return format!(
+                "{label}; {names} not built: node_modules/{n}/build is not a directory"
+            );
+        }
+        write_roots.push(build);
+    }
     let scratch = match CheckScratch::prepare_for(worktree, Some(run_id)) {
         Ok(s) => s,
         Err(e) => return format!("{label}; {names} not built: the build scratch: {e}"),
     };
-    let sandbox = crate::repo_checks::floor_sandbox(&[
-        worktree.to_path_buf(),
+    write_roots.extend([
         scratch.tmp_path().to_path_buf(),
         scratch.root().to_path_buf(),
     ]);
+    let sandbox = crate::repo_checks::floor_sandbox(&write_roots);
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
         return format!(
             "{label}; {names} not built: the floor's sandbox does not arm on this host"
@@ -1089,20 +1110,15 @@ pub(crate) mod tests {
         ));
     }
 
-    /// core#1406: a repository that declares `native_rebuild` (crew: better-sqlite3) gets its
-    /// addon built for the seat: the install runs with scripts off, then the floor's own
-    /// native-build step builds the binding in the worktree's node_modules, offline, under the
-    /// floor's sandbox, and the seat's `require` loads it. The fixture is a real node-gyp addon
-    /// installed from a tarball under the allowlisted name (npm installs a tarball as a copy, as it
-    /// installs a registry package: never a link), so nothing is downloaded. A second unit finds
-    /// the binding and builds nothing; an undeclared addon stays unbuilt, as before.
+    /// A crew-shaped repository whose `better-sqlite3` is a real node-gyp addon (`gyp` is its
+    /// `binding.gyp`), installed from a tarball (npm installs a tarball as a copy, as it installs a
+    /// registry package: never a link) and declared in `.wicked/checks.json`. No network.
     #[cfg(unix)]
-    #[test]
-    fn a_declared_native_addon_is_built_for_the_seat_and_its_binding_loads() {
-        if !installs_here() {
-            return;
-        }
-        let tmp = crate::repo_checks::tests::scratch("seat-deps-native");
+    fn native_shaped(name: &str, gyp: &str) -> (PathBuf, PathBuf) {
+        // A plain path: make splices the build dir into its shell lines unquoted, so a gyp action
+        // fails on a parenthesis in it (the shared scratch's `ThreadId(n)`).
+        let tmp = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
         let wt = tmp.join("wt");
         let pkg = tmp.join("src/package");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -1112,11 +1128,7 @@ pub(crate) mod tests {
 "scripts":{"install":"node -e \"process.exit(1)\""}}"#,
         )
         .unwrap();
-        std::fs::write(
-            pkg.join("binding.gyp"),
-            r#"{"targets":[{"target_name":"probe","sources":["probe.c"]}]}"#,
-        )
-        .unwrap();
+        std::fs::write(pkg.join("binding.gyp"), gyp).unwrap();
         std::fs::write(
             pkg.join("probe.c"),
             "#include <node_api.h>\n\
@@ -1158,6 +1170,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::write(wt.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(wt.join("README.md"), "reviewed\n").unwrap();
         git(&wt, &["init", "-q"]);
         // spawn-audit: test-only — npm writes the fixture's lockfile.
         let st = Command::new("npm")
@@ -1180,6 +1193,76 @@ pub(crate) mod tests {
         );
         git(&wt, &["add", "-A"]);
         git(&wt, &["commit", "-qm", "base"]);
+        (tmp, wt)
+    }
+
+    /// core#1406 (xreview): the addon's build runs repository-installed code (gyp actions), so it
+    /// may write only the addon's own `build/`: an action that writes the reviewed tree is refused
+    /// by the floor's sandbox, the tree stays as reviewed, and the label says the addon did not
+    /// build.
+    #[cfg(unix)]
+    #[test]
+    fn a_native_build_that_writes_the_reviewed_tree_is_refused() {
+        if !installs_here() {
+            return;
+        }
+        let (tmp, wt) = native_shaped(
+            "seat-deps-native-tamper",
+            r#"{"targets":[{"target_name":"probe","sources":["probe.c"],
+"actions":[{"action_name":"tamper","inputs":["probe.c"],"outputs":["<(INTERMEDIATE_DIR)/tampered"],
+"action":["sh","-c","mkdir -p <(INTERMEDIATE_DIR) && touch <(INTERMEDIATE_DIR)/started && echo changed > ../../README.md && touch <(INTERMEDIATE_DIR)/tampered"]}]}]}"#,
+        );
+        let gd = git_dir_of(&wt);
+        let before = tree_of(&wt);
+        let got = provision(&wt, Some(&gd), "r", &SeatPlatform::host());
+        let Provisioned::Installed { platform, .. } = &got else {
+            panic!("{got:?}");
+        };
+        assert!(
+            platform.contains("; better-sqlite3 did not build natively"),
+            "{platform}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("README.md")).unwrap(),
+            "reviewed\n"
+        );
+        assert_eq!(tree_of(&wt), before);
+        // Not vacuous: the action ran (it wrote its own build dir) and only its write to the
+        // reviewed tree was refused.
+        fn find(dir: &Path, name: &str) -> bool {
+            std::fs::read_dir(dir).is_ok_and(|d| {
+                d.flatten().any(|e| {
+                    let p = e.path();
+                    p.file_name().is_some_and(|f| f == name) || (p.is_dir() && find(&p, name))
+                })
+            })
+        }
+        let build = wt.join("node_modules/better-sqlite3/build");
+        assert!(
+            find(&build, "started"),
+            "the tamper action never ran: {platform}"
+        );
+        assert!(!find(&build, "tampered"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// core#1406: a repository that declares `native_rebuild` (crew: better-sqlite3) gets its
+    /// addon built for the seat: the install runs with scripts off, then the floor's own
+    /// native-build step builds the binding in the worktree's node_modules, offline, under the
+    /// floor's sandbox, and the seat's `require` loads it. The fixture is a real node-gyp addon
+    /// installed from a tarball under the allowlisted name (npm installs a tarball as a copy, as it
+    /// installs a registry package: never a link), so nothing is downloaded. A second unit finds
+    /// the binding and builds nothing; an undeclared addon stays unbuilt, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_native_addon_is_built_for_the_seat_and_its_binding_loads() {
+        if !installs_here() {
+            return;
+        }
+        let (tmp, wt) = native_shaped(
+            "seat-deps-native",
+            r#"{"targets":[{"target_name":"probe","sources":["probe.c"]}]}"#,
+        );
         let gd = git_dir_of(&wt);
         let before = tree_of(&wt);
         let loads = || -> String {

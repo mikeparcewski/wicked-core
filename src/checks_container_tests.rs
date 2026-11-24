@@ -1806,3 +1806,146 @@ fn the_floor_path_has_no_rustup_proxies_and_the_image_links_the_pinned_toolchain
         "built with the floor's pinned Rust toolchain; a repository rust-toolchain file is not applied"
     ));
 }
+
+/// core#1406: a tree that declares no native addon keeps sharing the floor's own claim; one that
+/// declares some gets the seat's own claim beside the floor's (filled as the floor's, then built
+/// in place), so nothing the repository's build writes reaches the floor's shared claim.
+#[test]
+fn a_seat_claim_with_native_addons_is_its_own_beside_the_floors() {
+    let (tag, lock, inputs) = (
+        "wicked-checks-floor:abc",
+        b"lock".as_slice(),
+        b"in".as_slice(),
+    );
+    let plain = seat_nm_volume(tag, lock, inputs, &[]);
+    assert_eq!(plain, nm_volume(tag, "", lock, inputs, &[]));
+    let native = seat_nm_volume(tag, lock, inputs, &["better-sqlite3"]);
+    let floor = nm_volume(tag, "", lock, inputs, &["better-sqlite3"]);
+    assert_eq!(native, format!("{floor}-seat"));
+    assert_ne!(native, plain);
+    assert!(native.starts_with(DEPENDENCY_PREFIX), "{native}");
+    assert!(native.len() <= 63, "a pod name of it fits: build-{native}");
+}
+
+/// core#1406: the seat claim's offline build is the floor's own native-build step, verbatim, run
+/// in a scratch dir whose `node_modules` is the claim, marked once it succeeded (a marked claim
+/// is a hit); a failure leaves no marker.
+#[cfg(unix)]
+#[test]
+fn the_seat_claims_native_build_is_the_floors_step_and_marks_only_success() {
+    let script = native_build_script(&["better-sqlite3"]);
+    let argv = crate::repo_checks::native_build_argv(&["better-sqlite3"]);
+    assert!(
+        script.contains(&format!("( {} ); touch", argv[2])),
+        "{script}"
+    );
+    assert!(script.contains(&format!("ln -s {FILL_DIR} /tmp/wicked-native/node_modules")));
+    // Run it for real against a stand-in claim: FILL_DIR and /tmp are re-pointed into a scratch
+    // dir, and `node`/`npm` are stubs that "build" when asked (or fail).
+    let root = std::env::temp_dir().join(format!("native-claim-{}", uuid::Uuid::new_v4()));
+    let claim = root.join("vol");
+    let bin = root.join("bin");
+    let gyp = root.join("lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js");
+    std::fs::create_dir_all(claim.join("better-sqlite3/build")).unwrap();
+    std::fs::write(claim.join("better-sqlite3/package.json"), "{}").unwrap();
+    std::fs::create_dir_all(gyp.parent().unwrap()).unwrap();
+    std::fs::write(&gyp, "").unwrap();
+    std::fs::create_dir_all(root.join("lib/node_modules/npm/bin")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let npm = root.join("lib/node_modules/npm/bin/npm-cli.js");
+    crate::test_env::install_stub(&npm, "#!/bin/sh\nexit 0\n");
+    std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
+    crate::test_env::install_stub(
+        &bin.join("node"),
+        "#!/bin/sh\n[ -n \"$GYP_FAILS\" ] && exit 7\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
+    );
+    let local = script
+        .replace(FILL_DIR, &claim.display().to_string())
+        .replace("/tmp/wicked-native", &root.join("t").display().to_string());
+    let run = |env: &[(&str, &str)]| {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &local])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let (ok, _) = run(&[("GYP_FAILS", "1")]);
+    assert!(!ok);
+    assert!(
+        !claim.join(NATIVE_BUILT).exists(),
+        "a failed build leaves no marker"
+    );
+    let (ok, out) = run(&[]);
+    assert!(ok, "{out}");
+    assert!(claim.join("better-sqlite3/build/Release/x.node").is_file());
+    assert!(claim.join(NATIVE_BUILT).is_file());
+    let (ok, out) = run(&[("GYP_FAILS", "1")]);
+    assert!(ok && out.contains("WICKED-HIT"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// core#1406: the native addons a seat's claim is built for come from the snapshot tree's own
+/// `.wicked/checks.json` blob (never the worktree's file), validated as the floor validates them.
+#[cfg(unix)]
+#[test]
+fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
+    let root = std::env::temp_dir().join(format!("native-decl-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join(".wicked")).unwrap();
+    let git = |args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("README.md"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "none"]);
+    let gd = root.join(".git");
+    let none = git(&["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(declared_native_in(&gd, &none).unwrap(), Vec::<&str>::new());
+    std::fs::write(
+        root.join(crate::repo_checks::CONFIG_PATH),
+        r#"{"native_rebuild":["better-sqlite3"]}"#,
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "declares"]);
+    let declares = git(&["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(
+        declared_native_in(&gd, &declares).unwrap(),
+        ["better-sqlite3"]
+    );
+    // The worktree's own edit is not the snapshot's.
+    std::fs::write(
+        root.join(crate::repo_checks::CONFIG_PATH),
+        r#"{"native_rebuild":["leftpad"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        declared_native_in(&gd, &declares).unwrap(),
+        ["better-sqlite3"]
+    );
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "bad"]);
+    let bad = git(&["rev-parse", "HEAD^{tree}"]);
+    assert!(declared_native_in(&gd, &bad)
+        .unwrap_err()
+        .contains("leftpad"));
+    let _ = std::fs::remove_dir_all(&root);
+}
