@@ -2869,3 +2869,82 @@ fn core1414_the_mcp_server_pack_stays_where_it_fits_or_the_fit_is_unknown() {
         );
     }
 }
+
+/// (core#1855) The latest same-change row decides, whatever the exclusions. Gate A (ord 2) KEPT
+/// POL-2101 with judge codex; gate B (ord 3, same change) could not reuse it and ruled BROKEN
+/// with judge pi; gate C (ord 4) now excludes pi. Dropping B's BROKEN for its excluded judge
+/// before picking the latest row made A's KEPT the "latest", and C passed the rule. B's row is
+/// now the one picked and, excluded, it is dropped: C judges again. An excluded latest KEPT never
+/// falls back to an older KEPT either, and with nothing excluded the latest row stands.
+#[test]
+fn core1855_a_later_broken_on_the_same_change_is_never_skipped_for_an_older_kept() {
+    use crate::rule_check::{RuleCheckReport, RuleOrigin, RuleStatus, RuleVerdict};
+    let registry = vec![seat("claude"), seat("codex"), seat("pi")];
+    let row = |judge: &str, status: RuleStatus| RuleVerdict {
+        rule_id: "POL-2101".into(),
+        rule_key: "k-pol-2101".into(),
+        status,
+        origin: Some(RuleOrigin::Judge),
+        judge: Some(judge.into()),
+        judge_ids: vec![judge.into()],
+        ..Default::default()
+    };
+    let gate = |ord: u32, rows: Vec<RuleVerdict>| {
+        let mut u = crate::domain::WorkUnit::pending(&format!("s:{ord}"), "s", ord, "gate");
+        u.rule_check = Some(RuleCheckReport {
+            change_key: Some("change-1".into()),
+            rows,
+            ..Default::default()
+        });
+        u
+    };
+    let excluding = |excluded: &[&str]| {
+        let e: Vec<String> = excluded.iter().map(|s| s.to_string()).collect();
+        JudgeExclusions::of(
+            &["claude".to_string()],
+            Some(&[]),
+            &e,
+            &[],
+            &[],
+            &registry,
+            false,
+        )
+    };
+    let pick = |units: &[crate::domain::WorkUnit], excluded: &[&str]| {
+        let ex = excluding(excluded);
+        same_change_rows(units, 4, |r| ex.may_reuse(r, &registry))
+            .into_iter()
+            .map(|(k, r)| (k, r.judge.unwrap_or_default(), r.status))
+            .collect::<Vec<_>>()
+    };
+    let none: Vec<(String, String, RuleStatus)> = Vec::new();
+    let kept_then_broken = [
+        gate(2, vec![row("codex", RuleStatus::Kept)]),
+        gate(3, vec![row("pi", RuleStatus::Broken)]),
+    ];
+    // Nothing excluded: the latest row is B's BROKEN (which rule_check never reuses).
+    assert_eq!(
+        pick(&kept_then_broken, &[]),
+        [("change-1".to_string(), "pi".to_string(), RuleStatus::Broken)]
+    );
+    // B's judge excluded: nothing is reused, A's older KEPT included.
+    assert_eq!(pick(&kept_then_broken, &["pi"]), none);
+    // An excluded latest KEPT does not fall back to an older KEPT by another judge.
+    let kept_twice = [
+        gate(2, vec![row("codex", RuleStatus::Kept)]),
+        gate(3, vec![row("pi", RuleStatus::Kept)]),
+    ];
+    assert_eq!(pick(&kept_twice, &["pi"]), none);
+    assert_eq!(
+        pick(&kept_twice, &[]),
+        [("change-1".to_string(), "pi".to_string(), RuleStatus::Kept)]
+    );
+    // Units listed out of order are read earliest first, and a later unit's row (ord 5) never
+    // answers this gate (ord 4).
+    let shuffled = [
+        gate(5, vec![row("codex", RuleStatus::Kept)]),
+        gate(3, vec![row("pi", RuleStatus::Broken)]),
+        gate(2, vec![row("codex", RuleStatus::Kept)]),
+    ];
+    assert_eq!(pick(&shuffled, &["pi"]), none);
+}
