@@ -3643,14 +3643,18 @@ fn collect_bash_write_targets(
     // (core#922 review) `<>FILE` opens FILE read-WRITE, and `>&WORD` with a WORD that is not a
     // descriptor sends stdout+stderr to the FILE `WORD`: both are write redirects too.
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    // (core#1852) Each redirect word is read up to a control operator glued to it, which the lexer
+    // leaves inside the word in a command holding an expansion (`… ${X} 2>/dev/null|head`).
     let mut i = 0;
     while i < toks.len() {
-        if let Some(glued) = redirect_glob(toks[i]).or_else(|| file_redirect_extra(toks[i])) {
+        let tok = before_glued_operator(toks[i]);
+        if let Some(glued) = redirect_glob(tok).or_else(|| file_redirect_extra(tok)) {
             if !glued.is_empty() {
                 targets.push(glued.to_string());
             } else if let Some(next) = toks.get(i + 1).filter(|n| !SEPS.contains(*n)) {
-                if !(toks[i].ends_with(">&") && is_descriptor_word(next)) {
-                    targets.push((*next).to_string());
+                let next = before_glued_operator(next);
+                if !(tok.ends_with(">&") && is_descriptor_word(next)) {
+                    targets.push(next.to_string());
                 }
                 i += 1;
             }
@@ -7011,6 +7015,60 @@ fn redirect_glob(tok: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+/// (core#1852) `word` up to its first unquoted, unescaped control operator (`|`, `&`, `;`) outside
+/// any `${…}`, `$(…)`, `$[…]` or backtick: what the shell reads as the word before the operator.
+/// A `|` or `&` right after `>`/`<` belongs to the redirect operator (`>|`, `>&`, `<&`), and one at
+/// the very start is left alone. The whole word when it has no such operator. The lexer splits a
+/// glued operator itself except in a command holding an expansion ([`lex_shell_tokens_reading`]),
+/// whose separate whitespace reading keeps `2>/dev/null|head` as one word.
+fn before_glued_operator(word: &str) -> &str {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut open: Vec<char> = Vec::new();
+    let mut prev = '\0';
+    let mut chars = word.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let before = std::mem::replace(&mut prev, c);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if single {
+            single = c != '\'';
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            '$' if matches!(chars.peek(), Some((_, '{' | '(' | '['))) => {
+                let (_, opener) = chars.next().unwrap();
+                prev = opener;
+                open.push(match opener {
+                    '{' => '}',
+                    '(' => ')',
+                    _ => ']',
+                });
+            }
+            '`' if open.last() == Some(&'`') => {
+                open.pop();
+            }
+            '`' => open.push('`'),
+            '(' if open.last() == Some(&')') => open.push(')'),
+            '{' if open.last() == Some(&'}') => open.push('}'),
+            c if open.last() == Some(&c) => {
+                open.pop();
+            }
+            '|' | '&' | ';'
+                if !double && open.is_empty() && at > 0 && !matches!(before, '>' | '<') =>
+            {
+                return &word[..at];
+            }
+            _ => {}
+        }
+    }
+    word
 }
 
 /// (core#922 review) The write redirects [`redirect_glob`] does not model: `N<>FILE` (opens FILE
@@ -16639,12 +16697,16 @@ mod boundary_tests {
                 "{cmd:?}: {targets:?}"
             );
         }
-        // A separator inside an expansion is no operator: the word stays whole (and unresolved).
+        // A separator inside an expansion is no operator: the word is not cut short, and every
+        // reading of it stays unresolved (refused), never a literal path.
         let targets = resolved_bash_write_targets("echo x >${X:-/tmp/a|b}", None);
         assert!(
             targets
                 .iter()
-                .all(|t| matches!(t, ShellTarget::Unresolved(w) if w.contains("|b"))),
+                .any(|t| matches!(t, ShellTarget::Unresolved(w) if w.contains("|b")))
+                && targets
+                    .iter()
+                    .all(|t| matches!(t, ShellTarget::Unresolved(_))),
             "{targets:?}"
         );
     }
