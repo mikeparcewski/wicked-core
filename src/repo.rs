@@ -2239,17 +2239,22 @@ fn in_clone_fallback(
     Ok(fallback)
 }
 
-/// (core#1860) Keep the in-checkout trees folder out of the checkout's status: one
-/// `wicked-worktrees/` line appended to the repository's own `info/exclude` (never the tracked
-/// `.gitignore`). The file is only ever appended to, never rewritten, so its other rules (in any
-/// encoding) survive concurrent launches; a file that cannot be read is left alone. Best-effort:
-/// a failure to write it is cosmetic.
+/// (core#1860) Keep the in-checkout trees folder out of the checkout's status: one line naming
+/// exactly that folder, anchored at the checkout's top (`/wicked-worktrees/`, or
+/// `/<subdirectory>/wicked-worktrees/` for a repository registered at a subdirectory), so a
+/// `wicked-worktrees` folder elsewhere in the repository stays visible. It is appended to the
+/// repository's own `info/exclude` (never the tracked `.gitignore`), never rewritten, so its other
+/// rules (in any encoding) survive; a file that cannot be read is left alone. Best-effort: a
+/// failure to write it is cosmetic, and two first launches at once may add the line twice.
 fn exclude_in_clone_trees(repo_root: &str) {
     use std::io::Write;
-    const ENTRY: &[u8] = b"wicked-worktrees/";
     let Ok((true, path, _)) = git(repo_root, &["rev-parse", "--git-path", "info/exclude"]) else {
         return;
     };
+    let Ok((true, prefix, _)) = git(repo_root, &["rev-parse", "--show-prefix"]) else {
+        return;
+    };
+    let entry = format!("/{prefix}{WORKTREES_DIR}/");
     let exclude = Path::new(repo_root).join(path.trim());
     let existing = match std::fs::read(&exclude) {
         Ok(bytes) => bytes,
@@ -2258,7 +2263,7 @@ fn exclude_in_clone_trees(repo_root: &str) {
     };
     if existing
         .split(|b| *b == b'\n')
-        .any(|line| line.trim_ascii() == ENTRY)
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == entry.as_bytes())
     {
         return;
     }
@@ -2269,7 +2274,7 @@ fn exclude_in_clone_trees(repo_root: &str) {
     if !existing.is_empty() && !existing.ends_with(b"\n") {
         line.push(b'\n');
     }
-    line.extend_from_slice(ENTRY);
+    line.extend_from_slice(entry.as_bytes());
     line.push(b'\n');
     let _ = std::fs::OpenOptions::new()
         .create(true)
@@ -5190,6 +5195,14 @@ mod tests {
             ok && status.trim().is_empty(),
             "the checkout stays clean: {status}"
         );
+        let probes = std::fs::read_dir(app.join(WORKTREES_DIR))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with(".wicked-probe"))
+            })
+            .count();
+        assert_eq!(probes, 0, "no probe is left among the trees");
         remove_worktree(p, run_id);
         assert!(!wt.exists(), "a removal reaps it");
     }
@@ -5245,8 +5258,13 @@ mod tests {
         assert_minted_inside(&app, "run-file-2");
         assert_eq!(
             std::fs::read(&exclude).unwrap(),
-            [rules, &b"\nwicked-worktrees/\n"[..]].concat()
+            [rules, &b"\n/wicked-worktrees/\n"[..]].concat()
         );
+        // The line names that one folder: a `wicked-worktrees` elsewhere stays visible.
+        std::fs::create_dir_all(app.join("fixtures").join(WORKTREES_DIR)).unwrap();
+        std::fs::write(app.join("fixtures").join(WORKTREES_DIR).join("a.rs"), "x\n").unwrap();
+        let (_, status, _) = git(app.to_str().unwrap(), &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("fixtures/"), "{status}");
 
         let (holder, app) = Holder::new("link-inside");
         std::fs::write(holder.0.join("app.wicked"), "not a folder\n").unwrap();
