@@ -534,7 +534,9 @@ impl RoleRecord {
         Self {
             role: role.as_str().to_string(),
             filled: FILLED_NONE.to_string(),
-            state: FILLED_NONE.to_string(),
+            // (core#1864) The DES state enum is `answered|failed|seated`: an obligation nobody
+            // filled is a failed one.
+            state: crate::standin::STATE_FAILED.to_string(),
             seat: None,
             stand_in: None,
             ord: Some(ord),
@@ -865,6 +867,17 @@ impl AssuranceReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (core#1864) A role nobody filled carries a state the DES enum names (`answered|failed|
+    /// seated`): `failed`, with `filled: none`.
+    #[test]
+    fn a_role_nobody_filled_is_failed_on_the_wire() {
+        let r = RoleRecord::none(crate::standin::Role::Judge, 2, 0);
+        assert_eq!(r.filled, FILLED_NONE);
+        assert_eq!(r.state, crate::standin::STATE_FAILED);
+        let wire = serde_json::to_value(&r).unwrap();
+        assert_eq!(wire["state"], "failed", "{wire}");
+    }
 
     /// core#1392 (review): an operator's waiver is never hidden behind another skip of the same
     /// instrument, and a delivery keeps every gate's waiver detail (once each).

@@ -44,6 +44,8 @@ mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
 mod stand_in_gate;
+#[cfg(test)]
+mod stand_in_packet_tests;
 mod team_gate;
 mod worktree_cleanup;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
@@ -13268,12 +13270,18 @@ fn power_dispatch(
             let task = crate::power::authored_task(&unit);
             unit.description = task.clone();
             // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
-            // hand-off's reviewers, judges and QE are dispatched without it.
+            // hand-off's reviewers, judges and QE are dispatched without it. (DES-STANDIN-001
+            // §3.4, core#1863) Never a stand-in's: none is minted for a creator, and if one were,
+            // it hears no communication.
+            let voice = power
+                .voice
+                .clone()
+                .filter(|_| !crate::execute_wrapped::is_stand_in_unit(&unit));
             unit.description.push_str(&crate::power::orchestrator_brief(
                 power.rigor,
                 power.plan.as_ref(),
                 round,
-                power.voice.as_deref(),
+                voice.as_deref(),
             ));
             // (core#1486) The attempt's retry or send-back notes ride turn 1 as their own block
             // too, and every later turn restates them ahead of the (clipped) task.
@@ -13289,7 +13297,7 @@ fn power_dispatch(
                     cli: unit.assigned_cli.clone().unwrap_or_default(),
                     round,
                     base: session.base_commit.clone(),
-                    voice: power.voice.clone(),
+                    voice,
                     notes,
                 },
             );
@@ -14139,6 +14147,8 @@ fn dispatch_unit_with(
             ))
         })
         .unzip();
+    // (core#1862) The work a stand-in is handed: exactly the blocks above, by position.
+    let work_blocks = prior_outputs.len();
     // (DES-L1 PR-1B, core#549) A creator re-run after `request_changes` is handed the full
     // amendment (evaluator findings + operator note) as prior context. The amendment is persisted
     // on the unit as `rework_amendment` (stored by `rewind_to_creator` since core#549); older
@@ -14393,7 +14403,8 @@ fn dispatch_unit_with(
     if stand_in {
         let keep: Vec<bool> = prior_outputs
             .iter()
-            .map(|p| crate::standin::packet_keeps(&p.label))
+            .enumerate()
+            .map(|(i, p)| i < work_blocks || crate::standin::packet_keeps(&p.label))
             .collect();
         let mut k = keep.iter();
         prior_outputs.retain(|_| *k.next().unwrap_or(&false));
@@ -21799,7 +21810,7 @@ pub(crate) fn refuse_before_resolving(
     // (DES-STANDIN-001 §3.10) A `stand_in_needed` gate takes three answers: use stand-ins,
     // approve (retry) and reject; `use_stand_ins` answers nothing else.
     if let crate::workflow::HumanDecision::UseStandIns { scope } = decision {
-        stand_in_gate::refuse_use_stand_ins(session, cursor, scope)?;
+        stand_in_gate::refuse_use_stand_ins(session, cursor, scope, actor)?;
     } else if stand_in_gate::gate_open(cursor)
         && !matches!(
             decision,

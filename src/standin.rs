@@ -238,9 +238,11 @@ impl Reason {
 }
 
 /// Binding states (§5.1, rev 3 N6). Only `answered` satisfies a check; every state counts as
-/// taking part. (`failed` comes with the councils' stand-ins, whose seats can fail and still count.)
+/// taking part. (`failed` comes with the councils' stand-ins, whose seats can fail and still count;
+/// a role record nobody filled carries it too, core#1864.)
 pub const STATE_SEATED: &str = "seated";
 pub const STATE_ANSWERED: &str = "answered";
+pub const STATE_FAILED: &str = "failed";
 
 /// (§3.3) One stand-in: a role filled on a base credential, for one scope. Durable on the run's
 /// contract (`RunAssurance::stand_ins`).
@@ -571,21 +573,27 @@ pub(crate) fn preface(lens: Option<&str>) -> String {
 /// The label the stand-in preface rides in a unit's context.
 pub(crate) const PREFACE_LABEL: &str = "[stand-in reviewer — read this first]";
 
-/// (§3.4) The context blocks a stand-in may be handed, by label: never team findings, earlier
-/// verdicts of the review, a send-back's findings, a team step's record or operator messages —
-/// everything that carries the builder's (or another reviewer's) reasoning. The step's checklist,
-/// the work's outputs and the engine's own records (floor, requirements, rulings, conformance) are
-/// facts and stay.
+/// (§3.4, core#1862) The context blocks a stand-in may be handed besides the work, by label: an
+/// ALLOW-LIST of the engine's own records (the step's checklist, the operator's rulings, the floor,
+/// requirements, editor conformance and draft render records). These are facts. Everything else is
+/// dropped, including any label added later: team findings, earlier verdicts, a send-back's
+/// findings, a team step's record, operator messages, and whatever carries the builder's (or
+/// another reviewer's) reasoning. The work itself (the earlier non-verdict units' outputs) is kept
+/// by position, not by label (`dispatch_unit_with`): its label names a seat, which no list can.
 pub(crate) fn packet_keeps(label: &str) -> bool {
-    const DROPPED: [&str; 6] = [
-        "[team findings",
-        "[prior verdicts",
-        "[review — unit",
-        "[team step",
-        "[operator messages",
-        "[team ",
+    const ENGINE_RECORDS: [&str; 3] = [
+        "[review checklist — unit ",
+        "[operator rulings — unit ",
+        "[floor record — unit ",
     ];
-    !DROPPED.iter().any(|d| label.starts_with(d))
+    ENGINE_RECORDS.iter().any(|r| label.starts_with(r))
+        || [
+            crate::repo::REQUIREMENTS_RECORD_LABEL,
+            crate::editor_conformance::RECORD_LABEL,
+            crate::draft_render::RECORD_LABEL,
+        ]
+        .iter()
+        .any(|r| label.starts_with(&format!("{r} — ")))
 }
 
 /// (§3.7) The stamp's label: who stood in, on what, and why ("Claude Code stood in for the
@@ -929,5 +937,43 @@ mod tests {
                 cause: "quota_exhausted".into()
             }
         );
+    }
+
+    /// (core#1862) Every context label `dispatch_unit_with` hands a seat today, classified: the
+    /// engine's records are kept, everything carrying someone's reasoning or communications is
+    /// dropped, and a label nobody classified (a block added later) is dropped by default.
+    #[test]
+    fn the_stand_in_packet_is_an_allow_list_of_engine_records() {
+        let kept = [
+            "[review checklist — unit 3]".to_string(),
+            "[operator rulings — unit 3]".to_string(),
+            "[floor record — unit 2]".to_string(),
+            format!(
+                "{} — engine record]",
+                crate::repo::REQUIREMENTS_RECORD_LABEL
+            ),
+            format!("{} — unit 2]", crate::editor_conformance::RECORD_LABEL),
+            format!("{} — unit 2]", crate::draft_render::RECORD_LABEL),
+        ];
+        for l in &kept {
+            assert!(packet_keeps(l), "an engine record is kept: {l}");
+        }
+        let dropped = [
+            "[review — unit 2 — requested changes]",
+            "[team findings — unit 1]",
+            "[prior verdicts — unit 3]",
+            "[team step — build by claude#2]",
+            "[operator messages — said while the run worked; act on them]",
+            crate::team::runner::ADVICE_LABEL,
+            // The work's labels name a seat: kept by position in the actor, never by label.
+            "[claude — unit 1]",
+            "[codex — unit 1 — depends_on `build`]",
+            // A block added later is dropped until someone classifies it.
+            "[a new context block — unit 2]",
+            "",
+        ];
+        for l in dropped {
+            assert!(!packet_keeps(l), "dropped by default: {l}");
+        }
     }
 }

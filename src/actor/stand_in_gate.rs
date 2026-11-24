@@ -38,6 +38,7 @@ pub(crate) fn refuse_use_stand_ins(
     session: &AgentSession,
     cursor: Option<&WorkUnit>,
     scope: &str,
+    actor: Option<&str>,
 ) -> anyhow::Result<()> {
     if !gate_open(cursor) {
         anyhow::bail!(
@@ -54,6 +55,14 @@ pub(crate) fn refuse_use_stand_ins(
     if scope != crate::standin::SCOPE_JOB && scope != crate::standin::SCOPE_ALWAYS {
         anyhow::bail!(
             "action `{}` needs scope `job` or `always`, not `{scope}`",
+            crate::workflow::USE_STAND_INS_ACTION
+        );
+    }
+    // (core#1864) A grant is consent, and consent is a person's: a grant naming no one is refused
+    // as a blank launch consent is (`StandInConsent::validate`), never recorded as `operator`.
+    if actor.is_none_or(|a| a.trim().is_empty()) {
+        anyhow::bail!(
+            "action `{}` names no one (`actor`): consent to stand-ins is a person's",
             crate::workflow::USE_STAND_INS_ACTION
         );
     }
@@ -174,11 +183,8 @@ pub(crate) fn answer(
     if let Some(scope) = grant {
         let consent = crate::standin::StandInConsent {
             scope: scope.to_string(),
-            by: actor
-                .map(str::trim)
-                .filter(|a| !a.is_empty())
-                .unwrap_or("operator")
-                .to_string(),
+            // Never blank: `refuse_use_stand_ins` refused a grant naming no one.
+            by: actor.map(str::trim).unwrap_or_default().to_string(),
             at: crate::interaction::now_millis(),
             via: "grant".to_string(),
         };

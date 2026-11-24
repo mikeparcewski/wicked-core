@@ -409,6 +409,14 @@ fn without_consent_the_run_parks_at_stand_in_needed_and_a_grant_continues() {
         .grant_stand_ins(sid, "job", Some("operator".into()), first, None)
         .expect_err("a grant for an earlier opening is refused");
     assert!(stale.to_string().starts_with("gate_changed"), "{stale:#}");
+    // core#1864: a grant is consent, and consent is a person's: one naming no one is refused (as a
+    // blank launch consent is), and the gate stays open for the real one.
+    for nobody in [None, Some("  ".to_string())] {
+        let e = core
+            .grant_stand_ins(sid, "job", nobody, now, None)
+            .expect_err("a grant naming no one is refused");
+        assert!(e.to_string().contains("names no one"), "{e:#}");
+    }
     // Read before the grant: the grant dispatches on the actor, so the build may start before
     // `grant_stand_ins` returns.
     let built_before = seen.lock().unwrap().iter().filter(|s| s.ord == 1).count();

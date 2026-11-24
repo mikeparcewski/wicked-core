@@ -321,7 +321,9 @@ fn answer_actions(
                         session,
                         run_id,
                         d,
-                        None,
+                        // The probe answers as someone: a real answer must name its person
+                        // (core#1864), and listing an action never depends on who will answer it.
+                        Some(PROBE),
                         adjudication_open,
                         floor_fix,
                     )
