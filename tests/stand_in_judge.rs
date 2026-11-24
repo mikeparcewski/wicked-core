@@ -442,12 +442,8 @@ fn t_r12_a_missing_judge_holds_and_a_grant_re_runs_only_the_judge() {
     );
     let first_seq = first.gate_seq.expect("gate_seq");
 
-    // core#1873: on the Windows runner the retry below never re-opens the gate at
-    // `stand_in_needed` (seen twice in CI), so there the grant answers the first opening.
-    let grant_seq = if cfg!(windows) {
-        first_seq
-    } else {
-        // A retry with still no helper: only the judge is tried again, and the gate re-opens.
+    // A retry with still no helper: only the judge is tried again, and the gate re-opens.
+    let grant_seq = {
         let status = rig
             .core
             .confirm_gate(
@@ -459,20 +455,52 @@ fn t_r12_a_missing_judge_holds_and_a_grant_re_runs_only_the_judge() {
             )
             .expect("a retry is taken");
         // Wait on the gate itself, not on an event: the first hold may have left a later
-        // `awaitingHuman` in the channel, and the re-judge runs on its own thread.
+        // `awaitingHuman` in the channel, and the re-judge runs on its own thread. What the run
+        // said meanwhile is kept for the failure message (core#1873).
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut seen: Vec<CoreEvent> = Vec::new();
         let now = loop {
-            let open = rig.core.gate_actions(sid).unwrap().filter(|g| {
+            while let Ok(e) = ev.try_recv() {
+                seen.push(e);
+            }
+            let gate = rig.core.gate_actions(sid).unwrap();
+            if let Some(g) = gate.clone().filter(|g| {
                 g.gate_seq != Some(first_seq)
                     && g.actions.iter().any(|a| a.action == "use_stand_ins")
-            });
-            if let Some(g) = open {
+            }) {
                 break g;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the gate re-opened at stand_in_needed after the retry ({status:?})"
-            );
+            if Instant::now() >= deadline {
+                let said: Vec<String> = seen
+                    .iter()
+                    .filter_map(|e| match e {
+                        CoreEvent::GateEscalated {
+                            session,
+                            condition,
+                            denial_source,
+                            verdict_summary,
+                            attempt,
+                            ..
+                        } if session == sid => Some(format!(
+                            "escalated {condition}/{denial_source} attempt {attempt}: {}",
+                            verdict_summary.chars().take(600).collect::<String>()
+                        )),
+                        CoreEvent::GateEvaluated { session, .. } if session == sid => {
+                            Some(format!("{e:?}").chars().take(1500).collect::<String>())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let names: Vec<String> = seen
+                    .iter()
+                    .map(|e| format!("{e:?}").chars().take(40).collect())
+                    .collect();
+                panic!(
+                    "the gate never re-opened at stand_in_needed after the retry ({status:?}); \
+                     gate now: {gate:?}\nsaid:\n{}\nevents: {names:?}",
+                    said.join("\n")
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         };
         let now_seq = now.gate_seq.expect("gate_seq");
