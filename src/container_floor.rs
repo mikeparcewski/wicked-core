@@ -4114,23 +4114,42 @@ mod tests {
             dir.0.join("tags").display(),
         );
         crate::test_env::install_stub(&rt.cli, &script);
-        let removed = |tag: &str| {
-            std::fs::read_to_string(&log)
-                .unwrap()
+        // The removals a step made: the log lines it appended.
+        let mark = || std::fs::read_to_string(&log).unwrap().len();
+        let removed_since = |at: usize| -> Vec<String> {
+            std::fs::read_to_string(&log).unwrap()[at..]
                 .lines()
-                .any(|l| l == format!("image rm {tag}"))
+                .filter_map(|l| l.strip_prefix("image rm ").map(str::to_string))
+                .collect()
         };
+        let pin = |id: &str| pin_seat_image(&rt, &format!("{repo}:build"), id).unwrap();
         // Launch 1 pins the first id; its pod is starting.
-        let held = pin_seat_image(&rt, &format!("{repo}:build"), &first).unwrap();
+        let held = pin(&first);
         // Launch 2 armed on a rebuilt image: its cleanup leaves launch 1's pin alone.
-        let other = pin_seat_image(&rt, &format!("{repo}:build"), &second).unwrap();
-        assert!(!removed(&pin_of(&first)), "a held pin stays");
-        // Launch 1 ends; the next pin's cleanup removes its pin, never launch 2's held one.
+        let at = mark();
+        let other = pin(&second);
+        assert_eq!(removed_since(at), Vec::<String>::new(), "a held pin stays");
+        // Launch 3 shares the first id with launch 1: one hold ending keeps the pin while the
+        // other still holds it.
+        let shared = pin(&first);
         drop(held);
-        let again = pin_seat_image(&rt, &format!("{repo}:build"), &second).unwrap();
-        assert!(removed(&pin_of(&first)), "a pin no launch holds goes");
-        assert!(!removed(&pin_of(&second)));
-        drop((other, again));
+        let at = mark();
+        let again = pin(&second);
+        assert_eq!(
+            removed_since(at),
+            Vec::<String>::new(),
+            "still held by launch 3"
+        );
+        // The last hold ends: the next pin's cleanup removes it, never a pin still held.
+        drop(shared);
+        let at = mark();
+        let last = pin(&second);
+        assert_eq!(
+            removed_since(at),
+            vec![pin_of(&first)],
+            "no launch holds it now"
+        );
+        drop((other, again, last));
     }
 
     #[test]
