@@ -11043,11 +11043,13 @@ fn denial_gate_prompt_body(
         }
         // (core#1846) The checks never ran (the machine was short of disk): nothing failed, so
         // the one way on is a retry once there is space; no seat, send-back or override fixes it.
-        "floor_failed" if floor_not_run(unit).is_some() => format!(
-            "Unit {ord}'s checks did not run: {}. Approve to retry the step once that is fixed \
-             (its checks run again), or reject to cancel the run{note}",
-            floor_not_run(unit).unwrap_or_default().trim_end_matches('.')
-        ),
+        "floor_failed" if floor_not_run(unit).is_some() => {
+            let (verb, cause) = floor_not_run(unit).map_or(("run", ""), |f| (f.verb, f.cause));
+            format!(
+                "Unit {ord}'s checks did not {verb}: {cause}. Approve to retry the step once that \
+                 is fixed (its checks run again), or reject to cancel the run{note}"
+            )
+        }
         "floor_failed" if floor_fix_applies(unit) => format!(
             "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
              phase, approve with a note to have a seat other than this read-only phase's make \
@@ -12010,10 +12012,10 @@ pub(crate) fn parked_reseat_refusal(
         );
     }
     // (core#1846) Another seat meets the same machine: the checks did not run for want of disk.
-    if let Some(cause) = floor_not_run(unit) {
+    if let Some(f) = floor_not_run(unit) {
         return Err(floor_not_run_refusal(
             ord,
-            cause,
+            &f,
             "moving the step to another seat",
         ));
     }
@@ -20918,34 +20920,60 @@ fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
         && floor_not_run(unit).is_none()
 }
 
-/// (core#1846) Why `unit`'s repo-checks floor did not run its checks because of the machine (the
-/// disk was short of space), not the change: the floor's own environment refusal
-/// ([`crate::repo_checks::RepoChecksReport::environment_refusal`]) without its wire prefix, or
-/// `None` for every other denial. Its gate is a retry once the machine is fixed: no seat, send-back
-/// or override answers it, since no check said anything about the work.
-pub(crate) fn floor_not_run(unit: &crate::domain::WorkUnit) -> Option<&str> {
-    let source = unit.denial.as_ref()?.source.as_str();
-    if source != crate::repo_checks::DENIAL_SOURCE
-        && source != crate::repo_checks::DENIAL_SOURCE_TIMEOUT
+/// (core#1846) A repo-checks floor stopped by the machine (the disk was short of space), not by
+/// the change ([`floor_not_run`]).
+pub(crate) struct FloorNotRun<'a> {
+    /// The floor's own cause, without its wire prefix; it says what to do.
+    pub(crate) cause: &'a str,
+    /// `run` when no check started, `finish` when the disk stopped the floor part way.
+    pub(crate) verb: &'static str,
+}
+
+/// (core#1846) Whether `unit`'s gate is ONLY its floor stopped by the machine: a repo-checks denial
+/// whose report carries the floor's environment refusal
+/// ([`crate::repo_checks::RepoChecksReport::environment_refusal`]), where no check that ran
+/// denied the work and no other layer denied the attempt. `None` for every other gate (a check
+/// that failed or timed out before the stop, or a denial behind the floor, keeps the floor gate's
+/// own answers). Its gate is a retry once the machine is fixed: no seat, send-back or override
+/// answers it, since nothing said anything against the work.
+pub(crate) fn floor_not_run(unit: &crate::domain::WorkUnit) -> Option<FloorNotRun<'_>> {
+    if unit.denial.as_ref()?.source != crate::repo_checks::DENIAL_SOURCE
+        || unit
+            .denials_behind
+            .as_deref()
+            .is_some_and(|b| !b.is_empty())
     {
         return None;
     }
-    let cause = unit.repo_checks.as_ref()?.environment_refusal()?;
-    Some(
-        cause
+    let report = unit.repo_checks.as_ref()?;
+    let cause = report.environment_refusal()?;
+    if report
+        .checks
+        .iter()
+        .any(|c| c.denies() && !c.environment_failure())
+    {
+        return None;
+    }
+    let started = report.checks.iter().any(|c| !c.environment_failure());
+    Some(FloorNotRun {
+        cause: cause
             .strip_prefix(crate::repo_checks::ENVIRONMENT_REFUSAL_PREFIX)
             .unwrap_or(cause)
-            .trim(),
-    )
+            .trim()
+            .trim_end_matches('.'),
+        verb: if started { "finish" } else { "run" },
+    })
 }
 
-/// (core#1846) The refusal every answer but a retry or a stop gets at a floor whose checks did
-/// not run ([`floor_not_run`]).
-fn floor_not_run_refusal(ord: u32, cause: &str, answer: &str) -> anyhow::Error {
+/// (core#1846) The refusal every answer but a retry or a stop gets at a floor the machine stopped
+/// ([`floor_not_run`]).
+fn floor_not_run_refusal(ord: u32, f: &FloorNotRun<'_>, answer: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "unit {ord}'s checks did not run: {cause}. Nothing about the work failed, so {answer} \
-         would not help: free disk space on this machine, then approve to retry the step, or \
-         reject to cancel the run"
+        "unit {ord}'s checks did not {}: {}. Nothing about the work failed, so {answer} would \
+         not help: free disk space on this machine, then approve to retry the step, or reject to \
+         cancel the run",
+        f.verb,
+        f.cause
     )
 }
 
@@ -21697,8 +21725,8 @@ pub(crate) fn refuse_before_resolving(
         && !team_gate::dispute_gate_open(session)
         && !team_gate::transport_gate_open(session)
     {
-        if let Some((u, cause)) = cursor.and_then(|u| floor_not_run(u).map(|c| (u, c))) {
-            return Err(floor_not_run_refusal(u.ord, cause, "sending the work back"));
+        if let Some((u, f)) = cursor.and_then(|u| floor_not_run(u).map(|f| (u, f))) {
+            return Err(floor_not_run_refusal(u.ord, &f, "sending the work back"));
         }
     }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
@@ -22366,8 +22394,8 @@ fn floor_override_for(
         ),
     };
     // (core#1846) No check ran: there is no failure for the operator's judgment to override.
-    if let Some(cause) = floor_not_run(u) {
-        return Err(floor_not_run_refusal(u.ord, cause, "your own judgment"));
+    if let Some(f) = floor_not_run(u) {
+        return Err(floor_not_run_refusal(u.ord, &f, "your own judgment"));
     }
     if u.member_step.is_some() {
         anyhow::bail!(
@@ -35846,6 +35874,10 @@ mod request_changes_tests {
         ));
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join("package.json"), r#"{"scripts":{"test":"exit 1"}}"#).unwrap();
+        // A test that turns the disk guard off (`WICKED_FLOOR_MIN_FREE_GB=0`) holds the write lock.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         crate::repo_checks::TEST_FREE_BYTES.with(|c| c.set(1 << 30));
         let report =
             crate::repo_checks::run_floor(&wt, &crate::repo_checks::FloorContext::default());
@@ -35933,6 +35965,40 @@ mod request_changes_tests {
         );
         assert!(floor_not_run(&red).is_none());
         assert!(floor_fix_applies(&red));
+
+        // The disk stopped the floor part way (xreview r1): a check that ran and passed first
+        // leaves it a retry, said as "did not finish"; a check that ran and FAILED first, or another
+        // layer that denied the attempt, keeps the floor gate's own answers.
+        let check = |exit: i32| -> crate::repo_checks::CheckRun {
+            serde_json::from_value(serde_json::json!({
+                "name": "lint", "argv": ["npm", "run", "lint"], "source": "package.json",
+                "exit_code": exit, "timed_out": false, "duration_ms": 900,
+                "stdout_tail": "", "stderr_tail": ""
+            }))
+            .unwrap()
+        };
+        let mut part = verify.clone();
+        part.repo_checks.as_mut().unwrap().checks.push(check(0));
+        let p = denial_gate_prompt(&part, "floor_failed", "x", None, "");
+        assert!(
+            p.starts_with("Unit 4's checks did not finish: the host has"),
+            "{p}"
+        );
+        assert!(!floor_fix_applies(&part));
+        let mut failed_first = verify.clone();
+        failed_first
+            .repo_checks
+            .as_mut()
+            .unwrap()
+            .checks
+            .push(check(1));
+        assert!(floor_not_run(&failed_first).is_none());
+        assert!(floor_fix_applies(&failed_first));
+        let mut behind = verify.clone();
+        behind.denials_behind = Some(vec![UnitDenial::new("evaluator_verdict", "FAIL")]);
+        assert!(floor_not_run(&behind).is_none());
+        let p = denial_gate_prompt(&behind, "floor_failed", "x", None, "");
+        assert!(p.contains("failed its deterministic floor"), "{p}");
     }
 
     /// (core#1846) The gate's published answers are a retry and a stop: no floor fix on the noted
