@@ -1690,11 +1690,11 @@ pub(crate) fn apply_and_finish_unit(
     // (DES-STANDIN-001 §3.6, §3.8) On a stand-in-aware run with no consent, the missing judge is
     // the `stand_in_needed` hold (grant a stand-in, sign a helper in and retry, or reject), never
     // the reduced offer.
-    // Only a pinned judge can take a stand-in (`standin::judge_offer`): a default judge's hold keeps
-    // today's words, since a grant could not fill it.
+    // A pinned and a default judge both take a stand-in (`standin::judge_offer`, coord F1 on
+    // #1854), so either one's hold is the stand-in hold.
     let stand_in_hold = crate::standin::active(&assurance)
         && assurance.stand_in.is_none()
-        && unit.validator.as_ref().is_some_and(|v| v.approved);
+        && unit.tool_cmd.is_none();
     // (T-R12) …and so is a judge whose every seat failed as a seat (lost during the run, no
     // fallback): a verdict-less answer stays the human's, as today.
     let agent_denial = agent_denial.map(|(source, why)| {
@@ -3080,8 +3080,13 @@ fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::
     if !now.same_tree_as(prior) {
         return Vec::new();
     }
-    let judge_layer =
-        |s: &str| s == "agent_validator" || s == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE;
+    // (DES-STANDIN-001 §3.10) An aware run's missing judge (`stand_in_needed`) is the judge
+    // layer's hold too: a re-judge after a grant gives that layer its fresh word.
+    let judge_layer = |s: &str| {
+        s == "agent_validator"
+            || s == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
+            || s == crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED
+    };
     let qe_layer = |s: &str| {
         s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
             || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE

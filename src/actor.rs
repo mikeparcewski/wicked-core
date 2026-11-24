@@ -15278,7 +15278,7 @@ fn dispatch_unit_with(
     // waits for the fold through it.
     let team_runner = team_gate::team_runner();
     let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
-    // (DES-STANDIN-001 §3.6) The stand-in this unit's pinned judge may run on, minted HERE on the
+    // (DES-STANDIN-001 §3.6) The stand-in this unit's judge (pinned or default) may run on, minted HERE on the
     // actor (slots never repeat); the judge takes it only when no distinct judge is left, and the
     // fold records it then.
     let stand_in_judge = session

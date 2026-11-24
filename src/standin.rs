@@ -448,11 +448,13 @@ pub(crate) struct JudgeStandIn {
     pub offer: Option<StandInBinding>,
 }
 
-/// (§3.6) The stand-in a unit's pinned judge may run on when no distinct judge is left: minted on
+/// (§3.6) The stand-in a unit's judge (pinned, or the default judge a changed tree convenes) may
+/// run on when no distinct judge is left: minted on
 /// the actor at dispatch (so slots never repeat), on the work's own seat (its base when that seat
 /// is itself a stand-in), and recorded only if the judge path takes it ([`judge_answered`]).
-/// `None` unless the run is stand-in-aware, consented and not reduced, and the unit pins an
-/// approved validator.
+/// `None` unless the run is stand-in-aware, consented and not reduced, and the unit is an agent
+/// unit (a tool step has no judge). The judge path decides whether a judge runs at all; the offer
+/// is only what it may take.
 pub(crate) fn judge_offer(
     run: &crate::assurance::RunAssurance,
     unit: &crate::domain::WorkUnit,
@@ -464,7 +466,9 @@ pub(crate) fn judge_offer(
     if !active(run) || run.stand_in.is_none() || run.reduced() {
         return None;
     }
-    unit.validator.as_ref().filter(|v| v.approved)?;
+    if unit.tool_cmd.is_some() {
+        return None;
+    }
     let base = seat_id::credential(unit.assigned_cli.as_deref()?).to_string();
     // (T-R13) A benched base stands nothing in: its credential is what failed.
     if benched.iter().any(|b| seat_id::credential(&b.cli) == base) {
@@ -898,9 +902,14 @@ mod tests {
             &[]
         )
         .is_none());
+        // (coord F1 on #1854) The default judge (no pinned validator) is offered one too; a tool
+        // step, which has no judge, is not.
         let mut unpinned = unit.clone();
         unpinned.validator = None;
-        assert!(judge_offer(&run, &unpinned, 1, &[], &[], &[]).is_none());
+        assert!(judge_offer(&run, &unpinned, 1, &[], &[], &[]).is_some());
+        let mut tool = unit.clone();
+        tool.tool_cmd = Some(vec!["cargo".into(), "test".into()]);
+        assert!(judge_offer(&run, &tool, 1, &[], &[], &[]).is_none());
         // T-R13: a benched base stands nothing in; a helper lost during the run is the reason.
         let bench = |cli: &str| crate::domain::BenchedSeat {
             cli: cli.into(),

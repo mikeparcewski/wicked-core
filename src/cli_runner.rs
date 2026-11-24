@@ -3668,6 +3668,48 @@ fn run_unit_and_judge_with_launches(
     )
 }
 
+/// [`run_unit_and_judge_with_fallback`] on a stand-in-aware run: the actor's `stand_in` (its
+/// awareness and the offer) handed to the judge, as `dispatch_unit_with` does.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_standing_in(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+    stand_in: &crate::standin::JudgeStandIn,
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    let bench = &crate::domain::ungoverned_bench(bench);
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    run_unit_and_judge_on(
+        runner,
+        input,
+        None,
+        &|_| {},
+        roster,
+        run_roster,
+        &benched,
+        JudgeFallbackCtx {
+            pool: &[],
+            registry: roster,
+            bench,
+            work_authors: &[],
+            author_binaries: Some(&[]),
+            reprobe: false,
+            rule_council: None,
+            stand_in_judge: Some(stand_in),
+        },
+        None,
+        None,
+        None,
+    )
+}
+
 /// (PRODUCT-WORKS J4) The production judge path with the re-probe armed: what [`run_unit_and_judge`]
 /// does, over a fabricated `roster` (the registry the due seats are looked up in).
 #[cfg(test)]
@@ -6315,6 +6357,30 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // never independent (`validator::NoIndependentJudge`, the fallback ladder continues it).
     crate::observed_provider::take_receipts();
     let _judging = crate::observed_provider::JudgingWork::of(&work_history);
+    // (DES-STANDIN-001 §3.6) The stand-in judge: the offer the actor made this unit, on its base's
+    // record, against the criterion of the judge it stands in for (pinned or default). Its own
+    // path: no identity or provider fence, stamped not distinct; the fold records its binding.
+    // `None` with no offer, or a base with no record (fail closed: no invocation, no judge).
+    let stand_in_judge_on = |criterion: &str| -> Option<crate::validator::AgentVerdict> {
+        let b = stand_in_offer?;
+        let work = stand_in_work.as_deref()?;
+        let invocation = crate::standin::resolve(&[], roster, &b.key)?;
+        let (verdict, refused) =
+            with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                crate::validator::judge_on_stand_in(
+                    b,
+                    &invocation,
+                    criterion,
+                    work,
+                    &**runner,
+                    Some(&input.run_id),
+                )
+            });
+        note_refusals(&refused);
+        Some(verdict.unwrap_or_else(|e| {
+            crate::validator::AgentVerdict::from_judge_error("stand-in judge", e)
+        }))
+    };
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (core#1540) Both transports reach the pinned path's admission and disclosures.
         let pinned: Option<crate::validator::AgentVerdict> = 'pinned: {
@@ -6424,30 +6490,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 &without_author_binaries(&unbenched_run, &excluded, &author_ids),
             );
             let registry = roster;
-            // (DES-STANDIN-001 §3.6) The stand-in judge: the offer the actor made this unit, on its
-            // base's record. Its own path: no identity or provider fence, stamped not distinct;
-            // the fold records its binding. `None` with no offer, or a base with no record (fail
-            // closed: no invocation, no judge).
-            let stand_in_verdict = || -> Option<crate::validator::AgentVerdict> {
-                let b = stand_in_offer?;
-                let work = stand_in_work.as_deref()?;
-                let invocation = crate::standin::resolve(&[], registry, &b.key)?;
-                let (verdict, refused) =
-                    with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
-                        crate::validator::judge_on_stand_in(
-                            b,
-                            &invocation,
-                            &judge_criterion,
-                            work,
-                            &**runner,
-                            Some(&input.run_id),
-                        )
-                    });
-                note_refusals(&refused);
-                Some(verdict.unwrap_or_else(|e| {
-                    crate::validator::AgentVerdict::from_judge_error("stand-in judge", e)
-                }))
-            };
+            let stand_in_verdict = || stand_in_judge_on(&judge_criterion);
             let mut roster = judge_roster(&excluded, &configured_x, &eligible_x);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
@@ -6781,6 +6824,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
             } else {
                 crate::validator::default_judge_criterion(&input.unit)
             };
+            // (DES-STANDIN-001 §3.2 judge row, coord F1 on #1854) The default judge takes the
+            // consented stand-in at the same points the pinned judge does: once no real judge is
+            // left (every rung above was tried), never in place of one.
+            let stand_in_verdict = || stand_in_judge_on(&criterion);
             if let Some(b) = benched_judge_unavailable(
                 "default judge",
                 &excluded,
@@ -6817,12 +6864,16 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
-                Some(held_with_fallback_failures(
-                    "default judge",
-                    b.held,
-                    b.lost,
-                    fb,
-                ))
+                // Every real judge lost and no fallback seat answered: the consented stand-in
+                // judges instead of the hold, as on the pinned path.
+                let stood = if matches!(fb, FallbackJudge::Answered(_)) {
+                    None
+                } else {
+                    stand_in_verdict()
+                };
+                Some(stood.unwrap_or_else(|| {
+                    held_with_fallback_failures("default judge", b.held, b.lost, fb)
+                }))
             } else if crate::validator::distinct_judge_available(&excluded, roster) {
                 eprintln!(
                     "wicked-core: unit {} requires a judge with no pinned validator — \
@@ -6901,23 +6952,41 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             emit_delta,
                         )
                     }
-                    Err(e) => judge_error_or_fallback(
-                        "default judge",
-                        e,
-                        &refused,
-                        &criterion,
-                        work_for_agent,
-                        &fallback_parties(&excluded, fallback.work_authors),
-                        fallback_ids(&author_ids),
-                        roster,
-                        benched,
-                        fallback,
-                        &**runner,
-                        &note_refusals,
-                        emit_delta,
-                        Some(&input.run_id),
-                    ),
+                    Err(e) => {
+                        let v = judge_error_or_fallback(
+                            "default judge",
+                            e,
+                            &refused,
+                            &criterion,
+                            work_for_agent,
+                            &fallback_parties(&excluded, fallback.work_authors),
+                            fallback_ids(&author_ids),
+                            roster,
+                            benched,
+                            fallback,
+                            &**runner,
+                            &note_refusals,
+                            emit_delta,
+                            Some(&input.run_id),
+                        );
+                        // As on the pinned path: every real judge failed as a seat and no
+                        // fallback answered, so the consented stand-in judges. A verdict-less
+                        // answer stays the human's.
+                        let lost = v.judge_cli.is_none()
+                            && v.seat_failure
+                                .as_deref()
+                                .is_some_and(|f| !f.contains(crate::validator::JUDGE_NO_VERDICT));
+                        if lost {
+                            stand_in_verdict().unwrap_or(v)
+                        } else {
+                            v
+                        }
+                    }
                 })
+            } else if let Some(v) = stand_in_verdict() {
+                // (DES-STANDIN-001 §3.6) No distinct judge, on a run that consented: the stand-in
+                // the actor offered judges instead of a skip.
+                Some(v)
             } else {
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
                 let seat_outcomes: Vec<String> = roster
@@ -8389,6 +8458,208 @@ mod tests {
         let verdict = verdict.unwrap();
         assert!(verdict.seat_failure.is_some(), "{verdict:?}");
         assert!(verdict.reasoning.contains("quota_exhausted"), "{verdict:?}");
+    }
+
+    // ── DES-STANDIN-001 §3.6, coord F2 on #1854: the four places the pinned judge takes the stand-in ──
+
+    /// A judge seat that answers on a stand-in with `verdict` and refuses (signed out) on every
+    /// real seat; records every judge launch by seat.
+    struct StandInJudgeRunner {
+        verdict: &'static str,
+        judged: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StepRunner for StandInJudgeRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+            let output = if input.unit.session_id == "validator" {
+                self.judged.lock().unwrap().push(seat.clone());
+                if wicked_apps_core::spawn::seat_id::is_stand_in(&seat) {
+                    format!("{}\nread the work cold\n{}", self.verdict, self.verdict)
+                } else {
+                    "Not logged in · Please run /login".to_string()
+                }
+            } else {
+                "did the work".to_string()
+            };
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output,
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A pinned build unit on `claude`, and the offer a consented aware run's actor makes it.
+    fn pinned_on_claude(dir: &std::path::Path) -> (StepInput, crate::standin::JudgeStandIn) {
+        let mut input = report_input(dir);
+        input.unit.assigned_cli = Some("claude".into());
+        input.unit.stage = crate::domain::StageKind::Build;
+        input.unit.role = crate::workflow::PhaseRole::Creator;
+        input.unit.catalog = None;
+        input.unit.rubric = None;
+        input.unit.worktree_guarded = false;
+        input.unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the change is right".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        let run = crate::standin::LaunchStandIn {
+            aware: true,
+            consent: Some(crate::standin::StandInConsent {
+                scope: "job".into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(crate::assurance::RunAssurance::default());
+        let offer = crate::standin::judge_offer(&run, &input.unit, 1, &[], &[], &[]);
+        assert!(offer.is_some(), "a consented aware run offers one");
+        (input, crate::standin::JudgeStandIn { aware: true, offer })
+    }
+
+    fn stand_in_runner(verdict: &'static str) -> (Arc<StandInJudgeRunner>, Arc<dyn StepRunner>) {
+        let r = Arc::new(StandInJudgeRunner {
+            verdict,
+            judged: std::sync::Mutex::new(Vec::new()),
+        });
+        let dynr: Arc<dyn StepRunner> = r.clone();
+        (r, dynr)
+    }
+
+    fn judge_bench(cli: &str) -> crate::domain::BenchedSeat {
+        crate::domain::BenchedSeat {
+            cli: cli.into(),
+            reason: "quota_exhausted".into(),
+            source: "judge".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        }
+    }
+
+    /// Site 2: no judge distinct from the creator on the run: the stand-in judges, once, stamped
+    /// not distinct; its PASS passes and its REJECT denies. With no offer (no consent) the creator
+    /// is never re-admitted on an aware run: no judge runs and the skip says why.
+    #[test]
+    fn a_pinned_judge_with_no_distinct_seat_takes_the_stand_in() {
+        let dir = std::env::temp_dir();
+        let roster = [seat("claude", "claude -p {PROMPT}")];
+        let run = vec!["claude".to_string()];
+        for (word, pass) in [("PASS", true), ("REJECT", false)] {
+            let (input, stand_in) = pinned_on_claude(&dir);
+            let (r, runner) = stand_in_runner(word);
+            let (_, v, evidence) =
+                run_unit_and_judge_standing_in(&runner, &input, &roster, &run, &[], &stand_in);
+            let v = v.expect("the stand-in judged");
+            assert_eq!(v.judge_cli.as_deref(), Some("claude~1"), "{v:?}");
+            assert_eq!(v.pass, pass, "{v:?}");
+            assert_eq!(v.judge_distinct, Some(false), "{v:?}");
+            assert!(evidence.judge_skipped.is_none());
+            assert_eq!(*r.judged.lock().unwrap(), ["claude~1"]);
+        }
+        let (input, _) = pinned_on_claude(&dir);
+        let (r, runner) = stand_in_runner("PASS");
+        let unconsented = crate::standin::JudgeStandIn {
+            aware: true,
+            offer: None,
+        };
+        let (_, v, evidence) =
+            run_unit_and_judge_standing_in(&runner, &input, &roster, &run, &[], &unconsented);
+        assert!(v.is_none(), "{v:?}");
+        assert!(evidence.judge_skipped.is_some());
+        assert!(
+            r.judged.lock().unwrap().is_empty(),
+            "the creator never judges"
+        );
+    }
+
+    /// Site 1: the run's only distinct judge is benched and no fallback seat answers: the stand-in
+    /// judges instead of the hold.
+    #[test]
+    fn a_pinned_judge_whose_distinct_seat_is_benched_takes_the_stand_in() {
+        let dir = std::env::temp_dir();
+        let (input, stand_in) = pinned_on_claude(&dir);
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let run = vec!["claude".to_string(), "codex".to_string()];
+        let (r, runner) = stand_in_runner("PASS");
+        let (_, v, _) = run_unit_and_judge_standing_in(
+            &runner,
+            &input,
+            &roster,
+            &run,
+            &[judge_bench("codex")],
+            &stand_in,
+        );
+        let v = v.expect("the stand-in judged");
+        assert_eq!(v.judge_cli.as_deref(), Some("claude~1"), "{v:?}");
+        assert!(v.pass && v.seat_failure.is_none(), "{v:?}");
+        assert_eq!(*r.judged.lock().unwrap(), ["claude~1"]);
+    }
+
+    /// Site 3 (`outside_only && all_failed`): since core#937 a pinned judge never reaches a seat
+    /// outside a run that names registry seats (`judge_pool`), and the outside-only test reads the
+    /// same pool the rotation walks, so a run whose own seats hold no distinct judge stops at the
+    /// no-distinct-judge point (site 2) before any outside seat could fail. Pinned here: with an
+    /// outside `codex` in the registry, the stand-in judges and `codex` is never launched.
+    #[test]
+    fn a_pinned_judge_never_reaches_an_outside_seat_and_the_stand_in_judges() {
+        let dir = std::env::temp_dir();
+        let (input, stand_in) = pinned_on_claude(&dir);
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let run = vec!["claude".to_string()];
+        let (r, runner) = stand_in_runner("PASS");
+        let (_, v, evidence) =
+            run_unit_and_judge_standing_in(&runner, &input, &roster, &run, &[], &stand_in);
+        let v = v.expect("the stand-in judged");
+        assert_eq!(v.judge_cli.as_deref(), Some("claude~1"), "{v:?}");
+        assert!(v.pass, "{v:?}");
+        assert!(evidence.judge_skipped.is_none());
+        assert_eq!(
+            *r.judged.lock().unwrap(),
+            ["claude~1"],
+            "no outside seat is launched"
+        );
+    }
+
+    /// Site 4: the run's own distinct judge failed as a seat and no fallback answered: the
+    /// stand-in judges instead of the lost verdict.
+    #[test]
+    fn a_pinned_judge_whose_run_seat_fails_takes_the_stand_in() {
+        let dir = std::env::temp_dir();
+        let (input, stand_in) = pinned_on_claude(&dir);
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let run = vec!["claude".to_string(), "codex".to_string()];
+        let (r, runner) = stand_in_runner("PASS");
+        let (_, v, _) =
+            run_unit_and_judge_standing_in(&runner, &input, &roster, &run, &[], &stand_in);
+        let v = v.expect("the stand-in judged");
+        assert_eq!(v.judge_cli.as_deref(), Some("claude~1"), "{v:?}");
+        assert!(v.pass && v.seat_failure.is_none(), "{v:?}");
+        let judged = r.judged.lock().unwrap().clone();
+        assert_eq!(
+            judged,
+            ["codex", "claude~1"],
+            "the real judge first, then the stand-in"
+        );
     }
 
     #[test]
