@@ -2890,7 +2890,7 @@ fn core1855_a_later_broken_on_the_same_change_is_never_skipped_for_an_older_kept
         ..Default::default()
     };
     let gate = |ord: u32, rows: Vec<RuleVerdict>| {
-        let mut u = crate::domain::WorkUnit::pending(&format!("s:{ord}"), "s", ord, "gate");
+        let mut u = crate::domain::WorkUnit::pending(format!("s:{ord}"), "s", ord, "gate");
         u.rule_check = Some(RuleCheckReport {
             change_key: Some("change-1".into()),
             rows,
