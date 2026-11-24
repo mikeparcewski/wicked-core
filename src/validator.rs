@@ -1640,7 +1640,8 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
 
 /// How long [`kill_child_tree`] keeps signalling a macOS group that still has a live member. A
 /// SIGKILLed process normally leaves within a few ms; the cap only bounds a process the kernel
-/// cannot end (an uninterruptible wait), the same backstop [`reap_bounded`] has.
+/// cannot end (an uninterruptible wait), the same backstop [`reap_bounded`] has. The two run one
+/// after the other, so on macOS a kill plus its reap is bounded at about 4 s, not 2 s.
 #[cfg(target_os = "macos")]
 const GROUP_KILL_CAP: Duration = Duration::from_secs(2);
 
@@ -1660,25 +1661,34 @@ mod macos_group {
     /// `PROC_PGRP_ONLY` from `<sys/proc_info.h>` (not exported by the `libc` crate).
     const PROC_PGRP_ONLY: u32 = 2;
 
-    /// The pids `proc_listpids` reports in group `pgid` (zombies included).
-    fn members(pgid: i32) -> Vec<libc::pid_t> {
-        let mut buf: Vec<libc::pid_t> = vec![0; 1024];
-        let bytes = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // Safe: the buffer is valid for `bytes` bytes; the call writes at most that many.
-        let n = unsafe {
-            libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes)
-        };
-        if n <= 0 {
-            return Vec::new();
+    /// The pids `proc_listpids` reports in group `pgid` (zombies included), or `None` when the
+    /// list could not be read whole. XNU stops filling at the buffer's end, so a full buffer is
+    /// read again into a bigger one: only a complete list can say the group is empty.
+    fn members(pgid: i32) -> Option<Vec<libc::pid_t>> {
+        let mut cap = 256usize;
+        while cap <= 1 << 16 {
+            let mut buf: Vec<libc::pid_t> = vec![0; cap];
+            let bytes = (cap * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+            // Safe: the buffer is valid for `bytes` bytes; the call writes at most that many.
+            let n = unsafe {
+                libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes)
+            };
+            if n < 0 {
+                return None;
+            }
+            if n < bytes {
+                buf.truncate(n as usize / std::mem::size_of::<libc::pid_t>());
+                buf.retain(|&pid| pid > 0);
+                return Some(buf);
+            }
+            cap *= 4;
         }
-        buf.truncate(n as usize / std::mem::size_of::<libc::pid_t>());
-        buf.retain(|&pid| pid > 0);
-        buf
+        None
     }
 
-    /// Whether `pid` is still a member of `pgid` that can run: not exited (a zombie cannot
-    /// write) and not gone. Read just before it is signalled, so a pid that left the group or
-    /// exited since the listing is not signalled.
+    /// Whether `pid` may still run as a member of `pgid`. `false` only when it is confirmed gone,
+    /// exited (a zombie cannot write), or now in another group; a read that fails for any other
+    /// reason counts it as live, so it is signalled again rather than assumed dead.
     fn live_member(pid: libc::pid_t, pgid: i32) -> bool {
         // Safe: a zeroed proc_bsdinfo is a valid out-parameter for this flavor.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -1692,38 +1702,60 @@ mod macos_group {
                 size,
             )
         };
-        got == size && info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB
+        if got == size {
+            return info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// SIGKILL every live member of `pgid` until none is left, for at most `cap`. The group's
-    /// leader is never reaped here, so its pid (the group id) stays reserved meanwhile.
+    /// leader is never reaped here, so the group id stays reserved meanwhile.
+    ///
+    /// "None left" takes two passes in a row that find no live member. The listing does not show
+    /// a process that is still being forked, but that process leaves that state before its
+    /// parent's `fork` returns. So a parent that the first pass sees exited has every child it
+    /// forked listed by the second pass, which lists again after the first pass's checks.
+    ///
+    /// Each member is checked (still in this group, not exited) right before its own SIGKILL. A
+    /// member's pid, unlike the leader's, is not reserved: if the member exits and is reaped
+    /// between the check and the kill, the pid is free. macOS hands out pids in sequence up to
+    /// 99999 before it wraps, so that pid going to another process within that gap would take
+    /// about 100,000 process starts. That is accepted.
     pub(super) fn kill_until_empty(pgid: i32, cap: Duration) {
         if pgid <= 1 {
             return;
         }
         let deadline = Instant::now() + cap;
+        let mut empty_passes = 0;
         loop {
-            let live: Vec<libc::pid_t> = members(pgid)
-                .into_iter()
-                .filter(|&pid| live_member(pid, pgid))
-                .collect();
-            if live.is_empty() {
+            // A list that could not be read whole is not known to be empty.
+            let mut empty = false;
+            if let Some(pids) = members(pgid) {
+                empty = true;
+                for pid in pids {
+                    if live_member(pid, pgid) {
+                        empty = false;
+                        // Safe: `pid` was a live member of this group (our child's) just above.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            empty_passes = if empty { empty_passes + 1 } else { 0 };
+            if empty_passes >= 2 {
                 return;
             }
-            if Instant::now() >= deadline {
+            // Past the cap, a pass that found the group empty still gets its confirming pass.
+            if !empty && Instant::now() >= deadline {
                 eprintln!(
-                    "wicked-core: {} process(es) in a stopped command's group did not exit \
-                     within {cap:?} of SIGKILL",
-                    live.len()
+                    "wicked-core: a stopped command's process group still had a live member \
+                     {cap:?} after SIGKILL; a process the kernel cannot end yet (an uninterruptible \
+                     wait) may finish its current system call"
                 );
                 return;
             }
-            // Safe: every pid was a live member of this group (our own child's) just above.
-            unsafe { libc::killpg(pgid, libc::SIGKILL) };
-            for pid in live {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
             std::thread::sleep(Duration::from_millis(1));
+            // Safe: the group is our own child's, its id reserved by the unreaped leader.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
     }
 }
@@ -6862,16 +6894,21 @@ mod tests {
     }
 
     /// core#1835: the issue's own shape, a writer backgrounded just before an immediate exit. The
-    /// production wait observes the exit and kills the group while the subshell may be mid-fork;
-    /// on macOS one `killpg` then missed the subshell, which wrote `f` after the verdict (7 of 16
-    /// runs on a loaded host, red on main). Repeated so the race shows itself: every run's writer
-    /// must be gone with its verdict, on the plain launch and on `sandbox-exec` when it can arm.
+    /// production wait observes the exit and kills the group; on macOS one `killpg` then missed
+    /// the subshell, which wrote `f` after the verdict (7 of 16 runs on a loaded host, red on
+    /// main). Repeated so the race shows itself: no run's writer may write after its verdict, on
+    /// the plain launch and on `sandbox-exec` when it can arm.
+    ///
+    /// "After its verdict" is judged by the file's own time against the moment the wait
+    /// returned, so a run whose wait is descheduled past the writer's `sleep` (a write before
+    /// the verdict, not an escape) does not fail the test. The same shape with a poll loop
+    /// released after the verdict (the #1810 test's handshake) did not reproduce the escape.
     #[cfg(unix)]
     #[test]
     fn a_writer_backgrounded_right_before_exit_ends_with_its_verdict_1835() {
         const RUNS: usize = 16;
         let root = crate::repo_checks::PrivateTmp::create().unwrap();
-        // `s` = the subshell ran; `f` = it wrote after its `sleep`, which outlives every verdict.
+        // `s` = the subshell ran; `f` = it wrote once its `sleep` ran out.
         let script = "(: > s; sleep 1; touch f) >/dev/null 2>&1 </dev/null & exit 0";
         let mut launchers: Vec<(&str, Vec<String>)> = vec![("plain", vec!["sh".into()])];
         let jail = find_on_path("sandbox-exec").filter(|_| sandbox_exec_arms());
@@ -6888,7 +6925,7 @@ mod tests {
         } else if cfg!(target_os = "macos") {
             eprintln!("core#1835: sandbox-exec cannot arm here; the jailed launch is skipped");
         }
-        let mut dirs = Vec::new();
+        let mut runs = Vec::new();
         for (name, argv) in &launchers {
             for run in 0..RUNS {
                 let dir = root.path().join(format!("{name}-{run}"));
@@ -6899,29 +6936,32 @@ mod tests {
                 apply_minimal_env(&mut cmd);
                 let (status, _) =
                     run_bounded_status_capturing_stderr(cmd, crate::test_env::PATIENT);
+                let verdict = std::time::SystemTime::now();
                 assert!(
                     status.unwrap().is_some_and(|s| s.success()),
                     "{name} run {run}: the script itself exits 0"
                 );
-                dirs.push((*name, run, dir));
+                runs.push((*name, run, dir, verdict));
             }
         }
-        // Every surviving writer's `sleep 1` has run out well before this.
+        // A surviving writer's `sleep 1` has run out well before this.
         std::thread::sleep(Duration::from_millis(2500));
-        let wrote: Vec<String> = dirs
+        let late: Vec<String> = runs
             .iter()
-            .filter(|(_, _, dir)| dir.join("f").exists())
-            .map(|(name, run, _)| format!("{name} run {run}"))
+            .filter_map(|(name, run, dir, verdict)| {
+                let wrote = std::fs::metadata(dir.join("f")).ok()?.modified().ok()?;
+                (wrote > *verdict).then(|| format!("{name} run {run}"))
+            })
             .collect();
         assert!(
-            wrote.is_empty(),
-            "a writer the validator backgrounded wrote after its verdict in: {wrote:?}"
+            late.is_empty(),
+            "a writer the validator backgrounded wrote after its verdict in: {late:?}"
         );
         for (name, _) in &launchers {
             assert!(
-                dirs.iter()
-                    .any(|(n, _, dir)| n == name && dir.join("s").exists()),
-                "{name}: no run's subshell started before its verdict, so this proves nothing"
+                runs.iter()
+                    .any(|(n, _, dir, _)| n == name && dir.join("s").exists()),
+                "{name}: no run's subshell started at all, so this run proves nothing"
             );
         }
     }
