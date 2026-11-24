@@ -544,6 +544,10 @@ pub struct FloorContext {
     /// the creator floor's engine-computed affected set reads it. `None` (no graph, or a floor
     /// built without a run) runs the full suite.
     pub code_graph: Option<PathBuf>,
+    /// (core#1208) The files a targeted selection is built for in place of the change since the
+    /// base: a hand-off round's delta (the files changed since the previous round's floor). Set
+    /// only by the floor itself, on the context it detects that selection with.
+    pub(crate) files: Option<Vec<String>>,
 }
 
 /// The evidence of one check having run.
@@ -588,8 +592,9 @@ pub struct CheckRun {
     /// when the engine did not retry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetrySummary>,
-    /// (core#1186) Set to the check's directory when this run's failure ids were shown to be a
-    /// complete, file-qualified account of its failures: a `rerun … by: "file"` check whose own
+    /// (core#1186) Set to the directory the failure ids are relative to (core#1709: the check's
+    /// directory joined with its `rerun` entry's `root`, [`runner_root`]) when this run's failure
+    /// ids were shown to be a complete, file-qualified account of its failures: a `rerun … by: "file"` check whose own
     /// runner summary counts exactly the failing files the ids name, with no error outside a test
     /// ([`crate::floor_scoped::head_complete`]) and nothing cut at the id cap. Only such a list may
     /// stand for "the tests the operator ruled on" when a later fresh floor is compared with an
@@ -643,6 +648,17 @@ pub struct CheckRun {
     /// duration, exit and retries are that floor's. `None` on every check that ran here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<CheckReuse>,
+    /// (core#1157) What this check left in a guarded checkout that is not part of the tree: the
+    /// untracked and ignored paths (collapsed per directory, git's own listing) present after it
+    /// ran and not before. A later floor runs on a FRESH checkout that has none of them, so a
+    /// result that left any is never reused there: a check after it may read them (a generated
+    /// test file a verify-only suite loops over). Capped at [`LEFT_OUTPUTS_CAP`] names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_outputs: Vec<String>,
+    /// (core#1208) Set on a hand-off round's creator check that ran ONLY the tests the round's
+    /// change reaches, standing on the previous round's pass for the rest ([`FloorDelta`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<FloorDelta>,
     /// (DES-FLOOR-V2) The floor's decision on this check; `None` on a nested run (a re-run, a base
     /// run) and on a stored record from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -737,6 +753,11 @@ impl CheckRun {
             .as_ref()
             .map(|s| format!(" — {}", s.note()))
             .unwrap_or_default();
+        // (core#1208) A hand-off round's delta says what it ran and what it stands on.
+        let picked = match &self.delta {
+            Some(d) => format!("{picked} — {}", d.note(&self.name)),
+            None => picked,
+        };
         match self.exit_code {
             Some(c) => format!("{}: exit {c} ({secs:.1}s{more}){cls}{picked}", self.name),
             None => format!(
@@ -1087,6 +1108,45 @@ pub struct CheckReuse {
     pub attempt: u32,
 }
 
+/// (core#1208) Where a hand-off round's delta check stands for the rest of its check
+/// ([`CheckRun::delta`]): the previous round's floor of the same unit, against the same base, that
+/// passed the check on `from_tree`. This round ran only what the files changed since then reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorDelta {
+    /// The tree the previous round's floor ran on.
+    pub from_tree: String,
+    /// The creator unit's phase (`build`, `fix`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub ord: u32,
+    pub attempt: u32,
+    /// The files changed between that tree and this one (the first [`DELTA_FILES_SHOWN`]).
+    pub changed: Vec<String>,
+    /// How many files changed in all.
+    pub changed_count: usize,
+}
+
+/// At most this many of a delta's changed files are named on the check.
+pub const DELTA_FILES_SHOWN: usize = 20;
+
+impl FloorDelta {
+    /// The operator's sentence for check `name`.
+    pub fn note(&self, name: &str) -> String {
+        format!(
+            "ran only the tests reached by the {} file{} changed since the floor on tree {} ({}, \
+             unit {}, attempt {}); the rest of `{name}` passed there and is reused from it, \
+             outside this round's change",
+            self.changed_count,
+            if self.changed_count == 1 { "" } else { "s" },
+            &self.from_tree[..self.from_tree.len().min(10)],
+            self.phase.as_deref().unwrap_or("the creator floor"),
+            self.ord,
+            self.attempt,
+        )
+    }
+}
+
 impl FloorReuse {
     /// The operator's sentence for the gate's `floorNote`.
     pub fn note(&self) -> String {
@@ -1118,7 +1178,7 @@ impl FloorReuse {
 /// a check from it only when the tree, the base, the check's directory, name, argv and bound, the
 /// boundary posture and the exclusion switch all match, and the check finished there with its
 /// evidence whole — the same rule a resumed journal follows ([`reusable_run`]).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreatorFloorRecord {
     floor_policy: u32,
     tree: String,
@@ -1142,6 +1202,10 @@ struct CreatorEntry {
     argv: Vec<String>,
     #[serde(default)]
     timeout_s: Option<u64>,
+    /// (core#1208) The detected check's source (`.wicked/checks.json test_targeted`, the derived
+    /// set, …): the run's own may name an affected subset instead. Absent on an older record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     run: CheckRun,
 }
 
@@ -1174,8 +1238,107 @@ fn write_creator_record(logs: &Path, record: &CreatorFloorRecord) {
 /// not a spawn or could-not-run failure) with every log it names still whole in `logs`? Only such
 /// a result stands in for running the check again. The `install` check never does: its receipt is
 /// not its output (`node_modules`, a venv), and a guarded floor runs on a fresh checkout.
+/// (core#1157) A run that left files outside the tree in its checkout ([`CheckRun::left_outputs`])
+/// is not reusable either: the later floor's fresh checkout has none of them.
 fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
-    !is_provisioning(&check.name) && run.argv == check.argv && finished_whole(run, logs)
+    !is_provisioning(&check.name)
+        && run.argv == check.argv
+        && run.left_outputs.is_empty()
+        && finished_whole(run, logs)
+}
+
+/// (core#1157) At most this many paths are kept on [`CheckRun::left_outputs`].
+pub const LEFT_OUTPUTS_CAP: usize = 20;
+
+/// (core#1157) At most this many paths are listed under the directories a floor's checks created;
+/// more is "cannot be listed" (the check is not reused), never a partial list.
+pub const INVENTORY_CAP: usize = 20_000;
+
+/// (core#1157) Runs `git <args>` where the checks execute (the guarded checkout on the host, the
+/// floor pod's copy in a container floor) and returns its stdout.
+pub(crate) type GitAt<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u8>, String>;
+
+/// (core#1157) Git's listing of every path outside the tree (untracked or ignored alike), an
+/// entirely untracked directory as one entry (`dir/`). The engine's own scratch (`tmp/`, where the
+/// base export lives) is not a check's output. A name that is not UTF-8 is kept, lossily.
+pub(crate) fn outside_tree(
+    git: GitAt,
+    under: &[String],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--others"];
+    if under.is_empty() {
+        args.push("--directory");
+    } else {
+        args.push("--");
+        args.extend(under.iter().map(String::as_str));
+    }
+    let out = git(&args).map_err(|e| format!("the checkout's files could not be listed: {e}"))?;
+    let scratch = crate::worktree_guard::ENGINE_SCRATCH_DIR;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .filter(|path| {
+            path.trim_end_matches('/') != scratch && !path.starts_with(&format!("{scratch}/"))
+        })
+        .collect())
+}
+
+/// (core#1157) The paths outside the tree in a guarded checkout: git's collapsed listing
+/// ([`outside_tree`]), with every directory NOT in `settled` (one an earlier check of this floor
+/// created) listed file by file, so a later check that writes beneath it is seen. `settled` holds
+/// what the checkout had before the floor's first check and what its provisioning left (the
+/// dependency trees every floor installs again): those are not walked. `Err` when the checkout
+/// cannot be listed, or holds more than [`INVENTORY_CAP`] such files.
+pub(crate) fn untracked_inventory(
+    git: GitAt,
+    settled: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut all = outside_tree(git, &[])?;
+    let created: Vec<String> = all
+        .iter()
+        .filter(|p| p.ends_with('/') && !settled.contains(*p))
+        .cloned()
+        .collect();
+    if !created.is_empty() {
+        all.extend(outside_tree(git, &created)?);
+    }
+    if all.len() > INVENTORY_CAP {
+        return Err(format!(
+            "more than {INVENTORY_CAP} files outside the tree could not be listed one by one"
+        ));
+    }
+    Ok(all)
+}
+
+/// (core#1157) Runs git in a guarded host checkout for [`untracked_inventory`]: no hooks, no
+/// fsmonitor, no untracked cache, no optional locks.
+pub(crate) fn git_at_checkout(worktree: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let no_hooks = no_hooks_dir()?;
+    let hooks = format!("core.hooksPath={}", no_hooks.to_string_lossy());
+    let env: [(&str, &Path); 1] = [("GIT_OPTIONAL_LOCKS", Path::new("0"))];
+    let mut a = vec![
+        "-c",
+        hooks.as_str(),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+    ];
+    a.extend(args);
+    crate::worktree_guard::git(worktree, &a, &env).map_err(|e| e.to_string())
+}
+
+/// (core#1157) What a check left: the paths in `after` that were not in `before`, capped. A listing
+/// that failed on either side is unknown, never "nothing": it is named, so the run is not reused.
+pub(crate) fn left_by_check(
+    before: &Result<std::collections::BTreeSet<String>, String>,
+    after: &Result<std::collections::BTreeSet<String>, String>,
+) -> Vec<String> {
+    match (before, after) {
+        (Ok(b), Ok(a)) => a.difference(b).take(LEFT_OUTPUTS_CAP).cloned().collect(),
+        (Err(e), _) | (_, Err(e)) => vec![format!("(unknown: {e})")],
+    }
 }
 
 /// Did `run` finish (not a timeout, not a spawn or could-not-run failure, a decision recorded)
@@ -1268,6 +1431,22 @@ impl CreatorSeed {
 
     /// Take the creator floor's result of `check` ([`Self::entry_for`]).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+        if let Some(left) = self
+            .record
+            .checks
+            .iter()
+            .find(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)
+            .map(|e| &e.run.left_outputs)
+            .filter(|l| !l.is_empty())
+        {
+            eprintln!(
+                "wicked-core: repo checks floor — `{}` left files outside the tree at {} ({}); \
+                 this checkout has none of them, so it runs again here",
+                check.name,
+                self.record.phase.as_deref().unwrap_or("the creator floor"),
+                left.join(", ")
+            );
+        }
         let mut run = self.entry_for(check, logs)?.run.clone();
         self.reused.push(check.name.clone());
         run.reused_from = Some(CheckReuse {
@@ -1318,6 +1497,269 @@ impl CreatorSeed {
             voided,
         })
     }
+}
+
+/// (core#1208) The checks a hand-off round's creator floor may narrow to what the round changed: the
+/// test set the repository declares a targeted command for (`test_targeted`, its `{files}` = the
+/// round's files). The cheap checks (install, typecheck, lint, the formatter) read the whole tree
+/// and always run in full. A cargo workspace's engine-affected set is NOT narrowed: its code graph
+/// is indexed at the run base, so a call an earlier round added is in no graph, and only the whole
+/// change since the base reaches its callers (xreview r1 on #1866).
+pub(crate) fn is_delta_check(name: &str) -> bool {
+    matches!(name, "test" | "test_targeted")
+}
+
+/// (core#1208) A path whose change can reach any test, so a round that touched it runs its test
+/// check in full: a manifest or lockfile, build or test configuration, the repo's floor config
+/// (`.wicked/`), a cargo build script, toolchain or `.cargo/` config, a crate root, a script the
+/// tests run through (`scripts/`), and git's own attribute and ignore files.
+pub(crate) fn reaches_any_test(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    let name = parts.last().copied().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    if dirs
+        .iter()
+        .any(|d| matches!(*d, ".wicked" | ".cargo" | "scripts"))
+    {
+        return true;
+    }
+    if matches!(
+        name,
+        "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "pnpm-workspace.yaml"
+            | "yarn.lock"
+            | ".npmrc"
+            | ".nvmrc"
+            | ".node-version"
+            | "Cargo.toml"
+            | "Cargo.lock"
+            | "build.rs"
+            | "go.mod"
+            | "go.sum"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "tox.ini"
+            | "pytest.ini"
+            | "conftest.py"
+            | "Makefile"
+            | "justfile"
+            | ".gitignore"
+            | ".gitattributes"
+    ) {
+        return true;
+    }
+    // A crate root (`src/lib.rs`, `src/main.rs`) declares the modules everything else hangs off.
+    if matches!(name, "lib.rs" | "main.rs") && dirs.last() == Some(&"src") {
+        return true;
+    }
+    [
+        "rust-toolchain",
+        "tsconfig",
+        "vitest.config",
+        "vitest.workspace",
+        "vite.config",
+        "jest.config",
+        "babel.config",
+        ".babelrc",
+        "playwright.config",
+        "requirements",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+        // A setup file (`tests/setup.ts`) is loaded by the runner's config, never imported.
+        || lower.contains("setup")
+}
+
+/// (core#1208) A hand-off round's creator floor on `T_cur` whose unit already ran floors on earlier
+/// trees against the same base, with the same engine, boundary and exclusion switch (their
+/// published [`CreatorFloorRecord`]s): its test check runs only what the files changed since the
+/// newest of them where that check passed IN FULL reach, and stands on that pass for the rest.
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaPlan {
+    /// The earlier floors, newest first.
+    pub(crate) from: Vec<DeltaFrom>,
+}
+
+/// One earlier floor a round may stand on, and the files changed between its tree and this one
+/// (added or modified; anything else, or a path that reaches any test, is the `Err` that widens).
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaFrom {
+    record: CreatorFloorRecord,
+    pub(crate) files: Result<Vec<String>, String>,
+}
+
+fn tree_label(tree: &str) -> String {
+    format!("the floor on tree {}", &tree[..tree.len().min(10)])
+}
+
+impl DeltaPlan {
+    /// The plan for the floor `j` runs: `Ok(None)` when its unit ran no earlier published floor on
+    /// another tree against this base; `Err(why)` when it did but none can stand for this round.
+    pub(crate) fn load(
+        logs: &Path,
+        j: &FloorJournal,
+        base: &str,
+        git_dir: &Path,
+        worktree: &Path,
+        posture_level: &str,
+        exclude: bool,
+    ) -> Result<Option<Self>, String> {
+        let Ok(dir) = std::fs::read_dir(logs) else {
+            return Ok(None);
+        };
+        let mut records: Vec<CreatorFloorRecord> = dir
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("creator-floor-") && n.ends_with(".json")
+            })
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|raw| serde_json::from_str::<CreatorFloorRecord>(&raw).ok())
+            .filter(|r| {
+                r.ord == j.ord && r.base == base && r.attempt < j.attempt && r.tree != j.tree
+            })
+            .collect();
+        records.sort_by_key(|r| std::cmp::Reverse(r.attempt));
+        let Some(newest) = records.first() else {
+            return Ok(None);
+        };
+        let prev = tree_label(&newest.tree);
+        records.retain(|r| {
+            r.floor_policy == FLOOR_POLICY_VERSION
+                && r.sandbox_level == posture_level
+                && r.exclude == exclude
+        });
+        if records.is_empty() {
+            return Err(format!(
+                "{prev} ran under another engine version, boundary or exclusion switch"
+            ));
+        }
+        let from = records
+            .into_iter()
+            .map(|record| {
+                let files = delta_files(&record.tree, &j.tree, git_dir, worktree);
+                DeltaFrom { record, files }
+            })
+            .collect();
+        Ok(Some(DeltaPlan { from }))
+    }
+
+    /// The earlier floor `check` may stand on this round (an index into [`Self::from`]): the newest
+    /// whose same check (directory, name, bound and source; the argv too, except a
+    /// `test_targeted`, whose `{files}` are the change's) passed there IN FULL (never itself a
+    /// delta: its own evidence is all there is), left nothing outside the tree, with its logs
+    /// whole. A failed or narrowed result there sends the search to an older floor, whose change
+    /// set holds this one. `Err(why)` when none can, or the change since it widens.
+    pub(crate) fn source_for(&self, check: &RepoCheck, logs: &Path) -> Result<usize, String> {
+        let mut why = None;
+        for (i, f) in self.from.iter().enumerate() {
+            let prev = tree_label(&f.record.tree);
+            let entry = f.record.checks.iter().find(|e| {
+                e.dir == check.dir
+                    && e.name == check.name
+                    && e.timeout_s == check.timeout_s
+                    && e.source.as_deref() == Some(check.source.as_str())
+                    && (check.name == "test_targeted" || e.argv == check.argv)
+            });
+            let run = match entry {
+                None => {
+                    why.get_or_insert(format!(
+                        "{prev} did not run `{}` as this floor does",
+                        check.name
+                    ));
+                    continue;
+                }
+                Some(e) => &e.run,
+            };
+            if run.denies() || run.delta.is_some() {
+                why.get_or_insert(format!("`{}` did not pass in full on {prev}", check.name));
+                continue;
+            }
+            if !(run.left_outputs.is_empty() && finished_whole(run, logs)) {
+                why.get_or_insert(format!(
+                    "`{}`'s result on {prev} cannot stand (it left files outside the tree, or \
+                     its logs are gone)",
+                    check.name
+                ));
+                continue;
+            }
+            return f.files.as_ref().map(|_| i).map_err(Clone::clone);
+        }
+        Err(why.unwrap_or_else(|| "no earlier floor ran it".into()))
+    }
+
+    /// The mark a delta check that stood on `from[i]` and passed carries ([`CheckRun::delta`]).
+    pub(crate) fn mark(&self, i: usize) -> FloorDelta {
+        let f = &self.from[i];
+        let files = f.files.as_deref().unwrap_or_default();
+        FloorDelta {
+            from_tree: f.record.tree.clone(),
+            phase: f.record.phase.clone(),
+            ord: f.record.ord,
+            attempt: f.record.attempt,
+            changed: files.iter().take(DELTA_FILES_SHOWN).cloned().collect(),
+            changed_count: files.len(),
+        }
+    }
+}
+
+/// (core#1208) The files changed between `from` and `to` through the pinned `git_dir`: added or
+/// modified only. A deletion, rename or type change, a path that can reach any test
+/// ([`reaches_any_test`]), no change, or a listing that cannot be read is the reason to widen.
+fn delta_files(
+    from: &str,
+    to: &str,
+    git_dir: &Path,
+    worktree: &Path,
+) -> Result<Vec<String>, String> {
+    let prev = tree_label(from);
+    let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+    let raw = crate::worktree_guard::git(
+        worktree,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--name-status",
+            from,
+            to,
+        ],
+        &env,
+    )
+    .map_err(|e| format!("the files changed since {prev} could not be listed: {e}"))?;
+    let fields: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    let mut files = Vec::new();
+    for pair in fields.chunks(2) {
+        let [status, path] = pair else {
+            return Err(format!("the files changed since {prev} could not be read"));
+        };
+        match status.as_str() {
+            "A" | "M" => {}
+            "D" => return Err(format!("this round deleted or renamed `{path}`")),
+            _ => return Err(format!("this round changed the type of `{path}`")),
+        }
+        if reaches_any_test(path) {
+            return Err(format!(
+                "this round changed `{path}`, which can reach any test"
+            ));
+        }
+        files.push(path.clone());
+    }
+    if files.is_empty() {
+        return Err(format!("no file changed since {prev}"));
+    }
+    Ok(files)
 }
 
 /// The journal file of `ord`'s floor in the run's log store.
@@ -1460,7 +1902,9 @@ impl OpenJournal {
             .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
         let entry = self.prior.remove(at);
         let (run, guarded) = (entry.run, entry.guarded_under);
-        finished_whole(&run, logs).then(|| {
+        // (core#1157) A check that left files outside the tree runs again: a floor resumed on a
+        // fresh checkout has none of them.
+        (run.left_outputs.is_empty() && finished_whole(&run, logs)).then(|| {
             if let Some(r) = self.resume.as_mut() {
                 r.reused.push(check.name.clone());
             }
@@ -1521,6 +1965,28 @@ impl OpenJournal {
             let _ = std::fs::remove_file(&self.path);
         }
         self.resume
+    }
+}
+
+/// (core#1709) The directory a check's file-qualified failure ids are relative to: its own
+/// directory joined with its `rerun` entry's `root` (`/`-separated; either may be empty).
+pub(crate) fn runner_root(dir: &str, root: &str) -> String {
+    match (dir.is_empty(), root.is_empty()) {
+        (_, true) => dir.to_string(),
+        (true, false) => root.to_string(),
+        (false, false) => format!("{dir}/{root}"),
+    }
+}
+
+/// (core#1709) The name a failing test is qualified by in [`RepoChecksReport::failing_set`]: the
+/// targeted test set runs the same tests as the full one, so a failure the operator overrode in a
+/// creator floor's `test_targeted` is the same failure in the verify floor's full `test` (the
+/// same runner root, [`runner_root`], and the same test id), and the override carries to it when
+/// its failures are a subset.
+pub(crate) fn test_set_name(check: &str) -> &str {
+    match check {
+        "test_targeted" => "test",
+        other => other,
     }
 }
 
@@ -1766,6 +2232,18 @@ impl RepoChecksReport {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// (F-7R2-005) The floor refused to run for want of an OS write boundary, and for nothing
+    /// else: not an environment refusal (no disk), a stop (cancel, shutdown, superseded) or a
+    /// runner that could not start. Keyed on the one writer's own text.
+    pub fn missing_boundary_refusal(&self) -> bool {
+        !self.passed
+            && self.checks.is_empty()
+            && self
+                .sandbox_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(NO_BOUNDARY_REFUSAL_PREFIX))
+    }
+
     /// An environment refusal carries its own cause and advice, distinct from a missing boundary.
     pub fn environment_refusal(&self) -> Option<&str> {
         self.sandbox_error
@@ -1955,7 +2433,8 @@ impl RepoChecksReport {
     }
 
     /// (core#1186) Every failing test this report's denying checks named, qualified by the check's
-    /// directory and name (`<dir>|<check>: <id>`), in first-seen order — the list an operator's
+    /// directory and name (`<dir>|<check>: <id>`; core#1709: `test_targeted` is named `test`,
+    /// [`test_set_name`]), in first-seen order — the list an operator's
     /// override is recorded as having ruled on, and that a later FRESH floor on the same tree is
     /// compared with. `None` unless every denying check's head run named a complete, file-qualified
     /// account of its failures ([`CheckRun::failures_complete_in`]) and no later run of it (the
@@ -1992,7 +2471,7 @@ impl RepoChecksReport {
                 return None;
             }
             for id in &deciding.failure_ids {
-                let named = format!("{dir}|{}: {id}", c.name);
+                let named = format!("{dir}|{}: {id}", test_set_name(&c.name));
                 if !out.contains(&named) {
                     out.push(named);
                 }
@@ -2715,6 +3194,9 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
 /// copied, modified, renamed) plus untracked-not-ignored files, through the PINNED git dir; the
 /// engine scratch is never a touched path. Empty when the run knows no base.
 pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some(files) = &ctx.files {
+        return Ok(files.clone());
+    }
     if let Some((root, dir)) = package_root(worktree, ctx) {
         let root_ctx = FloorContext {
             package_dir: None,
@@ -5481,6 +5963,11 @@ thread_local! {
 /// The wire prefix for a floor's environment refusal, whose text carries its own advice.
 pub const ENVIRONMENT_REFUSAL_PREFIX: &str = "environment:";
 
+/// How the floor's refusal for want of an OS write boundary begins (F-7R2-005): the default floor
+/// discloses that refusal rather than denying it, also when carried to an unchanged tree.
+pub(crate) const NO_BOUNDARY_REFUSAL_PREFIX: &str =
+    "no OS write boundary could be armed for the checks";
+
 /// Whether a refusal describes the environment rather than a missing OS write boundary.
 pub fn is_environment_refusal(error: &str) -> bool {
     error.starts_with(ENVIRONMENT_REFUSAL_PREFIX)
@@ -6111,7 +6598,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     sandbox_level,
                     sandbox_note: sandbox_note.clone(),
                     sandbox_error: Some(format!(
-                        "no OS write boundary could be armed for the checks ({}). On this host the \
+                        "{NO_BOUNDARY_REFUSAL_PREFIX} ({}). On this host the \
                          verify floor cannot run: install `bwrap` (Linux), or set \
                          {UNSANDBOXED_OPT_IN_ENV}=1 to run the repository's own scripts with NO \
                          write boundary, disclosed on every report",
@@ -8321,9 +8808,10 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// its package through the held directory and builds the root's declared native addons for a
 /// member, so a base result recorded without them is not reused; v18, core#1767: a red base's
 /// inventory holds only when its own run executed exactly what its list names, so an inventory
-/// recorded without that check is not reused): a record of any other version, or a bare
-/// `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 18;
+/// recorded without that check is not reused; v19, core#1157: a run's record says what it left
+/// outside the tree, so a creator record or journal written before it says so is not reused): a
+/// record of any other version, or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 19;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;

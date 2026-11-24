@@ -1,7 +1,8 @@
 //! P3 proving test — the repo registry + git-worktree isolation.
 //!
 //! Register a real git repo, launch a run targeting it, and prove: a worktree is created at
-//! `<repo>/wicked-worktrees/<run_id>` (crew#276: non-dotted), the worker receives that path as its `workdir`, the run's
+//! `<repo>.wicked/wicked-worktrees/<run_id>` beside the checkout (crew#276: non-dotted; core#1109: outside
+//! the checkout), the worker receives that path as its `workdir`, the run's
 //! work lands there, a COMPLETED run keeps its worktree (for review), and a CANCELLED run discards it.
 
 use std::path::PathBuf;
@@ -101,7 +102,7 @@ fn cli(key: &str) -> AgenticCli {
 /// Create a throwaway git repo with one commit; returns its absolute path.
 fn make_git_repo(name: &str) -> PathBuf {
     let repo = std::env::temp_dir().join(format!("wicked-core-p3-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
         Command::new("git")
@@ -156,6 +157,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),
@@ -254,10 +256,10 @@ fn launch_in_repo_creates_worktree_and_passes_workdir() {
         .expect("launch in repo");
     assert!(wait_status(&core, "run1", SessionStatus::Completed));
 
-    let expected_wt = repo.join("wicked-worktrees").join("run1");
+    let expected_wt = run_tree(&repo, "run1");
     assert!(
         expected_wt.is_dir(),
-        "worktree created at <repo>/wicked-worktrees/<run_id>"
+        "worktree created at <repo>.wicked/wicked-worktrees/<run_id>"
     );
     // The worker ran in that worktree and its work landed there.
     assert_eq!(
@@ -316,7 +318,7 @@ fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
     core.launch_run(s).expect("launch");
     assert!(wait_status(&core, "run2", SessionStatus::AwaitingHuman));
 
-    let wt = repo.join("wicked-worktrees").join("run2");
+    let wt = run_tree(&repo, "run2");
     assert!(wt.is_dir(), "worktree exists while the run is parked");
 
     assert_eq!(core.cancel_run("run2").unwrap(), SessionStatus::Cancelled);
@@ -333,7 +335,7 @@ fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
     s.human_confirm = HumanConfirm::Before(1);
     core.launch_run(s).expect("launch");
     assert!(wait_status(&core, "run3", SessionStatus::AwaitingHuman));
-    let wt = repo.join("wicked-worktrees").join("run3");
+    let wt = run_tree(&repo, "run3");
     assert!(wt.is_dir());
     std::fs::write(wt.join("fix.txt"), "the creator's uncommitted fix\n").unwrap();
     assert_eq!(core.cancel_run("run3").unwrap(), SessionStatus::Cancelled);
@@ -356,4 +358,23 @@ fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo`:
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+/// Remove a test checkout and the folder beside it that holds its run trees.
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }

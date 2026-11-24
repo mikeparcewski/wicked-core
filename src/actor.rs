@@ -43,6 +43,9 @@ pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
+mod stand_in_gate;
+#[cfg(test)]
+mod stand_in_packet_tests;
 mod team_gate;
 mod worktree_cleanup;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
@@ -1499,6 +1502,7 @@ pub(crate) fn run(
                     power: _,
                     // …and no orchestrator to hear a voice (core#1216).
                     voice: _,
+                    stand_in,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1528,6 +1532,14 @@ pub(crate) fn run(
                     )),
                     // (core#850) The reduced-assurance opt-in is recorded on the governed
                     // dispatch's session: refused here rather than silently dropped.
+                    // (DES-STANDIN-001 §3.8) Stand-in facts live on the run's contract, which
+                    // only the governed dispatch records: refused here, never dropped.
+                    Ok(None) if stand_in != crate::standin::LaunchStandIn::default() => {
+                        Err(anyhow::anyhow!(
+                            "a standInAware launch must use launch_run: the straight-through \
+                             path does not record the run's assurance contract"
+                        ))
+                    }
                     Ok(None) if reduced_assurance => Err(anyhow::anyhow!(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
@@ -1655,6 +1667,12 @@ pub(crate) fn run(
                     // (core#1216) The orchestrator's voice block: bounded, refused with NO
                     // session persisted.
                     crate::power::validate_voice(spec.voice.as_deref())?;
+                    // (DES-STANDIN-001 §3.8, rev 3 N4) Stand-in facts that cannot hold together
+                    // (aware + reduced, consent on an unaware launch, a malformed consent) are
+                    // refused with NO session persisted.
+                    spec.stand_in
+                        .validate(spec.reduced_assurance)
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     // core#411 / wicked-crew#497: the state-home INTAKE fence. An entry under the
                     // handed snapshot's state home that the registry cannot classify would refuse
                     // EVERY worker launch of this run — surfaced, until now, at the first worker
@@ -1928,19 +1946,25 @@ pub(crate) fn run(
                         // (QE acceptance) The operator's explicit skip or force, refused before
                         // anything persists when it is malformed or has nothing to apply to; an
                         // Apps run's contract carries its preset, and a publish's QE is forced.
-                        assurance: crate::apps::contract(
-                            crate::assurance::RunAssurance::new(
-                                selected_def
-                                    .as_ref()
-                                    .and_then(|d| d.required_instruments.as_deref()),
-                                spec.reduced_assurance,
-                            ),
-                            apps.clone(),
-                            &spec.qe_acceptance,
-                        )
-                        // Typed, so the bus bridge drops a request that will never launch
-                        // instead of retrying it forever.
-                        .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
+                        // (DES-STANDIN-001 §3.3, rev 3 N3) …and the launch's stand-in facts,
+                        // persisted here and read from here afterwards.
+                        assurance: spec.stand_in.apply(
+                            crate::apps::contract(
+                                crate::assurance::RunAssurance::new(
+                                    selected_def
+                                        .as_ref()
+                                        .and_then(|d| d.required_instruments.as_deref()),
+                                    spec.reduced_assurance,
+                                ),
+                                apps.clone(),
+                                &spec.qe_acceptance,
+                            )
+                            // Typed, so the bus bridge drops a request that will never launch
+                            // instead of retrying it forever.
+                            .map_err(|e| {
+                                anyhow::Error::new(crate::assurance::QeOverrideRefused(e))
+                            })?,
+                        ),
                         run_context: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
@@ -2595,15 +2619,23 @@ pub(crate) fn run(
                 // 390b273e's launch-time twin). Every other distribution error keeps the fail
                 // contract. `fail_run_by_id` guards the terminal statuses: do not clobber
                 // Cancelled with Failed if the run was cancelled while the council thread ran.
-                let parked = match error.downcast_ref::<NoEligibleSeat>() {
-                    Some(refusal) => park_at_dead_seat_gate(
+                // (DES-STANDIN-001 §3.2) A review a stand-in-aware run cannot seat independently,
+                // with no consent: the run parks at the `stand_in_needed` gate the same way.
+                let parked = match (
+                    error.downcast_ref::<NoEligibleSeat>(),
+                    error.downcast_ref::<crate::distribute::StandInNeeded>(),
+                ) {
+                    (Some(refusal), _) => park_at_dead_seat_gate(
                         &mut store,
                         &mut subscribers,
                         &self_tx,
                         &run_id,
                         refusal,
                     ),
-                    None => Ok(false),
+                    (None, Some(need)) => {
+                        stand_in_gate::park(&mut store, &mut subscribers, &self_tx, &run_id, need)
+                    }
+                    (None, None) => Ok(false),
                 };
                 match parked {
                     Ok(true) => {}
@@ -4797,6 +4829,14 @@ pub(crate) fn run(
                     &human_confirm,
                 ));
             }
+            Command::IndependencePreflight { shape, reply } => {
+                let contract = crate::independence::preflight_contract(&store, &registry, &shape)
+                    .map(|c| crate::independence::PreflightContract {
+                        contained: in_process_governance().is_some(),
+                        ..c
+                    });
+                let _ = reply.send(contract);
+            }
             Command::ProposePlan {
                 run_id,
                 plan,
@@ -5482,8 +5522,11 @@ mod council_tail_tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let reaper = crate::decision::BallotReaper::default();
         let seat = stopped.clone();
+        // (core#1794) The carried seat stops only when the test lets it, so every probe below
+        // knows the seat is still stopping: no wall-clock window decides the order.
+        let (let_stop, may_stop) = std::sync::mpsc::channel::<()>();
         reaper.hold(std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = may_stop.recv();
             seat.store(true, Ordering::SeqCst);
         }));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -5505,7 +5548,10 @@ mod council_tail_tests {
             !stopped.load(Ordering::SeqCst),
             "the verdict waited for a seat still stopping"
         );
-        while !stopped.load(Ordering::SeqCst) {
+        // The seat is still stopping (it waits on `let_stop`), so the slot must read busy. A
+        // zero-budget probe is sound here: a duplicate descriptor in another test's child only
+        // keeps the slot busier.
+        for _ in 0..5 {
             assert_eq!(
                 HostCouncilLock::acquire_until(&path, Instant::now()).err(),
                 Some(SlotRefused::Busy),
@@ -5513,9 +5559,19 @@ mod council_tail_tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(!stopped.load(Ordering::SeqCst));
+        let_stop.send(()).expect("the seat is waiting");
         tail.join().expect("the council tail");
+        assert!(stopped.load(Ordering::SeqCst), "the tail reaped the seat");
+        // (core#1794) The slot is a `flock` on an open file: a child another test spawns while the
+        // council holds it keeps a duplicate of that descriptor until its exec completes, so for
+        // that moment the slot still reads as held after the tail let it go. Under endpoint
+        // security an exec can wait seconds, so the probe waits on the release, bounded by the
+        // suite's failure guard (`test_env::PATIENT`); a slot the tail never released stays held
+        // past it and still fails.
         assert!(
-            HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+            HostCouncilLock::acquire_until(&path, Instant::now() + crate::test_env::PATIENT)
+                .is_ok(),
             "the slot is free once the seat is reaped"
         );
         let _ = std::fs::remove_file(&path);
@@ -5713,11 +5769,11 @@ fn team_plan_at_launch(
         {
             stub.assurance
         }
-        _ => launch_plan_assurance(
+        _ => spec.stand_in.apply(launch_plan_assurance(
             instruments.as_deref(),
             spec.reduced_assurance,
             &spec.qe_acceptance,
-        ),
+        )),
     };
     let prior = crate::plan_gate::TeamPlanState {
         roster: spec
@@ -10074,6 +10130,11 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // no eligible seat left — a decision about SEATS, not a verdict on the work
         // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
         Some("dead_seat") => "dead_seat",
+        // (DES-STANDIN-001 §3.10) A check no independent helper can take and no one has agreed
+        // to stand in for: a decision about SEATS and consent, never a verdict on the work.
+        Some(stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED) => {
+            stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED
+        }
         // (core#850) A review that ran on a seat that built its work, on a run that requires a
         // distinct evaluator — a decision about SEATS: reassign it, as for a dead seat.
         Some(crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR) => "dead_seat",
@@ -10324,6 +10385,7 @@ fn floor_override_gate(unit: &crate::domain::WorkUnit, source: &str) -> bool {
         && unit.member_step.is_none()
         && unit.tool_cmd.is_none()
         && !crate::deliver_lift::is_deliver_unit(unit)
+        && floor_not_run(unit).is_none()
 }
 
 /// The operator-judgment offer clause, byte-identical wherever the engine offers it (studio's
@@ -10957,6 +11019,7 @@ fn denial_gate_prompt_body(
         .map(|d| d.source.as_str())
         .unwrap_or("gate");
     match class {
+        stand_in_gate::DENIAL_SOURCE_STAND_IN_NEEDED => stand_in_gate::prompt(unit, reason, note),
         "evaluator_mutated_worktree" => {
             let phase = unit.phase_id().unwrap_or("read-only");
             let paths = mutation
@@ -11030,6 +11093,15 @@ fn denial_gate_prompt_body(
                  RE-RUNS the `{phase}` phase from the start under the same policies (a retry; \
                  the captured output is not accepted), or reject to cancel the run{note}",
                 reason_head(reason)
+            )
+        }
+        // (core#1846) The checks never ran (the machine was short of disk): nothing failed, so
+        // the one way on is a retry once there is space; no seat, send-back or override fixes it.
+        "floor_failed" if floor_not_run(unit).is_some() => {
+            let (verb, cause) = floor_not_run(unit).map_or(("run", ""), |f| (f.verb, f.cause));
+            format!(
+                "Unit {ord}'s checks did not {verb}: {cause}. Approve to retry the step once that \
+                 is fixed (its checks run again), or reject to cancel the run{note}"
             )
         }
         "floor_failed" if floor_fix_applies(unit) => format!(
@@ -11416,12 +11488,20 @@ fn distinct_evaluator_seat(
     // stays and the gate decides (codex r1 on #898).
     let mut candidates = eligible_roster_keys(session);
     candidates.sort_by_key(|k| shares(k));
+    // A party is matched by its record's binary too; no registry read on a run with no parties.
+    let party_records = if session.assurance.parties.is_empty() {
+        Vec::new()
+    } else {
+        crate::registry_roster()
+    };
     candidates.into_iter().find(|k| {
         crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_none()
             && (key_author || !shares(k))
             && k != seat
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
+            // (DES-STANDIN-001 §3.8) A party never reviews for real: empty on an unaware run.
+            && !crate::distribute::is_party(k, &session.assurance.parties, &party_records)
     })
 }
 
@@ -11993,6 +12073,14 @@ pub(crate) fn parked_reseat_refusal(
              PA's seat; approve to run the review again, or reject to stop the run"
         );
     }
+    // (core#1846) Another seat meets the same machine: the checks did not run for want of disk.
+    if let Some(f) = floor_not_run(unit) {
+        return Err(floor_not_run_refusal(
+            ord,
+            &f,
+            "moving the step to another seat",
+        ));
+    }
     refuse_author_reassign(session, units, session.unit_ix, cli)?;
     // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units, parked or not.
     if let Some(why) = crate::apps::reassign_refusal(session, cli) {
@@ -12079,7 +12167,9 @@ fn reseat_off_benched_seat(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
-    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == seat) else {
+    // (DES-STANDIN-001 §3.3) A stand-in (`claude~1`) is benched with its credential (`claude`).
+    let credential = wicked_apps_core::spawn::seat_id::credential(&seat);
+    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == credential) else {
         return Ok(Reseat::Unchanged);
     };
     // The template the unit would carry on each seat: the launch roster's own, when another unit
@@ -13214,12 +13304,18 @@ fn power_dispatch(
             let task = crate::power::authored_task(&unit);
             unit.description = task.clone();
             // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
-            // hand-off's reviewers, judges and QE are dispatched without it.
+            // hand-off's reviewers, judges and QE are dispatched without it. (DES-STANDIN-001
+            // §3.4, core#1863) Never a stand-in's: none is minted for a creator, and if one were,
+            // it hears no communication.
+            let voice = power
+                .voice
+                .clone()
+                .filter(|_| !crate::execute_wrapped::is_stand_in_unit(&unit));
             unit.description.push_str(&crate::power::orchestrator_brief(
                 power.rigor,
                 power.plan.as_ref(),
                 round,
-                power.voice.as_deref(),
+                voice.as_deref(),
             ));
             // (core#1486) The attempt's retry or send-back notes ride turn 1 as their own block
             // too, and every later turn restates them ahead of the (clipped) task.
@@ -13235,7 +13331,7 @@ fn power_dispatch(
                     cli: unit.assigned_cli.clone().unwrap_or_default(),
                     round,
                     base: session.base_commit.clone(),
-                    voice: power.voice.clone(),
+                    voice,
                     notes,
                 },
             );
@@ -14052,6 +14148,18 @@ fn dispatch_unit_with(
     // and dropping (1) is the bug. Declared-dependency membership is by PHASE ID, the token the def
     // uses; `phase_id()` returns None for prose-planned units, which correctly matches nothing.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
+    // (DES-STANDIN-001 §3.4) A stand-in's packet is ALLOW-LISTED: of the earlier units it gets the
+    // work (every unit that is no review: a `creator` or an unroled build, a tool's facts), never an
+    // earlier review's or test's verdict. Keyed on the stage too, since a def's phases need not
+    // name a role (an unroled `build` is the work; an unroled `review` is a verdict).
+    let stand_in = crate::execute_wrapped::is_stand_in_unit(unit);
+    let is_verdict = |u: &crate::domain::WorkUnit| {
+        u.role == crate::workflow::PhaseRole::Evaluator
+            || matches!(
+                u.stage,
+                crate::domain::StageKind::Review | crate::domain::StageKind::Test
+            )
+    };
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
     let (mut prior_outputs, mut context_items): (
@@ -14059,6 +14167,7 @@ fn dispatch_unit_with(
         Vec<crate::event::InjectedContext>,
     ) = units
         .iter()
+        .filter(|u| !stand_in || !is_verdict(u))
         .filter_map(|u| {
             let label = prior_context_label(unit, u, current_cli)?;
             let output = crate::domain::get_work_output(store, &u.id)?;
@@ -14072,6 +14181,8 @@ fn dispatch_unit_with(
             ))
         })
         .unzip();
+    // (core#1862) The work a stand-in is handed: exactly the blocks above, by position.
+    let work_blocks = prior_outputs.len();
     // (DES-L1 PR-1B, core#549) A creator re-run after `request_changes` is handed the full
     // amendment (evaluator findings + operator note) as prior context. The amendment is persisted
     // on the unit as `rework_amendment` (stored by `rewind_to_creator` since core#549); older
@@ -14281,7 +14392,8 @@ fn dispatch_unit_with(
     // (program DES-POWER-MODE) OPERATOR MESSAGES queued while no turn could hear them (the
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
-    if unit.tool_cmd.is_none() && review_of.is_none() {
+    // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
+    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -14318,6 +14430,40 @@ fn dispatch_unit_with(
     // for this unit's seats BEFORE any of them is built (a restarted engine re-primes here), and
     // named on the unit's context event. The carrier renders it (not a prior output: never clipped,
     // never read as an earlier phase's work).
+    // (DES-STANDIN-001 §3.4) A STAND-IN's context is an allow-listed packet: the step's task and
+    // checklist, the work's final output, the engine's records (floor, requirements, rulings) and
+    // the stand-in preface — never team findings, earlier verdicts, communications or anything
+    // that carries the builder's reasoning ([`crate::standin::packet_keeps`]).
+    if stand_in {
+        let keep: Vec<bool> = prior_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| i < work_blocks || crate::standin::packet_keeps(&p.label))
+            .collect();
+        let mut k = keep.iter();
+        prior_outputs.retain(|_| *k.next().unwrap_or(&false));
+        let mut k = keep.iter();
+        context_items.retain(|_| *k.next().unwrap_or(&false));
+        let lens = session
+            .assurance
+            .stand_ins
+            .iter()
+            .find(|b| Some(b.key.as_str()) == unit.assigned_cli.as_deref())
+            .and_then(|b| b.lens.clone());
+        let preface = crate::standin::preface(lens.as_deref());
+        let label = crate::standin::PREFACE_LABEL.to_string();
+        context_items.insert(
+            0,
+            crate::event::InjectedContext::new(unit.ord, label.clone(), preface.len()),
+        );
+        prior_outputs.insert(
+            0,
+            PriorUnitOutput {
+                label,
+                output: preface,
+            },
+        );
+    }
     crate::run_context::publish(run_id, session.run_context.as_ref());
     let run_context_item = (unit.tool_cmd.is_none())
         .then(|| crate::run_context::current(run_id))
@@ -15177,6 +15323,23 @@ fn dispatch_unit_with(
     // waits for the fold through it.
     let team_runner = team_gate::team_runner();
     let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
+    // (DES-STANDIN-001 §3.6) The stand-in this unit's judge (pinned or default) may run on, minted HERE on the
+    // actor (slots never repeat); the judge takes it only when no distinct judge is left, and the
+    // fold records it then.
+    let stand_in_judge = session
+        .assurance
+        .stand_in_aware
+        .then(|| crate::standin::JudgeStandIn {
+            aware: true,
+            offer: crate::standin::judge_offer(
+                &session.assurance,
+                unit,
+                input.attempt,
+                &crate::registry_roster(),
+                &session.clis,
+                &session.benched_seats,
+            ),
+        });
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -15222,6 +15385,7 @@ fn dispatch_unit_with(
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
             floor_stop,
+            stand_in_judge.as_ref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
@@ -18415,7 +18579,8 @@ pub(crate) fn plan_answer_refusal(
         | HumanDecision::RetryQe
         | HumanDecision::RecheckRules { .. }
         | HumanDecision::OperatorJudgment { .. }
-        | HumanDecision::SkipQe { .. } => anyhow::bail!(
+        | HumanDecision::SkipQe { .. }
+        | HumanDecision::UseStandIns { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
              amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
              plan, or reject"
@@ -20075,6 +20240,13 @@ pub(crate) fn confirm_gate_expecting(
             "approve": true, "action": choice, "amend": null,
         })
         .to_string(),
+        // (DES-STANDIN-001 §3.8) The consent's scope is the record.
+        crate::workflow::HumanDecision::UseStandIns { scope } => serde_json::json!({
+            "approve": true,
+            "action": crate::workflow::USE_STAND_INS_ACTION,
+            "scope": scope,
+        })
+        .to_string(),
     };
     // (core#1313) Domain helpers batch independently. Suppress those inner boundaries
     // until the row and the state this answer arms are durable together.
@@ -20255,6 +20427,52 @@ pub(crate) fn confirm_gate_expecting(
         }
         d => d,
     };
+    // (DES-STANDIN-001 §3.10) THE STAND-IN GATE: a grant puts the consent on the contract; a grant
+    // or a retry re-routes the units that have not run (real helpers first, a stand-in only with
+    // consent) and the cursor then runs as a plain approve — or, still short, the gate re-opens.
+    let decision = match decision {
+        crate::workflow::HumanDecision::UseStandIns { .. }
+        | crate::workflow::HumanDecision::Approve { amend: None, .. }
+            if stand_in_gate::gate_open(
+                crate::domain::session_units(store, run_id)?.get(session.unit_ix),
+            ) =>
+        {
+            let grant = match &decision {
+                crate::workflow::HumanDecision::UseStandIns { scope } => Some(scope.as_str()),
+                _ => None,
+            };
+            match stand_in_gate::answer(
+                store,
+                &mut answer_events,
+                self_tx,
+                &mut session,
+                run_id,
+                grant,
+                actor.as_deref(),
+            )? {
+                // (T-R12) A check held after its seat ran (a missing judge): only the judge runs
+                // again, on the reviewed attempt's output and tree; no seat is re-dispatched.
+                stand_in_gate::Answered::Run
+                    if crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .is_some_and(|u| u.last_attempt.is_some()) =>
+                {
+                    armed_rejudge = Some(rejudge_basis(&*store, run_id, Vec::new())?);
+                    crate::workflow::HumanDecision::Rejudge
+                }
+                stand_in_gate::Answered::Run => crate::workflow::HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+                stand_in_gate::Answered::Held => {
+                    finish_answer(store, subscribers)?;
+                    in_flight.remove(run_id);
+                    return Ok(SessionStatus::AwaitingHuman);
+                }
+            }
+        }
+        d => d,
+    };
     if let crate::workflow::HumanDecision::OperatorJudgment { rationale } = &decision {
         let units = crate::domain::session_units(store, run_id)?;
         let grant = floor_override_for(
@@ -20419,6 +20637,10 @@ pub(crate) fn confirm_gate_expecting(
         // Answered above (`answer_skip_qe`): it became an approve, a judgment or a re-opened gate.
         crate::workflow::HumanDecision::SkipQe { .. } => {
             anyhow::bail!("run {run_id}: a QE skip is answered before any re-dispatch")
+        }
+        // Answered above (`stand_in_gate::answer`): it became an approve or a re-opened gate.
+        crate::workflow::HumanDecision::UseStandIns { .. } => {
+            anyhow::bail!("run {run_id}: stand-ins are granted before any re-dispatch")
         }
     };
     {
@@ -20881,6 +21103,8 @@ pub(crate) fn confirm_gate_expecting(
 /// own repo-checks floor ran and denied it. Its note goes to a seat that can write
 /// ([`floor_fix_request`]) and only the floor re-runs; the note on the read-only phase itself
 /// would reach no seat that can act on it.
+/// (core#1846) Never at a floor whose checks did not run ([`floor_not_run`]): nothing failed
+/// for a seat to fix.
 fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
     crate::worktree_guard::applies_to(unit)
         && unit.repo_checks_floor
@@ -20889,6 +21113,63 @@ fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
             d.source == crate::repo_checks::DENIAL_SOURCE
                 || d.source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
         })
+        && floor_not_run(unit).is_none()
+}
+
+/// (core#1846) A repo-checks floor stopped by the machine (the disk was short of space), not by
+/// the change ([`floor_not_run`]).
+pub(crate) struct FloorNotRun<'a> {
+    /// The floor's own cause, without its wire prefix; it says what to do.
+    pub(crate) cause: &'a str,
+    /// `run` when no check started, `finish` when the disk stopped the floor part way.
+    pub(crate) verb: &'static str,
+}
+
+/// (core#1846) Whether `unit`'s gate is ONLY its floor stopped by the machine: a repo-checks denial
+/// whose report carries the floor's environment refusal
+/// ([`crate::repo_checks::RepoChecksReport::environment_refusal`]), where no check that ran
+/// denied the work and the gate's record says no other layer denied the attempt. `None` for every other gate (a check
+/// that failed or timed out before the stop, or a denial behind the floor, keeps the floor gate's
+/// own answers). Its gate is a retry once the machine is fixed: no seat, send-back or override
+/// answers it, since nothing said anything against the work.
+pub(crate) fn floor_not_run(unit: &crate::domain::WorkUnit) -> Option<FloorNotRun<'_>> {
+    // `None` behind the floor is an unknown record, not an empty one: another layer may have
+    // denied the attempt.
+    if unit.denial.as_ref()?.source != crate::repo_checks::DENIAL_SOURCE
+        || !unit.denials_behind.as_deref().is_some_and(|b| b.is_empty())
+    {
+        return None;
+    }
+    let report = unit.repo_checks.as_ref()?;
+    let cause = report.environment_refusal()?;
+    if report
+        .checks
+        .iter()
+        .any(|c| c.denies() && !c.environment_failure())
+    {
+        return None;
+    }
+    let started = report.checks.iter().any(|c| !c.environment_failure());
+    Some(FloorNotRun {
+        cause: cause
+            .strip_prefix(crate::repo_checks::ENVIRONMENT_REFUSAL_PREFIX)
+            .unwrap_or(cause)
+            .trim()
+            .trim_end_matches('.'),
+        verb: if started { "finish" } else { "run" },
+    })
+}
+
+/// (core#1846) The refusal every answer but a retry or a stop gets at a floor the machine stopped
+/// ([`floor_not_run`]).
+fn floor_not_run_refusal(ord: u32, f: &FloorNotRun<'_>, answer: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unit {ord}'s checks did not {}: {}. Nothing about the work failed, so {answer} would \
+         not help: free disk space on this machine, then approve to retry the step, or reject to \
+         cancel the run",
+        f.verb,
+        f.cause
+    )
 }
 
 /// (core#782) The `floor_fix` re-run for `cursor`: `note` handed to a seat DISTINCT from the
@@ -21173,6 +21454,17 @@ fn rejudge_request(
             }
         );
     }
+    rejudge_basis(store, run_id, r.eligible)
+}
+
+/// (rejudge) The re-judge of `run_id`'s cursor unit as it stands: the reviewed attempt's captured
+/// output (the seat does not run again), its attempt and monitors. `seats` names the judges
+/// eligible when it was armed (the record's; a stand-in grant names none).
+pub(crate) fn rejudge_basis(
+    store: &dyn GraphStore,
+    run_id: &str,
+    seats: Vec<String>,
+) -> anyhow::Result<crate::domain::RequestedRejudge> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -21193,7 +21485,7 @@ fn rejudge_request(
     Ok(crate::domain::RequestedRejudge {
         output,
         attempt,
-        seats: r.eligible,
+        seats,
         monitors: crate::cli_runner::unit_team_monitors(cursor),
         team: cursor.team.clone().map(Box::new),
         consumed: false,
@@ -21608,6 +21900,22 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (DES-STANDIN-001 §3.10) A `stand_in_needed` gate takes three answers: use stand-ins,
+    // approve (retry) and reject; `use_stand_ins` answers nothing else.
+    if let crate::workflow::HumanDecision::UseStandIns { scope } = decision {
+        stand_in_gate::refuse_use_stand_ins(session, cursor, scope, actor)?;
+    } else if stand_in_gate::gate_open(cursor)
+        && !matches!(
+            decision,
+            crate::workflow::HumanDecision::Approve { amend: None, .. }
+                | crate::workflow::HumanDecision::Reject
+        )
+    {
+        anyhow::bail!(
+            "run {run_id} is held for want of an independent helper: use stand-ins, approve to \
+             retry, or reject"
+        );
+    }
     // (core#1748, codex xreview) A lost PA review's `failure` gate re-runs the review (approve) or
     // stops the run (reject). A send-back there would rewind onto the same unit with its review
     // state kept, and re-run the PA's review over the member's unchanged output: sending the
@@ -21629,6 +21937,19 @@ pub(crate) fn refuse_before_resolving(
              finish (it ran out of time, or the engine lost its result): approve to run the \
              review again, or reject to stop the run"
         );
+    }
+    // (core#1846) A floor whose checks did not run (the machine was short of disk) said nothing
+    // about the work: sending it back would rework a change no check faulted.
+    if matches!(
+        decision,
+        crate::workflow::HumanDecision::RequestChanges { .. }
+    ) && !adjudication_open
+        && !team_gate::dispute_gate_open(session)
+        && !team_gate::transport_gate_open(session)
+    {
+        if let Some((u, f)) = cursor.and_then(|u| floor_not_run(u).map(|f| (u, f))) {
+            return Err(floor_not_run_refusal(u.ord, &f, "sending the work back"));
+        }
     }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
     // provider, with no other seat of the run able to review the work, would run on that seat
@@ -22294,6 +22615,10 @@ fn floor_override_for(
             source.unwrap_or("nothing")
         ),
     };
+    // (core#1846) No check ran: there is no failure for the operator's judgment to override.
+    if let Some(f) = floor_not_run(u) {
+        return Err(floor_not_run_refusal(u.ord, &f, "your own judgment"));
+    }
     if u.member_step.is_some() {
         anyhow::bail!(
             "unit {} is a team member's step: its team answers its gate (approve re-runs it), \
@@ -23987,6 +24312,104 @@ pub(crate) mod sessions_detail_fold_tests {
         finished.status = crate::domain::UnitStatus::Done;
         let d = crate::deliver_lift::delivery_receipt(&s, &[finished, deliver]);
         assert!(judge_skips(&d).is_empty(), "{:?}", d.skipped);
+    }
+
+    /// T-R15 / T-R20 (DES-STANDIN-001 §5.1): on a stand-in-aware run, gate 1's real judge and
+    /// gate 2's stand-in judge both stay in the delivery's roles (the keyed union) and make its
+    /// independence `mixed`, and the legacy projection is conservative (the judge never `ran`). A judge missing
+    /// at a third gate stays unsatisfied: the stand-in never hides that skip. A gate with no judge
+    /// due beside a real judge stays `independent`.
+    #[test]
+    fn a_stand_in_judge_at_one_gate_makes_the_delivery_mixed_and_never_ran() {
+        use crate::assurance as a;
+        let mut s = session("stand-in-delivery");
+        s.assurance.roles = Some(Vec::new());
+        s.assurance.stand_in_aware = true;
+        s.assurance.stand_in_label = Some("Checked by a stand-in".into());
+        let gate = |ord: u32, f: &dyn Fn(&mut a::AssuranceReceipt)| {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("stand-in-delivery:{ord}"),
+                "stand-in-delivery",
+                ord,
+                "step",
+            );
+            let mut r = a::AssuranceReceipt::for_run(&s.assurance, 0);
+            f(&mut r);
+            u.assurance = Some(r);
+            u
+        };
+        let real = |r: &mut a::AssuranceReceipt| {
+            r.ran(a::JUDGE);
+            r.judge = Some("codex".into());
+            r.roles = Some(vec![a::RoleRecord::real(
+                crate::standin::Role::Judge,
+                "codex",
+                1,
+                0,
+            )]);
+        };
+        let stood = |r: &mut a::AssuranceReceipt| {
+            let b = crate::standin::StandInBinding {
+                key: "claude~1".into(),
+                base: "claude".into(),
+                role: crate::standin::Role::Judge,
+                slot: 1,
+                model: None,
+                builder_model: None,
+                lens: None,
+                ord: Some(2),
+                attempt: Some(0),
+                subject: None,
+                evidence: None,
+                invocation: "i".into(),
+                reason: crate::standin::Reason::OnlyOneHelper {
+                    cli: "Claude Code".into(),
+                },
+                state: crate::standin::STATE_ANSWERED.into(),
+                display: None,
+            };
+            r.skip(a::JUDGE, a::SKIP_STAND_IN, Some("by a stand-in".into()));
+            r.roles = Some(vec![a::RoleRecord::stand_in(&b, "Claude Code")]);
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &stood)]);
+        assert!(!d.ran.iter().any(|i| i == a::JUDGE), "{:?}", d.ran);
+        assert!(d
+            .skipped
+            .iter()
+            .any(|k| k.instrument == a::JUDGE && k.reason == a::SKIP_STAND_IN));
+        // The keyed union: gate 1's real judge and gate 2's stand-in both stay.
+        let roles = d.roles.as_ref().expect("canonical");
+        let filled: Vec<(&str, Option<u32>)> =
+            roles.iter().map(|r| (r.filled.as_str(), r.ord)).collect();
+        assert_eq!(
+            filled,
+            [(a::FILLED_REAL, Some(1)), (a::FILLED_STAND_IN, Some(2))]
+        );
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENCE_MIXED));
+        assert_eq!(d.stand_in_label.as_deref(), Some("Checked by a stand-in"));
+        // A required judge missing at gate 3 is the delivery's word.
+        let missing = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NO_DISTINCT_SEAT, Some("no seat".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(
+            &s,
+            &[gate(1, &real), gate(2, &stood), gate(3, &missing)],
+        );
+        let judge_skips: Vec<&str> = d
+            .skipped
+            .iter()
+            .filter(|k| k.instrument == a::JUDGE)
+            .map(|k| k.reason.as_str())
+            .collect();
+        assert_eq!(judge_skips, [a::SKIP_NO_DISTINCT_SEAT]);
+        // No judge due at gate 2, a real one at gate 1: independent.
+        let not_due = |r: &mut a::AssuranceReceipt| {
+            r.skip(a::JUDGE, a::SKIP_NOT_APPLICABLE, Some("no files".into()))
+        };
+        let d = crate::deliver_lift::delivery_receipt(&s, &[gate(1, &real), gate(2, &not_due)]);
+        assert_eq!(d.independence.as_deref(), Some(a::INDEPENDENT));
+        assert!(d.ran.iter().any(|i| i == a::JUDGE));
+        assert_eq!(d.stand_in_label, None);
     }
 
     /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored
@@ -35757,6 +36180,208 @@ mod request_changes_tests {
                 .unwrap()
                 .note,
             crate::NoteRule::Required
+        );
+    }
+
+    /// (core#1846) The floor's report when the machine is short of disk, made by the floor itself
+    /// (`repo_checks::run_floor`, whose disk guard refuses before any check runs): the test seam
+    /// stands in for a volume with 1 GiB free.
+    fn disk_refused_floor() -> crate::repo_checks::RepoChecksReport {
+        let wt = std::env::temp_dir().join(format!(
+            "wicked-1846-disk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("package.json"), r#"{"scripts":{"test":"exit 1"}}"#).unwrap();
+        // A test that turns the disk guard off (`WICKED_FLOOR_MIN_FREE_GB=0`) holds the write lock.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::repo_checks::TEST_FREE_BYTES.with(|c| c.set(1 << 30));
+        let report =
+            crate::repo_checks::run_floor(&wt, &crate::repo_checks::FloorContext::default());
+        crate::repo_checks::TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+        let _ = std::fs::remove_dir_all(&wt);
+        assert!(report.checks.is_empty(), "no check ran: {report:?}");
+        assert!(report.environment_refusal().is_some(), "{report:?}");
+        report
+    }
+
+    /// (core#1846) `unit` denied by `report` as the gate fold books a failed floor
+    /// (`pipeline.rs` `apply_and_finish_unit`: `report.denial_source()`, `report.denial_reason()`).
+    fn deny_by_floor(unit: &mut WorkUnit, report: crate::repo_checks::RepoChecksReport) {
+        let why = report.denial_reason();
+        unit.status = UnitStatus::Rejected;
+        unit.repo_checks_floor = true;
+        unit.denial = Some(UnitDenial::new(report.denial_source(), &why));
+        unit.denial_reason = Some(why);
+        unit.denials_behind = Some(Vec::new());
+        unit.repo_checks = Some(report);
+    }
+
+    /// (core#1846) A read-only phase's floor refused for low disk (cert t12r2-j4-retry): `verify`,
+    /// on a three-seat roster, its gate open.
+    fn seed_disk_refused_verify(store: &mut dyn GraphStore, run_id: &str) {
+        seed_floor_red_verify(store, run_id, "codex");
+        let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+        put_node(store, s.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        units[3].worktree_guarded = true;
+        deny_by_floor(&mut units[3], disk_refused_floor());
+        put_node(store, units[3].to_node()).unwrap();
+        open_row(store, run_id, 4, "escalation");
+    }
+
+    /// (core#1846) A floor whose checks never ran for want of disk says so, why, and that the way
+    /// on is to free space and retry, on a read-only phase and on a creator alike. It never reads
+    /// as a failed check, and offers no floor fix, no send-back and no operator judgment.
+    #[test]
+    fn a_disk_refused_floor_gate_says_the_checks_did_not_run_and_to_free_space_then_retry() {
+        let report = disk_refused_floor();
+        let mut verify = WorkUnit::pending("r:verify", "r", 4, "verify");
+        verify.role = PhaseRole::Evaluator;
+        verify.worktree_guarded = true;
+        deny_by_floor(&mut verify, report.clone());
+        assert!(floor_not_run(&verify).is_some());
+        assert!(!floor_fix_applies(&verify), "no seat can fix a full disk");
+        let mut fix = WorkUnit::pending("r:fix", "r", 3, "fix");
+        fix.role = PhaseRole::Creator;
+        deny_by_floor(&mut fix, report);
+        for u in [&verify, &fix] {
+            let reason = u.denial_reason.clone().unwrap();
+            let class = denial_class(u.denial.as_ref(), false);
+            assert_eq!(class, "floor_failed");
+            let p = denial_gate_prompt(u, class, &reason, None, "");
+            assert!(
+                p.starts_with(&format!(
+                    "Unit {}'s checks did not run: the host has 1.0 GiB free",
+                    u.ord
+                )),
+                "{p}"
+            );
+            assert!(p.contains("no check ran. Free disk space"), "{p}");
+            assert!(p.contains("Approve to retry the step"), "{p}");
+            assert!(p.ends_with("or reject to cancel the run"), "{p}");
+            for never in [
+                "failed its deterministic floor",
+                "environment:",
+                "approve with a note",
+                "operator_judgment",
+                "could not run:",
+            ] {
+                assert!(!p.contains(never), "{never}: {p}");
+            }
+        }
+        // A floor whose checks ran and failed keeps its own prompt and its floor fix.
+        let mut red = verify.clone();
+        red.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap(),
+        );
+        assert!(floor_not_run(&red).is_none());
+        assert!(floor_fix_applies(&red));
+
+        // The disk stopped the floor part way (xreview r1): a check that ran and passed first
+        // leaves it a retry, said as "did not finish"; a check that ran and FAILED first, or another
+        // layer that denied the attempt, keeps the floor gate's own answers.
+        let check = |exit: i32| -> crate::repo_checks::CheckRun {
+            serde_json::from_value(serde_json::json!({
+                "name": "lint", "argv": ["npm", "run", "lint"], "source": "package.json",
+                "exit_code": exit, "timed_out": false, "duration_ms": 900,
+                "stdout_tail": "", "stderr_tail": ""
+            }))
+            .unwrap()
+        };
+        let mut part = verify.clone();
+        part.repo_checks.as_mut().unwrap().checks.push(check(0));
+        let p = denial_gate_prompt(&part, "floor_failed", "x", None, "");
+        assert!(
+            p.starts_with("Unit 4's checks did not finish: the host has"),
+            "{p}"
+        );
+        assert!(!floor_fix_applies(&part));
+        let mut failed_first = verify.clone();
+        failed_first
+            .repo_checks
+            .as_mut()
+            .unwrap()
+            .checks
+            .push(check(1));
+        assert!(floor_not_run(&failed_first).is_none());
+        assert!(floor_fix_applies(&failed_first));
+        // xreview r2: an unknown record (`None`, from before the record existed or a same-tree
+        // retry that did not ask every layer) is not "nothing else denied".
+        for record in [
+            Some(vec![UnitDenial::new("evaluator_verdict", "FAIL")]),
+            None,
+        ] {
+            let mut behind = verify.clone();
+            behind.denials_behind = record;
+            assert!(floor_not_run(&behind).is_none());
+            assert!(floor_fix_applies(&behind));
+            let p = denial_gate_prompt(&behind, "floor_failed", "x", None, "");
+            assert!(p.contains("failed its deterministic floor"), "{p}");
+        }
+    }
+
+    /// (core#1846) The gate's published answers are a retry and a stop: no floor fix on the noted
+    /// approve, no send-back, no reassign and no operator judgment, and the engine refuses each of
+    /// those with the cause and what to do.
+    #[test]
+    fn gate_actions_disk_refused_floor_offers_only_retry_and_stop() {
+        let listed = listed_is_accepted("floor-disk-refused", &seed_disk_refused_verify);
+        let approve = action(&listed, "approve").expect("approve");
+        assert_eq!(approve.intent, "retry", "{listed:#?}");
+        assert_eq!(approve.note_intent, None, "{listed:#?}");
+        for never in [
+            "request_changes",
+            "reassign",
+            crate::workflow::OPERATOR_JUDGMENT_ACTION,
+        ] {
+            assert!(action(&listed, never).is_none(), "{never}: {listed:#?}");
+        }
+        assert!(action(&listed, "reject").is_some(), "{listed:#?}");
+
+        let run_id = format!("disk-refused-answers-{}", std::process::id());
+        let refused = |d: HumanDecision| {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_disk_refused_verify(&mut store, &run_id);
+            answer(&mut store, &run_id, d)
+                .0
+                .expect_err("refused")
+                .to_string()
+        };
+        for e in [
+            refused(HumanDecision::RequestChanges {
+                note: Some("fix it".into()),
+            }),
+            refused(HumanDecision::OperatorJudgment {
+                rationale: "the disk, not the work".into(),
+            }),
+        ] {
+            assert!(
+                e.starts_with("unit 4's checks did not run: the host has 1.0 GiB free")
+                    && e.contains("free disk space on this machine, then approve to retry"),
+                "{e}"
+            );
+        }
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        let s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let e = reseat_parked_unit(&mut store, &mut subs, &s, 4, Some("pi"))
+            .expect_err("no reassign")
+            .to_string();
+        assert!(
+            e.contains("moving the step to another seat would not help"),
+            "{e}"
         );
     }
 }

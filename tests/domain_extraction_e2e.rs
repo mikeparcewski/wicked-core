@@ -245,7 +245,7 @@ fn seed(db: &str, accounted: bool) {
 
 fn make_git_repo(name: &str) -> std::path::PathBuf {
     let repo = std::env::temp_dir().join(format!("wicked-core-e2e-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
         Command::new("git")
@@ -538,6 +538,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         primary: None,
         // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
         reduced_assurance: true,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),
@@ -664,8 +665,8 @@ fn rejected(view: &SessionView, phase: &str) -> bool {
 }
 
 fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
-    // crew#276: run worktrees live under the non-dotted root now.
-    repo_root.join("wicked-worktrees").join(run_id)
+    // crew#276: run worktrees live under the non-dotted root; core#1109: beside the checkout.
+    run_tree(repo_root, run_id)
 }
 
 // --- TEST 1: the governed run produces the gated artifacts ---
@@ -1053,4 +1054,23 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo`:
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+/// Remove a test checkout and the folder beside it that holds its run trees.
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }

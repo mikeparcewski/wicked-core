@@ -122,6 +122,7 @@ impl RunSpec {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),
@@ -430,7 +431,8 @@ impl Campaign {
                     | HumanDecision::AcceptSuggestion
                     | HumanDecision::ConsentChoice { .. }
                     | HumanDecision::Rejudge
-                    | HumanDecision::RetryQe => None,
+                    | HumanDecision::RetryQe
+                    | HumanDecision::UseStandIns { .. } => None,
                     // (DES-RULE-CHECK-001 S2) The skips' reasons are the record.
                     HumanDecision::RecheckRules { skips } => (!skips.is_empty()).then(|| {
                         skips

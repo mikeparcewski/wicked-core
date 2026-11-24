@@ -96,7 +96,7 @@ fn cli(key: &str) -> AgenticCli {
 fn make_git_repo(name: &str) -> PathBuf {
     let repo =
         std::env::temp_dir().join(format!("wicked-core-handoff-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
         Command::new("git")
@@ -137,6 +137,7 @@ fn spec(session_id: &str, repo_ref: &str) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),
@@ -227,7 +228,7 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
             registered_at: 0,
         })
         .unwrap();
-    let wt = repo.join("wicked-worktrees").join("r-handoff");
+    let wt = run_tree(&repo, "r-handoff");
 
     core.launch_run(spec("r-handoff", &entry.id))
         .expect("launch");
@@ -277,7 +278,7 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
     release.store(true, Ordering::SeqCst);
     let _ = core.cancel_run("r-handoff");
     drop(core);
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -287,4 +288,23 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo`:
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+/// Remove a test checkout and the folder beside it that holds its run trees.
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }

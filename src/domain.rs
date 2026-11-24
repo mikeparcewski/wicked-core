@@ -730,7 +730,12 @@ impl BenchedSeat {
 /// (PRODUCT-WORKS J4, core#1479) A quota or sign-in bench added here without a lift time is
 /// stamped with the first backoff of its cause ([`crate::seat_bench::stamp`]); a site that read the
 /// provider's reset time sets [`BenchedSeat::benched_until`] itself first.
-pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
+pub fn bench_seat(benched: &mut Vec<BenchedSeat>, mut seat: BenchedSeat) -> bool {
+    // (DES-STANDIN-001 §3.3) A bench follows the CREDENTIAL: a stand-in's failure benches its
+    // base (`claude~1` benches `claude`), so no later fill bases a stand-in on it.
+    if wicked_apps_core::spawn::seat_id::is_stand_in(&seat.cli) {
+        seat.cli = wicked_apps_core::spawn::seat_id::credential(&seat.cli).to_string();
+    }
     let seat = crate::seat_bench::stamp(seat, crate::seat_bench::now_ms());
     match benched.iter_mut().find(|b| b.cli == seat.cli) {
         Some(existing) if existing.governed_only && !seat.governed_only => {
@@ -931,6 +936,12 @@ impl FromNode for AgentSession {
 /// [`UnitDenial::source`] of a worker exit on a dead-seat class with no eligible seat left
 /// (core#461) — the payload the escalation gate's reassign arm keys on.
 pub const DENIAL_SOURCE_DEAD_SEAT: &str = "dead_seat";
+
+/// (core#1674) [`UnitDenial::source`] when a step that writes code was refused, by its seat's own
+/// layer (its CLI sandbox, a read-only mount, file permissions), writes inside its work tree it
+/// never made afterwards: the work is not as built, whatever later checks find. No engine hook saw
+/// those refusals, so nothing else in the fold names them.
+pub const DENIAL_SOURCE_SEAT_REFUSED: &str = "seat_refused";
 
 /// (core#772) [`UnitDenial::source`] when the agent JUDGE could not run: every eligible
 /// identity-distinct judge seat failed as a seat (quota, sign-in, not installed, an empty
@@ -1955,6 +1966,16 @@ pub enum RoutingInfo {
     /// `{"method":"teamed","winner":"<seat>"}`; `Council` and `Degraded` stay for the routing a
     /// recorded run already carries.
     Teamed { winner: String },
+    /// (DES-STANDIN-001 §5.1) The unit is checked by a STAND-IN: no seat distinct from its
+    /// builders (or from the run's parties) could take it, and a person consented. `winner` is the
+    /// binding key (`claude~1`), `base` the credential it runs on, `role` the independent role it
+    /// fills (`evaluator` | `party_excluded`). Only on a stand-in-aware run. Additive on the wire:
+    /// `{"method":"stand_in","winner":"claude~1","base":"claude","role":"evaluator"}`.
+    StandIn {
+        winner: String,
+        base: String,
+        role: String,
+    },
 }
 
 impl WorkUnit {

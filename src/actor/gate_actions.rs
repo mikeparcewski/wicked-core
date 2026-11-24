@@ -321,7 +321,9 @@ fn answer_actions(
                         session,
                         run_id,
                         d,
-                        None,
+                        // The probe answers as someone: a real answer must name its person
+                        // (core#1864), and listing an action never depends on who will answer it.
+                        Some(PROBE),
                         adjudication_open,
                         floor_fix,
                     )
@@ -374,7 +376,15 @@ fn answer_actions(
 
     // The named arms, each by its own token.
     use crate::repo_checks::FloorRerunMode as Mode;
-    let named: [(HumanDecision, &str, NoteRule); 9] = [
+    let named: [(HumanDecision, &str, NoteRule); 10] = [
+        // (DES-STANDIN-001 §3.10, S0 ruling 1) Listed once; a skin draws both scopes from it.
+        (
+            HumanDecision::UseStandIns {
+                scope: crate::standin::SCOPE_JOB.to_string(),
+            },
+            crate::workflow::USE_STAND_INS_ACTION,
+            NoteRule::None,
+        ),
         (
             HumanDecision::RetryQe,
             crate::workflow::RETRY_QE_ACTION,
@@ -560,6 +570,9 @@ fn approve_intent(
         "terminal" => "complete",
         // A failed step's gate (triage could not apply its flag, or escalated): approve re-runs it.
         "failure" | "triage" => "retry",
+        // (DES-STANDIN-001 §3.10) A stand-in hold's approve retries the seating: real helpers
+        // first, a stand-in only with consent by then.
+        _ if super::stand_in_gate::gate_open(cursor) => "retry",
         _ if cursor.is_some_and(|u| u.status == crate::domain::UnitStatus::Rejected) => "retry",
         _ => "continue",
     }

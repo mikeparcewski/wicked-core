@@ -145,6 +145,24 @@ export interface LaunchOptions {
    */
   reducedAssurance?: boolean
   /**
+   * (DES-STANDIN-001 §3.8, §8) The launcher implements the stand-in choice. Omit (or `false`)
+   * and the run behaves exactly as before, reduced assurance included; `true` with
+   * `reducedAssurance` REJECTS the launch.
+   */
+  standInAware?: boolean
+  /**
+   * (DES-STANDIN-001 §3.8) Seats that authored the work under review: never seated for real in
+   * an independent role, still on the roster so a stand-in can be based on them. Only with
+   * `standInAware`.
+   */
+  parties?: Array<string>
+  /**
+   * (DES-STANDIN-001 §3.8) A human's consent to stand-ins, as JSON:
+   * `{"scope":"job"|"always","by":"<actor>","at":<ms>,"via":"launch"|…}`. `by`/`at` are the
+   * launcher server's, never a request body's. Only with `standInAware`.
+   */
+  standInJson?: string
+  /**
    * (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
    * step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
    * session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
@@ -453,6 +471,17 @@ export declare class Core {
    */
   confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectPlanRev?: number | undefined | null, expectGateSeq?: number | undefined | null): Promise<string>
   /**
+   * (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at the run's open `stand_in_needed` gate (the
+   * answer studio sends as `{approve: true, action: "use_stand_ins", scope}`): `scope` is `job`
+   * or `always`, `actor` the person who answered (the server's, never a body's). The consent goes
+   * on the run's contract and exactly the held check continues. Refused at any other gate, on a
+   * run that is not stand-in-aware or runs reduced, without an `actor` (consent is a person's), and
+   * with an error that starts `gate_changed:` when the opening `expectGateSeq` names (the open
+   * gate's `gateSeq`, required) or `expectOrd` is no longer the open one. Resolves to the status
+   * token.
+   */
+  grantStandIns(runId: string, scope: string, expectGateSeq: number, actor?: string | undefined | null, expectOrd?: number | undefined | null): Promise<string>
+  /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
    */
@@ -685,6 +714,23 @@ export declare class Core {
    * `humanConfirm` / `deliverStepJson`.
    */
   previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null, repoRef?: string | undefined | null, deliverStepJson?: string | undefined | null): Promise<string>
+  /**
+   * (DES-STANDIN-001 §3.9; core#1721) Before a launch: which independent roles the job needs and
+   * how many real seats can fill each on the shape it would take, so a launcher asks once, before
+   * anything runs, when the roster is short. `clisJson`: the launch roster (as `launchRun`'s);
+   * `shapeJson`: `{ workflow?, projectId?, planJson?, power?, reducedAssurance?, primary?, parties?,
+   * excludeSeats?, skipQeAcceptanceReason?, forceQeAcceptance?, repoBound?, councilSize? }`. The
+   * contract is resolved by the engine through the launch's own code. Resolves to JSON `{ short,
+   * primary, roles: [{ role, needed, real, shortBy, canStandIn, standInFrom, conditional, why }],
+   * reason, reasonData, signedIn, benched, judges, diversity: { providers, needed,
+   * neededWithFailover, sharing, outsideHelper, note } }`; `primary` is null when the launch draws
+   * its PA (each role is then its worst case over every work seat). Rejects with the launch's
+   * refusal of the shape (malformed `planJson`, a plan beside a preset, a bad QE word, an unknown or
+   * ballot-only `primary`); the launch's own plan checks stay the launch's.
+   * Diagnostic: every role keeps its own admission at its gate. An addon without this method
+   * predates it; crew keys on its presence.
+   */
+  independencePreflight(clisJson: string, shapeJson: string): Promise<string>
   /**
    * A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
    * ADD. Held and applied at the run's next step boundary through the engine's revision path
@@ -1704,6 +1750,18 @@ export interface RepoCheckRunJson {
    * floor's result of the same tree and base, so `durationMs`, the exit and the retries are that floor's.
    * `phase` is null when the creator unit's phase is unknown. */
   reusedFrom?: { phase: string | null; ord: number; attempt: number }
+  /** (core#1208) Present only on a hand-off round's creator check that ran just the tests the
+   * round's change reaches: the earlier round's floor of the same unit whose pass stands for the
+   * rest of the check (`fromTree`, `ord`, `attempt`; `phase` null when unknown), and the files
+   * changed since it (the first 20 in `changed`; `changedCount` is whole). */
+  delta?: {
+    fromTree: string
+    phase: string | null
+    ord: number
+    attempt: number
+    changed: string[]
+    changedCount: number
+  }
 }
 
 /** (core#1187) The engine's affected-set selection for one cargo workspace test check. */

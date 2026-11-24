@@ -11,8 +11,9 @@
 # its own lockfile and `.cargo/` config for the same reason. Its single test runs from an explicit
 # `--manifest-path` in CI instead.
 #
-# `wicked-worktrees` is excluded for the engine's own run worktrees (core#1109): a run on this repo
-# checks it out at `<clone>/wicked-worktrees/<id>`, and cargo looks for a package's workspace by
+# `wicked-worktrees` is excluded for the engine's own run worktrees (core#1109): an engine before
+# core#1109 checked a run on this repo out at `<clone>/wicked-worktrees/<id>` (new runs sit beside
+# the clone, and those trees keep running in place), and cargo looks for a package's workspace by
 # walking up to the first `[workspace]` that does not exclude it. From a worktree's core-ts that
 # walk passes the worktree's own root (which excludes core-ts) and reached THIS file in the main
 # clone, which then claimed the package and refused it. Excluding the directory sends the walk on.

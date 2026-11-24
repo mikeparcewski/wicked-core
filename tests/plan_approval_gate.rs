@@ -247,6 +247,7 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         evidence_root: None,
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

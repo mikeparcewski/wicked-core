@@ -60,7 +60,7 @@ fn echo_cli() -> AgenticCli {
 
 fn make_git_repo(name: &str) -> std::path::PathBuf {
     let repo = std::env::temp_dir().join(format!("wicked-core-p4a-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&repo);
+    rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |a: &[&str]| {
         Command::new("git")
@@ -139,6 +139,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         evidence_root: None,
         primary: None,
         reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),
@@ -176,7 +177,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
     // Assert instead that the session RECORDED that worktree as its workdir — deterministic, and
     // the honest evidence that the run used it. `actor.rs` sets workdir to the worktree path on
     // `WorktreeReady`.
-    let expected_wt = repo.join("wicked-worktrees").join("run");
+    let expected_wt = run_tree(&repo, "run");
     assert_eq!(
         v.session.workdir.as_deref(),
         Some(expected_wt.to_string_lossy().as_ref()),
@@ -198,4 +199,23 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo`:
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+/// Remove a test checkout and the folder beside it that holds its run trees.
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }

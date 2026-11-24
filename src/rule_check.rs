@@ -426,6 +426,11 @@ pub struct RuleCheckReport {
     /// only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub carry_keys: BTreeMap<String, String>,
+    /// (core#1842) [`same_change_key`] of what this unit-gate check read (any
+    /// [`CheckStage::Review`] check, never delivery): a later step's check with an equal key
+    /// reuses this one's POL-2101 verdict ([`CheckInput::same_change`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_key: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -793,6 +798,30 @@ pub fn job_facts(
 /// never truncated).
 fn digest(parts: &[&str]) -> String {
     digest_bytes(&parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
+}
+
+/// (core#1842) What two gates' POL-2101 checks must share for one to answer the other: the
+/// change's exact bytes, the person's instructions, and the creator steps' records (each label and
+/// text). Not the floor's text (a re-run's timings) nor the checking step's own record (a
+/// reviewer's STACK-CHECK can only add a check).
+fn same_change_key(input: &CheckInput<'_>) -> String {
+    let mut parts: Vec<&[u8]> = vec![
+        b"change",
+        &input.change.raw,
+        b"\0told",
+        input.instructions.unwrap_or("").as_bytes(),
+    ];
+    match input.creator_records {
+        Some(recs) => {
+            for r in recs {
+                parts.push(b"\0record");
+                parts.push(r.label.as_bytes());
+                parts.push(r.text.as_bytes());
+            }
+        }
+        None => parts.push(b"\0unreadable"),
+    }
+    digest_bytes(&parts)
 }
 
 fn digest_bytes(parts: &[&[u8]]) -> String {
@@ -1268,6 +1297,13 @@ pub struct CheckInput<'a> {
     /// change alone (not a process rule, a step-record clause or a machine obligation). Anything
     /// else is judged again.
     pub carried: &'a [RuleSkip],
+    /// (core#1842) The rows of the run's EARLIER gates, each with its report's
+    /// [`RuleCheckReport::change_key`], earliest first. On POL-2101 the latest one with this
+    /// check's own [`same_change_key`] answers it when it is a KEPT or N/A a judge or council
+    /// reached and its judge may still approve this work ([`RuleJudge::approval_failure`]): the
+    /// change, the instructions and the creator records are the same, and this step's own record
+    /// can only add a check. A later BROKEN, or anything else, is judged again.
+    pub same_change: &'a [(String, RuleVerdict)],
 }
 
 /// (Part B) One creator step's record, as the run stored it (its last output), for POL-2101's
@@ -3477,6 +3513,9 @@ pub const NO_AGENT_WROTE_CODE: &str = "no agent wrote code in this run (its code
                                        are the engine's own tool steps, or there are none), and \
                                        the rule binds agents writing code";
 
+/// (core#1842) How a POL-2101 row reused from an earlier step's check of the same change says so.
+pub const SAME_CHANGE_REUSED: &str = "already checked at an earlier step on this same change";
+
 /// (Part B) Where POL-2101's record part waits for the engine to combine it with its substance.
 const RECORD_SLOT: &str = "\u{0}record";
 
@@ -3705,6 +3744,8 @@ pub fn check(
         CheckStage::Delivery => None,
     };
     let mut carry_keys: BTreeMap<String, String> = BTreeMap::new();
+    // (core#1842) What an earlier gate's POL-2101 row must have read to answer this one.
+    let this_change = same_change_key(input);
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     // (Part B) POL-2101's ids whose two parts the engine combines.
     let mut combine: Vec<String> = Vec::new();
@@ -3947,6 +3988,36 @@ pub fn check(
             rows.insert(rule.id.clone(), c);
             continue;
         }
+        // (core#1842) POL-2101 already ruled KEPT or N/A at an earlier step's check of this same
+        // change (the review before QE): the question is the same, so it is not asked again. A
+        // judge seat failing here (J4: the only other seat shares the work's provider) would
+        // otherwise hold a step that changed nothing.
+        if pack == Some(PackKind::WorkWithRecord) {
+            if let Some(r) = input
+                .same_change
+                .iter()
+                .rev()
+                .find(|(k, r)| *k == this_change && r.rule_id == rule.id && r.rule_key == rk)
+                .map(|(_, r)| r)
+                .filter(|r| matches!(r.status, RuleStatus::Kept | RuleStatus::NotApplicable))
+                .filter(|r| {
+                    r.judge
+                        .as_deref()
+                        .is_none_or(|seat| judge.approval_failure(seat).is_none())
+                })
+                .and_then(reuse)
+            {
+                rows.insert(
+                    rule.id.clone(),
+                    RuleVerdict {
+                        reason: format!("{SAME_CHANGE_REUSED}: {}", r.reason),
+                        evidence_key: Some(ek),
+                        ..r
+                    },
+                );
+                continue;
+            }
+        }
         if is_machine {
             // Decided from the change where it can be: no model call, no run. A change with no
             // source code is not applicable whatever the scope; a finding against the change
@@ -4098,6 +4169,7 @@ pub fn check(
             0
         },
         carry_keys,
+        change_key: (input.stage == CheckStage::Review).then_some(this_change),
         ..Default::default()
     };
     // (S3) The machine check runs beside the judge batches; one base run answers every rule that

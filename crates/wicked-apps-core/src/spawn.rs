@@ -1502,12 +1502,43 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 pub const SEAT_INSTANCE_SEP: char = '#';
 
 /// The CLI (MODEL) key a seat key names — what a predicate about the MODEL must read (core#591):
-/// `"claude#2"` → `"claude"`, `"claude"` → `"claude"`, `"my-claude"` → `"my-claude"`.
+/// `"claude#2"` → `"claude"`, `"claude"` → `"claude"`, `"my-claude"` → `"my-claude"`, and a
+/// stand-in binding `"claude~1"` → `"claude"` ([`seat_id::family`], DES-STANDIN-001 §3.3).
 #[must_use]
 pub fn seat_cli_key(seat_key: &str) -> &str {
-    match seat_key.split_once(SEAT_INSTANCE_SEP) {
-        Some((cli, _)) => cli,
-        None => seat_key,
+    seat_id::family(seat_key)
+}
+
+/// (DES-STANDIN-001 §3.3) The separator of a STAND-IN binding key: `claude~1` is the first
+/// stand-in minted on the `claude` credential, `codex#2~1` the first on `codex#2`. Reserved for the
+/// engine: a launch roster key carrying it is refused where a duplicate key is (the launch's
+/// distribution, core#591), so no launched run works on a key that reads as a stand-in.
+pub const STAND_IN_SEP: char = '~';
+
+/// (DES-STANDIN-001 §3.3) The three identities a seat key names, parsed in this one place.
+pub mod seat_id {
+    use super::{SEAT_INSTANCE_SEP, STAND_IN_SEP};
+
+    /// The CLI family (the model key): up to the first `#` or `~`. `codex#2~1` → `codex`.
+    #[must_use]
+    pub fn family(key: &str) -> &str {
+        key.split([SEAT_INSTANCE_SEP, STAND_IN_SEP])
+            .next()
+            .unwrap_or(key)
+    }
+
+    /// The credential instance: the key without a stand-in's `~n`. `codex#2~1` → `codex#2`,
+    /// `claude~1` → `claude`; a real seat key is its own credential.
+    #[must_use]
+    pub fn credential(key: &str) -> &str {
+        key.split_once(STAND_IN_SEP).map_or(key, |(c, _)| c)
+    }
+
+    /// Whether `key` has the reserved stand-in syntax (a `~`). Syntax only: whether the engine
+    /// minted it, and whether the binding is valid, are its admission's and resolution's checks.
+    #[must_use]
+    pub fn is_stand_in(key: &str) -> bool {
+        key.contains(STAND_IN_SEP)
     }
 }
 
@@ -1643,6 +1674,9 @@ fn seat_config_in(
     cli: SeatCli,
     seat_key: &str,
 ) -> anyhow::Result<SeatConfig> {
+    // (DES-STANDIN-001 §3.3, rev 3 N1) A stand-in runs on its BASE credential: `codex#2~1`
+    // resolves `codex#2`'s home, never `codex`'s, and no `~n` suffix reaches the instance root.
+    let seat_key = seat_id::credential(seat_key);
     let Some(name) = cli.root_name() else {
         return Ok(SeatConfig::Isolated {
             cli,
@@ -1762,8 +1796,66 @@ impl HardenedCommand for Command {
         for key in ENGINE_INTERNAL_ENV {
             self.env_remove(key);
         }
+        if is_git(self) {
+            harden_git(self);
+        }
         self
     }
+}
+
+/// (wicked-crew#1843) The daemon's raw Azure DevOps credential: a personal access token, or the
+/// service principal crew mints a header from. No git the engine starts needs it (git reads none
+/// of them; a push that needs Azure DevOps gets a minted header from the deliver script), and a
+/// git passes its environment to every hook, filter and `fsmonitor--daemon` it starts.
+pub const ADO_RAW_CREDENTIAL_ENV: &[&str] = &[
+    "AZURE_DEVOPS_EXT_PAT",
+    "CREW_ADO_TENANT_ID",
+    "CREW_ADO_CLIENT_ID",
+    "CREW_ADO_CLIENT_SECRET",
+];
+
+/// Whether `cmd` runs git itself (`git`, a path to it, `git.exe`), by the last component of its
+/// program on either separator.
+fn is_git(cmd: &Command) -> bool {
+    let program = cmd.get_program().to_string_lossy();
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("");
+    name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+}
+
+/// The `-c` entry every engine git carries (wicked-crew#1843), in `GIT_CONFIG_PARAMETERS`' quoting.
+const FSMONITOR_OFF_PARAMETER: &str = "'core.fsmonitor=false'";
+
+/// (wicked-crew#1843) Every engine git: no raw Azure DevOps credential, and `core.fsmonitor=false`.
+/// A host whose global config turns fsmonitor on would otherwise start a `git fsmonitor--daemon`
+/// for each worktree the engine reads, carrying the git's environment and outliving the daemon.
+///
+/// The setting rides `GIT_CONFIG_PARAMETERS`, the channel `git -c` uses: git reads it after every
+/// config file AND after the `GIT_CONFIG_COUNT` entries, and within it the last entry wins, so it is
+/// APPENDED to what the command would otherwise pass (its own value, else the daemon's). A site
+/// that sets its own `GIT_CONFIG_COUNT` entries before or after this keeps them and cannot undo it;
+/// only a later `env_remove`/`env_clear` of the variable, or a `-c core.fsmonitor=…` argument, does.
+fn harden_git(cmd: &mut Command) {
+    for key in ADO_RAW_CREDENTIAL_ENV {
+        cmd.env_remove(key);
+    }
+    let same = |k: &std::ffi::OsStr| {
+        if cfg!(windows) {
+            k.to_string_lossy()
+                .eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS")
+        } else {
+            k == "GIT_CONFIG_PARAMETERS"
+        }
+    };
+    let current = match cmd.get_envs().find(|(k, _)| same(k)) {
+        Some((_, set)) => set.map(std::ffi::OsStr::to_os_string),
+        None => std::env::var_os("GIT_CONFIG_PARAMETERS"),
+    };
+    let mut value = current.unwrap_or_default();
+    if !value.to_string_lossy().trim().is_empty() {
+        value.push(" ");
+    }
+    value.push(FSMONITOR_OFF_PARAMETER);
+    cmd.env("GIT_CONFIG_PARAMETERS", value);
 }
 
 /// Marker documenting where the rule is mechanically enforced.
@@ -1886,6 +1978,112 @@ mod tests {
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned());
         assert_eq!(found.as_deref(), Some("/run/store.db"));
+    }
+
+    /// (wicked-crew#1843) An engine git carries no raw Azure DevOps credential and runs with
+    /// `core.fsmonitor=false`, appended after the `-c` entries the command already carries.
+    #[test]
+    fn a_hardened_git_drops_the_ado_credential_and_turns_fsmonitor_off() {
+        let envs = |cmd: &Command| -> std::collections::HashMap<String, Option<String>> {
+            cmd.get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        for program in [
+            "git",
+            "/usr/bin/git",
+            "git.exe",
+            r"C:\Program Files\Git\cmd\git.exe",
+        ] {
+            let mut cmd = Command::new(program);
+            for key in ADO_RAW_CREDENTIAL_ENV {
+                cmd.env(key, "made-up"); // ggignore: a made-up test value
+            }
+            cmd.env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'");
+            cmd.hardened();
+            let e = envs(&cmd);
+            for key in ADO_RAW_CREDENTIAL_ENV {
+                assert_eq!(e.get(*key), Some(&None), "{program}: {key} is removed");
+            }
+            assert_eq!(
+                e["GIT_CONFIG_PARAMETERS"].as_deref(),
+                Some("'core.fsmonitor=true' 'core.fsmonitor=false'"),
+                "{program}: appended, so it is the entry git reads last"
+            );
+        }
+        // Nothing to append to: the entry alone.
+        let mut bare = Command::new("git");
+        bare.env_remove("GIT_CONFIG_PARAMETERS").hardened();
+        assert_eq!(
+            envs(&bare)["GIT_CONFIG_PARAMETERS"].as_deref(),
+            Some("'core.fsmonitor=false'")
+        );
+        // Anything else keeps the credential (the deliver script mints its header from it), and a
+        // program merely NAMED like git is not git.
+        for program in ["sh", "git.sh", "/usr/bin/gitk", "git-lfs"] {
+            let mut other = Command::new(program);
+            other.env("AZURE_DEVOPS_EXT_PAT", "made-up"); // ggignore: a made-up test value
+            other.hardened();
+            let e = envs(&other);
+            assert_eq!(
+                e["AZURE_DEVOPS_EXT_PAT"].as_deref(),
+                Some("made-up"),
+                "{program}"
+            );
+            assert!(!e.contains_key("GIT_CONFIG_PARAMETERS"), "{program}");
+        }
+    }
+
+    /// (wicked-crew#1843) The same, observed by a real git: fsmonitor reads off over a global
+    /// config that turns it on, over an inherited `-c core.fsmonitor=true`, and over a
+    /// `GIT_CONFIG_COUNT` entry the site sets after hardening (as an authenticated fetch sets its
+    /// header entries); and a command git starts sees no Azure DevOps credential.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_hardened_git_reads_fsmonitor_off_and_passes_no_ado_credential_on() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("wicked-1843-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        std::fs::write(&global, "[core]\n\tfsmonitor = true\n").unwrap();
+        let run = |args: &[&str]| -> String {
+            let mut cmd = Command::new("git");
+            cmd.env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'")
+                .env("AZURE_DEVOPS_EXT_PAT", "made-up") // ggignore: a made-up test value
+                .env("CREW_ADO_CLIENT_SECRET", "made-up") // ggignore: a made-up test value
+                .current_dir(&dir)
+                .hardened()
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+                .env("GIT_CONFIG_VALUE_0", "true")
+                .args(args);
+            let out = cmd.output().expect("git runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run(&["config", "--get", "core.fsmonitor"]), "false");
+        // A shell alias is a command git starts with its own environment (as a hook or filter is).
+        let probe = run(&[
+            "-c",
+            "alias.probe=!f() { test -n \"${AZURE_DEVOPS_EXT_PAT+x}\" && echo pat-present || echo pat-absent; test -n \"${CREW_ADO_CLIENT_SECRET+x}\" && echo sp-present || echo sp-absent; }; f",
+            "probe",
+        ]);
+        assert_eq!(probe, "pat-absent\nsp-absent");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The worker-home resolver, over explicit values so no test mutates the process environment:
@@ -3916,6 +4114,12 @@ rebase.autosquash\0";
             // No separator ⇒ no instance: an operator's own key is the CLI's only instance and
             // keeps the root it has had since core#410 (moving it would be the #578 hazard).
             ("my-claude", "claude"),
+            // (DES-STANDIN-001 T-R18, rev 3 N1) A stand-in resolves its BASE credential's root:
+            // `claude#2~1` is `claude#2`'s home, never `claude`'s, and `2~1` never reaches the
+            // instance-suffix validator (which would refuse it).
+            ("claude~1", "claude"),
+            ("claude#2~1", "claude-2"),
+            ("claude#cheap_2~3", "claude-cheap_2"),
         ] {
             let root = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key)
                 .expect("resolves")
@@ -4039,12 +4243,36 @@ rebase.autosquash\0";
             .expect_err("a seat with a root fails closed when the base is unresolvable");
     }
 
+    /// (DES-STANDIN-001 §3.3, T-R1) One parser, three identities: the family (model), the
+    /// credential instance a stand-in runs on, and whether a key is a stand-in at all. A real
+    /// seat key is its own credential, so nothing about a real roster reads differently.
+    #[test]
+    fn a_seat_key_names_its_family_its_credential_and_whether_it_stands_in() {
+        use super::seat_id::{credential, family, is_stand_in};
+        for (key, fam, cred, stand_in) in [
+            ("claude", "claude", "claude", false),
+            ("claude#2", "claude", "claude#2", false),
+            ("my-claude", "my-claude", "my-claude", false),
+            ("claude~1", "claude", "claude", true),
+            ("codex#2~1", "codex", "codex#2", true),
+            ("codex#2~12", "codex", "codex#2", true),
+        ] {
+            assert_eq!(family(key), fam, "{key}");
+            assert_eq!(credential(key), cred, "{key}");
+            assert_eq!(is_stand_in(key), stand_in, "{key}");
+        }
+    }
+
     /// (core#591) The seat-key split is total and the joiner is injective: every seat key has a
     /// CLI key, and no two acceptable instance keys name one directory.
     #[test]
     fn a_seat_key_splits_into_a_cli_key_and_an_instance() {
         assert_eq!(seat_cli_key("claude"), "claude");
         assert_eq!(seat_cli_key("claude#2"), "claude");
+        // (DES-STANDIN-001 T-R1) A stand-in binding's model is its base's: red before the one
+        // parser, which returned `claude~1` whole.
+        assert_eq!(seat_cli_key("claude~1"), "claude");
+        assert_eq!(seat_cli_key("codex#2~1"), "codex");
         assert_eq!(seat_cli_key("my-claude"), "my-claude");
         assert_eq!(seat_cli_key(""), "");
         assert_eq!(seat_instance_suffix("claude"), None);

@@ -374,6 +374,25 @@ pub(crate) fn reviewer_input(
     }
 }
 
+/// (core#1847) The reviewer's launch exclusion, shared with the launch preflight: a seat the launch
+/// excluded by its key or by its whole CLI (`claude` excludes `claude#2`).
+pub(crate) fn qe_seat_excluded(k: &str, exclude_seats: &[String]) -> bool {
+    use crate::team::runner::seat_key;
+    exclude_seats.iter().any(|e| e == k || e == seat_key(k))
+}
+
+/// (core#1847) The reviewer's author fence, shared with the launch preflight: the seat authored
+/// the work by its key, its credential or its CLI (`claude#2` for a `claude` author), or was seen
+/// calling the author's provider. `own_observed` `None` reads the seat's observed providers.
+pub(crate) fn qe_seat_authored(
+    k: &str,
+    own_observed: Option<&[crate::observed_provider::Provider]>,
+    authors: &[String],
+    providers: &[crate::observed_provider::Provider],
+) -> bool {
+    crate::observed_provider::shares_identity(k, own_observed, authors, providers).is_some()
+}
+
 /// (§3.2) The seats the reviewer may run on, from the run's OWN seats only, in order. Absolute
 /// exclusions (never relaxed): off-roster, benched, launch-excluded, and a seat whose skills do
 /// not admit the reviewer. Authors (`work_authors` ∪ the unit's own `authored_by`, compared by
@@ -391,12 +410,7 @@ pub(crate) fn candidates(
         }
     }
     let providers = crate::pipeline::work_author_providers(units, unit.ord);
-    let excluded = |k: &str| {
-        session
-            .exclude_seats
-            .iter()
-            .any(|e| e == k || e == seat_key(k))
-    };
+    let excluded = |k: &str| qe_seat_excluded(k, &session.exclude_seats);
     // (codex r1 on the code) The launch roster's template for a seat, read off a unit the roster
     // seated there — what the reviewer turn will actually run, and what admission judges.
     let invocation = |k: &str| -> Option<String> {
@@ -426,9 +440,7 @@ pub(crate) fn candidates(
         .filter(|k| !excluded(k))
         .filter(|k| crate::distribute::seat_admits_unit(&shape, k, invocation(k)))
         .collect();
-    let is_author = |k: &str| {
-        crate::observed_provider::shares_identity(k, None, &authors, &providers).is_some()
-    };
+    let is_author = |k: &str| qe_seat_authored(k, None, &authors, &providers);
     let same_cli = |k: &str| authors.iter().any(|a| a != k && seat_key(a) == seat_key(k));
     let executor = unit.assigned_cli.as_deref();
     let seat = |k: &str, basis: &str| QeReviewerSeat {

@@ -145,6 +145,7 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            stand_in: Default::default(),
             power: false,
             voice: None,
             deliverables: Vec::new(),

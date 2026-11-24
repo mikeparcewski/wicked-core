@@ -67,10 +67,10 @@ mod graph_browser;
 mod headless;
 mod hook_relay;
 mod image_archive;
+mod independence;
 mod index_budget;
 mod install_fence;
 mod interaction;
-mod judge_coverage;
 mod k8s;
 mod knowledge;
 #[cfg(test)]
@@ -132,6 +132,7 @@ pub mod run_context;
 mod run_mirror;
 mod runtime_wait;
 mod skill_use;
+mod standin;
 pub mod tool_activity;
 // S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
 #[allow(dead_code)]
@@ -291,11 +292,14 @@ pub use gate_hook::{
     GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
 pub use hook_relay::relay_client;
+pub use independence::{
+    judge_coverage, AuthorCoverage, Diversity, IndependencePreflight, Judge, JudgeCoverage,
+    NotJudge, PreflightShape, ProviderSharing, RolePreflight, ShortReason, StandInFrom,
+};
 pub use index_budget::{
     index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
     INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,
 };
-pub use judge_coverage::{judge_coverage, AuthorCoverage, Judge, JudgeCoverage, NotJudge};
 pub use k8s::cli::cluster_main;
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, judge_mcp_call_json, list_mcp_tools_json,
@@ -443,6 +447,10 @@ pub use repo_intel::{
 pub use scope::{resolve_scope, EntityMode};
 pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use standin::{
+    refuse_forged_stand_ins, LaunchStandIn, Reason as StandInReason, Role as StandInRole,
+    StandInBinding, StandInConsent,
+};
 pub use state_home::{
     preflight_state_home, StateHomeConfigError, StateHomePreflight, UnregisteredEntry,
 };
@@ -602,6 +610,10 @@ pub struct LaunchSpec {
     /// [`power::VOICE_MAX_BYTES`] (a longer one refuses the launch, nothing persisted). Ignored
     /// on a phased run (there is no orchestrator). `None` ⇒ no voice section.
     pub voice: Option<String>,
+    /// (DES-STANDIN-001 §3.8) The launch's stand-in facts: `standInAware` (the activation switch;
+    /// `false`, the default, keeps today's behaviour), the parties and any human consent.
+    /// Persisted on the run's contract, never re-read from here.
+    pub stand_in: crate::standin::LaunchStandIn,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):
@@ -1373,6 +1385,36 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (DES-STANDIN-001 §3.8, §3.10) USE STAND-INS at `run_id`'s open `stand_in_needed` gate —
+    /// studio's `{approve: true, action: "use_stand_ins", scope}`: the consent (`scope` `job` |
+    /// `always`, `by` = `actor`, recorded `via: "grant"`) goes on the run's contract and exactly the
+    /// held check continues, on a stand-in where no real helper can take it. Refused at any other
+    /// gate, on a run that is not stand-in-aware or runs reduced, and (through `expect`) for a gate
+    /// that is no longer the open one. Idempotent per gate: the gate it answered is closed.
+    pub fn grant_stand_ins(
+        &self,
+        run_id: &str,
+        scope: &str,
+        actor: Option<String>,
+        gate_seq: u32,
+        ord: Option<u32>,
+    ) -> anyhow::Result<SessionStatus> {
+        // (DES-STANDIN-001 §3.10, T-R12) A grant always names the opening it answers: a delayed
+        // grant never answers a later `stand_in_needed` opening (`gate_changed`).
+        self.confirm_gate_expecting(
+            run_id,
+            HumanDecision::UseStandIns {
+                scope: scope.to_string(),
+            },
+            actor,
+            Some(crate::workflow::GateExpect {
+                ord,
+                plan_rev: None,
+                gate_seq: Some(gate_seq),
+            }),
+        )
+    }
+
     /// (rejudge) Whether `run_id`'s open gate can RE-RUN ITS JUDGE now
     /// ([`HumanDecision::Rejudge`], wire action `rejudge`): it applies to a unit denied
     /// `judge_unavailable`, and is available when the engine's own judge selection names a seat as
@@ -2104,6 +2146,40 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-STANDIN-001 §3.9; core#1721) Before a launch: which independent roles the job needs
+    /// and how many real seats can fill each on the shape it would take, so a launcher asks once,
+    /// before anything runs, when the roster is short. `clis`: the launch roster (as `launchRun`'s
+    /// `clisJson`); `shape`: the launch options that decide the contract and the shape. The
+    /// contract is resolved by the engine through the launch's own code (an actor command: presets
+    /// and defs live in the store); the roles, over this process's registry and observed providers.
+    /// Diagnostic: every role keeps its own admission at its gate. `Err`: the shape is one the
+    /// launch refuses (malformed plan JSON, a plan beside a preset, a bad QE word, an unknown or
+    /// ballot-only primary); the launch's own plan checks stay the launch's.
+    pub fn independence_preflight(
+        &self,
+        clis: &[AgenticCli],
+        shape: &PreflightShape,
+    ) -> anyhow::Result<IndependencePreflight> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::IndependencePreflight {
+                shape: shape.clone(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        let contract = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        let registry = registry_roster();
+        let skills = crate::skills_snapshot::routing_snapshot();
+        let host = independence::HostFacts {
+            registry: &registry,
+            skills: skills.as_ref(),
+            seen: &crate::observed_provider::last_seen,
+        };
+        independence::independence_preflight_in(clis, &host, shape, contract)
     }
 
     /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit (`POST /api/v1/runs/:id/plan`): the

@@ -103,6 +103,7 @@ fn spec(session_id: &str, hc: HumanConfirm, project_id: Option<String>) -> Launc
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        stand_in: Default::default(),
         power: false,
         voice: None,
         deliverables: Vec::new(),

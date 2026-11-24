@@ -2830,6 +2830,43 @@ fn host_version(
         .or_else(|| parse_version(&String::from_utf8_lossy(&out.stderr)))
 }
 
+/// The version the seats run for `cli`: the engine's pin, unless the operator runs a seat image
+/// of their own (`own_image`: [`crate::container_floor::image_override`], which reads a blank
+/// `WICKED_SEAT_IMAGE_<CLI>` as unset, exactly as the image selection does).
+#[cfg(unix)]
+fn seat_pin(cli: &str, own_image: Option<String>) -> Option<&'static str> {
+    if own_image.is_some() {
+        None
+    } else {
+        pinned_version(cli)
+    }
+}
+
+/// The refusal when `cli`'s sign-in needs this host's own `cli` and it is not on the daemon's PATH.
+/// It ends with the command that installs it (crew lifts that command into its sign-in refusal):
+/// the seat package at the version the seats run (`pinned`, the same version the sentence names),
+/// or the package alone when the operator runs a seat image of their own (`pinned` is `None`).
+#[cfg(unix)]
+fn host_cli_missing(cli: &str, pinned: Option<&str>) -> String {
+    let seats = pinned
+        .map(|v| format!(" (the seats run {cli} {v})"))
+        .unwrap_or_default();
+    let install = match crate::container_floor::seat_package(cli) {
+        Some(crate::container_floor::SeatPackage::Npm(p)) => {
+            let name = p.rsplit_once('@').map_or(p, |(n, _)| n);
+            let name = if name.is_empty() { p } else { name };
+            match pinned {
+                Some(v) => format!(": npm install -g {name}@{v}"),
+                None => format!(": npm install -g {name}"),
+            }
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{cli} is not installed on this host: its sign-in runs this host's own {cli}{seats}. Install it, then sign in again{install}"
+    )
+}
+
 /// Open a host login session for `cli` and render its argv (see [`host_login`]). `daemon_env` is
 /// the daemon's environment, of which only [`HOST_LOGIN_PASSTHROUGH`] reaches the login.
 #[cfg(unix)]
@@ -2840,22 +2877,12 @@ fn prepare_host_login_argv(
     daemon_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
-    let pinned =
-        if std::env::var_os(format!("WICKED_SEAT_IMAGE_{}", cli.to_ascii_uppercase())).is_some() {
-            None
-        } else {
-            pinned_version(cli)
-        };
+    let pinned = seat_pin(cli, crate::container_floor::image_override(cli));
     let path = daemon_env
         .iter()
         .find(|(k, _)| k == "PATH")
         .map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
-    let exe = find_on_path(cli, path).ok_or_else(|| {
-        format!(
-            "{cli} is not installed on this host: its sign-in runs this host's own {cli}{}. Install it, then sign in again",
-            pinned.map(|v| format!(" (the seats run {cli} {v})")).unwrap_or_default()
-        )
-    })?;
+    let exe = find_on_path(cli, path).ok_or_else(|| host_cli_missing(cli, pinned))?;
     // The version probe runs in a throwaway home of its own, before any session exists: a
     // probe that fails touches no session marker (codex review: a failure after `new_session`
     // could delete a concurrent sign-in's marker outside the mutation lock). A probe home a
@@ -4853,6 +4880,51 @@ mod tests {
         assert_eq!(read_session(&fake.dir, "opencode").unwrap(), None);
     }
 
+    /// core#1845: a host sign-in for a missing CLI ends with the command that installs it, the
+    /// seat package at the version the seats run (crew lifts it into its refusal, studio offers it
+    /// with Copy); an operator's own seat image pins no version, so the package installs unpinned.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_host_cli_names_its_install_command() {
+        for cli in ["codex", "pi", "opencode"] {
+            let Some(crate::container_floor::SeatPackage::Npm(package)) =
+                crate::container_floor::seat_package(cli)
+            else {
+                panic!("{cli} ships an npm seat package");
+            };
+            let pinned = pinned_version(cli);
+            assert!(pinned.is_some(), "{cli} pins a version");
+            let refusal = host_cli_missing(cli, pinned);
+            assert!(
+                refusal.starts_with(&format!("{cli} is not installed on this host")),
+                "{refusal}"
+            );
+            assert!(
+                refusal.ends_with(&format!(": npm install -g {package}")),
+                "{refusal}"
+            );
+            let (name, version) = package.rsplit_once('@').unwrap();
+            assert_eq!(Some(version), pinned);
+            let own_image = host_cli_missing(cli, None);
+            assert!(
+                own_image.ends_with(&format!(": npm install -g {name}")),
+                "{own_image}"
+            );
+        }
+        // A CLI with no npm package (agy's vendor tarball) names no npm command.
+        assert!(host_cli_missing("agy", pinned_version("agy"))
+            .ends_with(". Install it, then sign in again"),);
+        // The version is the engine's pin unless the operator's own image is in use; a blank
+        // override is not one (`image_override` reads it as unset, as the image selection does).
+        assert_eq!(seat_pin("codex", None), pinned_version("codex"));
+        assert_eq!(seat_pin("codex", Some("my/codex:1".into())), None);
+        let v = pinned_version("codex").unwrap();
+        assert_eq!(
+            host_cli_missing("codex", Some(v)),
+            format!("codex is not installed on this host: its sign-in runs this host's own codex (the seats run codex {v}). Install it, then sign in again: npm install -g @openai/codex@{v}")
+        );
+    }
+
     /// The host CLI is found on the daemon's PATH and must answer a version; the session it
     /// opened is removed when it does not (another tool of that name, e.g. AWS's `copilot`).
     #[cfg(unix)]
@@ -4869,6 +4941,10 @@ mod tests {
         let env = |path: &Path| vec![("PATH".to_string(), path.display().to_string())];
         let err = prepare_host_login_argv(&fake.io, &fake.dir, "codex", &env(&bin)).unwrap_err();
         assert!(err.contains("codex is not installed on this host"), "{err}");
+        assert!(
+            err.contains(". Install it, then sign in again: npm install -g @openai/codex@"),
+            "{err}"
+        );
         assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         // A stand-in that records where it ran and with which environment.
         crate::test_env::install_stub(

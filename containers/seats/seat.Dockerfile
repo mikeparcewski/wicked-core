@@ -13,20 +13,28 @@
 # is a tmpfs. WICKED_SEAT_BASE_IMAGE swaps the base for a project toolchain image (Debian-based).
 ARG BASE=node:24.22.2-trixie-slim
 FROM ${BASE}
-ARG CLI
-ARG CLI_PACKAGE=
-ARG CLI_PIN=
-ARG CLI_TARBALL_MEMBER=
-ARG CLI_TARBALL_URL_AMD64=
-ARG CLI_TARBALL_SHA256_AMD64=
-ARG CLI_TARBALL_URL_ARM64=
-ARG CLI_TARBALL_SHA256_ARM64=
 # Python suites (core#1401): a seat runs `python3 -m pytest` as the floor does, from Debian's own
 # archive (pytest, PyYAML, zstandard, venv): no PyPI, no new registry.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl procps ripgrep jq python3 make g++ \
       python3-pytest python3-yaml python3-zstandard python3-venv \
  && (command -v npm >/dev/null || apt-get install -y --no-install-recommends nodejs npm) \
+ && rm -rf /var/lib/apt/lists/*
+# A headless browser and the media tools, from Debian's own archive (amd64 and arm64), in their own
+# layer: a UI job takes its own screenshot evidence (core#1455: `chromium --screenshot`, or
+# Playwright's `executablePath: '/usr/bin/chromium'`), and a demo review samples its own stills
+# (core#1614: ffmpeg, ffprobe). The seat's floor has no display, no user namespaces and a read-only
+# /dev (src/container_floor.rs landrun_prefix), so Debian's launcher reads the flags that make
+# Chromium work there from /etc/chromium.d (headless, no Chromium sandbox, shared memory in /tmp).
+# Best effort, like the ledger below: an operator base whose archive lacks them still builds, and
+# its seats then have no browser.
+RUN if apt-get update \
+     && apt-get install -y --no-install-recommends chromium fonts-liberation ffmpeg \
+     && test -d /etc/chromium.d; then \
+      printf '%s\n' 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --headless --no-sandbox --disable-dev-shm-usage --disable-gpu"' > /etc/chromium.d/wicked-seat; \
+    else \
+      echo "wicked-seat: chromium and ffmpeg did not install on this base; its seats cannot take screenshots or sample video stills" >&2; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 # wicked-ledger at the version wicked-crew's QE acceptance check reads (core#1009). The QE unit
 # records its verdict with it: the carrier hands that unit WICKED_LEDGER_PKG_DIR naming this copy
@@ -44,6 +52,16 @@ RUN mkdir -p /opt/wicked-ledger \
 # vendor signs nothing; the pin is the trust), and its one binary is installed root-owned and
 # read-only at /usr/local/bin/<cli> (agy skips its self-update on a read-only install dir, and the
 # root filesystem is read-only at run time as well).
+# The CLI's arguments are declared here, after every shared layer: each RUN after an ARG carries
+# it in its cache key, so a layer above them is built and stored once for all CLIs, not per CLI.
+ARG CLI
+ARG CLI_PACKAGE=
+ARG CLI_PIN=
+ARG CLI_TARBALL_MEMBER=
+ARG CLI_TARBALL_URL_AMD64=
+ARG CLI_TARBALL_SHA256_AMD64=
+ARG CLI_TARBALL_URL_ARM64=
+ARG CLI_TARBALL_SHA256_ARM64=
 RUN set -eu; \
     if [ -n "$CLI_PACKAGE" ]; then \
       npm install -g --no-fund --no-audit "$CLI_PACKAGE"; npm cache clean --force; \

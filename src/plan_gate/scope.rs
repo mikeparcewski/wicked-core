@@ -12,7 +12,8 @@
 //!   and blast-radius rules as a user plan's declared touch ([`super::intent_score_for_run`]); no
 //!   usable graph still fails closed at 100. (core#649 option A) An EMPTY touch set,
 //!   `SCOPE {"touch":[]}`, is an answer only for a plan that [writes nothing]
-//!   (every creator step declares `writes_nothing`): it scores as touching no file. For any other
+//!   (every creator step declares `writes_nothing`), or (core#1838) a domain mapping whose writes
+//!   are [confined](writes_confined_to_mapping): it scores as touching no code file. For any other
 //!   plan it is no answer.
 //!
 //! [writes nothing]: crate::plan::PlanSteps::writes_nothing
@@ -72,6 +73,45 @@ pub struct ScopeAnswer {
     pub lines: String,
 }
 
+/// (core#1838) A domain mapping whose writes are confined by the engine, not by the PA's word: a
+/// [mapping plan](PlanSteps::maps_only) (its agent steps compose with the mapping write set, the
+/// domain model under `.wicked/domain/` and the coverage report) whose every step that runs as a
+/// Tool is one the built-in `domain-extraction` preset ships (the host's own scripts). A step runs
+/// as a Tool when it authors a Tool executor or its catalog entry is a Tool entry, which covers an
+/// entry's own fixed command (`walkthrough_review`) taken with no executor authored; a step whose
+/// entry is not in the catalog counts as a Tool. Such a plan changes no code, so an empty scope is
+/// an honest answer for it.
+pub(crate) fn writes_confined_to_mapping(plan: &PlanSteps) -> bool {
+    if !plan.maps_only() {
+        return false;
+    }
+    // `catalog::builtin_preset` is a test fixture; the production lookup is over the list.
+    let shipped = crate::catalog::builtin_presets()
+        .into_iter()
+        .find(|(name, _)| *name == crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
+        .map(|(_, steps)| steps)
+        .unwrap_or_default();
+    let runs_as_tool = |s: &crate::plan::PlanStep| {
+        matches!(
+            s.executor,
+            Some(crate::workflow::PhaseExecutor::Tool { .. })
+        ) || crate::catalog::catalog()
+            .iter()
+            .find(|e| e.id == s.catalog)
+            .is_none_or(crate::catalog::is_tool_entry)
+    };
+    plan.steps
+        .iter()
+        .filter(|s| runs_as_tool(s))
+        .all(|s| shipped.contains(s))
+}
+
+/// Whether an empty `SCOPE` touch set answers for `plan`: it [writes nothing](PlanSteps::writes_nothing)
+/// (core#649 option A), or it is a confined domain mapping ([`writes_confined_to_mapping`]).
+fn scopes_nothing_honestly(plan: &PlanSteps) -> bool {
+    plan.writes_nothing() || writes_confined_to_mapping(plan)
+}
+
 /// The PA scores this launch plan: it has a creator step and declares no touch set.
 pub(crate) fn needs_pa_scope(plan: &PlanSteps) -> bool {
     plan.has_creator() && plan.touch.as_ref().is_none_or(|t| t.is_empty())
@@ -99,6 +139,11 @@ pub(crate) fn scope_step(plan: &PlanSteps, unbound: bool) -> PlanStep {
             " Every step of this plan declares that it writes no file in the repo: if that holds, \
              answer SCOPE {\"touch\":[]}, which scores as touching nothing; if a step would in \
              fact change a file, list it."
+        } else if writes_confined_to_mapping(plan) {
+            // (core#1838) A domain mapping writes only its own model and report, never code.
+            " This plan maps the repository's domain: its steps write only the domain model under \
+             .wicked/domain/ and coverage-report.json, never code. Answer SCOPE {\"touch\":[]}, \
+             which scores as touching no code file."
         } else {
             ""
         };
@@ -233,13 +278,10 @@ pub(crate) enum Declared {
 /// Parse the PA's answer: every line of the run's kind (`SCOPE` on a repo run, `RISK` on a
 /// repo-less one) must parse; several are merged so the answer can only get riskier (the union of
 /// the touch sets, the highest rating). `Err` names why there is no usable answer.
-/// `writes_nothing`: the held plan [writes nothing](crate::plan::PlanSteps::writes_nothing), so
-/// an empty `SCOPE` touch set is an answer (core#649 option A); otherwise it is refused.
-pub(crate) fn parse_answer(
-    lines: &str,
-    unbound: bool,
-    writes_nothing: bool,
-) -> Result<Declared, String> {
+/// `empty_ok`: the held plan [writes nothing](crate::plan::PlanSteps::writes_nothing) (core#649
+/// option A) or is a confined domain mapping (core#1838), so an empty `SCOPE` touch set is an
+/// answer; otherwise it is refused.
+pub(crate) fn parse_answer(lines: &str, unbound: bool, empty_ok: bool) -> Result<Declared, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ScopeLine {
@@ -293,11 +335,11 @@ pub(crate) fn parse_answer(
         } else {
             let s: ScopeLine = serde_json::from_str(json)
                 .map_err(|e| format!("a malformed {prefix} line: {e}"))?;
-            if s.touch.is_empty() && !writes_nothing {
+            if s.touch.is_empty() && !empty_ok {
                 return Err(format!(
                     "a {prefix} line with an empty touch set, on a plan with a step that may \
-                     write files (only a plan whose every creator step declares writes_nothing \
-                     may scope nothing)"
+                     write files (only a plan whose every creator step declares writes_nothing, \
+                     or a domain mapping, may scope nothing)"
                 ));
             }
             for p in s.touch {
@@ -330,14 +372,25 @@ pub(crate) fn parse_answer(
 pub(crate) const SCOPED_NOTHING: &str =
     "the PA scoped no file, and every creator step of the plan declares writes_nothing";
 
-/// (core#649 option A) The score of `SCOPE {"touch":[]}` on a plan that writes nothing: no file
-/// is touched, so 0, the lowest band. The diff re-score still measures what the run changes.
-fn scoped_nothing() -> Scored {
+/// (core#1838) The first reason of an empty scope on a confined domain mapping.
+pub(crate) const SCOPED_MAPPING: &str =
+    "the PA scoped no code file: the plan maps the domain and writes only its model under \
+     .wicked/domain/ and coverage-report.json";
+
+/// (core#649 option A, core#1838) The score of `SCOPE {"touch":[]}` on a plan that writes nothing
+/// or only maps the domain: no code file is touched, so 0, the lowest band. The diff re-score
+/// still measures what the run changes.
+fn scoped_nothing(plan: &PlanSteps) -> Scored {
+    let reason = if plan.writes_nothing() {
+        SCOPED_NOTHING
+    } else {
+        SCOPED_MAPPING
+    };
     Scored {
         assessment: Assessment {
             deterministic: 0,
             score: 0,
-            reasons: vec![SCOPED_NOTHING.to_string()],
+            reasons: vec![reason.to_string()],
             model: None,
             signals: Some(crate::review_scale::ImpactSignals::default()),
             plan: crate::review_scale::plan_for(0),
@@ -409,13 +462,17 @@ pub(crate) fn scope_score(
             None,
         );
     };
-    match parse_answer(&answer.lines, hold.unbound, hold.plan.writes_nothing()) {
+    match parse_answer(
+        &answer.lines,
+        hold.unbound,
+        scopes_nothing_honestly(&hold.plan),
+    ) {
         Err(why) => (no_scope(&why), None),
         Ok(Declared::Risk { score, reasons }) => {
             (judged(THRESHOLDS.repo_less_baseline, score, &reasons), None)
         }
         Ok(Declared::Touch(touch)) if !diff_rescored => (no_scope(NO_DIFF_RESCORE), Some(touch)),
-        Ok(Declared::Touch(touch)) if touch.is_empty() => (scoped_nothing(), Some(touch)),
+        Ok(Declared::Touch(touch)) if touch.is_empty() => (scoped_nothing(&hold.plan), Some(touch)),
         Ok(Declared::Touch(touch)) => {
             let plan = PlanSteps {
                 steps: hold.plan.steps.clone(),
@@ -907,5 +964,73 @@ mod tests {
             .contains("SCOPE {\"touch\":[]}"));
         let step = scope_step(&plan(json!({"steps": [{"catalog": "produce"}]})), false);
         assert!(!step.instructions.as_deref().unwrap().contains("[]}"));
+    }
+
+    /// (core#1838) Two `/analyze domain` runs on the same repo scored 0 and 100: one PA listed
+    /// files, the other answered `SCOPE {"touch":[]}` (run 96bda11b's gate: "a SCOPE line with an
+    /// empty touch set, on a plan with a step that may write files"). The shipped mapping preset
+    /// writes only its domain model and report, so an empty scope scores as touching no code
+    /// file, in the lowest band, as the listed one did. A mapping plan with an authored Tool step
+    /// (an arbitrary command) is not confined and still fails closed.
+    #[test]
+    fn an_empty_scope_on_the_shipped_domain_mapping_scores_in_the_lowest_band() {
+        let mapping = PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..PlanSteps::default()
+        };
+        assert!(mapping.maps_only() && !mapping.writes_nothing());
+        assert!(writes_confined_to_mapping(&mapping));
+        let hold = |plan: PlanSteps, lines: &str| ScopeHold {
+            plan,
+            unbound: false,
+            answer: Some(ScopeAnswer {
+                ord: 1,
+                attempt: 0,
+                by: "claude".into(),
+                lines: lines.into(),
+            }),
+        };
+        let (empty, touch) = scope_score(
+            &hold(mapping.clone(), "SCOPE {\"touch\":[]}"),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(empty.assessment.score, 0, "{:?}", empty.assessment.reasons);
+        assert_eq!(empty.assessment.reasons, [SCOPED_MAPPING]);
+        assert_eq!(touch, Some(vec![]));
+        let step = scope_step(&mapping, false);
+        assert!(
+            step.instructions
+                .as_deref()
+                .unwrap()
+                .contains("Answer SCOPE {\"touch\":[]}"),
+            "{:?}",
+            step.instructions
+        );
+
+        // xreview r1: a catalog entry whose own fixed command is a Tool (no `executor` authored)
+        // is not the preset's either.
+        let mut inherited = mapping.clone();
+        inherited.steps.push(PlanStep {
+            catalog: "walkthrough_review".into(),
+            id: "record".into(),
+            ..PlanStep::default()
+        });
+        assert!(!writes_confined_to_mapping(&inherited));
+        // An authored Tool step: not the preset's own, so not confined.
+        let mut authored = mapping.clone();
+        authored.steps.push(PlanStep {
+            catalog: "run".into(),
+            id: "mutate".into(),
+            executor: Some(crate::workflow::PhaseExecutor::Tool {
+                cmd: vec!["sh".into(), "-c".into(), "echo x > src/a.rs".into()],
+            }),
+            ..PlanStep::default()
+        });
+        assert!(!writes_confined_to_mapping(&authored));
+        let (s, _) = scope_score(&hold(authored, "SCOPE {\"touch\":[]}"), None, None, true);
+        assert_eq!(s.assessment.score, 100);
+        assert_eq!(s.assessment.reasons[0], PA_DECLARED_NO_SCOPE);
     }
 }
