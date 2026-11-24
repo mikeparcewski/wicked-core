@@ -2908,6 +2908,10 @@ pub(crate) fn any_seat_marker() -> String {
 /// nothing), earliest first, each with what its check read; the check reuses only one that read
 /// what this one reads, under the same exclusions as every cached verdict (`may_reuse`). A later
 /// unit's row never answers an earlier one sent back.
+///
+/// (core#1855) Only the LATEST row per (change, rule id, rule text) is kept, and the exclusions
+/// are applied to that row alone: a later BROKEN whose judge is now excluded drops out with
+/// nothing behind it, so the rule is judged again, never answered by an older KEPT.
 fn same_change_rows(
     others: &[crate::domain::WorkUnit],
     ord: u32,
@@ -2916,11 +2920,20 @@ fn same_change_rows(
     let mut earlier: Vec<&crate::domain::WorkUnit> =
         others.iter().filter(|u| u.ord < ord).collect();
     earlier.sort_by_key(|u| u.ord);
-    earlier
+    let mut latest: Vec<(&String, &crate::rule_check::RuleVerdict)> = Vec::new();
+    for (k, r) in earlier
         .into_iter()
         .filter_map(|u| u.rule_check.as_ref())
         .filter_map(|rc| rc.change_key.as_ref().map(|k| (k, &rc.rows)))
         .flat_map(|(k, rows)| rows.iter().map(move |r| (k, r)))
+    {
+        latest.retain(|(lk, lr)| {
+            !(*lk == k && lr.rule_id == r.rule_id && lr.rule_key == r.rule_key)
+        });
+        latest.push((k, r));
+    }
+    latest
+        .into_iter()
         .filter(|(_, r)| may_reuse(r))
         .map(|(k, r)| (k.clone(), r.clone()))
         .collect()
