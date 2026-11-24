@@ -3651,9 +3651,11 @@ fn collect_bash_write_targets(
     // subshell or nothing). And never in a command holding a heredoc (a body line keeps a glued
     // operator in both readings), a backtick (its own escape layer can make a `|` the word's
     // literal byte), a `#` (a comment's quote is read as a quote) or an ANSI-C `$'…'` string (its
-    // `\'` is read as a closing quote): there the whole word stays, unresolved or refused as on
-    // main. The boundary is defense in depth, not a shell parser (see [`bash_write_targets`]).
-    let cut_redirects = !["<<", "`", "#", "$'"].iter().any(|t| original.contains(t));
+    // `\'` is read as a closing quote), nor where a `${…}` or `$[…]` spans whitespace (a later
+    // word's `|` is that expansion's data, not an operator): there the whole word stays,
+    // unresolved or refused as on main. The boundary is defense in depth, not a shell parser (see [`bash_write_targets`]).
+    let cut_redirects = !["<<", "`", "#", "$'"].iter().any(|t| original.contains(t))
+        && !expansion_spans_whitespace(original);
     let cut = |at: usize| {
         let word = toks[at];
         let prefix = before_glued_operator(word);
@@ -7035,6 +7037,41 @@ fn redirect_glob(tok: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+/// (core#1852) Does a `${…}` or `$[…]` in `command` hold unquoted whitespace? Then a later
+/// whitespace word lies inside it, and a `|` there is the expansion's data, not an operator, which
+/// no single word's scan ([`before_glued_operator`]) can tell.
+fn expansion_spans_whitespace(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut open: Vec<char> = Vec::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if single {
+            single = c != '\'';
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            '$' if matches!(chars.peek(), Some('{' | '[')) => {
+                open.push(if chars.next() == Some('{') { '}' } else { ']' });
+            }
+            '{' if !open.is_empty() => open.push('}'),
+            '[' if !open.is_empty() => open.push(']'),
+            c if open.last() == Some(&c) => {
+                open.pop();
+            }
+            c if c.is_whitespace() && !double && !open.is_empty() => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// (core#1852) Does `rest` (a control operator and what follows it in one word, `|head`) go on to
@@ -16766,6 +16803,8 @@ mod boundary_tests {
             ": ${X} >/dev/null&&!touch /outside/f",
             ": ${X} >/dev/null| { touch /outside/f; }",
             ": ${X} >/dev/null&&then touch /outside/f",
+            "touch -- -${X:-unused >a|/../../outside/f }",
+            "echo $[1 >a|/../../outside/f ]",
         ] {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
