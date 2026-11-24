@@ -3726,14 +3726,9 @@ fn collect_bash_write_targets(
                     // a redirect (`R='> /outside/f'; sh -c "echo x $R"`). So the `-c` word itself
                     // is unresolved whenever it carries one ([`OPAQUE_EXPANSION`]), whether or not
                     // the rest of the inner command writes.
-                    // (core#1882) A pager setting before the wrapper is in the environment of a git
-                    // the inner command runs, which its rescan judges without it.
-                    if let Some(a) = assignments
-                        .iter()
-                        .find(|a| pager_assignment_runs(a) == Some(true))
-                    {
-                        targets.push(format!("$({a} {word})"));
-                    }
+                    // (core#1882) A pager setting before the wrapper is in the environment of every
+                    // git the inner command line runs: its rescan judges them with it.
+                    let _pager = PagerHanded::hand(&assignments);
                     match lex_shell_word(&word, home, true, !cfg!(windows)) {
                         Some((mut exact, opaque)) => {
                             exact.push_str(&argv_tail);
@@ -4536,6 +4531,35 @@ fn pager_assignment_runs(assignment: &str) -> Option<bool> {
     }
 }
 
+thread_local! {
+    /// (core#1882) How many wrappers around the command line being rescanned hand it a pager
+    /// setting that is not harmless ([`pager_assignment_runs`]): every git in it may page.
+    static PAGER_HANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One wrapper's hand of a pager setting to the command line it runs, for as long as its rescan.
+struct PagerHanded(bool);
+
+impl PagerHanded {
+    fn hand(assignments: &[&str]) -> Self {
+        let hands = assignments
+            .iter()
+            .any(|a| pager_assignment_runs(a) == Some(true));
+        if hands {
+            PAGER_HANDED.with(|n| n.set(n.get() + 1));
+        }
+        Self(hands)
+    }
+}
+
+impl Drop for PagerHanded {
+    fn drop(&mut self) {
+        if self.0 {
+            PAGER_HANDED.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+}
+
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder
 /// (`user.*` is inert; `core.hooksPath` is the remote-write fence's), on top of the inert ones.
 /// Any other key may carry a command git runs (`core.fsmonitor`, `core.sshCommand`,
@@ -4625,6 +4649,8 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
             runs = true;
         }
     }
+    // (core#1882) A wrapper around this command line handed it a pager setting.
+    runs |= PAGER_HANDED.with(|n| n.get() > 0);
     // Each word as git receives it; a word holding a replace string is one fed word of any
     // spelling (any number of words for BSD `-J`), and appended words are any number of them.
     let fed = |raw: &str| {
@@ -10701,6 +10727,42 @@ mod tests {
         }
     }
 
+    /// core#1882 (review r2): a pager setting before `env -S` or `sh -c` is in the environment of
+    /// the git the inner command line runs, and of nothing else: the git is judged with it (its
+    /// stand-in target, the read-root advisory's case after a `cd`), and an inner command that runs
+    /// no git gets no target from it.
+    #[test]
+    fn a_wrappers_pager_setting_reaches_the_git_it_runs_and_nothing_else_core1882() {
+        let stand_in = |c: &str| {
+            resolved_bash_write_targets(c, None)
+                .iter()
+                .any(|t| matches!(t, ShellTarget::Unresolved(w) if w.starts_with("$(git ")))
+        };
+        for c in [
+            "PAGER=less env -S 'git log -1'",
+            "env PAGER=less -S 'git log -1'",
+            "PAGER+=cat env -S 'git log -1'",
+            "LESSOPEN='|- touch /x' sh -c 'git log -1'",
+            "GIT_PAGER=less sh -c 'cd src && git log -1'",
+        ] {
+            assert!(
+                stand_in(c),
+                "{c}: {:?}",
+                resolved_bash_write_targets(c, None)
+            );
+        }
+        for c in [
+            "PAGER=less env -S 'cat README.md'",
+            "LESSOPEN='|- touch /x' sh -c 'ls src'",
+            "PAGER=cat env -S 'git log -1'",
+            "env -S 'git log -1'",
+        ] {
+            assert_eq!(resolved_bash_write_targets(c, None), Vec::new(), "{c}");
+        }
+        // The hand ends with the wrapper's rescan.
+        assert_eq!(PAGER_HANDED.with(|n| n.get()), 0);
+    }
+
     /// core#1857, #1858, #1859, #1868 (the gate_hook git read/write family): a git invocation is a
     /// READ only on an allow-listed form, every word of it settled by the text. Each issue's
     /// examples are rows here, beside a read of the same form that must stay allowed, and the
@@ -10965,6 +11027,8 @@ mod tests {
             ("i1882", Advisory, format!("env PAGER=less -S 'git -C {r} -p log -1'")),
             ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' env -S 'git -C {r} -p log -1'")),
             ("i1882", Advisory, format!("GIT_PAGER=less sh -c 'git -C {r} -p log -1'")),
+            ("i1882", Advisory, format!("cd {r} && PAGER=less sh -c 'git log -1'")),
+            ("i1882", Advisory, format!("cd {r} && LESSOPEN='|- touch {o}/victim' env -S 'git log -1'")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (

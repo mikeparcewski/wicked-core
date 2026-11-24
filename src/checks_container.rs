@@ -1467,7 +1467,7 @@ pub(crate) fn admit_dependency_claim(
                     .unwrap_or_else(|p| p.into_inner())
                     .retain(|k| k != &key && !k.starts_with(&under));
                 // And a refusal of its build (core#1887): a claim made again is new storage.
-                forget_native_refusals(ns, &under);
+                forget_claim_refusals(&under);
                 if let Some(used) = DEPENDENCY_USED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -3507,8 +3507,8 @@ static FILLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// (core#1887) The seat claims whose native build this process saw refused for a reason no retry
 /// within the run changes (`<ns>/<claim>/<run>`), with the note it gave: a later unit of the run
 /// gets the plain claim with that note, and starts no build pod. `cleared` counts, per namespace,
-/// how often its refusals were forgotten (its storage deleted): a build that began before that
-/// publishes nothing.
+/// how often it was deleted ([`forget_namespace`]): a build that began before that publishes
+/// nothing.
 struct NativeRefusals {
     notes: Vec<(String, String)>,
     cleared: std::collections::BTreeMap<String, u64>,
@@ -3531,12 +3531,12 @@ fn native_refusal(key: &str) -> Option<String> {
         .map(|(_, note)| note.clone())
 }
 
-/// How often namespace `ns`'s refusals were forgotten so far.
+/// How often namespace `ns` was deleted so far.
 fn native_generation(ns: &str) -> u64 {
     native_refusals().cleared.get(ns).copied().unwrap_or(0)
 }
 
-/// Remember `key`'s refusal, unless its namespace's refusals were forgotten since `generation`.
+/// Remember `key`'s refusal, unless its namespace was deleted since `generation`.
 fn remember_native_refusal(key: &str, note: &str, generation: u64) {
     let ns = key.split('/').next().unwrap_or(key);
     let mut r = native_refusals();
@@ -3547,11 +3547,12 @@ fn remember_native_refusal(key: &str, note: &str, generation: u64) {
     }
 }
 
-/// Forget the refusals of namespace `ns` whose keys start with `prefix`.
-fn forget_native_refusals(ns: &str, prefix: &str) {
-    let mut r = native_refusals();
-    r.notes.retain(|(k, _)| !k.starts_with(prefix));
-    *r.cleared.entry(ns.to_string()).or_default() += 1;
+/// Forget the refusals whose keys start with `prefix`: one claim's (`<ns>/<claim>/`), deleted under
+/// its volume lock, which a build of it holds throughout, so no build of it is in flight.
+fn forget_claim_refusals(prefix: &str) {
+    native_refusals()
+        .notes
+        .retain(|(k, _)| !k.starts_with(prefix));
 }
 
 fn filled(key: &str) -> bool {
@@ -3583,7 +3584,10 @@ pub(crate) fn forget_namespace(ns: &str) {
         let pre = format!("{ns}/");
         f.retain(|k| !k.starts_with(&pre));
     }
-    forget_native_refusals(ns, &format!("{ns}/"));
+    let mut r = native_refusals();
+    let pre = format!("{ns}/");
+    r.notes.retain(|(k, _)| !k.starts_with(&pre));
+    *r.cleared.entry(ns.to_string()).or_default() += 1;
 }
 
 #[cfg(test)]

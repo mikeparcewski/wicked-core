@@ -2375,6 +2375,9 @@ fn a_refusal_from_before_its_namespace_was_deleted_is_not_kept() {
     // namespace was deleted.
     let began = native_generation(&ns);
     forget_namespace(&format!("{ns}-other"));
+    // And one that began before another claim of its namespace was evicted (review r2): that
+    // claim's storage is not this one's.
+    forget_claim_refusals(&format!("{ns}/other/"));
     remember_native_refusal(&key, "Landlock is not in force", began);
     assert_eq!(
         native_refusal(&key).as_deref(),
