@@ -4,7 +4,8 @@
 //!
 //! A [`RepoEntry`] is a `Node(Other("repo_entry"))` on the shared estate store (mirrors the
 //! `AgentSession` projection in [`crate::domain`]). A run that targets a registered repo gets its own
-//! worktree at `<repo>/wicked-worktrees/<id>` on branch `wicked/<id>`, where `<id>` is the run id's
+//! worktree at `<repo>.wicked/wicked-worktrees/<id>` (BESIDE the checkout, core#1109; see
+//! [`worktrees_root`]) on branch `wicked/<id>`, where `<id>` is the run id's
 //! ref- and filesystem-safe spelling ([`sanitize_worktree_id`], core#337 — a campaign node's run id
 //! carries `:`, illegal in a git ref and on NTFS); the worker runs there
 //! (augment mode — see `ORCHESTRATOR.md` §4). Worktrees are reaped on a terminal run status — but
@@ -966,14 +967,54 @@ pub fn graph_kinds_for_repo(
     crate::graph_browser::graph_kinds(repo.code_graph_db.as_str())
 }
 
-/// The directory NEW worktrees for `repo_root` are created under (crew#276): a NON-dotted
-/// path. Worktrees used to live at `.wicked/worktrees/`, which put a dot-segment into every
-/// absolute path inside the run — and dotfile-sensitive behavior in the repo under test broke
-/// purely from location (express `send` 404s any path containing a dot-segment; two
-/// wicked-interactive export tests failed in every governed worktree). A worker diagnosing
-/// phantom failures the operator can't reproduce is a workflow hazard, not a cosmetic one.
+/// The directory NEW worktrees for `repo_root` are created under: `<repo>.wicked/wicked-worktrees`,
+/// a sibling of the checkout (core#1109).
+///
+/// OUTSIDE the checkout: tools that walk up from a run's tree must not find the checkout. Inside
+/// it, cargo looked for an excluded crate's workspace above the run's own root and reached the
+/// checkout's `Cargo.toml`, which claims the crate and then refuses it ("believes it's in a
+/// workspace when it's not"), so a run could not build a Rust repository with an excluded crate.
+/// NON-dotted segments (crew#276): worktrees once lived at `.wicked/worktrees/`, a dot-segment in
+/// every absolute path inside the run, and dotfile-sensitive behavior in the repo under test broke
+/// purely from location (express `send` 404s any path containing a dot-segment). The last segment
+/// stays `wicked-worktrees`, the name the sibling-worktree fence, the check-scratch keys and the
+/// seat floors know a run tree by. A repository registered at a SUBDIRECTORY of its checkout gets
+/// its trees beside the checkout itself (the nearest folder at or above it holding `.git`), never
+/// inside the checkout's working tree. A root with no parent (a filesystem root) keeps the tree
+/// inside, and so does a checkout whose `<name>.wicked` is itself a checkout (a repository named
+/// `app.wicked` beside `app`): its `wicked-worktrees` holds THAT checkout's trees from before
+/// core#1109, and nothing of this one is ever minted, reused, repaired or reaped there.
 pub(crate) fn worktrees_root(repo_root: &str) -> PathBuf {
-    Path::new(repo_root).join("wicked-worktrees")
+    let registered = Path::new(repo_root);
+    let root = registered
+        .ancestors()
+        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+        .unwrap_or(registered);
+    match (root.parent(), root.file_name()) {
+        (Some(parent), Some(name)) => {
+            let mut beside = name.to_os_string();
+            beside.push(WORKTREES_BESIDE_SUFFIX);
+            let beside = parent.join(beside);
+            if std::fs::symlink_metadata(beside.join(".git")).is_ok() {
+                return in_clone_worktrees_root(repo_root);
+            }
+            beside.join(WORKTREES_DIR)
+        }
+        _ => in_clone_worktrees_root(repo_root),
+    }
+}
+
+/// The last segment of every worktrees root, old and new.
+const WORKTREES_DIR: &str = "wicked-worktrees";
+
+/// What [`worktrees_root`] appends to the checkout's own name for the directory beside it.
+const WORKTREES_BESIDE_SUFFIX: &str = ".wicked";
+
+/// Where worktrees lived from crew#276 until core#1109: inside the checkout. Runs created there
+/// keep resuming and reaping in place — their sessions carry absolute workdirs, and the (repo,
+/// run_id) → path derivation in this module finds them too ([`worktree_path`]).
+fn in_clone_worktrees_root(repo_root: &str) -> PathBuf {
+    Path::new(repo_root).join(WORKTREES_DIR)
 }
 
 /// Where worktrees lived before crew#276. Runs created under the old layout must keep resuming
@@ -981,6 +1022,16 @@ pub(crate) fn worktrees_root(repo_root: &str) -> PathBuf {
 /// in this module must find them too.
 fn legacy_worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
+}
+
+/// Every root a run's tree may sit under, the CURRENT one first: [`worktrees_root`], then the
+/// earlier layouts in-place trees still use ([`in_clone_worktrees_root`], [`legacy_worktrees_root`]).
+fn all_worktrees_roots(repo_root: &str) -> [PathBuf; 3] {
+    [
+        worktrees_root(repo_root),
+        in_clone_worktrees_root(repo_root),
+        legacy_worktrees_root(repo_root),
+    ]
 }
 
 /// The 64-bit FNV-1a hash of `s` — small, dependency-free, and (unlike `DefaultHasher`) stable
@@ -1088,18 +1139,29 @@ pub(crate) fn sanitize_worktree_id(run_id: &str) -> String {
     }
 }
 
-/// The on-disk path of `run_id`'s worktree: `<new root>/<sanitized id>`, unless the run already
-/// exists at an earlier spelling — the legacy `.wicked/worktrees` root (resume/reap of a pre-move
-/// run), or the RAW id under the new root (crew#390/#391: crew's shipped workaround
+/// The on-disk path of `run_id`'s worktree: `<current root>/<sanitized id>`, unless the run already
+/// exists at an earlier place — under the in-checkout root (core#1109: a run minted before the
+/// move keeps resuming and reaping in place) or the legacy `.wicked/worktrees` root (a pre-crew#276
+/// run), or at the RAW id under a `wicked-worktrees` root (crew#390/#391: crew's shipped workaround
 /// pre-provisions campaign-node worktrees at `wicked-worktrees/<raw id>` and rides the documented
 /// reuse contract, so the derivation must FIND them; a raw spelling that needed sanitizing can
-/// only exist on filesystems that allow it, so the probe is inert on Windows).
+/// only exist on filesystems that allow it, so the probe is inert on Windows). Earlier places are
+/// probed before the current root's raw spelling, oldest first, as before the move.
 fn worktree_path(repo_root: &str, run_id: &str) -> PathBuf {
     let legacy = legacy_worktrees_root(repo_root).join(run_id);
     if legacy.is_dir() {
         return legacy;
     }
     let sanitized = sanitize_worktree_id(run_id);
+    let in_clone = in_clone_worktrees_root(repo_root);
+    if in_clone != worktrees_root(repo_root) {
+        for name in [run_id, sanitized.as_str()] {
+            let old = in_clone.join(name);
+            if old.is_dir() {
+                return old;
+            }
+        }
+    }
     if sanitized != run_id {
         let raw = worktrees_root(repo_root).join(run_id);
         if raw.is_dir() {
@@ -1107,31 +1169,6 @@ fn worktree_path(repo_root: &str, run_id: &str) -> PathBuf {
         }
     }
     worktrees_root(repo_root).join(sanitized)
-}
-
-/// Keep the operator's `git status` clean in the parent checkout: the new worktree dir is not
-/// dotted, so exclude it via `.git/info/exclude` (repo-local, never touches the tracked
-/// `.gitignore`). Idempotent; best-effort — a failure to write the exclude is cosmetic.
-fn ensure_worktrees_excluded(repo_root: &str) {
-    const ENTRY: &str = "wicked-worktrees/";
-    let exclude = Path::new(repo_root)
-        .join(".git")
-        .join("info")
-        .join("exclude");
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == ENTRY) {
-        return;
-    }
-    if let Some(parent) = exclude.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(ENTRY);
-    content.push('\n');
-    let _ = std::fs::write(&exclude, content);
 }
 
 /// Is `wt` a live git worktree, rather than merely a directory that sits where one should?
@@ -1165,6 +1202,40 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
 // colliding run's cancel/terminal cleanup derives the OWNER's path (actor.rs keys both on
 // `repo_ref` alone), and without the guard it would reap or force-remove a live run's tree.
 
+/// The checkouts a run tree at `wt` may belong to, read from where the tree sits in the engine's
+/// layouts ([`all_worktrees_roots`]) — never from the tree's own contents: beside the checkout
+/// (`<P>/<name>.wicked/wicked-worktrees/<tree>` names `<P>/<name>`), inside it
+/// (`<repo>/wicked-worktrees/<tree>`), or the legacy `<repo>/.wicked/worktrees/<tree>`. A
+/// `wicked-worktrees` directory under a folder whose name ends in `.wicked` fits both of the first
+/// two, so both are named; the caller keeps the one git's own pair confirms.
+fn worktree_layout_repos(wt: &Path) -> Vec<PathBuf> {
+    let Some(parent) = wt.parent() else {
+        return Vec::new();
+    };
+    let named = |p: &Path, n: &str| p.file_name().is_some_and(|f| f == n);
+    if named(parent, WORKTREES_DIR) {
+        let Some(holder) = parent.parent() else {
+            return Vec::new();
+        };
+        let beside = holder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(WORKTREES_BESIDE_SUFFIX))
+            .filter(|n| !n.is_empty())
+            .and_then(|n| Some(holder.parent()?.join(n)));
+        return beside
+            .into_iter()
+            .chain(std::iter::once(holder.to_path_buf()))
+            .collect();
+    }
+    match parent.parent() {
+        Some(dot) if named(parent, "worktrees") && named(dot, ".wicked") => {
+            dot.parent().map(Path::to_path_buf).into_iter().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The worktree's git admin directory (`<common git dir>/worktrees/<name>`) — resolvable only
 /// while the tree is a live worktree.
 ///
@@ -1172,7 +1243,8 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
 /// own `.git` file alone (a seat can rewrite that file, and its own admin dir, to name another
 /// tree's admin dir or another tree): the tree's `.git` names an entry of the REPOSITORY's
 /// `worktrees/` dir, and that entry's `gitdir` back-pointer names this tree's `.git`. The
-/// repository is the tree's place in the engine's layout (`<repo>/wicked-worktrees/<name>`, or the
+/// repository is the tree's place in the engine's layout (`<repo>.wicked/wicked-worktrees/<name>`
+/// beside it, core#1109; `<repo>/wicked-worktrees/<name>` inside it before that; or the
 /// pre-crew#276 `<repo>/.wicked/worktrees/<name>`), its common git dir found from the checkout
 /// ([`repo_common_dir`]). An admin dir's NAME is never trusted (git suffixes it on a collision, so
 /// one tree's admin dir can carry another tree's name). A seat that breaks its own pair only makes
@@ -1180,14 +1252,16 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
 /// tree resolve to an admin dir other than the sibling's own. Link files are read no-follow,
 /// non-blocking and bounded ([`read_link_file`]).
 fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
-    let parent = wt.parent()?;
-    let repo = if parent.file_name()? == "wicked-worktrees" {
-        parent.parent()?
-    } else if parent.file_name()? == "worktrees" && parent.parent()?.file_name()? == ".wicked" {
-        parent.parent()?.parent()?
-    } else {
+    worktree_layout_repos(wt)
+        .iter()
+        .find_map(|repo| worktree_admin_dir_in(wt, repo))
+}
+
+/// [`worktree_admin_dir`] for the checkout at `repo`: `Some` only when git's pair confirms it.
+fn worktree_admin_dir_in(wt: &Path, repo: &Path) -> Option<PathBuf> {
+    if !repo.is_dir() {
         return None;
-    };
+    }
     let admin_root = std::fs::canonicalize(repo_common_dir(repo)?.join("worktrees")).ok()?;
     let here = std::fs::canonicalize(wt).ok()?;
     let link = read_link_file(&wt.join(".git")).ok()?;
@@ -1695,11 +1769,13 @@ impl Drop for TreeLock {
     }
 }
 
-/// Create an isolated git worktree for `run_id` at `<repo>/wicked-worktrees/<id>` on a fresh
-/// `wicked/<id>` branch, where `<id>` is [`sanitize_worktree_id`]'s spelling of the run id
-/// (core#337 — campaign run ids carry `:`, illegal in a git ref and on NTFS; plain ids pass
-/// through byte-for-byte). Idempotent for a genuine resume: a live worktree already at the path is
-/// reused — including one a downstream pre-provisioned at the RAW id spelling (crew#390/#391).
+/// Create an isolated git worktree for `run_id` on a fresh `wicked/<id>` branch, at
+/// `<parent>/<name>.wicked/wicked-worktrees/<id>` beside the checkout ([`worktrees_root`],
+/// core#1109), where `<id>` is [`sanitize_worktree_id`]'s spelling of the run id (core#337 —
+/// campaign run ids carry `:`, illegal in a git ref and on NTFS; plain ids pass through
+/// byte-for-byte). Idempotent for a genuine resume: a live worktree already where
+/// [`worktree_path`] finds it is reused — inside the checkout where an earlier engine minted it,
+/// or one a downstream pre-provisioned at the RAW id spelling (crew#390/#391).
 /// Reuse is OWNER-only: a live tree marked for a DIFFERENT raw run id that merely spells the same
 /// sanitized name (the hashless colon tier) is refused loudly, never shared — see the worktree
 /// ownership section above [`worktree_owner`]. Returns the worktree path.
@@ -2037,8 +2113,21 @@ pub fn create_worktree_based(
         // registered". Prune drops exactly those dangling entries and touches no live worktree.
         let _ = git(repo_root, &["worktree", "prune"]);
     }
-    std::fs::create_dir_all(worktrees_root(repo_root))?;
-    ensure_worktrees_excluded(repo_root);
+    if let Some(parent) = wt.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "could not create the folder for this run's working copy, {}: {e}. Runs on this \
+                 repository need to create folders beside its checkout; make {} writable for this \
+                 computer's user",
+                parent.display(),
+                parent
+                    .ancestors()
+                    .find(|dir| dir.is_dir())
+                    .unwrap_or(parent)
+                    .display()
+            )
+        })?;
+    }
     let branch = worktree_branch(run_id);
     let wt_str = wt.to_string_lossy().to_string();
     // core#431 (F-3R2-013): the base is the remote default branch's CURRENT tip when the clone
@@ -2242,18 +2331,32 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
     let Ok(entries) = std::fs::read_dir(&admin_root) else {
         return 0;
     };
-    let trees = worktrees_root(&root.to_string_lossy());
+    // (core#1109) Every `wicked-worktrees` root: beside the checkout as it now resolves; beside
+    // it as REGISTERED (a checkout moved and left behind a symlink keeps its beside trees at the
+    // old name, codex review of #1851); and the in-checkout one an earlier engine used (it moved
+    // with the checkout).
+    let mut roots = vec![worktrees_root(&root.to_string_lossy())];
+    if let Ok(registered) = std::fs::canonicalize(worktrees_root(repo_root)) {
+        roots.push(crate::worktree_guard::plain_path(registered));
+    }
+    roots.push(in_clone_worktrees_root(&root.to_string_lossy()));
+    roots.dedup();
     let mut repaired = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let admin = admin_root.join(&name);
-        let tree = trees.join(&name);
-        let dot_git = tree.join(".git");
-        if !std::fs::symlink_metadata(&admin).is_ok_and(|m| m.is_dir())
-            || !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file())
-        {
+        if !std::fs::symlink_metadata(&admin).is_ok_and(|m| m.is_dir()) {
             continue;
         }
+        let Some((trees, dot_git)) = roots.iter().find_map(|trees| {
+            let dot_git = trees.join(&name).join(".git");
+            std::fs::symlink_metadata(&dot_git)
+                .is_ok_and(|m| m.is_file())
+                .then_some((trees, dot_git))
+        }) else {
+            continue;
+        };
+        let tree = trees.join(&name);
         let owner = read_link_file(&admin.join(DAEMON_MARKER)).unwrap_or_default();
         if owner.trim() != daemon {
             continue;
@@ -2367,11 +2470,9 @@ pub fn reap_orphan_worktrees(
     let live_names = with_sanitized(live_run_ids);
     let terminal_names = with_sanitized(terminal_run_ids);
     for repo in repos {
-        // Both layouts: pre-crew#276 leftovers under `.wicked/worktrees` reap by the same rules.
-        for root in [
-            worktrees_root(&repo.root_path),
-            legacy_worktrees_root(&repo.root_path),
-        ] {
+        // Every layout: trees an earlier engine put inside the checkout (core#1109) and pre-crew#276
+        // leftovers under `.wicked/worktrees` reap by the same rules.
+        for root in all_worktrees_roots(&repo.root_path) {
             let Ok(entries) = std::fs::read_dir(&root) else {
                 continue;
             };
@@ -2649,18 +2750,29 @@ mod tests {
 
     /// crew#276 — new worktrees land at the non-dotted root, while a run whose worktree already
     /// exists under the legacy `.wicked/worktrees` keeps resolving there (resume/reap compat).
+    /// core#1109 — that root is BESIDE the checkout, and a tree an earlier engine put inside the
+    /// checkout keeps resolving in place, at either spelling of its id.
     #[test]
     fn worktree_path_is_non_dotted_and_prefers_a_legacy_tree_when_present() {
         let repo = std::env::temp_dir().join(format!("wt-move-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         let root = repo.to_str().unwrap();
 
-        // Fresh run: the non-dotted root.
+        // Fresh run: the non-dotted root, outside the checkout.
         let fresh = worktree_path(root, "run-new");
+        let mut beside = repo.file_name().unwrap().to_os_string();
+        beside.push(".wicked");
+        assert_eq!(
+            fresh,
+            repo.with_file_name(beside)
+                .join("wicked-worktrees")
+                .join("run-new"),
+            "a new run's worktree lives beside the checkout"
+        );
         assert!(
-            fresh.starts_with(repo.join("wicked-worktrees")),
-            "a new run's worktree must live under the non-dotted root: {}",
+            !fresh.starts_with(&repo),
+            "a new run's worktree is outside the checkout: {}",
             fresh.display()
         );
         assert!(
@@ -2676,7 +2788,15 @@ mod tests {
             legacy,
             "an existing legacy worktree must keep resolving for resume/reap"
         );
-        let _ = std::fs::remove_dir_all(&repo);
+        // Pre-core#1109 runs: a tree inside the checkout keeps resolving there, at either spelling.
+        let in_clone = repo.join("wicked-worktrees").join("run-1109");
+        std::fs::create_dir_all(&in_clone).unwrap();
+        assert_eq!(worktree_path(root, "run-1109"), in_clone);
+        let campaign = sanitize_worktree_id("camp:node:b1");
+        let in_clone_sanitized = repo.join("wicked-worktrees").join(&campaign);
+        std::fs::create_dir_all(&in_clone_sanitized).unwrap();
+        assert_eq!(worktree_path(root, "camp:node:b1"), in_clone_sanitized);
+        rm_repo(&repo);
     }
 
     #[test]
@@ -2694,7 +2814,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
         std::fs::create_dir_all(&root).unwrap();
         for e in entries {
             let p = root.join(e);
@@ -2739,7 +2859,7 @@ mod tests {
         // Stated separately from the equality above because it is a CONTRACT, not an incidental
         // property of this fixture: the PTY runner writes the prompt line-based.
         assert!(!map.contains('\n'), "the map must stay single-line: {map}");
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// `.git` alone would dwarf the rest of the map, and no work unit is ever about `node_modules`.
@@ -2759,7 +2879,7 @@ mod tests {
         );
         let map = worktree_layout(&root).unwrap();
         assert_eq!(map, "src/; root files: Cargo.toml");
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// A budget that exactly fits the map spends all of it and clips nothing.
@@ -2785,7 +2905,7 @@ mod tests {
             tight.ends_with(LAYOUT_TRUNCATED) && !tight.contains("Cargo.toml"),
             "one byte short must actually clip, or the budget means nothing: {tight}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// Bounded, and HONEST about being bounded — a clipped map that reads as complete would send a
@@ -2818,7 +2938,7 @@ mod tests {
                 && !map.contains(&format!("file{MAX_ROOT_FILES:03}.txt")),
             "root files get their own tighter cap: {map}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// No worktree, or an empty one, must append NOTHING — a bare heading over an empty map is worse
@@ -2833,8 +2953,8 @@ mod tests {
         assert_eq!(worktree_layout(&root), None);
         let hidden_only = scratch("hidden-only", &[".git/objects"]);
         assert_eq!(worktree_layout(&hidden_only), None);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&hidden_only);
+        rm_repo(&root);
+        rm_repo(&hidden_only);
     }
 
     #[test]
@@ -2912,7 +3032,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
         // Bind a scratch state home for this thread: with no override in the process env, the root
         // is `<base>/state/repo-graphs` and nothing resolves into a real home.
         std::fs::create_dir_all(base.join("state")).unwrap();
@@ -3039,7 +3159,7 @@ mod tests {
             None,
             "a clean checkout gets no boot notice"
         );
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
     }
 
     // ── worktree isolation (FINDING-059) ──────────────────────────────────────
@@ -3060,9 +3180,33 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        rm_repo(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Remove a test checkout and the directory its run trees sit in beside it (core#1109).
+    pub(super) fn rm_repo(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
+        if let Some(beside) = worktrees_root(&root.to_string_lossy()).parent() {
+            if !root.starts_with(beside) {
+                let _ = std::fs::remove_dir_all(beside);
+            }
+        }
+    }
+
+    /// Mint `run_id`'s tree where an engine before core#1109 put it, inside the checkout: an
+    /// empty directory at that place is a shell [`worktree_path`] finds and [`create_worktree`]
+    /// re-adds in place.
+    fn create_in_clone_tree(repo_root: &str, run_id: &str) -> PathBuf {
+        std::fs::create_dir_all(in_clone_worktrees_root(repo_root).join(run_id)).unwrap();
+        let wt = create_worktree(repo_root, run_id).unwrap();
+        assert!(
+            wt.starts_with(in_clone_worktrees_root(repo_root)),
+            "{}",
+            wt.display()
+        );
+        wt
     }
 
     fn git_repo(name: &str) -> std::path::PathBuf {
@@ -3071,7 +3215,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
         std::fs::create_dir_all(&root).unwrap();
         let p = root.to_str().unwrap();
         for args in [
@@ -3154,8 +3298,8 @@ mod tests {
             "an unknown repo_ref must error, not return a vacuous report"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&state_home);
+        rm_repo(&root);
+        rm_repo(&state_home);
     }
 
     /// #122 web surface: `graph_kinds_for_repo` summarises a repo's OWN graph (node counts by kind),
@@ -3217,8 +3361,8 @@ mod tests {
             "an unknown repo_ref must error, not return an empty summary"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&state_home);
+        rm_repo(&root);
+        rm_repo(&state_home);
     }
 
     fn empty_model() -> wicked_governance::DomainModel {
@@ -3393,8 +3537,8 @@ mod tests {
             legacy.contains("src::REQ-003") && legacy.contains("code doesn't meet it"),
             "{legacy}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&state_home);
+        rm_repo(&root);
+        rm_repo(&state_home);
     }
 
     /// Operator rulings 2026-11-06 (P1, P3): the read says how old the code behind the listed build
@@ -3509,8 +3653,8 @@ mod tests {
             );
             assert_eq!(r["code"]["built_from"]["at"].is_string(), dated, "{commit}");
         }
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&state_home);
+        rm_repo(&root);
+        rm_repo(&state_home);
     }
 
     /// Operator ruling 2026-10-31: the requirements graph is read from the repo's own estate store.
@@ -3654,8 +3798,8 @@ mod tests {
         );
         assert!(requirements_graph_for_repo(&daemon, db, "no-such-repo").is_err());
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&state_home);
+        rm_repo(&root);
+        rm_repo(&state_home);
     }
 
     #[cfg(unix)]
@@ -3933,7 +4077,7 @@ mod tests {
         assert_eq!(fetched.root_path, expected);
         assert_eq!(fetched.code_graph_db, entry.code_graph_db);
 
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     #[test]
@@ -4227,8 +4371,8 @@ mod tests {
             Some(v) => std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, v),
             None => std::env::remove_var(crate::code_graph::REPO_GRAPH_ROOT_ENV),
         }
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&graph_root);
+        rm_repo(&root);
+        rm_repo(&graph_root);
     }
 
     /// A fresh repo publishes its root path on the record, with no findings, and registration
@@ -4281,8 +4425,8 @@ mod tests {
             Some(v) => std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, v),
             None => std::env::remove_var(crate::code_graph::REPO_GRAPH_ROOT_ENV),
         }
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&estate_root);
+        rm_repo(&root);
+        rm_repo(&estate_root);
     }
 
     /// The heart of FINDING-059. `rev-parse` succeeds anywhere beneath the parent repo, including in
@@ -4291,7 +4435,8 @@ mod tests {
     #[test]
     fn an_empty_dir_under_the_repo_is_not_a_worktree_though_rev_parse_succeeds_in_it() {
         let root = git_repo("revparse");
-        let empty = worktrees_root(root.to_str().unwrap()).join("run-1");
+        // The trap lives inside the checkout, where an engine before core#1109 put its trees.
+        let empty = in_clone_worktrees_root(root.to_str().unwrap()).join("run-1");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(
             git(empty.to_str().unwrap(), &["rev-parse", "--git-dir"])
@@ -4300,7 +4445,7 @@ mod tests {
             "precondition: rev-parse resolves here, which is the trap"
         );
         assert!(!is_live_worktree(&empty));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#431 (F-3R2-013), the stale-base scenario: the registered clone is behind `origin/main`
@@ -4343,7 +4488,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
         std::fs::create_dir_all(&base).unwrap();
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
@@ -4485,7 +4630,7 @@ mod tests {
             .note
             .as_deref()
             .is_some_and(|n| n.contains("no `origin` remote")));
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
     }
 
     /// DES-L9 / crew#550 (BC-59): an EXPLICIT base names `origin/<branch>` — an open pull request's
@@ -4529,7 +4674,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
         std::fs::create_dir_all(&base).unwrap();
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
@@ -4668,7 +4813,7 @@ mod tests {
         // …and `None` keeps today's resolution on the same clone.
         let (_, today) = create_worktree_based(lone.to_str().unwrap(), "r-today", None).unwrap();
         assert!(today.unwrap().base_ref.is_none());
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
     }
 
     #[test]
@@ -4685,7 +4830,7 @@ mod tests {
             std::fs::read_to_string(second.join("worker-output.txt")).unwrap(),
             "from turn 1\n"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// The observed state: `remove_worktree`'s `remove_dir_all` fallback stripped the `.git` file
@@ -4707,7 +4852,7 @@ mod tests {
             is_live_worktree(&again),
             "the run must get a real checkout, not the shell it was handed before"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// Same shell, prune never ran, so git may still hold an admin entry for the path — and
@@ -4727,7 +4872,7 @@ mod tests {
             "worktrees still registered: {}",
             git(p, &["worktree", "list"]).unwrap().1
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// The case that must fail the run rather than proceed: a directory of unknown provenance. It
@@ -4745,7 +4890,7 @@ mod tests {
         assert!(err.contains("is not a git worktree"), "{err}");
         // A refusal must not double as a delete.
         assert!(wt.join("someone-elses-work.txt").is_file());
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// FINDING-003, the common case: a terminal run whose tree is clean loses the CHECKOUT but
@@ -4772,7 +4917,7 @@ mod tests {
             ok && branches.contains("wicked/run-1"),
             "the wicked/run-1 branch must survive the reap — it is the record, got: {branches}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// FINDING-003, the safety property the whole design leans on: a tree holding uncommitted
@@ -4810,7 +4955,304 @@ mod tests {
             "never committed\n",
             "the uncommitted bytes are untouched"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
+    }
+
+    /// core#1109 — a Rust repository with a crate EXCLUDED from its workspace builds in a run.
+    /// Cargo finds a package's workspace by walking up to the first `[workspace]` that does not
+    /// exclude it: from the run tree's excluded crate it passes the tree's own root and, with the
+    /// tree inside the checkout, reached the checkout's `Cargo.toml`, which claims the crate and
+    /// then refuses it ("believes it's in a workspace when it's not"). The tree is minted by the
+    /// engine's own route ([`create_worktree`]) from a committed repository, and cargo itself is
+    /// asked about the crate there.
+    #[test]
+    fn a_run_on_a_rust_repo_with_an_excluded_crate_builds_outside_the_checkout() {
+        let root = git_repo("rust-excluded");
+        let p = root.to_str().unwrap();
+        let tool = root.join("tools").join("gen");
+        std::fs::create_dir_all(root.join("app").join("src")).unwrap();
+        std::fs::create_dir_all(tool.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nexclude = [\"tools/gen\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let package = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n")
+        };
+        std::fs::write(root.join("app").join("Cargo.toml"), package("app")).unwrap();
+        std::fs::write(root.join("app").join("src").join("lib.rs"), "").unwrap();
+        std::fs::write(tool.join("Cargo.toml"), package("gen")).unwrap();
+        std::fs::write(tool.join("src").join("lib.rs"), "").unwrap();
+        assert!(git(p, &["add", "-A"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "workspace"]).unwrap().0);
+        let metadata = |manifest: &Path| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            // spawn-audit: test-only (cargo itself, on a fixture manifest; it reads no engine state).
+            std::process::Command::new(cargo)
+                .args([
+                    "metadata",
+                    "--no-deps",
+                    "--offline",
+                    "--format-version",
+                    "1",
+                ])
+                .arg("--manifest-path")
+                .arg(manifest)
+                // Cargo never walks above `CARGO_HOME` looking for a workspace root: bounding it at
+                // the temp dir keeps any workspace around it out of the answer.
+                .env("CARGO_HOME", std::env::temp_dir())
+                .current_dir(std::env::temp_dir())
+                .output()
+                .expect("cargo runs")
+        };
+        let in_checkout = metadata(&tool.join("Cargo.toml"));
+        assert!(
+            in_checkout.status.success(),
+            "the fixture builds in the checkout itself: {}",
+            String::from_utf8_lossy(&in_checkout.stderr)
+        );
+
+        let wt = create_worktree(p, "run-rust").unwrap();
+        assert!(!wt.starts_with(&root), "{}", wt.display());
+        let in_run = metadata(&wt.join("tools").join("gen").join("Cargo.toml"));
+        assert!(
+            in_run.status.success(),
+            "cargo refused the excluded crate in the run's tree: {}",
+            String::from_utf8_lossy(&in_run.stderr)
+        );
+        assert!(
+            !std::fs::read_to_string(root.join(".git").join("info").join("exclude"))
+                .unwrap_or_default()
+                .contains("wicked-worktrees"),
+            "nothing is added to the checkout's git excludes any more"
+        );
+        rm_repo(&root);
+    }
+
+    /// core#1109 — a tree an engine before the move minted INSIDE the checkout keeps working in
+    /// place after the upgrade: a resume reuses it, and the startup reaper still finds it (a clean
+    /// terminal leftover converges, an unknown one of this daemon's goes), while a new run's tree
+    /// is minted beside the checkout.
+    #[test]
+    fn trees_minted_inside_the_checkout_resume_and_reap_in_place() {
+        let root = git_repo("in-clone-compat");
+        let p = root.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let old_live = create_in_clone_tree(p, "run-old-live");
+        let old_done = create_in_clone_tree(p, "run-old-done");
+        let old_gone = create_in_clone_tree(p, "run-old-unknown");
+        assert_eq!(
+            create_worktree(p, "run-old-live").unwrap(),
+            old_live,
+            "a resume reuses the in-checkout tree"
+        );
+        let fresh = create_worktree(p, "run-new").unwrap();
+        assert!(fresh.starts_with(worktrees_root(p)) && !fresh.starts_with(&root));
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let live: HashSet<String> = ["run-old-live".to_string(), "run-new".to_string()]
+            .into_iter()
+            .collect();
+        let terminal: HashSet<String> = ["run-old-done".to_string()].into_iter().collect();
+        reap_orphan_worktrees(
+            std::slice::from_ref(&repo),
+            &live,
+            &terminal,
+            Some("daemon-me"),
+        );
+        assert!(is_live_worktree(&old_live));
+        assert!(is_live_worktree(&fresh));
+        assert!(
+            !old_done.exists(),
+            "a clean terminal in-checkout leftover converges"
+        );
+        assert!(
+            !old_gone.exists(),
+            "an unknown in-checkout tree of this daemon goes"
+        );
+        assert_eq!(worktree_owner(&old_live).as_deref(), Some("run-old-live"));
+        rm_repo(&root);
+    }
+
+    /// core#1109 + core#1662 — trees minted BESIDE the checkout are repaired when the folder
+    /// holding both moves (a home or volume remounted): the checkout and the trees beside it
+    /// move together, and the links are rewritten to the resolved paths.
+    #[cfg(unix)]
+    #[test]
+    fn trees_beside_a_moved_checkout_get_their_links_repaired_at_boot() {
+        let holder = std::env::temp_dir().join(format!(
+            "wicked-wt-holder-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let moved_holder = holder.with_file_name(format!(
+            "{}-moved",
+            holder.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&holder);
+        let _ = std::fs::remove_dir_all(&moved_holder);
+        std::fs::create_dir_all(&holder).unwrap();
+        let made = git_repo("beside-move");
+        let old = holder.join("repo");
+        std::fs::rename(&made, &old).unwrap();
+        let p = old.to_str().unwrap();
+        let mine = {
+            let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+            create_worktree(p, "run-mine").unwrap()
+        };
+        assert!(
+            mine.starts_with(holder.join("repo.wicked")),
+            "{}",
+            mine.display()
+        );
+        std::fs::rename(&holder, &moved_holder).unwrap();
+        let moved = moved_holder.join("repo");
+        let reg = moved.to_str().unwrap();
+        assert_eq!(repair_moved_worktrees("r", reg, Some("daemon-me")), 1);
+        let resolved = std::fs::canonicalize(&moved).unwrap();
+        let tree = worktrees_root(&resolved.to_string_lossy()).join("run-mine");
+        let admin = resolved.join(".git").join("worktrees").join("run-mine");
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".git")).unwrap().trim(),
+            format!("gitdir: {}", admin.display())
+        );
+        assert_eq!(
+            Path::new(
+                std::fs::read_to_string(admin.join("gitdir"))
+                    .unwrap()
+                    .trim()
+            ),
+            tree.join(".git")
+        );
+        assert!(is_live_worktree(&tree));
+        let pinned = crate::worktree_guard::pinned_git_dir(&tree, &resolved).unwrap();
+        crate::container_floor::verify_linked_worktree(&tree, Some(&pinned)).unwrap();
+        assert_eq!(repair_moved_worktrees("r", reg, Some("daemon-me")), 0);
+        let _ = std::fs::remove_dir_all(&moved_holder);
+    }
+
+    /// Codex review of #1851: a checkout moved and left behind a symlink keeps the trees minted
+    /// beside it at the OLD name (`<P>/repo.wicked`); the boot repair finds them from the
+    /// registered spelling and rewrites both links to the resolved checkout, so a container
+    /// mounting resolved paths can use the tree.
+    #[cfg(unix)]
+    #[test]
+    fn trees_beside_a_checkout_moved_behind_a_symlink_get_their_links_repaired_at_boot() {
+        let holder = std::env::temp_dir().join(format!(
+            "wicked-wt-holder-link-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&holder);
+        std::fs::create_dir_all(&holder).unwrap();
+        let old = holder.join("repo");
+        std::fs::rename(git_repo("beside-link"), &old).unwrap();
+        let reg = old.to_str().unwrap();
+        let mine = {
+            let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+            create_worktree(reg, "run-mine").unwrap()
+        };
+        assert!(
+            mine.starts_with(holder.join("repo.wicked")),
+            "{}",
+            mine.display()
+        );
+        let moved = holder.join("repo-moved");
+        std::fs::rename(&old, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &old).unwrap();
+        assert_eq!(repair_moved_worktrees("r", reg, Some("daemon-me")), 1);
+        let resolved = std::fs::canonicalize(&moved).unwrap();
+        let tree = std::fs::canonicalize(&mine).unwrap();
+        let admin = resolved.join(".git").join("worktrees").join("run-mine");
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".git")).unwrap().trim(),
+            format!("gitdir: {}", admin.display())
+        );
+        assert_eq!(
+            Path::new(
+                std::fs::read_to_string(admin.join("gitdir"))
+                    .unwrap()
+                    .trim()
+            ),
+            tree.join(".git")
+        );
+        assert!(is_live_worktree(&tree));
+        let pinned = crate::worktree_guard::pinned_git_dir(&tree, &resolved).unwrap();
+        crate::container_floor::verify_linked_worktree(&tree, Some(&pinned)).unwrap();
+        assert_eq!(repair_moved_worktrees("r", reg, Some("daemon-me")), 0);
+        let _ = std::fs::remove_dir_all(&holder);
+    }
+
+    /// Codex review of #1851: `app.wicked`, the name of the folder beside `app`, can be ANOTHER
+    /// checkout, whose in-checkout `wicked-worktrees` holds its own trees from before core#1109.
+    /// `app` then keeps its trees inside itself: a run on `app` with the same run id never reuses
+    /// the other checkout's tree, and the boot repair (after both move) and the startup reaper for
+    /// `app` leave that tree and its links as they are.
+    #[test]
+    fn a_checkout_named_like_the_trees_folder_keeps_its_trees_from_the_other_checkout() {
+        let holder = std::env::temp_dir().join(format!(
+            "wicked-wt-holder-foreign-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let moved_holder = holder.with_file_name(format!(
+            "{}-moved",
+            holder.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&holder);
+        let _ = std::fs::remove_dir_all(&moved_holder);
+        std::fs::create_dir_all(&holder).unwrap();
+        std::fs::rename(git_repo("foreign-app"), holder.join("app")).unwrap();
+        std::fs::rename(git_repo("foreign-other"), holder.join("app.wicked")).unwrap();
+        let app = holder.join("app");
+        let p = app.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let theirs = create_in_clone_tree(holder.join("app.wicked").to_str().unwrap(), "run-x");
+        let link = |wt: &Path| std::fs::read_to_string(wt.join(".git")).unwrap();
+        let back = |checkout: &Path| {
+            std::fs::read_to_string(checkout.join(".git/worktrees/run-x/gitdir")).unwrap()
+        };
+        let (theirs_link, theirs_back) = (link(&theirs), back(&holder.join("app.wicked")));
+
+        assert_eq!(worktrees_root(p), app.join("wicked-worktrees"));
+        let mine = create_worktree(p, "run-x").unwrap();
+        assert_eq!(mine, app.join("wicked-worktrees").join("run-x"));
+        assert_eq!(link(&theirs), theirs_link);
+
+        std::fs::rename(&holder, &moved_holder).unwrap();
+        let app = moved_holder.join("app");
+        let p = app.to_str().unwrap();
+        let theirs = moved_holder.join("app.wicked/wicked-worktrees/run-x");
+        assert_eq!(repair_moved_worktrees("app", p, Some("daemon-me")), 1);
+        assert_eq!(link(&theirs), theirs_link, "the other checkout's tree");
+        assert_eq!(back(&moved_holder.join("app.wicked")), theirs_back);
+
+        let repo = RepoEntry {
+            id: "app".into(),
+            name: "app".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(&app),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        reap_orphan_worktrees(&[repo], &HashSet::new(), &HashSet::new(), Some("daemon-me"));
+        assert!(
+            !app.join("wicked-worktrees/run-x").exists(),
+            "app's own unknown tree"
+        );
+        assert_eq!(link(&theirs), theirs_link, "never reaped from app");
+        let _ = std::fs::remove_dir_all(&moved_holder);
     }
 
     /// FINDING-003's restart half: the startup reaper must converge terminal runs' leftovers
@@ -4864,10 +5306,11 @@ mod tests {
             !wt_gone.exists(),
             "a worktree no session owns is force-removed, dirty or not"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
-    /// core#1662: a checkout moved after its run worktrees were minted. This daemon's tree gets
+    /// core#1662: a checkout moved after its run worktrees were minted INSIDE it (before core#1109),
+    /// so they moved with it. This daemon's tree gets
     /// both links rewritten to the resolved paths, from the checkout's new spelling, whether the
     /// old path is gone (renamed) or still resolves (behind a symlink); the container floor's
     /// link check then accepts it. Another daemon's tree and an unmarked tree keep their links. A
@@ -4885,15 +5328,15 @@ mod tests {
             let p = old.to_str().unwrap();
             let mine = {
                 let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
-                create_worktree(p, "run-mine").unwrap()
+                create_in_clone_tree(p, "run-mine")
             };
             let theirs = {
                 let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
-                create_worktree(p, "run-theirs").unwrap()
+                create_in_clone_tree(p, "run-theirs")
             };
             let unmarked = {
                 let _none = DaemonOwnerScope::bind(None);
-                create_worktree(p, "run-unmarked").unwrap()
+                create_in_clone_tree(p, "run-unmarked")
             };
             let link_text = |wt: &Path| std::fs::read_to_string(wt.join(".git")).unwrap();
             let before_theirs = link_text(&theirs);
@@ -4911,7 +5354,7 @@ mod tests {
                 "{}-moved",
                 old.file_name().unwrap().to_string_lossy()
             ));
-            let _ = std::fs::remove_dir_all(&moved);
+            rm_repo(&moved);
             std::fs::rename(&old, &moved).unwrap();
             let registered = if behind_symlink {
                 std::os::unix::fs::symlink(&moved, &old).unwrap();
@@ -4986,7 +5429,7 @@ mod tests {
             if behind_symlink {
                 let _ = std::fs::remove_file(&old);
             }
-            let _ = std::fs::remove_dir_all(&moved);
+            rm_repo(&moved);
         }
     }
 
@@ -5004,12 +5447,12 @@ mod tests {
         let old = git_repo("move-pair");
         let p = old.to_str().unwrap();
         let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
-        let healthy = create_worktree(p, "run-ok").unwrap();
-        let a = create_worktree(p, "run-a").unwrap();
-        let b = create_worktree(p, "run-b").unwrap();
-        let c = create_worktree(p, "run-c").unwrap();
-        create_worktree(p, "run-d").unwrap();
-        create_worktree(p, "run-e").unwrap();
+        let healthy = create_in_clone_tree(p, "run-ok");
+        let a = create_in_clone_tree(p, "run-a");
+        let b = create_in_clone_tree(p, "run-b");
+        let c = create_in_clone_tree(p, "run-c");
+        create_in_clone_tree(p, "run-d");
+        create_in_clone_tree(p, "run-e");
         let canon = std::fs::canonicalize(&old).unwrap();
         let admin_at = |root: &Path, n: &str| root.join(".git").join("worktrees").join(n);
         std::fs::write(
@@ -5053,7 +5496,7 @@ mod tests {
         std::fs::write(admin_at(&canon, "run-e").join("gitdir"), &legacy).unwrap();
 
         let moved = sentinel("moved");
-        let _ = std::fs::remove_dir_all(&moved);
+        rm_repo(&moved);
         std::fs::rename(&old, &moved).unwrap();
         let resolved = std::fs::canonicalize(&moved).unwrap();
         let tree = |wt: &Path| {
@@ -5108,7 +5551,7 @@ mod tests {
         );
         let _ = std::fs::remove_file(&outside_c);
         let _ = std::fs::remove_file(&outside_d);
-        let _ = std::fs::remove_dir_all(&moved);
+        rm_repo(&moved);
     }
 
     /// core#1662 (coord review): on every OS (Windows' canonical spelling is verbatim), a boot on a
@@ -5126,7 +5569,7 @@ mod tests {
         );
         assert_eq!(repair_moved_worktrees("r", p, Some("daemon-me")), 0);
         assert!(is_live_worktree(&wt));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1662 (review): a seat that leaves a FIFO in place of its admin dir's daemon marker or
@@ -5158,7 +5601,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("the repair returned instead of blocking on a FIFO");
         assert_eq!(repaired, 0);
-        let _ = std::fs::remove_dir_all(&old);
+        rm_repo(&old);
     }
 
     /// core#1662: the boot pass runs the repair for every registered repository, before the boot
@@ -5227,7 +5670,7 @@ mod tests {
             !daemon_may_touch(&b),
             "the sibling stays the other daemon's"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (review on #1760): git suffixes an admin dir whose name is taken, so a tree's admin
@@ -5272,7 +5715,7 @@ mod tests {
             !daemon_may_touch(&victim),
             "a namesake admin dir never makes the victim this daemon's"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (review on #1760): a registered checkout whose `.git` is a FILE (a
@@ -5317,7 +5760,7 @@ mod tests {
         assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
         let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
         assert!(!daemon_may_touch(&theirs));
-        let _ = std::fs::remove_dir_all(&base);
+        rm_repo(&base);
     }
 
     /// core#1436 (review r2 on #1760): a repository registered at a SUBDIRECTORY of its checkout
@@ -5335,12 +5778,14 @@ mod tests {
             let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
             create_worktree(sub.to_str().unwrap(), "run-sub").unwrap()
         };
-        assert!(theirs.starts_with(&sub));
+        // (core#1109) Beside the CHECKOUT, never inside its working tree.
+        assert!(theirs.starts_with(worktrees_root(p)) && !theirs.starts_with(&root));
+        assert_eq!(worktrees_root(sub.to_str().unwrap()), worktrees_root(p));
         assert_eq!(worktree_owner(&theirs).as_deref(), Some("run-sub"));
         assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
         let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
         assert!(!daemon_may_touch(&theirs));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (review r2 on #1760): a seat that replaces its run marker with a link to a file
@@ -5369,7 +5814,7 @@ mod tests {
             "a stamp replaces the link, never writes through it"
         );
         assert_eq!(worktree_owner(&wt).as_deref(), Some("run-linked"));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (review on #1760): a seat that replaces its admin dir's back-pointer or its
@@ -5420,7 +5865,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_fifo());
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436: a dispatch re-entering a persisted tree that no daemon marked (minted before
@@ -5443,7 +5888,7 @@ mod tests {
         claim_reentered_worktree(&theirs);
         assert_eq!(worktree_daemon(&legacy).as_deref(), Some("daemon-me"));
         assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (coord review F3): a fresh mint whose daemon claim another daemon won between the
@@ -5468,7 +5913,7 @@ mod tests {
         );
         let wt = worktree_path(p, "run-raced");
         assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-other"));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436 (coord review F2): the common git dir resolves whether git prints it relative
@@ -5491,7 +5936,7 @@ mod tests {
                 at.display()
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1436: dispatch admission claims the run's worktree, on every dispatch path, off the
@@ -5611,8 +6056,8 @@ mod tests {
             "B's restart takes B's own orphan (force: it is B's)"
         );
         assert!(is_live_worktree(&wt_old));
-        let _ = std::fs::remove_dir_all(&leaf_b);
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&leaf_b);
+        rm_repo(&root);
     }
 
     /// (review on #1431) Another daemon's tree is never handed over or destroyed by this one: a
@@ -5694,7 +6139,7 @@ mod tests {
             is_live_worktree(&current),
             "the shadowed tree is kept, not confused"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// (review r2 on #1431) A thread bound to no daemon owns no marked tree; a resume never adopts
@@ -5754,7 +6199,7 @@ mod tests {
             daemon_owner_of_store(":memory:"),
             daemon_owner_of_store(":memory:")
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// (review r3 on #1431) The daemon's own cleanup threads still clean its marked trees (bound),
@@ -5824,7 +6269,7 @@ mod tests {
             }
             std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// (core#1429, review on #1433) A tree's queue is first come, first served: a reap whose place
@@ -5854,7 +6299,7 @@ mod tests {
             is_live_worktree(&wt),
             "the relaunch minted after the reap: its tree is live"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// (coord review of #1736, B1) A ticket whose holder never waits for it (a cleanup thread that
@@ -5900,7 +6345,7 @@ mod tests {
         let _x = DaemonOwnerScope::bind(Some("daemon-x".into()));
         adopt_live_worktree(&wt).unwrap();
         assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-x"));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// core#1373: a resumed or adopted tree that no daemon marked takes the resuming daemon's
@@ -5918,7 +6363,7 @@ mod tests {
             "a resume reuses it"
         );
         assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-x"));
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     // ── worktree name sanitization (core#337) ─────────────────────────────────
@@ -6063,7 +6508,7 @@ mod tests {
             std::fs::read_to_string(again.join("turn-1.txt")).unwrap(),
             "landed\n"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// crew#390/#391 COMPAT: crew's shipped workaround pre-provisions a campaign node's worktree
@@ -6099,7 +6544,7 @@ mod tests {
             std::fs::read_to_string(wt.join("provisioned.txt")).unwrap(),
             "crew\n"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// The startup reaper matches directory names against the store's RAW run ids — a live
@@ -6142,7 +6587,7 @@ mod tests {
         );
         assert!(!leaf_done.exists(), "{}", leaf_done.display());
         assert!(leaf_live.is_dir(), "a live run's check scratch is kept");
-        let _ = std::fs::remove_dir_all(&leaf_live);
+        rm_repo(&leaf_live);
 
         assert!(
             is_live_worktree(&wt_live),
@@ -6152,7 +6597,7 @@ mod tests {
             !wt_done.exists(),
             "a clean terminal campaign tree converges"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// ADVERSARIAL PROBE (core#337): the colon tier is deliberately hashless (crew#390/#391
@@ -6189,7 +6634,7 @@ mod tests {
         );
         // The owner itself still resumes.
         assert_eq!(create_worktree(p, "a-b:c:a0").unwrap(), wt_x);
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// ADVERSARIAL PROBE (core#337): the colliding run's own CLEANUP is the other half —
@@ -6222,7 +6667,7 @@ mod tests {
         // The owner's own cleanup still works — ownership guards the tree, not the reap.
         assert!(reap_worktree_if_clean(p, "a-b:c:a0"));
         assert!(!wt_x.exists(), "the owner's keyed reap still converges");
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 
     /// The core#337 repro end-to-end at the id's SOURCE: the run id comes from the engine's own
@@ -6276,7 +6721,7 @@ mod tests {
             wt.file_name().unwrap().to_str().unwrap(),
             "web-refresh-lint-a0"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        rm_repo(&root);
     }
 }
 
@@ -6284,6 +6729,7 @@ mod tests {
 /// minted, so a same-id relaunch mints both from the base again instead of adopting the branch.
 #[cfg(test)]
 mod discard_minted_tests {
+    use super::tests::rm_repo;
     use super::*;
 
     fn run(cwd: &Path, args: &[&str]) {
@@ -6323,6 +6769,6 @@ mod discard_minted_tests {
         assert!(!wt.exists(), "the tree is gone");
         let (ok, _, _) = git(&root, &["rev-parse", "--verify", "--quiet", &branch]).unwrap();
         assert!(!ok, "the branch is gone");
-        let _ = std::fs::remove_dir_all(&repo);
+        rm_repo(&repo);
     }
 }

@@ -1000,8 +1000,9 @@ fn boundary_denial_judged(
         .filter(|p| !p.is_empty())
     {
         let is_write = WRITE_TOOLS.contains(&tool);
-        // (crew#634 R7) WORKER FENCE: another run's worktree is not readable, although it sits
-        // under the repository a seat may read (`<repo>/wicked-worktrees/<id>`). A read is
+        // (crew#634 R7) WORKER FENCE: another run's worktree is not readable, although it may sit
+        // under a directory a seat may read (`<repo>/wicked-worktrees/<id>` from before core#1109,
+        // `<repo>.wicked/wicked-worktrees/<id>` beside it after). A read is
         // ADVISORY like every out-of-bounds read (blocked, audited, the seat continues); a write
         // there is already outside the write roots and is judged by the check below.
         if !is_write {
@@ -1290,8 +1291,9 @@ fn boundary_denial_judged(
 /// pattern: "wicked-worktrees/run-2/**"}`, `Grep {glob: …}`; codex review), or any path pattern
 /// naming the worktrees directory from a search root outside the unit's own tree. Grep's
 /// `pattern` is a CONTENT regex and is not a path. A plain recursive search of the repository
-/// root does not descend into `wicked-worktrees/`: the engine lists it in the clone's
-/// `.git/info/exclude` (`repo::ensure_worktrees_excluded`), which the search tools honour.
+/// root does not descend into `wicked-worktrees/`: new run trees sit beside the checkout
+/// (core#1109, `repo::worktrees_root`), and an earlier engine listed the in-checkout directory in
+/// the clone's `.git/info/exclude`, which the search tools honour.
 fn sibling_worktree_target(
     path: &str,
     context: &serde_json::Value,
