@@ -16789,14 +16789,19 @@ mod boundary_tests {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(targets.contains(&P(target.into())), "{cmd:?}: {targets:?}");
         }
-        for (cmd, target) in [
-            ("echo x >/tmp/a\\|b", "/tmp/a|b"),
-            ("echo ${X} >/tmp/a\\|b", "/tmp/a|b"),
-            ("echo ${X} >\"/tmp/a|b\"", "/tmp/a|b"),
+        // An escaped or quoted `|` is never a cut point: every reading keeps `|b` in the name
+        // (Windows also reads the escape's backslash as a path byte: `/tmp/a\\|b`).
+        for cmd in [
+            "echo x >/tmp/a\\|b",
+            "echo ${X} >/tmp/a\\|b",
+            "echo ${X} >\"/tmp/a|b\"",
         ] {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
-                !targets.is_empty() && targets.iter().all(|t| *t == P(target.into())),
+                targets.contains(&P("/tmp/a|b".into()))
+                    && targets
+                        .iter()
+                        .all(|t| matches!(t, P(p) if p.starts_with("/tmp/a") && p.ends_with("|b"))),
                 "{cmd:?}: {targets:?}"
             );
         }
