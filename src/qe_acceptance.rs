@@ -266,34 +266,73 @@ fn decide(
     graph_key: Option<&str>,
     baseline: Option<(&str, &Path)>,
 ) -> QeAcceptance {
-    decide_with(
-        session,
-        ord,
-        repo_root,
-        baseline,
-        |signals, root, base| match graph_key.and_then(crate::code_graph::existing_code_graph) {
-            None => rs::assess(
+    decide_with(session, ord, repo_root, baseline, |signals, root, base| {
+        graph_assess(signals, root, base, graph_key)
+    })
+}
+
+/// Score `signals` against the run repo's code graph (`graph_key`) at `base`: the one scorer, with
+/// an unindexed or unopenable graph read as unavailable (fail-closed in `assess`).
+fn graph_assess(
+    signals: &ChangeSignals,
+    root: &Path,
+    base: &str,
+    graph_key: Option<&str>,
+) -> rs::Assessment {
+    match graph_key.and_then(crate::code_graph::existing_code_graph) {
+        None => rs::assess(
+            signals,
+            Graph::Unavailable(format!("no code graph is indexed for {}", root.display())),
+            None,
+        ),
+        Some(db) => match wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())) {
+            Ok(store) => rs::assess(
                 signals,
-                Graph::Unavailable(format!("no code graph is indexed for {}", root.display())),
+                Graph::Ready {
+                    store: &store,
+                    base_commit: base,
+                },
                 None,
             ),
-            Some(db) => match wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())) {
-                Ok(store) => rs::assess(
-                    signals,
-                    Graph::Ready {
-                        store: &store,
-                        base_commit: base,
-                    },
-                    None,
-                ),
-                Err(e) => rs::assess(
-                    signals,
-                    Graph::Unavailable(format!("the code graph could not be opened: {e}")),
-                    None,
-                ),
-            },
+            Err(e) => rs::assess(
+                signals,
+                Graph::Unavailable(format!("the code graph could not be opened: {e}")),
+                None,
+            ),
         },
-    )
+    }
+}
+
+/// The run's diff signals from `base` to `tree` exactly as the QE decision reads them: the diff,
+/// the touched paths' history and their whole files.
+fn diff_signals(
+    root: &Path,
+    git_dir: &Path,
+    base: &str,
+    tree: &str,
+) -> Result<ChangeSignals, String> {
+    let diff = run_diff(root, git_dir, base, tree)
+        .map_err(|e| format!("the run's diff could not be read: {e}"))?;
+    let mut signals = rs::signals_from_diff(&diff);
+    with_history(&mut signals, root, git_dir, base);
+    with_whole_files(&mut signals, root, git_dir, base, tree);
+    Ok(signals)
+}
+
+/// (core#1709) The diff score the QE decision would give `tree` (the change from `base`, through
+/// the pinned `git_dir`, against the graph `graph_key`), and whether the change is destructive:
+/// a power checkpoint's re-score before the hand-off reads the same evidence acceptance does.
+pub(crate) fn diff_assessment(
+    root: &Path,
+    git_dir: &Path,
+    base: &str,
+    tree: &str,
+    graph_key: Option<&str>,
+) -> Result<(rs::Assessment, bool), String> {
+    let signals = diff_signals(root, git_dir, base, tree)?;
+    let a = graph_assess(&signals, root, base, graph_key);
+    let destructive = signals.destructive || a.signals.as_ref().is_some_and(|s| s.destructive);
+    Ok((a, destructive))
 }
 
 /// [`decide`] with the scorer injected: `score(signals, repo_root, base_commit)` reads the graph.
@@ -327,13 +366,10 @@ fn decide_with(
             None,
         );
     };
-    let diff = match run_diff(root, git_dir, base, tree) {
-        Ok(d) => d,
-        Err(e) => return required(format!("the run's diff could not be read: {e}"), Some(tree)),
+    let signals = match diff_signals(root, git_dir, base, tree) {
+        Ok(s) => s,
+        Err(e) => return required(e, Some(tree)),
     };
-    let mut signals = rs::signals_from_diff(&diff);
-    with_history(&mut signals, root, git_dir, base);
-    with_whole_files(&mut signals, root, git_dir, base, tree);
     from_assessment(&score(&signals, root, base), ord, tree)
 }
 

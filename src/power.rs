@@ -1812,6 +1812,10 @@ pub struct CheckpointReport {
     pub reverts: u32,
     pub failed_runs: u32,
     pub summary: String,
+    /// (core#1709) At the hand-off (`pre_handoff`) only: the worktree's whole content as a tree
+    /// (committed, uncommitted and new files) written through the unit's pinned git dir, and that
+    /// dir — what the re-score reads the run's diff from, exactly as the QE decision does.
+    pub snapshot: Option<(String, std::path::PathBuf)>,
 }
 
 // ── The worker's turn loop ───────────────────────────────────────────────────────────────────────
@@ -1926,7 +1930,22 @@ pub fn measure(
         reverts: u32::try_from(reverts).unwrap_or(u32::MAX),
         failed_runs,
         summary: summary.to_string(),
+        snapshot: None,
     }
+}
+
+/// (core#1709) The hand-off checkpoint's snapshot ([`CheckpointReport::snapshot`]): the worktree
+/// `wd` as a tree through the unit's pinned git dir, written into the repository's objects so the
+/// actor can diff it against the run's base. `None` when the unit has no pinned git dir or the
+/// worktree cannot be read.
+pub fn handoff_snapshot(
+    wd: &std::path::Path,
+    unit: &crate::domain::WorkUnit,
+) -> Option<(String, std::path::PathBuf)> {
+    let git_dir = std::path::PathBuf::from(unit.worktree_baseline.as_ref()?.git_dir.as_deref()?);
+    crate::worktree_guard::snapshot_through(wd, &git_dir)
+        .ok()
+        .map(|s| (s.tree, git_dir))
 }
 
 /// The worktree's per-file +/- against `base` (committed and not), for activity rows.
@@ -2306,7 +2325,11 @@ pub fn orchestrate(
                     input.unit.ord,
                     input.attempt,
                 );
-                measure(w, start.as_deref(), trigger, turn, failed, &summary)
+                let mut r = measure(w, start.as_deref(), trigger, turn, failed, &summary);
+                if trigger == "pre_handoff" {
+                    r.snapshot = handoff_snapshot(w, &input.unit);
+                }
+                r
             })
             .and_then(|r| send_checkpoint(&tx, &turn_input, r, true))
             .unwrap_or_default();

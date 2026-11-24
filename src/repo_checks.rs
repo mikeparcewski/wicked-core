@@ -1524,6 +1524,17 @@ impl OpenJournal {
     }
 }
 
+/// (core#1709) The name a failing test is qualified by in [`RepoChecksReport::failing_set`]: the
+/// targeted test set runs the same tests as the full one, so a failure the operator overrode in a
+/// creator floor's `test_targeted` is the same failure in the verify floor's full `test` (same
+/// directory, same test id), and the override carries to it when its failures are a subset.
+pub(crate) fn test_set_name(check: &str) -> &str {
+    match check {
+        "test_targeted" => "test",
+        other => other,
+    }
+}
+
 /// (j4-gates) A failed floor's failing tests against the run base ([`RepoChecksReport::failure_split`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FailureSplit {
@@ -1955,7 +1966,8 @@ impl RepoChecksReport {
     }
 
     /// (core#1186) Every failing test this report's denying checks named, qualified by the check's
-    /// directory and name (`<dir>|<check>: <id>`), in first-seen order — the list an operator's
+    /// directory and name (`<dir>|<check>: <id>`; core#1709: `test_targeted` is named `test`,
+    /// [`test_set_name`]), in first-seen order — the list an operator's
     /// override is recorded as having ruled on, and that a later FRESH floor on the same tree is
     /// compared with. `None` unless every denying check's head run named a complete, file-qualified
     /// account of its failures ([`CheckRun::failures_complete_in`]) and no later run of it (the
@@ -1992,7 +2004,7 @@ impl RepoChecksReport {
                 return None;
             }
             for id in &deciding.failure_ids {
-                let named = format!("{dir}|{}: {id}", c.name);
+                let named = format!("{dir}|{}: {id}", test_set_name(&c.name));
                 if !out.contains(&named) {
                     out.push(named);
                 }

@@ -6265,3 +6265,47 @@ fn journeys_are_verify_stage_checks_in_name_order_767() {
     assert!(err.contains("not a journey name"), "{err}");
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// (core#1709) A creator floor's `test_targeted` and the verify floor's full `test` run the same
+/// tests: a failure the operator overrode in the one is the same failure in the other (same
+/// directory, same test id), so both name it alike and the override's subset rule
+/// (`pipeline::carried_floor_override`, which compares these lists) carries it to the verify floor
+/// instead of asking again for a second long red run. A test the override did not see still asks.
+#[test]
+fn core_1709_a_targeted_failure_and_the_same_full_suite_failure_name_the_same_test() {
+    let report = |check: &str, ids: &[&str]| -> RepoChecksReport {
+        serde_json::from_value(serde_json::json!({
+            "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
+            "tree": "T", "key": {"tree": "T", "base": "B", "checks": "d"},
+            "checks": [{
+                "name": check, "argv": ["node", "scripts/test-related.mjs"], "source": "t",
+                "exit_code": 1, "timed_out": false, "duration_ms": 1,
+                "stdout_tail": "", "stderr_tail": "",
+                "failure_ids": ids, "failures_complete_in": "packages/crew",
+            }],
+        }))
+        .expect("a report")
+    };
+    let id = "FAIL tests/a.test.ts > lookup > windows";
+    let ruled = report("test_targeted", &[id])
+        .failing_set()
+        .expect("complete");
+    assert_eq!(ruled, vec![format!("packages/crew|test: {id}")]);
+    let verify = report("test", &[id]).failing_set().expect("complete");
+    assert!(
+        verify.iter().all(|t| ruled.contains(t)),
+        "{verify:?} within {ruled:?}"
+    );
+    let more = report("test", &[id, "FAIL tests/b.test.ts > other"])
+        .failing_set()
+        .expect("complete");
+    assert!(
+        !more.iter().all(|t| ruled.contains(t)),
+        "a new failure asks again"
+    );
+    // Any other check keeps its own name.
+    assert_eq!(
+        report("e2e", &[id]).failing_set(),
+        Some(vec![format!("packages/crew|e2e: {id}")])
+    );
+}
