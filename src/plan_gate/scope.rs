@@ -75,25 +75,34 @@ pub struct ScopeAnswer {
 
 /// (core#1838) A domain mapping whose writes are confined by the engine, not by the PA's word: a
 /// [mapping plan](PlanSteps::maps_only) (its agent steps compose with the mapping write set, the
-/// domain model under `.wicked/domain/` and the coverage report), whose every Tool step is one the
-/// built-in `domain-extraction` preset ships (the host's own scripts), never an authored command.
-/// Such a plan changes no code, so an empty scope is an honest answer for it.
+/// domain model under `.wicked/domain/` and the coverage report) whose every step that runs as a
+/// Tool is one the built-in `domain-extraction` preset ships (the host's own scripts). A step runs
+/// as a Tool when it authors a Tool executor or its catalog entry is a Tool entry, which covers an
+/// entry's own fixed command (`walkthrough_review`) taken with no executor authored; a step whose
+/// entry is not in the catalog counts as a Tool. Such a plan changes no code, so an empty scope is
+/// an honest answer for it.
 pub(crate) fn writes_confined_to_mapping(plan: &PlanSteps) -> bool {
     if !plan.maps_only() {
         return false;
     }
-    let shipped =
-        crate::catalog::builtin_preset(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
-            .unwrap_or_default();
+    // `catalog::builtin_preset` is a test fixture; the production lookup is over the list.
+    let shipped = crate::catalog::builtin_presets()
+        .into_iter()
+        .find(|(name, _)| *name == crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
+        .map(|(_, steps)| steps)
+        .unwrap_or_default();
+    let runs_as_tool = |s: &crate::plan::PlanStep| {
+        matches!(
+            s.executor,
+            Some(crate::workflow::PhaseExecutor::Tool { .. })
+        ) || crate::catalog::catalog()
+            .iter()
+            .find(|e| e.id == s.catalog)
+            .is_none_or(crate::catalog::is_tool_entry)
+    };
     plan.steps
         .iter()
-        .filter(|s| {
-            s.catalog == "run"
-                || matches!(
-                    s.executor,
-                    Some(crate::workflow::PhaseExecutor::Tool { .. })
-                )
-        })
+        .filter(|s| runs_as_tool(s))
         .all(|s| shipped.contains(s))
 }
 
@@ -1000,6 +1009,15 @@ mod tests {
             step.instructions
         );
 
+        // xreview r1: a catalog entry whose own fixed command is a Tool (no `executor` authored)
+        // is not the preset's either.
+        let mut inherited = mapping.clone();
+        inherited.steps.push(PlanStep {
+            catalog: "walkthrough_review".into(),
+            id: "record".into(),
+            ..PlanStep::default()
+        });
+        assert!(!writes_confined_to_mapping(&inherited));
         // An authored Tool step: not the preset's own, so not confined.
         let mut authored = mapping.clone();
         authored.steps.push(PlanStep {

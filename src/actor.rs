@@ -5490,8 +5490,11 @@ mod council_tail_tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let reaper = crate::decision::BallotReaper::default();
         let seat = stopped.clone();
+        // (core#1794) The carried seat stops only when the test lets it, so every probe below
+        // knows the seat is still stopping: no wall-clock window decides the order.
+        let (let_stop, may_stop) = std::sync::mpsc::channel::<()>();
         reaper.hold(std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = may_stop.recv();
             seat.store(true, Ordering::SeqCst);
         }));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -5513,23 +5516,21 @@ mod council_tail_tests {
             !stopped.load(Ordering::SeqCst),
             "the verdict waited for a seat still stopping"
         );
-        // (core#1794) A probe that takes the slot proves the order only when the seat had already
-        // stopped: the seat may stop, be reaped and free the slot between the loop's read of
-        // `stopped` and the probe, and that is the right order, not a freed-early slot.
-        while !stopped.load(Ordering::SeqCst) {
-            match HostCouncilLock::acquire_until(&path, Instant::now()) {
-                Err(e) => assert_eq!(e, SlotRefused::Busy),
-                Ok(_free) => {
-                    assert!(
-                        stopped.load(Ordering::SeqCst),
-                        "the slot was freed while a carried seat was still stopping"
-                    );
-                    break;
-                }
-            }
+        // The seat is still stopping (it waits on `let_stop`), so the slot must read busy. A
+        // zero-budget probe is sound here: a duplicate descriptor in another test's child only
+        // keeps the slot busier.
+        for _ in 0..5 {
+            assert_eq!(
+                HostCouncilLock::acquire_until(&path, Instant::now()).err(),
+                Some(SlotRefused::Busy),
+                "the slot was freed while a carried seat was still stopping"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(!stopped.load(Ordering::SeqCst));
+        let_stop.send(()).expect("the seat is waiting");
         tail.join().expect("the council tail");
+        assert!(stopped.load(Ordering::SeqCst), "the tail reaped the seat");
         // (core#1794) The slot is a `flock` on an open file: a child another test spawns while the
         // council holds it keeps a duplicate of that descriptor until its exec completes, so for
         // that moment the slot still reads as held after the tail let it go. Under endpoint
