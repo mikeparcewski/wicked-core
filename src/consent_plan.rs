@@ -209,19 +209,23 @@ pub fn offer_sentence(offer: &ConsentOffer, home: Option<&str>) -> String {
         s.push_str(&format!(" \u{2022} {}{default} — {writes}.", c.label));
     }
     s.push_str(" \u{2022} Decline — writes nothing and cancels the run.");
-    if !plan.skipped.is_empty() {
-        let skipped: Vec<String> = plan
-            .skipped
-            .iter()
-            .map(|k| {
-                if k.why.is_empty() {
-                    k.cli.clone()
-                } else {
-                    format!("{} ({})", k.cli, k.why)
-                }
-            })
-            .collect();
-        s.push_str(&format!(" Not installed for: {}.", skipped.join(", ")));
+    // (garden#1543) One sentence per reason, in first-seen order: a host-wide reason (no
+    // wicked-installer) skips every CLI with the same text, which is said once.
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for k in &plan.skipped {
+        let why = k.why.trim().trim_end_matches('.');
+        match groups.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, clis)) => clis.push(&k.cli),
+            None => groups.push((why, vec![&k.cli])),
+        }
+    }
+    for (why, clis) in groups {
+        let clis = clis.join(", ");
+        if why.is_empty() {
+            s.push_str(&format!(" Not installed for {clis}."));
+        } else {
+            s.push_str(&format!(" Not installed for {clis}: {why}."));
+        }
     }
     s
 }
