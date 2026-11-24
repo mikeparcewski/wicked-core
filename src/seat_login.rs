@@ -2830,10 +2830,22 @@ fn host_version(
         .or_else(|| parse_version(&String::from_utf8_lossy(&out.stderr)))
 }
 
+/// The version the seats run for `cli`: the engine's pin, unless the operator runs a seat image
+/// of their own (`own_image`: [`crate::container_floor::image_override`], which reads a blank
+/// `WICKED_SEAT_IMAGE_<CLI>` as unset, exactly as the image selection does).
+#[cfg(unix)]
+fn seat_pin(cli: &str, own_image: Option<String>) -> Option<&'static str> {
+    if own_image.is_some() {
+        None
+    } else {
+        pinned_version(cli)
+    }
+}
+
 /// The refusal when `cli`'s sign-in needs this host's own `cli` and it is not on the daemon's PATH.
 /// It ends with the command that installs it (crew lifts that command into its sign-in refusal):
-/// the seat package at the version the seats run (`pinned`), or the package alone when the
-/// operator runs a seat image of their own (`pinned` is `None`).
+/// the seat package at the version the seats run (`pinned`, the same version the sentence names),
+/// or the package alone when the operator runs a seat image of their own (`pinned` is `None`).
 #[cfg(unix)]
 fn host_cli_missing(cli: &str, pinned: Option<&str>) -> String {
     let seats = pinned
@@ -2841,11 +2853,12 @@ fn host_cli_missing(cli: &str, pinned: Option<&str>) -> String {
         .unwrap_or_default();
     let install = match crate::container_floor::seat_package(cli) {
         Some(crate::container_floor::SeatPackage::Npm(p)) => {
-            let package = match (pinned, p.rsplit_once('@')) {
-                (None, Some((name, _))) if !name.is_empty() => name,
-                _ => p,
-            };
-            format!(": npm install -g {package}")
+            let name = p.rsplit_once('@').map_or(p, |(n, _)| n);
+            let name = if name.is_empty() { p } else { name };
+            match pinned {
+                Some(v) => format!(": npm install -g {name}@{v}"),
+                None => format!(": npm install -g {name}"),
+            }
         }
         _ => String::new(),
     };
@@ -2864,12 +2877,7 @@ fn prepare_host_login_argv(
     daemon_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
-    let pinned =
-        if std::env::var_os(format!("WICKED_SEAT_IMAGE_{}", cli.to_ascii_uppercase())).is_some() {
-            None
-        } else {
-            pinned_version(cli)
-        };
+    let pinned = seat_pin(cli, crate::container_floor::image_override(cli));
     let path = daemon_env
         .iter()
         .find(|(k, _)| k == "PATH")
@@ -4903,6 +4911,13 @@ mod tests {
                 "{own_image}"
             );
         }
+        // A CLI with no npm package (agy's vendor tarball) names no npm command.
+        assert!(host_cli_missing("agy", pinned_version("agy"))
+            .ends_with(". Install it, then sign in again"),);
+        // The version is the engine's pin unless the operator's own image is in use; a blank
+        // override is not one (`image_override` reads it as unset, as the image selection does).
+        assert_eq!(seat_pin("codex", None), pinned_version("codex"));
+        assert_eq!(seat_pin("codex", Some("my/codex:1".into())), None);
         let v = pinned_version("codex").unwrap();
         assert_eq!(
             host_cli_missing("codex", Some(v)),
