@@ -227,7 +227,7 @@ fn rig(name: &str, verdict: &'static str, pinned: bool) -> Rig {
             launches: launches.clone(),
         }),
     );
-    core.register_workflow(&fix_def(&format!("{name}-def"), pinned))
+    core.register_workflow(fix_def(&format!("{name}-def"), pinned))
         .expect("the fix def registers");
     let entry = core
         .register_repo(RepoSpec {
