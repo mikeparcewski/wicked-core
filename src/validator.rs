@@ -1663,7 +1663,9 @@ mod macos_group {
 
     /// The pids `proc_listpids` reports in group `pgid` (zombies included), or `None` when the
     /// list could not be read whole. XNU stops filling at the buffer's end, so a full buffer is
-    /// read again into a bigger one: only a complete list can say the group is empty.
+    /// read again into a bigger one: only a complete list can say the group is empty. The
+    /// wrapper answers 0 when the call fails; a real listing is never empty here, because the
+    /// unreaped leader stays in its group, so 0 is a failed read.
     fn members(pgid: i32) -> Option<Vec<libc::pid_t>> {
         let mut cap = 256usize;
         while cap <= 1 << 16 {
@@ -1673,7 +1675,7 @@ mod macos_group {
             let n = unsafe {
                 libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes)
             };
-            if n < 0 {
+            if n <= 0 {
                 return None;
             }
             if n < bytes {
@@ -1686,10 +1688,17 @@ mod macos_group {
         None
     }
 
-    /// Whether `pid` may still run as a member of `pgid`. `false` only when it is confirmed gone,
-    /// exited (a zombie cannot write), or now in another group; a read that fails for any other
-    /// reason counts it as live, so it is signalled again rather than assumed dead.
-    fn live_member(pid: libc::pid_t, pgid: i32) -> bool {
+    /// What a read of one listed pid says about it.
+    enum Member {
+        /// Still running in this group: signalled by pid.
+        Live,
+        /// Gone, exited (a zombie cannot write), or now in another group.
+        Gone,
+        /// The read failed: not signalled by pid (it was not verified), not counted as gone.
+        Unknown,
+    }
+
+    fn member(pid: libc::pid_t, pgid: i32) -> Member {
         // Safe: a zeroed proc_bsdinfo is a valid out-parameter for this flavor.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1703,9 +1712,17 @@ mod macos_group {
             )
         };
         if got == size {
-            return info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB;
+            return if info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB {
+                Member::Live
+            } else {
+                Member::Gone
+            };
         }
-        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            Member::Gone
+        } else {
+            Member::Unknown
+        }
     }
 
     /// SIGKILL every live member of `pgid` until none is left, for at most `cap`. The group's
@@ -1716,11 +1733,11 @@ mod macos_group {
     /// parent's `fork` returns. So a parent that the first pass sees exited has every child it
     /// forked listed by the second pass, which lists again after the first pass's checks.
     ///
-    /// Each member is checked (still in this group, not exited) right before its own SIGKILL. A
-    /// member's pid, unlike the leader's, is not reserved: if the member exits and is reaped
-    /// between the check and the kill, the pid is free. macOS hands out pids in sequence up to
-    /// 99999 before it wraps, so that pid going to another process within that gap would take
-    /// about 100,000 process starts. That is accepted.
+    /// Each member is read (still in this group, not exited) right before its own SIGKILL, and a
+    /// pid whose read failed is never signalled by pid. A member's pid, unlike the leader's, is
+    /// not reserved: if the member exits and launchd reaps it inside the gap between that read
+    /// and the kill, and the next pid handed out is that one, the kill reaches another process.
+    /// That gap is a few microseconds; the race is stated, not closed.
     pub(super) fn kill_until_empty(pgid: i32, cap: Duration) {
         if pgid <= 1 {
             return;
@@ -1733,10 +1750,14 @@ mod macos_group {
             if let Some(pids) = members(pgid) {
                 empty = true;
                 for pid in pids {
-                    if live_member(pid, pgid) {
-                        empty = false;
-                        // Safe: `pid` was a live member of this group (our child's) just above.
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    match member(pid, pgid) {
+                        Member::Gone => {}
+                        Member::Unknown => empty = false,
+                        Member::Live => {
+                            empty = false;
+                            // Safe: `pid` was read as a live member of this group just above.
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                        }
                     }
                 }
             }
@@ -6957,11 +6978,19 @@ mod tests {
             late.is_empty(),
             "a writer the validator backgrounded wrote after its verdict in: {late:?}"
         );
+        // A run tests the kill only when its subshell had started and had not yet written when
+        // the wait returned.
         for (name, _) in &launchers {
+            let tested = runs.iter().any(|(n, _, dir, verdict)| {
+                let written_before = std::fs::metadata(dir.join("f"))
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|wrote| wrote <= *verdict);
+                n == name && dir.join("s").exists() && !written_before
+            });
             assert!(
-                runs.iter()
-                    .any(|(n, _, dir, _)| n == name && dir.join("s").exists()),
-                "{name}: no run's subshell started at all, so this run proves nothing"
+                tested,
+                "{name}: no run had a started writer still pending at its verdict, so this \
+                 run proves nothing"
             );
         }
     }
