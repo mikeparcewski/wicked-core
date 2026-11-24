@@ -1187,8 +1187,24 @@ fn boundary_denial_judged(
             // relative write targets in subsequent segments land in the cd destination, not in the
             // process cwd (the worktree). Check the cd destination against the boundary so the
             // escape is caught before the write segments run.  Unit-fatal like any write escape.
-            let mut cds = bash_cd_escape_targets(command, &write_cwds, home);
-            cds.extend(bash_cd_escape_targets(command, &operands.cwds, home));
+            // One classification of the command's programs serves both the `cd` collection and
+            // the judgement below: a later rescan under an exhausted budget must never weaken it.
+            let (capability, classified) = command_write_capability(command);
+            let mut cds = bash_cd_escape_targets(command, &write_cwds, home, capability);
+            cds.extend(bash_cd_escape_targets(
+                command,
+                &operands.cwds,
+                home,
+                capability,
+            ));
+            // (crew#1795) A `cd` into a declared READ root (a chat's repository, a skill folder)
+            // in a command whose ONLY possible writer is a program that may write unseen (an
+            // interpreter, a shell) is refused ADVISORY with the form that works, so a question
+            // about a repository never ends at a rules card. Everything else stays a unit-fatal
+            // write escape: a program that writes in the form used (`git commit`, `rm`, `sed -i`),
+            // any write target in the command (a redirect, `cp`: the scan's view of where a
+            // program writes is not complete, `cp -t`, `sort -o`), a scan that ran out of budget,
+            // and another run's worktree.
             for (target, base) in cds
                 .iter()
                 .flat_map(|t| candidates.iter().map(move |b| (t, b)))
@@ -1197,11 +1213,34 @@ fn boundary_denial_judged(
                     continue;
                 };
                 if let Err(d) = crate::path_policy::check(target, roots, true, base, home) {
-                    let reason = format!("Bash `cd` leaves the unit boundary: {d}");
-                    if !in_system_temp(&d.resolved) {
-                        return Some((reason, true));
+                    if in_system_temp(&d.resolved) {
+                        advisory.get_or_insert(format!("Bash `cd` leaves the unit boundary: {d}"));
+                        continue;
                     }
-                    advisory.get_or_insert(reason);
+                    let read_root = capability == WriteCapability::Opaque
+                        && classified
+                        && writes.is_empty()
+                        && roots
+                            .read
+                            .iter()
+                            .any(|r| crate::path_policy::resolved_is_within(&d.resolved, r))
+                        && crate::path_policy::sibling_worktree(
+                            &d.resolved.to_string_lossy(),
+                            cwd,
+                            home,
+                        )
+                        .is_none();
+                    if !read_root {
+                        return Some((format!("Bash `cd` leaves the unit boundary: {d}"), true));
+                    }
+                    advisory.get_or_insert(format!(
+                        "{READ_ROOT_CD_REASON_PREFIX} {} is read-only to this job, and the command \
+                         also runs a program whose writes there cannot be checked (python, \
+                         node or a shell script), so it was not run. Run it from your \
+                         working folder and name the folder in the command instead, for \
+                         example `git -C <folder> log -5` or `ls <folder>`",
+                        d.resolved.display()
+                    ));
                 }
             }
             // ESTATE COMMAND FENCE (DES-GROUNDING-001 §7, issue #463): guard write-path access to
@@ -3562,6 +3601,10 @@ fn collect_bash_write_targets(
                 let args = &words[idx + 1..];
                 let mut c_paths: Vec<String> = Vec::new();
                 let mut j = 0;
+                // (crew#1795 round 2, F1) Judged with the words an `xargs` before git feeds it,
+                // including when no subcommand is written (`… | xargs git -C <dir>`: the fed
+                // words are the subcommand).
+                let mut subcommand_reads = git_reads_after(&words[..idx], &[]);
                 while j < args.len() {
                     if (args[j] == "-c" || args[j] == "--config") && j + 1 < args.len() {
                         // INDEPENDENT REVIEW item 6 (site 1): skip -c key=value so the value
@@ -3585,11 +3628,12 @@ fn collect_bash_write_targets(
                         j += 1;
                     } else {
                         // First non-flag word is the git subcommand.
-                        if !c_paths.is_empty() && !GIT_READ_VERBS.contains(&args[j]) {
-                            targets.extend(c_paths);
-                        }
+                        subcommand_reads = git_reads_after(&words[..idx], &args[j..]);
                         break;
                     }
+                }
+                if !subcommand_reads {
+                    targets.extend(c_paths);
                 }
             }
             // issue #540: `ln <src> <dest>` — the last non-flag argument is the destination.
@@ -3692,6 +3736,260 @@ const GIT_READ_VERBS: &[&str] = &[
     "fsck",
 ];
 
+/// Whether a git invocation only reads, given its words from the subcommand on (`args[0]` is the
+/// verb). Every [`GIT_READ_VERBS`] verb reads; (crew#1795) so do the LISTING forms of verbs that
+/// otherwise write — `git branch -a`, `git remote -v`, `git tag -l`, `git stash list`, `git worktree
+/// list`, `git reflog` — the forms a seat reaches for when it is asked about a repository. Any other
+/// word (a branch or tag name to create, an option this list does not know) is a write, as before.
+fn git_subcommand_reads(args: &[&str]) -> bool {
+    let Some((&verb, rest)) = args.split_first() else {
+        return true;
+    };
+    // (crew#1795 review r2) Judged as git receives each word, after the shell's quote removal:
+    // `'-m'` is the option `-m`, `$'--output=f'` is `--output=f`. A word the text cannot settle
+    // (an expansion, ANSI-C quoting) keeps only its literal start ([`GitWord::Lead`]).
+    let words: Vec<GitWord> = rest.iter().map(|a| GitWord::of(a)).collect();
+    let end_of_options = GitWord::Known("--".to_string());
+    // (crew#1795 round 2, F2; core#1859 B) `git stash list` consumes the `--` itself and hands
+    // the words after it to `git log` as options, so `stash list -- --output=f` writes `f`: a
+    // `stash` form is judged on every word.
+    let cut_at_dashdash = verb != "stash";
+    if words
+        .iter()
+        .take_while(|w| !cut_at_dashdash || **w != end_of_options)
+        .any(|w| git_option_writes(verb, w))
+    {
+        return false;
+    }
+    if GIT_READ_VERBS.contains(&verb) {
+        return true;
+    }
+    // A listing form is admitted only on words it can read in full, and on a glob that can only
+    // name operands (`git tag -l v*`; spelled so it matches no keyword).
+    let Some(rest) = words
+        .iter()
+        .map(|w| match w {
+            GitWord::Known(a) => Some(a.as_str()),
+            GitWord::Pattern(l) if !l.is_empty() && !l.starts_with('-') => Some("\0pattern"),
+            GitWord::Pattern(_) | GitWord::Lead(_) => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return false;
+    };
+    let only = |allowed: &[&str]| rest.iter().all(|a| allowed.contains(a));
+    match verb {
+        // No operand: a name would create a branch. `-l` is left out (old git read it as
+        // `--create-reflog`).
+        "branch" => only(&[
+            "-a",
+            "--all",
+            "-r",
+            "--remotes",
+            "-v",
+            "-vv",
+            "--verbose",
+            "--list",
+            "--show-current",
+            "--no-color",
+        ]),
+        // Bare, or `-l`/`--list` with patterns only: any other option (`-d`, `-a`, `-f`, `-m`
+        // whose message would be the next word) writes.
+        "tag" => {
+            rest.is_empty()
+                || (rest.iter().any(|a| matches!(*a, "-l" | "--list"))
+                    && rest
+                        .iter()
+                        .all(|a| !a.starts_with('-') || matches!(*a, "-l" | "--list")))
+        }
+        "remote" => {
+            only(&["-v", "--verbose"]) || matches!(rest.first(), Some(&("get-url" | "show")))
+        }
+        "stash" => matches!(rest.first(), Some(&("list" | "show"))),
+        "worktree" => matches!(rest.first(), Some(&"list")),
+        // Git takes the first word that is not an option as the subcommand, wherever the options
+        // stand (`git reflog --all expire` expires, agy r1 on #1849): `show`, `exists`, or none
+        // at all reads; anything else (`expire`, `delete`, a ref name) is judged a write.
+        "reflog" => rest
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .is_none_or(|a| matches!(*a, "show" | "exists")),
+        _ => false,
+    }
+}
+
+/// The word [`git_reads_after`] puts where `xargs` adds words of its own: an expansion, so git
+/// receives words of any spelling there ([`GitWord::Lead`] with no literal start).
+const XARGS_FED_WORD: &str = "\"$XARGS\"";
+
+/// (crew#1795 round 2, F1) [`git_subcommand_reads`] for a git program reached through the wrapper
+/// words `prefix` (`words[..idx]` of an [`Unwrapped::Program`]), given git's words from the
+/// subcommand on (empty when no subcommand is written). An `xargs` in the prefix runs git with
+/// words read from stdin that the command text never shows: appended after the last word, or, with
+/// a replace string (`-I R`, `-iR`, `-i`, `--replace[=R]`), in place of every word that holds it.
+/// Those words are judged as an expansion, which is a write unless git only takes them as
+/// pathspecs after `--`: `… | xargs git remote` runs `git remote set-url origin <url>`.
+fn git_reads_after(prefix: &[&str], args: &[&str]) -> bool {
+    let mut replace: Vec<String> = Vec::new();
+    let mut append = false;
+    let mut fed_at_all = false;
+    for at in (0..prefix.len()).filter(|&i| program_basename(prefix[i]) == "xargs") {
+        fed_at_all = true;
+        // This `xargs`'s own options only: they end at `--` or at the first word that is not an
+        // option or an option's value (the next wrapper or the program).
+        let mut own: Vec<String> = Vec::new();
+        let mut words = prefix[at + 1..].iter().map(|w| strip_one_quote_layer(w));
+        while let Some(flag) = words.next() {
+            if flag == "--" || !flag.starts_with('-') {
+                break;
+            }
+            let value_next = matches!(
+                flag,
+                "-a" | "--arg-file"
+                    | "-L"
+                    | "--max-lines"
+                    | "-n"
+                    | "--max-args"
+                    | "-d"
+                    | "--delimiter"
+                    | "-P"
+                    | "--max-procs"
+                    | "-s"
+                    | "--max-chars"
+                    | "-E"
+                    | "--eof"
+            );
+            if flag == "-I" {
+                own.extend(words.next().map(str::to_string));
+            } else if flag == "-i" || flag == "--replace" {
+                own.push("{}".to_string());
+            } else if let Some(r) = flag
+                .strip_prefix("--replace=")
+                .or_else(|| flag.strip_prefix("-I"))
+                .or_else(|| flag.strip_prefix("-i"))
+            {
+                own.push(r.to_string());
+            } else if value_next {
+                words.next();
+            }
+        }
+        own.retain(|r| !r.is_empty());
+        // Without a replace string this `xargs` appends; with one it substitutes. An outer
+        // `xargs` feeding an inner one appends to the inner one's words, so to git's.
+        append |= own.is_empty();
+        replace.extend(own);
+    }
+    if !fed_at_all {
+        return git_subcommand_reads(args);
+    }
+    let mut fed: Vec<&str> = args
+        .iter()
+        .map(|w| {
+            if replace.iter().any(|r| w.contains(r.as_str())) {
+                XARGS_FED_WORD
+            } else {
+                *w
+            }
+        })
+        .collect();
+    if append {
+        fed.push(XARGS_FED_WORD);
+    }
+    git_subcommand_reads(&fed)
+}
+
+/// One git argument as the shell hands it to git.
+#[derive(Debug, PartialEq)]
+enum GitWord {
+    /// The exact word, quotes removed and escapes applied.
+    Known(String),
+    /// A glob or a brace list (`v*`, `v{1,2}`): one or more words, each starting with this
+    /// literal text.
+    Pattern(String),
+    /// A word holding something the text cannot settle — an expansion (`"$x"`, `$(…)`) or ANSI-C
+    /// quoting (`$'…'`) — kept as the literal text before it. Unquoted, its value can split
+    /// into more words of any spelling.
+    Lead(String),
+}
+
+impl GitWord {
+    fn of(raw: &str) -> Self {
+        let chars: Vec<char> = raw.chars().collect();
+        let mut out = String::new();
+        let (mut single, mut double) = (false, false);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            i += 1;
+            if single {
+                if c == '\'' {
+                    single = false;
+                } else {
+                    out.push(c);
+                }
+                continue;
+            }
+            match c {
+                // An expansion here, or one the outer shell made of a `-c` word.
+                '$' | '`' | OPAQUE_EXPANSION => return Self::Lead(out),
+                '\\' if !cfg!(windows) => match chars.get(i) {
+                    Some(&n) if !double || matches!(n, '$' | '`' | '"' | '\\') => {
+                        out.push(n);
+                        i += 1;
+                    }
+                    Some('\n') => i += 1,
+                    Some(_) => out.push('\\'),
+                    None => return Self::Lead(out),
+                },
+                '"' => double = !double,
+                '\'' if !double => single = true,
+                '*' | '?' | '[' if !double => return Self::Pattern(out),
+                // A brace LIST (`{a,b}`, `{1..3}`) expands to several words; `stash@{0}` is one.
+                '{' if !double => {
+                    let body: String = chars[i..].iter().take_while(|&&n| n != '}').collect();
+                    if body.contains(',') || body.contains("..") {
+                        return Self::Pattern(out);
+                    }
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        if single || double {
+            return Self::Lead(out);
+        }
+        Self::Known(out)
+    }
+}
+
+/// (crew#1795 review) Whether one word of a reading git invocation may still write a file or run
+/// a program: `--output` (log, diff, show, and the verbs that take their options, `stash show` and
+/// `reflog`) and every abbreviation git accepts for it, `archive -o`, `fsck --lost-found`, `grep
+/// -O` / `--open-files-in-pager`. `--output-indicator-new`/`-old`/`-context` only change patch
+/// characters and read. A [`GitWord::Lead`] writes when the word it starts could still become one
+/// of these (`"$x"`, `--out$x`, `-$x`).
+fn git_option_writes(verb: &str, word: &GitWord) -> bool {
+    let (a, lead) = match word {
+        GitWord::Known(a) => (a.as_str(), false),
+        GitWord::Pattern(l) | GitWord::Lead(l) => (l.as_str(), true),
+    };
+    if lead && matches!(a, "" | "-") {
+        return true;
+    }
+    // The long option `full`, or an abbreviation of it at least `min` long; for a lead with no
+    // `=` yet, any start the rest of the word could complete into one.
+    let long = |full: &str, min: &str| match a.split_once('=') {
+        Some((name, _)) => name.starts_with(min) && full.starts_with(name),
+        None => (a.starts_with(min) || lead) && a.starts_with("--") && full.starts_with(a),
+    };
+    let short = a.starts_with('-') && !a.starts_with("--");
+    long("--output", "--out")
+        || (verb == "archive" && short && (lead || a.contains('o')))
+        || (verb == "fsck" && long("--lost-found", "--lo"))
+        || (verb == "grep"
+            && ((short && (lead || a.contains('O'))) || long("--open-files-in-pager", "--op")))
+}
+
 /// Interpreter programs that can write files with unresolvable targets when invoked with inline
 /// code (`-c`/`-e`/`-r`), a script argument, or stdin (`-`). Under ReadOnly posture,
 /// [`opaque_interpreter_denial`] refuses these when they look like code execution.
@@ -3704,46 +4002,92 @@ const OPAQUE_WRITER_PROGRAMS: &[&str] = &[
     "sh", "bash", "zsh", "dash",
 ];
 
-/// Returns `true` when `command` contains a program that can write files with targets that
-/// `bash_write_targets` cannot resolve from the command text — interpreters, shells without
-/// `-c`, git non-read verbs, `ln`, `sed`, `rm`, `truncate`, `patch` (item 4 of the review).
-/// Used by `bash_cd_escape_targets` to judge `cd` destinations even when there is no
-/// statically-resolvable write target.
-fn command_contains_write_capable_program(command: &str) -> bool {
+/// How a command's programs may write files whose targets `bash_write_targets` cannot resolve
+/// from the command text (item 4 of the review). Ordered: a command takes its strongest segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WriteCapability {
+    /// No such program: every write the command makes is a target the scan resolves.
+    None,
+    /// (crew#1795) A program whose code the scan cannot see — an interpreter, a shell without
+    /// `-c`, any `-c` wrapper. It MAY write; most often it only reads (`python3 -c 'print(…)'`).
+    Opaque,
+    /// A program invoked in a form that writes: a git verb that is not a read, `ln`, `rm`,
+    /// `truncate`, `patch`, a `sed` that may write.
+    Writes,
+}
+
+/// The strongest [`WriteCapability`] among `command`'s programs, and whether the scan read the
+/// command with the full wrapper grammar (`false`: the shared scan budget was spent, and main's
+/// grammar may have missed a wrapper). Used by `bash_cd_escape_targets` to judge `cd`
+/// destinations even when there is no statically-resolvable write target.
+fn command_write_capability(command: &str) -> (WriteCapability, bool) {
     let _scan = ShellScanGuard::scan(command, false);
+    let mut extended = _scan.extended;
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut seg: Vec<&str> = Vec::new();
+    // Every redirection and its spaced operand leave the argument stream, as in the write-target
+    // scan's segment builder (`git tag 2> /dev/null`: `/dev/null` is no argument of git's).
+    let mut operand_next = false;
     for &t in &toks {
         if SEPS.contains(&t) {
+            operand_next = false;
             if !seg.is_empty() {
                 segments.push(std::mem::take(&mut seg));
             }
-        } else if redirect_glob(t).is_none() {
+        } else if std::mem::take(&mut operand_next) {
+            // The spaced operand of the redirection before it: a file, a delimiter, a descriptor.
+        } else if let Some(takes_next) = redirection_operand(t) {
+            operand_next = takes_next;
+        } else {
             seg.push(t);
         }
     }
     if !seg.is_empty() {
         segments.push(seg);
     }
+    let mut strongest = WriteCapability::None;
     for (words, unwrapped) in segments.iter().flat_map(|words| {
         unwrap_programs(words)
             .into_iter()
             .map(move |unwrapped| (words, unwrapped))
     }) {
         match unwrapped {
-            Unwrapped::Inline { .. } => return true, // any -c wrapper is write-capable
+            // Any -c wrapper may write: its code is a string this scan does not run. What the
+            // inner command line shows is classified too, so wrapping a write in `sh -c` never
+            // makes it weaker (agy r1 on #1849): `bash -c 'rm -rf src'` writes.
+            // The inner text is classified exactly as the inner shell receives it (codex r2 on
+            // #1849: `bash -c "\"git\" branch x"` runs `"git" branch x`), as the write scan
+            // decodes it; text this decoding cannot settle is judged a write.
+            Unwrapped::Inline {
+                word, argv_tail, ..
+            } => {
+                let Some((mut exact, _)) = lex_shell_word(&word, None, true, !cfg!(windows)) else {
+                    return (WriteCapability::Writes, extended);
+                };
+                exact.push_str(&argv_tail);
+                let (nested, complete) = command_write_capability(&exact);
+                extended &= complete;
+                if nested == WriteCapability::Writes {
+                    return (WriteCapability::Writes, extended);
+                }
+                strongest = strongest.max(WriteCapability::Opaque);
+            }
             Unwrapped::Program { idx, .. } => {
                 let Some(prog) = words.get(idx) else { continue };
                 let basename = program_basename(prog);
                 if OPAQUE_WRITER_PROGRAMS.contains(&basename) {
-                    return true;
+                    strongest = strongest.max(WriteCapability::Opaque);
+                    continue;
                 }
                 if basename == "git" {
                     let args = &words[idx + 1..];
                     let mut j = 0;
+                    // (crew#1795 round 2, F1) As at the write-target site: the words an `xargs`
+                    // feeds git count, even with no subcommand written.
+                    let mut subcommand_reads = git_reads_after(&words[..idx], &[]);
                     while j < args.len() {
                         // INDEPENDENT REVIEW item 6 (site 2): skip the value of flags that
                         // take a separate-token argument so the value is never mistaken for
@@ -3759,15 +4103,22 @@ fn command_contains_write_capable_program(command: &str) -> bool {
                         } else if args[j].starts_with('-') {
                             j += 1;
                         } else {
-                            if !GIT_READ_VERBS.contains(&args[j]) {
-                                return true;
-                            }
+                            subcommand_reads = git_reads_after(&words[..idx], &args[j..]);
                             break;
                         }
                     }
+                    if !subcommand_reads {
+                        return (WriteCapability::Writes, extended);
+                    }
                 }
-                if matches!(basename, "ln" | "rm" | "truncate" | "patch") {
-                    return true;
+                // `cp`/`mv`/`install` write wherever their destination is, and the target scan
+                // can name the wrong word for it (`cp -t . /dev/null` writes `./null`; the scan
+                // takes the sink `/dev/null` and drops it, codex r2 on #1849).
+                if matches!(
+                    basename,
+                    "ln" | "rm" | "truncate" | "patch" | "cp" | "mv" | "install"
+                ) {
+                    return (WriteCapability::Writes, extended);
                 }
                 // (PRODUCT-WORKS J6) `sed` writes only in-place, from a script file this scan
                 // cannot read, or through a script command that writes (`w`, `s///w`, `e`). A
@@ -3775,12 +4126,12 @@ fn command_contains_write_capable_program(command: &str) -> bool {
                 // after `cd`-ing into a read root) is not write-capable: counting it made a design
                 // step's `cd <skill dir> && ls && sed -n …p` a boundary WRITE that denied the unit.
                 if basename == "sed" && sed_may_write(&words[idx + 1..]) {
-                    return true;
+                    return (WriteCapability::Writes, extended);
                 }
             }
         }
     }
-    false
+    (strongest, extended)
 }
 
 /// Whether a `sed` invocation (its arguments, after the program word, as `shell_tokens` spells
@@ -4050,9 +4401,10 @@ fn bash_cd_escape_targets(
     command: &str,
     destinations: &[String],
     home: Option<&Path>,
+    capability: WriteCapability,
 ) -> Vec<ShellTarget> {
     let _scan = ShellScanGuard::session();
-    if bash_write_targets(command).is_empty() && !command_contains_write_capable_program(command) {
+    if bash_write_targets(command).is_empty() && capability == WriteCapability::None {
         return Vec::new();
     }
     // (core#922) Judged as the shell resolves the destination, like the write targets are — and
@@ -6777,6 +7129,9 @@ pub(crate) const TOOL_LESS_REASON: &str = "this step answers from its prompt onl
 /// deny-dominates guarantee, so each fence names itself here, in the `engine:` namespace the
 /// phase-scope rule already uses (a structural property of the engine, not an operator-authored
 /// policy row): one id per fence, so an operator can grep and alert on the specific boundary.
+/// (crew#1795) The leading text of the ADVISORY refusal of a `cd` into a read root in a command
+/// whose program may write there unseen (an interpreter, a shell).
+pub(crate) const READ_ROOT_CD_REASON_PREFIX: &str = "Bash `cd` into a read-only folder:";
 pub(crate) const BOUNDARY_WRITE_RULE_ID: &str = "engine:filesystem-boundary-write";
 pub(crate) const BOUNDARY_READ_RULE_ID: &str = "engine:filesystem-boundary-read";
 pub(crate) const INFRA_RULE_ID: &str = "engine:governance-infra";
@@ -8726,6 +9081,419 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// crew#1795 (sitrep row 27, chat runs 6684f077 and 0f8437c5): a repo-scoped chat's seat
+    /// `cd`-ed into the chat's repository — a declared READ root — and the hook judged the `cd` a
+    /// boundary WRITE because the command also held a write-capable program, so the answer stopped
+    /// at a rules card. A `cd` into a read root is a read unless the command may write there:
+    /// - no write at all: allowed, and the listing forms of git (`branch -a`, `remote -v`, `tag
+    ///   -l`, `stash list`) are reads, at the `cd` and through `git -C`, unless an option writes
+    ///   (`--output`, `archive -o`, `fsck --lost-found`);
+    /// - a program whose writes cannot be seen (python, node, a `-c` shell) and nothing else that
+    ///   writes: refused ADVISORY with the form that works, never unit-fatal;
+    /// - a program that writes in the form used, or ANY write target (the scan's view of where a
+    ///   program writes is not complete: `cp -t`, `sort -o`): unit-fatal, as before;
+    /// - outside every root, or into another run's worktree under the read root: unit-fatal.
+    #[test]
+    fn a_cd_into_a_chat_read_root_is_a_read_unless_it_writes_1795() {
+        use crate::path_policy::AllowedRoots;
+        // Outside the system temp, as a registered repository is: a refusal there is FATAL.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("crew1795-cd-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("tiny-math");
+        let wt = repo.join("wicked-worktrees").join("own");
+        let sibling = repo.join("wicked-worktrees").join("other");
+        let outside = base.join("outside");
+        for d in [&wt, &sibling, &outside, &repo.join("src")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(repo.join("src").join("math.js"), "x").unwrap();
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![repo.clone()],
+        };
+        let check = |cmd: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            )
+        };
+        let r = shell_read_951_path(&repo);
+        let w = shell_read_951_path(&wt);
+        let o = shell_read_951_path(&outside);
+        let s = shell_read_951_path(&sibling);
+        for read in [
+            format!("cd {r} && git log --oneline -5"),
+            format!("cd {r} && ls -la && cat src/math.js"),
+            format!("cd {r} && git branch -a"),
+            format!("cd {r} && git branch --show-current && git remote -v"),
+            format!("cd {r} && git tag -l 'v*' && git stash list"),
+            format!("cd {r} && git worktree list && git reflog -5"),
+            format!("cd {r} && git remote get-url origin"),
+            format!("cd {r} && git log -3 2>/dev/null | head"),
+            format!("git -C {r} branch -a"),
+            format!("git -C {r} remote -v"),
+            format!("git -C {r} tag"),
+            // agy r1 on #1849: the shell's redirections are not git's words.
+            format!("cd {r} && git branch -a 2>/dev/null"),
+            format!("cd {r} && git remote -v 2>&1 | head"),
+            format!("cd {r} && git tag 2> /dev/null"),
+            format!("git -C {r} branch --show-current 2>/dev/null"),
+            // Codex r2 on #1849: patch-character options only read; a ref with `@{N}`, a quoted
+            // pattern and a pathspec glob after `--` are no options.
+            format!("git -C {r} diff --output-indicator-new=+ HEAD~1"),
+            format!("cd {r} && git log -p --output-indicator-old=- -1"),
+            format!("cd {r} && git stash show stash@{{0}}"),
+            format!("cd {r} && git tag -l \"v1.*\""),
+            format!("git -C {r} log --oneline -- *.rs"),
+        ] {
+            assert_eq!(check(&read), None, "a read: {read}");
+        }
+        for maybe in [
+            format!("cd {r} && python3 -c 'print(1)'"),
+            format!("cd {r} && node -e 'console.log(1)'"),
+            format!("cd {r} && bash -c 'ls src'"),
+            format!("cd {r}/src && python3 - <<'PY'\nprint(1)\nPY"),
+            format!("cd {r} && python3 -c 'print(1)' 2>/dev/null"),
+        ] {
+            let (reason, fatal) = check(&maybe).unwrap_or_else(|| panic!("refused: {maybe}"));
+            assert!(!fatal, "advisory, never a rules card: {maybe}: {reason}");
+            assert!(
+                reason.starts_with(READ_ROOT_CD_REASON_PREFIX)
+                    && reason.contains("git -C <folder> log -5"),
+                "{maybe}: {reason}"
+            );
+        }
+        for write in [
+            format!("cd {r} && git commit -qam x"),
+            format!("cd {r} && git checkout -b feature"),
+            format!("cd {r} && git branch feature"),
+            format!("cd {r} && git branch -l feature"),
+            format!("cd {r} && git branch -D main"),
+            format!("cd {r} && git tag v1"),
+            format!("cd {r} && git tag -d v1"),
+            format!("cd {r} && git tag -l -d v1"),
+            format!("cd {r} && git stash"),
+            format!("cd {r} && git remote add up u"),
+            format!("cd {r} && git worktree add x"),
+            format!("cd {r} && git reflog expire --all"),
+            format!("cd {r} && rm -rf build"),
+            format!("cd {r} && sed -i 's/a/b/' src/math.js"),
+            format!("cd {r} && echo x > src/out.txt"),
+            format!("cd {r} && python3 -c 'print(1)' > out.txt"),
+            format!("cd {r} && python3 -c 'x' && git checkout -b y"),
+            format!("git -C {r} branch feature"),
+            format!("git -C {r} tag v1"),
+            format!("cd {o} && python3 -c 'print(1)'"),
+            format!("cd {o} && git branch -a > out.txt"),
+            format!("cd {s} && python3 -c 'print(1)'"),
+            // Codex r1 on #1849: an option of a reading git form writes a file.
+            format!("cd {r} && git reflog --output=victim"),
+            format!("cd {r} && git reflog '--output=victim'"),
+            format!("cd {r} && git stash show --output=victim"),
+            format!("cd {r} && git log --outp=victim"),
+            format!("git -C {r} reflog --output={r}/victim"),
+            format!("git -C {r} log --output={o}/new"),
+            format!("git -C {r} archive -o {r}/x.tar HEAD"),
+            format!("cd {r} && git fsck --lost-found"),
+            // Any write target keeps the `cd` fatal: where a program writes is not always the
+            // operand the scan reads (`cp -t`), or a target at all (`sort -o`).
+            format!("cd {r} && cp -t . {w}/payload"),
+            format!("cd {r} && sort -o victim {w}/input > {w}/notes"),
+            format!("cd {r} && grep -rn sum src > {w}/notes.txt"),
+            format!("cd {r} && python3 -c 'print(1)' > {w}/out.txt"),
+            // agy r1 on #1849: options before the reflog subcommand, a wrapped write, a write to a
+            // target only the shell can resolve.
+            format!("cd {r} && git reflog --all expire --expire=now"),
+            format!("git -C {r} reflog --updateref delete HEAD@{{0}}"),
+            format!("cd {r} && bash -c 'rm -rf src'"),
+            format!("cd {r} && sh -c 'git branch -D main'"),
+            format!("cd {r} && echo x > \"$f\""),
+            // Codex r2 on #1849: each word is judged as git receives it. `'-m'` is an option
+            // (its message is `-l`, so this CREATES the tag), ANSI-C quoting and expansions may
+            // spell `--output`, an escaped inner quote still runs git, and `cp -t . /dev/null`
+            // writes `./null` although the scan reads `/dev/null` as the destination.
+            format!("git -C {r} tag '-m' -l injected"),
+            format!("cd {r} && git tag '-m' -l injected"),
+            format!("git -C {r} stash show $'--output={r}/victim'"),
+            format!("cd {r} && git stash show $'--output=victim'"),
+            format!("git -C {r} log \"$out\""),
+            format!("git -C {r} log --out\"put\"={r}/victim"),
+            format!("cd {r} && python3 --version && cp -t . /dev/null"),
+            format!("cd {r} && cp -t . /dev/null"),
+        ]
+        .into_iter()
+        // A backslash escapes only where the gate reads commands as a POSIX shell does.
+        .chain(
+            (!cfg!(windows)).then(|| format!("cd {r} && bash -c \"\\\"git\\\" branch injected\"")),
+        ) {
+            let (reason, fatal) =
+                check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
+            assert!(fatal, "a write escape is fatal: {write}: {reason}");
+        }
+        // Codex r1 on #1849: once the shared scan budget is spent, a rescan reads the command with
+        // main's grammar and can miss the `env -S` wrapper; the one classification made while the
+        // budget held decides, and the call stays blocked.
+        let padded = format!(
+            "{}cd {r} && env -S 'truncate -s 0 victim'",
+            " ".repeat(12_000)
+        );
+        assert!(
+            check(&padded).is_some(),
+            "an exhausted scan never admits it"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn git_listing_forms_read_and_every_other_form_writes_1795() {
+        for read in [
+            &["log", "-5"][..],
+            &["branch"],
+            &["branch", "-a"],
+            &["branch", "-vv", "--all"],
+            &["branch", "--show-current"],
+            &["remote"],
+            &["remote", "-v"],
+            &["remote", "show", "origin"],
+            &["remote", "get-url", "origin"],
+            &["tag"],
+            &["tag", "-l"],
+            &["tag", "--list", "v*"],
+            &["stash", "list"],
+            &["stash", "show", "-p"],
+            &["worktree", "list"],
+            &["reflog"],
+            &["reflog", "show", "-5"],
+            &["reflog", "-5"],
+            &["reflog", "exists", "main"],
+            &["grep", "-o", "x"],
+            &["archive", "--format=tar", "HEAD"],
+            &["fsck", "--full"],
+            &["log", "-O", "order.txt"],
+            // Codex r2 on #1849.
+            &["diff", "--output-indicator-new=+"],
+            &["log", "--output-indicator-context=."],
+            &["stash", "show", "stash@{0}"],
+            &["tag", "-l", "v1.*"],
+            &["tag", "-l", "\"v1.*\""],
+            &["log", "--", "*.rs", "--output=x"],
+            &["log", "--grep=\"$x\""],
+            &["log", "--format='%h %s'"],
+            &["reflog", "show", "HEAD@{1}"],
+            &[],
+        ] {
+            assert!(git_subcommand_reads(read), "{read:?}");
+        }
+        for write in [
+            &["branch", "x"][..],
+            &["branch", "-l"],
+            &["branch", "-d", "x"],
+            &["branch", "--list", "x*"],
+            &["branch", "-m", "y"],
+            &["tag", "v1"],
+            &["tag", "-d", "v1"],
+            &["tag", "-l", "-d", "v1"],
+            &["tag", "-a", "v1"],
+            &["remote", "add", "o", "u"],
+            &["remote", "-v", "add"],
+            &["remote", "set-url", "o", "u"],
+            &["stash"],
+            &["stash", "pop"],
+            &["worktree", "add", "x"],
+            &["worktree", "prune"],
+            &["reflog", "expire"],
+            &["reflog", "delete", "main@{0}"],
+            &["reflog", "--all", "expire", "--expire=now"],
+            &["reflog", "--updateref", "delete", "main@{0}"],
+            &["reflog", "main"],
+            &["commit", "-m", "x"],
+            &["fetch"],
+            &["config", "user.name", "x"],
+            &["log", "--output=x"],
+            &["diff", "--output", "x"],
+            &["show", "'--output=x'"],
+            &["reflog", "--outp=x"],
+            &["stash", "show", "--output=x"],
+            &["stash", "list", "--output=x"],
+            &["branch", "-a", "--output=x"],
+            &["archive", "-o", "x.tar", "HEAD"],
+            &["archive", "-vox.tar", "HEAD"],
+            &["fsck", "--lost-found"],
+            &["grep", "-O", "x"],
+            &["grep", "--open-files-in-pager=vi", "x"],
+            // Codex r2 on #1849: judged as git receives each word.
+            &["tag", "'-m'", "-l", "injected"],
+            &["tag", "\"-d\"", "-l", "v1"],
+            &["tag", "-l", "v$x"],
+            &["tag", "-l", "{-d,v1}"],
+            &["tag", "-l", "'-x'*"],
+            &["stash", "show", "$'--output=x'"],
+            &["log", "\"$out\""],
+            &["log", "$out"],
+            &["log", "--out\"put\"=x"],
+            &["log", "--out$x"],
+            &["log", "-$x"],
+            &["archive", "-v$x", "HEAD"],
+            &["branch", "-a", "$x"],
+        ]
+        .into_iter()
+        // A backslash escapes only where the gate reads commands as a POSIX shell does.
+        .chain((!cfg!(windows)).then_some(&["log", "--o\\utput=x"][..]))
+        {
+            assert!(!git_subcommand_reads(write), "{write:?}");
+        }
+    }
+
+    /// crew#1795 round 2 (coord review of #1849). F1: `xargs` runs git with words from stdin that
+    /// the command text never shows (appended, or in place of a `-I` replace string), so a listing
+    /// form under `xargs` is judged with those words, as an expansion: `… | xargs git -C <root>
+    /// remote` runs `git remote set-url origin <url>`. F2: `git stash list` hands the words after
+    /// its `--` to `git log` as options, so `stash list -- --output=f` writes (core#1859 B). The
+    /// two commands the crew#1795 chat runs were refused for are judged as they read now: run
+    /// 6684f077 is a read, run 0f8437c5 (`node` after the `cd`) is the advisory with the remedy.
+    /// Every row is checked and every failing row is listed, so a red run proves each one.
+    #[test]
+    fn xargs_fed_git_words_and_stash_list_after_dashdash_are_judged_1795_r2() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("crew1795-r2-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("tiny-math-rd");
+        let wt = repo.join("wicked-worktrees").join("own");
+        for d in [&wt, &repo.join("src")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![repo.clone()],
+        };
+        let check = |cmd: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            )
+        };
+        let r = shell_read_951_path(&repo);
+        let mut failures: Vec<String> = Vec::new();
+        for read in [
+            // Run 6684f077 unit 1, the command as refused (gateEvaluated seq 716 on the proof
+            // daemon), with the repository path replaced.
+            format!(
+                "cd {r} && git status | head -5; git branch -a; git log --oneline --all | head -20; ls; grep -rn \"median\" --include=* -r . -l --exclude-dir=.git --exclude-dir=node_modules | head"
+            ),
+            // Fed words after `--` are pathspecs for `log`: still a read.
+            format!("cd {r} && git ls-files | xargs git log -1 --oneline --"),
+            format!("git ls-files | xargs -I{{}} git -C {r} log -1 --oneline -- {{}}"),
+            format!("cd {r} && git branch -a | xargs echo"),
+        ] {
+            if check(&read).is_some() {
+                failures.push(format!("refused, but a read: {read}"));
+            }
+        }
+        // Run 0f8437c5 unit 2, the command as refused (seq 1421): an interpreter after the `cd`
+        // is the advisory refusal with the form that works, never the rules card.
+        let node = format!(
+            "cd {r} && node --test test/math.test.js 2>&1 | grep -E '^# |not ok|^ok' ; node -e 'import(\"./src/math.js\").then(m=>{{console.log(m.max([-0,0]),m.max([1,NaN,3]),m.max([NaN,1]),m.max([-Infinity]),m.mean([2,4]),m.sum([1,2,3]))}})'"
+        );
+        match check(&node) {
+            Some((reason, false)) if reason.starts_with(READ_ROOT_CD_REASON_PREFIX) => {}
+            other => failures.push(format!("not the advisory: {node}: {other:?}")),
+        }
+        for write in [
+            // F1: the four commands of the review.
+            format!(
+                "echo 'set-url origin https://attacker.example/x.git' | xargs git -C {r} remote"
+            ),
+            format!("cd {r} && echo -D wip | xargs git branch"),
+            format!("echo 'expire --expire=now --all' | xargs git -C {r} reflog"),
+            format!("cd {r} && echo '-m x v9' | xargs git tag"),
+            // F1: the other ways xargs feeds git.
+            format!("cd {r} && echo set-url | xargs -I{{}} git remote {{}} origin u"),
+            format!("echo -D | xargs -I % git -C {r} branch % wip"),
+            format!("cd {r} && echo -D | xargs -i git branch {{}} wip"),
+            format!("cd {r} && echo -D | xargs --replace git branch {{}} wip"),
+            format!("cd {r} && echo v9 | xargs -n 1 git tag"),
+            format!("cd {r} && echo -D wip | xargs -0 git branch"),
+            format!("cd {r} && echo -D wip | xargs env git branch"),
+            format!("cd {r} && echo -D wip | xargs xargs -I{{}} git branch {{}}"),
+            format!("echo 'branch -D wip' | xargs git -C {r}"),
+            format!("cd {r} && echo --output=victim | xargs git log"),
+            format!("cd {r} && echo --output=victim | xargs git stash list --"),
+            // F2: `stash list` hands what follows its `--` to `git log`.
+            format!("cd {r} && git stash list -- --output=victim"),
+            format!("git -C {r} stash list --format='all:%n\techo INJECTED' -- --output=Makefile"),
+        ] {
+            match check(&write) {
+                Some((_, true)) => {}
+                other => failures.push(format!("not fatal, but a write: {write}: {other:?}")),
+            }
+        }
+        for (args, reads) in [
+            (&["stash", "list", "--", "--output=x"][..], false),
+            (&["stash", "show", "--", "--output=x"], false),
+            (&["stash", "list", "--"], true),
+            (&["log", "--", "*.rs", "--output=x"], true),
+        ] {
+            if git_subcommand_reads(args) != reads {
+                failures.push(format!("git_subcommand_reads({args:?}) != {reads}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            failures.is_empty(),
+            "{} rows:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// crew#1795 round 2, F1: what `git_reads_after` makes of each `xargs` spelling (the wrapper
+    /// words before git, git's words from the subcommand on).
+    #[test]
+    fn git_reads_after_judges_the_words_xargs_feeds_1795_r2() {
+        for (prefix, args, reads) in [
+            (&[][..], &["branch"][..], true),
+            (&["env", "-i"], &["branch"], true),
+            (&["xargs"], &["branch"], false),
+            (&["xargs"], &["remote"], false),
+            (&["xargs"], &["reflog"], false),
+            (&["xargs"], &["tag"], false),
+            (&["xargs"], &[], false),
+            (&["xargs"], &["log"], false),
+            (&["xargs"], &["log", "-1", "--"], true),
+            (&["xargs"], &["stash", "list", "--"], false),
+            (&["xargs", "-n", "1"], &["tag"], false),
+            (&["xargs", "-0", "-L", "1"], &["branch", "-a"], false),
+            (&["xargs", "-I", "{}"], &["branch", "{}"], false),
+            (&["xargs", "-I{}"], &["log", "-1", "--", "{}"], true),
+            (&["xargs", "-I", "%"], &["%", "-a"], false),
+            (&["xargs", "-I", "{}"], &[], true),
+            (&["xargs", "-i"], &["branch", "{}"], false),
+            (&["xargs", "-iR"], &["branch", "-a"], true),
+            (&["xargs", "--replace"], &["tag", "-l", "{}"], false),
+            (&["xargs", "--replace=R"], &["branch", "--list", "R"], false),
+            (&["xargs", "env", "-i"], &["branch"], false),
+            (&["xargs", "xargs", "-I{}"], &["branch", "{}"], false),
+            (&["xargs", "xargs", "-I{}"], &["log", "--", "{}"], true),
+            (&["/usr/bin/xargs"], &["remote"], false),
+        ] {
+            assert_eq!(git_reads_after(prefix, args), reads, "{prefix:?} {args:?}");
+        }
     }
 
     /// PRODUCT-WORKS J6 (run 6f11390c unit 4, a design step): `cd <skill dir> && ls && sed -n 1,40p
