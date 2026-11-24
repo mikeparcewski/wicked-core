@@ -6547,13 +6547,15 @@ mod judge_bench_tests {
     /// denies, or a tree whose checks failed would pass the machine gate.
     #[test]
     fn a_carried_environment_refusal_of_the_default_floor_still_denies() {
+        // The writer's shape: the admission refusal (repo_checks.rs `FloorSlot::admit` →
+        // `runner_refused`) with the disk guard's own text, stamped with the tree it was asked to
+        // judge (cli_runner.rs `FloorPlan::finish`).
+        let why = crate::repo_checks::disk_guard(Some(1 << 30), 15).expect("refused");
+        assert!(crate::repo_checks::is_environment_refusal(&why));
         let refused = serde_json::json!({
-            "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
-            "sandbox_error": format!(
-                "{} the host has 1.0 GiB free on the check cache's volume; no check ran",
-                crate::repo_checks::ENVIRONMENT_REFUSAL_PREFIX
-            ),
-            "tree": "t1", "checks": [],
+            "detected": [], "skipped": [], "passed": false,
+            "sandbox_level": crate::validator::SandboxLevel::BestEffort.as_wire(),
+            "sandbox_error": why, "tree": "t1", "checks": [],
         });
         assert_eq!(
             fold_unchanged_tree("carry-environment", refused).as_deref(),
