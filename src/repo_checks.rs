@@ -592,8 +592,9 @@ pub struct CheckRun {
     /// when the engine did not retry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetrySummary>,
-    /// (core#1186) Set to the check's directory when this run's failure ids were shown to be a
-    /// complete, file-qualified account of its failures: a `rerun … by: "file"` check whose own
+    /// (core#1186) Set to the directory the failure ids are relative to (core#1709: the check's
+    /// directory joined with its `rerun` entry's `root`, [`runner_root`]) when this run's failure
+    /// ids were shown to be a complete, file-qualified account of its failures: a `rerun … by: "file"` check whose own
     /// runner summary counts exactly the failing files the ids name, with no error outside a test
     /// ([`crate::floor_scoped::head_complete`]) and nothing cut at the id cap. Only such a list may
     /// stand for "the tests the operator ruled on" when a later fresh floor is compared with an
@@ -1967,6 +1968,28 @@ impl OpenJournal {
     }
 }
 
+/// (core#1709) The directory a check's file-qualified failure ids are relative to: its own
+/// directory joined with its `rerun` entry's `root` (`/`-separated; either may be empty).
+pub(crate) fn runner_root(dir: &str, root: &str) -> String {
+    match (dir.is_empty(), root.is_empty()) {
+        (_, true) => dir.to_string(),
+        (true, false) => root.to_string(),
+        (false, false) => format!("{dir}/{root}"),
+    }
+}
+
+/// (core#1709) The name a failing test is qualified by in [`RepoChecksReport::failing_set`]: the
+/// targeted test set runs the same tests as the full one, so a failure the operator overrode in a
+/// creator floor's `test_targeted` is the same failure in the verify floor's full `test` (the
+/// same runner root, [`runner_root`], and the same test id), and the override carries to it when
+/// its failures are a subset.
+pub(crate) fn test_set_name(check: &str) -> &str {
+    match check {
+        "test_targeted" => "test",
+        other => other,
+    }
+}
+
 /// (j4-gates) A failed floor's failing tests against the run base ([`RepoChecksReport::failure_split`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FailureSplit {
@@ -2398,7 +2421,8 @@ impl RepoChecksReport {
     }
 
     /// (core#1186) Every failing test this report's denying checks named, qualified by the check's
-    /// directory and name (`<dir>|<check>: <id>`), in first-seen order — the list an operator's
+    /// directory and name (`<dir>|<check>: <id>`; core#1709: `test_targeted` is named `test`,
+    /// [`test_set_name`]), in first-seen order — the list an operator's
     /// override is recorded as having ruled on, and that a later FRESH floor on the same tree is
     /// compared with. `None` unless every denying check's head run named a complete, file-qualified
     /// account of its failures ([`CheckRun::failures_complete_in`]) and no later run of it (the
@@ -2435,7 +2459,7 @@ impl RepoChecksReport {
                 return None;
             }
             for id in &deciding.failure_ids {
-                let named = format!("{dir}|{}: {id}", c.name);
+                let named = format!("{dir}|{}: {id}", test_set_name(&c.name));
                 if !out.contains(&named) {
                     out.push(named);
                 }

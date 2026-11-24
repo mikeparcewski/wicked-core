@@ -594,7 +594,10 @@ pub(super) fn run_detected(
                     && s.complete.is_ok()
                     && run.failure_ids.len() < MAX_FAILURE_IDS
                 {
-                    run.failures_complete_in = Some(check.dir.clone());
+                    // (core#1709) The directory the ids are relative to: the check's own joined
+                    // with the declared `rerun.<check>.root`, so two checks whose runners name
+                    // files from different roots never qualify a test alike.
+                    run.failures_complete_in = Some(runner_root(&check.dir, &s.root));
                 }
             }
             if let Some(Err(why)) = &scoped {

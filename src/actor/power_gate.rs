@@ -130,7 +130,47 @@ pub(super) fn on_checkpoint(
         });
     }
     let graph_key = power_graph_key(&*store, &session);
-    let scored = if report.paths.is_empty() {
+    // (core#1709) At the hand-off the re-score reads the run's DIFF exactly as the QE decision
+    // does (the whole worktree against the base: lines, history, whole files), never the paths
+    // alone: a lowering must not rest on a thinner score than acceptance uses. When that diff
+    // cannot be read the rigor is never lowered.
+    // The worker read the diff off this thread ([`crate::power::handoff_diff`]); only the graph
+    // read happens here, as it does for every checkpoint.
+    let handoff_scored = (report.trigger == "pre_handoff").then(|| {
+        let signals = match &report.handoff_diff {
+            Some(Ok(s)) => s,
+            Some(Err(why)) => return Err(why.clone()),
+            None => return Err("the build's worktree was not read at the hand-off".to_string()),
+        };
+        let root = session
+            .repo_ref
+            .as_deref()
+            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+            .map(|r| r.root_path)
+            .ok_or("the run has no registered repository")?;
+        let base = session
+            .base_commit
+            .as_deref()
+            .ok_or("the run's base commit is unknown")?;
+        let (assessment, destructive) = crate::qe_acceptance::diff_assessment(
+            signals,
+            std::path::Path::new(&root),
+            base,
+            graph_key.as_deref(),
+        );
+        Ok(crate::plan_gate::Scored {
+            assessment,
+            destructive,
+        })
+    });
+    let (handoff_scored, unread) = match handoff_scored {
+        Some(Ok(s)) => (Some(s), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
+    let scored = if let Some(s) = handoff_scored {
+        Some(s)
+    } else if report.paths.is_empty() {
         None
     } else {
         Some(crate::plan_gate::diff_score_for_run(
@@ -238,6 +278,14 @@ pub(super) fn on_checkpoint(
             to.as_str(),
             to.tests()
         ));
+    } else if let Some(why) = unread.as_deref().filter(|_| is_final) {
+        reasons.insert(
+            0,
+            format!(
+                "Rigor is not lowered at the hand-off: {why}, so the change cannot be scored as \
+                 QE acceptance scores it"
+            ),
+        );
     } else if is_final {
         // (operator ruling 2026-10-29) Lowering only here, from evidence, one band, within the
         // hand-off only (fewer tests, never fewer reviewers), never below a floor.
@@ -705,6 +753,18 @@ pub(super) fn handoff_step(
     let Ok(Some(mut session)) = crate::domain::get_session(&*store, run_id) else {
         return;
     };
+    // (core#1709) A step that went on because the operator overrode its floor did not pass. The
+    // build's `checks` row keeps its floor's `failed`, which the run's floor override turns into
+    // "Overridden by you" on the hand-off card (studio's `handoffRow`); any other step says it
+    // stands on the override.
+    let overridden = status == "passed" && floor_overridden(&session, unit);
+    let (status, summary) = match (overridden, step) {
+        (true, s) => (
+            if s == "checks" { "failed" } else { status },
+            summary.or_else(|| Some(crate::assurance::FLOOR_OVERRIDE_LABEL.to_string())),
+        ),
+        (false, _) => (status, summary),
+    };
     let Some(power) = session.power.as_mut() else {
         return;
     };
@@ -738,6 +798,17 @@ pub(super) fn handoff_step(
             step: Box::new(row),
         },
     );
+}
+
+/// (core#1709) Did the operator override `unit`'s floor at its latest attempt (or did an override
+/// carry onto that attempt's floor)?
+fn floor_overridden(session: &AgentSession, unit: &crate::domain::WorkUnit) -> bool {
+    let attempt = unit.last_attempt.unwrap_or(0);
+    session.assurance.floor_overrides.iter().any(|j| {
+        j.floor_override
+            .as_ref()
+            .is_some_and(|f| f.ord == unit.ord && f.attempt == attempt)
+    })
 }
 
 /// At a dispatch on a power run: every hand-off step still `running` on an earlier ord passed
@@ -794,7 +865,8 @@ pub(super) fn on_dispatch(
                     s.round == h.round
                         && s.step == "checks"
                         && s.ord == Some(b.ord)
-                        && s.status == "passed"
+                        && (s.status == "passed"
+                            || (s.status == "failed" && floor_overridden(&session, b)))
                 })
             });
             if !floored {
@@ -1414,6 +1486,7 @@ mod held_pause_tests {
             reverts: 0,
             failed_runs: 0,
             summary: String::new(),
+            handoff_diff: None,
         }
     }
 
@@ -1448,6 +1521,180 @@ mod held_pause_tests {
         let mut off = held("pw-off", (true, false, false, false));
         off.power.as_mut().unwrap().on = false;
         assert!(held_pause(&off).is_none());
+    }
+
+    /// (core#1709) The hand-off checkpoint scores the run's DIFF as QE acceptance does, never the
+    /// paths the worker listed alone: here the listed path is a doc (score 0) while the worktree
+    /// changed code, which (no code graph indexed) fails closed at the top band. The worker reads
+    /// the diff ([`crate::power::handoff_diff`], strict snapshot); a hand-off whose diff could not
+    /// be read is never lowered from where it stands, and says why.
+    #[cfg(unix)]
+    #[test]
+    fn the_hand_off_rescore_reads_the_same_diff_as_qe_acceptance() {
+        let dir = crate::repo_checks::tests::scratch("pw-1709-rescore");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "docs\n").unwrap();
+        std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        let base = crate::repo_checks::tests::git_repo_with_commit(&dir);
+        // The build's uncommitted change: code, though the listed path is the doc.
+        std::fs::write(dir.join("src/a.rs"), "pub fn a() { b() }\npub fn b() {}\n").unwrap();
+        let git_dir = std::fs::canonicalize(dir.join(".git")).unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let repo = crate::repo::register_repo(
+            &mut store,
+            crate::repo::RepoSpec {
+                name: format!("pw-1709-{}", std::process::id()),
+                root_path: dir.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let session = |id: &str| {
+            let mut s = held(id, (false, false, false, false));
+            s.power.as_mut().unwrap().pause = None;
+            s.repo_ref = Some(repo.id.clone());
+            s.base_commit = Some(base.clone());
+            s
+        };
+        // The worker's read, as orchestrate makes it at `pre_handoff`, through the baseline the
+        // dispatch pinned on the unit (`snapshot_through` records the git dir it read through).
+        let mut unit =
+            crate::domain::WorkUnit::pending("pw-1709-diff:build", "pw-1709-diff", 1, "build");
+        unit.worktree_baseline =
+            Some(crate::worktree_guard::snapshot_through(&dir, &git_dir).unwrap());
+        assert!(unit.worktree_baseline.as_ref().unwrap().git_dir.is_some());
+        let mut thin = report("pre_handoff");
+        thin.paths = vec!["README.md".into()];
+        let mut whole = thin.clone();
+        whole.handoff_diff = Some(crate::power::handoff_diff(&dir, &unit, Some(&base)));
+        let signals = whole
+            .handoff_diff
+            .clone()
+            .unwrap()
+            .expect("the diff was read");
+        assert_eq!(signals.code_files, 1, "{signals:?}");
+        let id = "pw-1709-diff";
+        put_node(&mut store, session(id).to_node()).unwrap();
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &whole).unwrap();
+        let top = Rigor::of(crate::review_scale::THRESHOLDS.no_graph_score, false);
+        assert_eq!(a.rigor, Some(top), "the diff's code change was scored");
+        crate::power::forget_run(id);
+        // Unread (the worker's strict snapshot failed): the run stays at High, though the listed
+        // doc path alone would score it Light.
+        let id = "pw-1709-unread";
+        let mut s = session(id);
+        s.power.as_mut().unwrap().rigor = Some(Rigor::High);
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut unread = thin.clone();
+        unread.handoff_diff = Some(Err("the hand-off's worktree could not be read whole".into()));
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &unread).unwrap();
+        assert_eq!(
+            a.rigor,
+            Some(Rigor::High),
+            "an unread hand-off is never lowered"
+        );
+        let row = crate::domain::get_session(&store, id)
+            .unwrap()
+            .unwrap()
+            .power
+            .unwrap()
+            .history
+            .last()
+            .cloned()
+            .expect("a re-score row");
+        assert!(
+            row.reasons.iter().any(|r| r.starts_with(
+                "Rigor is not lowered at the hand-off: the hand-off's \
+                     worktree could not be read whole"
+            )),
+            "{:?}",
+            row.reasons
+        );
+        crate::power::forget_run(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1709) After an operator overrode a unit's floor, its hand-off row never reads "passed":
+    /// the build's `checks` row keeps `failed` (the card shows "Overridden by you" from the run's
+    /// floor override), another step says it stands on the override, and the run moving past the
+    /// build does not add a second checks row. Without an override the row passes as before.
+    #[test]
+    fn a_hand_off_step_after_a_floor_override_reads_overridden() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let id = "pw-1709-label";
+        let mut s = held(id, (false, false, false, false));
+        s.power.as_mut().unwrap().pause = None;
+        s.power.as_mut().unwrap().orchestrator.ord = Some(1);
+        let mut build = crate::domain::WorkUnit::pending(format!("{id}:build"), id, 1, "build");
+        build.catalog = Some("build".into());
+        build.last_attempt = Some(1);
+        let mut qe = crate::domain::WorkUnit::pending(format!("{id}:test"), id, 2, "verify");
+        qe.catalog = Some("test".into());
+        let mut deliver =
+            crate::domain::WorkUnit::pending(format!("{id}:deliver"), id, 3, "deliver");
+        deliver.catalog = Some("deliver".into());
+        let judged = |ord: u32, attempt: u32| crate::assurance::OperatorJudgment {
+            by: "operator".into(),
+            at: 0,
+            note: Some("load flake".into()),
+            reason: None,
+            floor_override: Some(crate::assurance::FloorOverride {
+                layer: "repo_checks".into(),
+                result_id: format!("{id}:unit-{ord}:attempt-{attempt}:repo_checks"),
+                ord,
+                attempt,
+                tree: None,
+                label: crate::assurance::FLOOR_OVERRIDE_LABEL.into(),
+                key: None,
+                carried_from: None,
+                failing: None,
+                fingerprint: None,
+            }),
+            judge_stand_in: None,
+        };
+        // An override of an EARLIER attempt is not this round's.
+        s.assurance.floor_overrides = vec![judged(1, 0)];
+        put_node(&mut store, s.to_node()).unwrap();
+        handoff_step(&mut store, &mut sink, id, &build, "passed", None);
+        let last = |store: &dyn GraphStore| {
+            crate::domain::get_session(store, id)
+                .unwrap()
+                .unwrap()
+                .power
+                .unwrap()
+                .handoff
+                .unwrap()
+                .steps
+        };
+        assert_eq!(last(&store).last().unwrap().status, "passed");
+        let mut s = crate::domain::get_session(&store, id).unwrap().unwrap();
+        s.power.as_mut().unwrap().handoff = None;
+        s.assurance.floor_overrides = vec![judged(1, 1), judged(2, 0)];
+        put_node(&mut store, s.to_node()).unwrap();
+        for u in [&build, &qe, &deliver] {
+            put_node(&mut store, u.to_node()).unwrap();
+        }
+        handoff_step(&mut store, &mut sink, id, &build, "passed", None);
+        handoff_step(&mut store, &mut sink, id, &qe, "passed", None);
+        let steps = last(&store);
+        let checks = steps.iter().find(|r| r.step == "checks").unwrap();
+        assert_eq!(checks.status, "failed", "{steps:?}");
+        assert_eq!(
+            checks.summary.as_deref(),
+            Some(crate::assurance::FLOOR_OVERRIDE_LABEL)
+        );
+        let q = steps.iter().find(|r| r.step == "qe").unwrap();
+        assert_eq!(q.status, "passed");
+        assert_eq!(
+            q.summary.as_deref(),
+            Some(crate::assurance::FLOOR_OVERRIDE_LABEL)
+        );
+        // The run moves past the build: no second checks row.
+        on_dispatch(&mut store, &mut sink, id, &deliver);
+        let checks_rows = last(&store).iter().filter(|r| r.step == "checks").count();
+        assert_eq!(checks_rows, 1, "{:?}", last(&store));
     }
 
     /// A stale pause (on a run switched to phased) is cleared and persisted; a held one is not.
