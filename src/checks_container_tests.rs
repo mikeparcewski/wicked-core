@@ -1909,6 +1909,12 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     let npm = root.join("lib/node_modules/npm/bin/npm-cli.js");
     crate::test_env::install_stub(&npm, "#!/bin/sh\nexit 0\n");
     std::os::unix::fs::symlink(&npm, bin.join("npm")).unwrap();
+    // With JAIL_ABI2 set, the jail proof answers as on a Landlock ABI v1/v2 kernel (core#1886):
+    // the open refused, the truncate allowed.
+    crate::test_env::install_stub(
+        &bin.join("python3"),
+        "#!/bin/sh\n[ -z \"$JAIL_ABI2\" ] || exit 5\nPATH=/usr/bin:/bin exec python3 \"$@\"\n",
+    );
     crate::test_env::install_stub(
         &bin.join("node"),
         "#!/bin/sh\nif [ -n \"$GYP_FAILS\" ]; then mkdir -p build/Release && : > build/Release/partial.node; exit 7; fi\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
@@ -1972,6 +1978,11 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     refused(&[("JAIL_OPEN", "1")], "Landlock is not in force");
     // An existing file at the claim's top still truncatable under the jail: refused.
     refused(&[("CANARY_OPEN", "1")], "Landlock is not in force");
+    // A kernel whose Landlock cannot deny truncation says so (core#1886).
+    refused(
+        &[("JAIL_ABI2", "1")],
+        "Landlock on this kernel is too old to confine truncation (it needs ABI v3, Linux 6.2 or newer)",
+    );
     // A claim the engine cannot write (full, read-only): the confined refusal would prove nothing.
     let mut ro = std::fs::metadata(&claim).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut ro, 0o555);
@@ -2041,12 +2052,199 @@ fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
         (0, 1),
         "both refused by Landlock: proven"
     );
-    // ABI v1/v2: the open refused, the truncate allowed (it ran: the canary is empty).
-    assert_eq!(proof(eacces, "0"), (4, 0));
+    // ABI v1/v2: the open refused, the truncate allowed (it ran: the canary is empty). Its own
+    // code (core#1886), so the script says the kernel's Landlock is too old, not absent.
+    assert_eq!(proof(eacces, "0"), (5, 0));
     assert_eq!(proof("0", eacces).0, 4, "a writable canary");
     assert_eq!(proof(enospc, eacces).0, 4, "a full claim is no denial");
     assert_eq!(proof(eacces, enospc).0, 4);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// core#1886, core#1887: a seat claim's native build through `build_native`, against a stand-in
+/// cluster whose `kubectl exec` runs the engine's own build script (its paths re-pointed into a
+/// scratch dir, a stand-in launcher, and a `python3` that answers the jail proof as a Landlock ABI
+/// v1/v2 kernel does: the open refused, the truncate allowed). kubectl's stderr is then the
+/// script's own, ended by kubectl's `command terminated with exit code N` line, as a real
+/// `kubectl exec` writes it (src/k8s/seat_tests.rs pins that line for a write-back error).
+#[cfg(unix)]
+mod native_build_refusals {
+    use super::*;
+
+    struct RuntimeChoice(Option<std::ffi::OsString>);
+
+    impl Drop for RuntimeChoice {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(crate::container_floor::RUNTIME_ENV, v),
+                None => std::env::remove_var(crate::container_floor::RUNTIME_ENV),
+            }
+        }
+    }
+
+    const KUBECTL: &str = r#"#!/usr/bin/env python3
+import json, pathlib, subprocess, sys
+base = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+args = args[next(i for i, v in enumerate(args) if v in ('apply', 'get', 'exec', 'delete')):]
+with (base / 'calls').open('a') as f: f.write(json.dumps(args) + '\n')
+statefile = base / 'state.json'
+state = json.loads(statefile.read_text()) if statefile.exists() else {}
+def save(): statefile.write_text(json.dumps(state))
+if args[0] == 'apply':
+    body = json.load(sys.stdin)
+    if (base / 'refuse-apply').exists():
+        sys.stderr.write('Error from server (Forbidden): exceeded quota\n')
+        sys.exit(1)
+    for d in body['items']:
+        d['status'] = {'phase': 'Running', 'hostIP': '10.0.0.2',
+            'conditions': [{'type': 'Ready', 'status': 'True'}],
+            'containerStatuses': [{'name': 'floor', 'ready': True}]}
+        state[d['metadata']['name']] = d
+    save()
+elif args[0] == 'get':
+    if args[1] == 'nodes':
+        print(json.dumps({'items': [{'metadata': {'name': 'n', 'uid': 'n-uid'}, 'spec': {},
+            'status': {'nodeInfo': {'containerRuntimeVersion': 'docker://27.0.0'}}}]}))
+    elif args[1] == 'pvc':
+        print(json.dumps({'metadata': {'name': args[2], 'labels': {'wicked.dev/owner': 'me'}}}))
+    elif args[1] == 'pod' and args[2] in state:
+        print(json.dumps(state[args[2]]))
+elif args[0] == 'delete':
+    state.pop(args[2], None)
+    save()
+elif args[0] == 'exec':
+    script = args[-1]
+    if 'nc_()' in script:
+        print('net=closed node=closed')
+        sys.exit(0)
+    with (base / 'builds').open('a') as f: f.write('build\n')
+    for k, v in json.loads((base / 'paths.json').read_text()).items():
+        script = script.replace(k, v)
+    p = subprocess.run(['/bin/sh', '-c', script], capture_output=True,
+        env={'PATH': str(base / 'bin') + ':/usr/bin:/bin'})
+    sys.stdout.buffer.write(p.stdout)
+    sys.stderr.buffer.write(p.stderr)
+    if p.returncode:
+        sys.stderr.write('command terminated with exit code %d\n' % p.returncode)
+        sys.exit(p.returncode)
+else:
+    sys.stderr.write('unexpected kubectl: %s\n' % args)
+    sys.exit(1)
+"#;
+
+    fn lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_build_the_kernel_refuses_says_why_and_is_not_retried_by_the_next_unit() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("native-refused-{}", uuid::Uuid::new_v4()));
+        let claim = dir.join("vol");
+        std::fs::create_dir_all(claim.join("better-sqlite3")).unwrap();
+        std::fs::write(claim.join("better-sqlite3/package.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        // A docker-runtime node shares the builder's image store: no load runs, and the stand-in
+        // runtime only answers `version`.
+        let runtime = RuntimeChoice(std::env::var_os(crate::container_floor::RUNTIME_ENV));
+        let docker = dir.join("docker");
+        crate::test_env::install_stub(
+            &docker,
+            "#!/bin/sh\ncase \"$1\" in version) echo 27;; *) exit 98;; esac\n",
+        );
+        std::env::set_var(crate::container_floor::RUNTIME_ENV, &docker);
+        let landrun = dir.join("landrun");
+        crate::test_env::install_stub(
+            &landrun,
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        // Landlock ABI v1/v2: the write-open of the canary is refused, its truncate is not.
+        crate::test_env::install_stub(&dir.join("bin/python3"), "#!/bin/sh\nexit 5\n");
+        let paths = std::collections::BTreeMap::from([
+            (FILL_DIR.to_string(), claim.display().to_string()),
+            (
+                "/tmp/wicked-native".into(),
+                dir.join("t").display().to_string(),
+            ),
+            ("/floor/landrun".into(), landrun.display().to_string()),
+        ]);
+        std::fs::write(
+            dir.join("paths.json"),
+            serde_json::to_string(&paths).unwrap(),
+        )
+        .unwrap();
+        let kubectl = dir.join("kubectl");
+        crate::test_env::install_stub(&kubectl, KUBECTL);
+        let place = crate::k8s::floor::Place {
+            kube: crate::k8s::Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "me".into(),
+            },
+            ns: format!("nb-{}", uuid::Uuid::new_v4()),
+            run: "run".into(),
+            owned: false,
+        };
+        let filler = Filler {
+            place: &place,
+            tag: "image",
+            floor_image: "floor",
+            memory: "6g",
+            git_dir: Path::new("unused.git"),
+        };
+        let volume = seat_nm_volume("image", b"{}", b"", &["better-sqlite3"]);
+        let (calls, builds) = (dir.join("calls"), dir.join("builds"));
+
+        // A pod the cluster does not admit is transient: the next unit tries again.
+        std::fs::write(dir.join("refuse-apply"), "").unwrap();
+        let first = filler.build_native(&volume, &["better-sqlite3"]);
+        assert!(
+            first.as_ref().is_err_and(|e| e.contains("not admitted")),
+            "{first:?}"
+        );
+        std::fs::remove_file(dir.join("refuse-apply")).unwrap();
+
+        // core#1886: the note is the script's own reason, never kubectl's exit line; and on a
+        // kernel whose Landlock cannot deny truncation it says so (not "not in force").
+        let refused = filler
+            .build_native(&volume, &["better-sqlite3"])
+            .expect_err("the jail proof fails on this kernel");
+        assert_eq!(lines(&builds), 1, "the retry reached the build");
+        assert!(
+            refused.contains("Landlock on this kernel is too old to confine truncation")
+                && refused.contains("ABI v3, Linux 6.2 or newer"),
+            "{refused}"
+        );
+        assert!(!refused.contains("command terminated"), "{refused}");
+        assert!(!refused.contains("not in force"), "{refused}");
+        assert!(
+            place
+                .kube
+                .get_json(Some(&place.ns), "pod", &format!("build-{volume}"))
+                .unwrap()
+                .is_none(),
+            "the build pod is gone"
+        );
+
+        // core#1887: the jail proof cannot pass in this run, so a later unit starts no pod (no
+        // kubectl call at all) and gets the same note.
+        let before = lines(&calls);
+        let again = filler.build_native(&volume, &["better-sqlite3"]);
+        assert_eq!(again.as_ref().err(), Some(&refused), "{again:?}");
+        assert_eq!(lines(&calls), before, "no build pod, no kubectl call");
+        assert_eq!(lines(&builds), 1);
+
+        forget_namespace(&place.ns);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// core#1406: the native addons a seat's claim is built for come from the snapshot tree's own

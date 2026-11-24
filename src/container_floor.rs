@@ -4663,6 +4663,116 @@ esac
         assert!(ro_dev && !rw_shm, "{p:?}");
     }
 
+    /// core#1888: the browser layer is best effort only where the base's archive has no candidate
+    /// for its packages. Any other failure (an index fetch, a partial download) is retried once and
+    /// then fails the build, so a passing mirror error never bakes a browserless image that is
+    /// reused until this file changes. The layer's own shell runs here, with `apt-get`,
+    /// `apt-cache` and `sleep` stand-ins and its system paths re-pointed into a scratch dir.
+    #[cfg(unix)]
+    #[test]
+    fn the_browser_layer_falls_back_only_when_the_archive_has_no_candidate_core1888() {
+        let joined = SEAT_DOCKERFILE.replace("\\\n", "");
+        let layer = joined
+            .lines()
+            .find(|l| l.starts_with("RUN ") && l.contains("chromium fonts-liberation ffmpeg"))
+            .expect("the browser layer");
+        let root = std::env::temp_dir().join(format!("seat-browser-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = layer
+            .trim_start_matches("RUN ")
+            .replace(
+                "/etc/chromium.d",
+                &root.join("chromium.d").display().to_string(),
+            )
+            .replace(
+                "/var/lib/apt/lists",
+                &root.join("lists").display().to_string(),
+            );
+        // `apt-get` logs each call and fails the next `<verb>-fails` times; a good install brings
+        // chromium's launcher dir. `apt-cache policy` answers as apt does: a package the archive
+        // lists with no installable version shows `Candidate: (none)`, an unknown one prints nothing.
+        crate::test_env::install_stub(
+            &bin.join("apt-get"),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROOT/apt.log\"\n\
+             f=\"$ROOT/$1-fails\"; n=$(cat \"$f\" 2>/dev/null || echo 0)\n\
+             if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$f\"; echo \"E: $1 failed\" >&2; exit 100; fi\n\
+             [ \"$1\" != install ] || mkdir -p \"$ROOT/chromium.d\"\n",
+        );
+        crate::test_env::install_stub(
+            &bin.join("apt-cache"),
+            "#!/bin/sh\n[ \"$1\" = policy ] || exit 1\n\
+             if grep -qx \"$2\" \"$ROOT/unknown\" 2>/dev/null; then exit 0; fi\n\
+             c=1.0-1; if grep -qx \"$2\" \"$ROOT/none\" 2>/dev/null; then c='(none)'; fi\n\
+             printf '%s:\\n  Installed: (none)\\n  Candidate: %s\\n  Version table:\\n' \"$2\" \"$c\"\n",
+        );
+        crate::test_env::install_stub(&bin.join("sleep"), "#!/bin/sh\nexit 0\n");
+        let run = |setup: &[(&str, &str)]| -> (bool, String, Vec<String>, bool) {
+            let _ = std::fs::remove_dir_all(root.join("chromium.d"));
+            for f in [
+                "apt.log",
+                "update-fails",
+                "install-fails",
+                "none",
+                "unknown",
+            ] {
+                let _ = std::fs::remove_file(root.join(f));
+            }
+            std::fs::create_dir_all(root.join("lists")).unwrap();
+            for (f, body) in setup {
+                std::fs::write(root.join(f), body).unwrap();
+            }
+            // spawn-audit: test-only — runs the seat Dockerfile's browser layer against stand-ins.
+            let o = std::process::Command::new("/bin/sh")
+                .hardened()
+                .args(["-c", &script])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("ROOT", &root)
+                .output()
+                .unwrap();
+            let log = std::fs::read_to_string(root.join("apt.log")).unwrap_or_default();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                log.lines().map(str::to_string).collect(),
+                root.join("chromium.d/wicked-seat").is_file(),
+            )
+        };
+        let installs = |log: &[String]| log.iter().filter(|l| l.starts_with("install")).count();
+        // The archive has them: installed, and Chromium gets the seat flags.
+        let (ok, err, log, flags) = run(&[]);
+        assert!(ok && flags, "{err}");
+        assert_eq!(installs(&log), 1, "{log:?}");
+        // A failed index fetch is an error, never read as a missing package.
+        assert!(
+            log.iter()
+                .filter(|l| l.starts_with("update"))
+                .all(|l| l.contains("APT::Update::Error-Mode=any")),
+            "{log:?}"
+        );
+        // No candidate for one of them (listed with none, or not known at all): the image still
+        // builds without a browser, says which is missing, and installs nothing.
+        for (file, what) in [("none", "chromium"), ("unknown", "ffmpeg")] {
+            let (ok, err, log, flags) = run(&[(file, what)]);
+            assert!(ok && !flags, "{file}: {err}");
+            assert_eq!(installs(&log), 0, "{file}: {log:?}");
+            assert!(err.contains(what), "{file}: {err}");
+        }
+        // A passing install failure is retried; one that stays fails the build.
+        let (ok, err, log, flags) = run(&[("install-fails", "1")]);
+        assert!(ok && flags, "{err}");
+        assert_eq!(installs(&log), 2, "{log:?}");
+        let (ok, _, log, flags) = run(&[("install-fails", "2")]);
+        assert!(!ok && !flags, "{log:?}");
+        assert_eq!(installs(&log), 2, "{log:?}");
+        // So does an index fetch that keeps failing.
+        let (ok, _, log, _) = run(&[("update-fails", "2")]);
+        assert!(!ok, "{log:?}");
+        assert_eq!(installs(&log), 0, "{log:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn one_slow_runtime_answer_is_retried_not_final() {
         let mut calls = 0;

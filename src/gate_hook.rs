@@ -10913,6 +10913,12 @@ mod tests {
             ("c2.B1", Read, format!("git -c log.showSignature=false -C {r} log")),
             ("c2.B1", Read, format!("cd {r} && GIT_PAGER=cat git log -5")),
             ("c2.B1", Read, format!("cd {r} && git -c core.pager=cat log -3")),
+            // (core#1882) `less` runs LESSOPEN's preprocessor on what git pipes into it (`|-`): only
+            // a pager that prints nothing but its input is harmless.
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' GIT_PAGER=less git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("LESSOPEN='|- touch {o}/victim' git -c core.pager=less -C {r} -p log -1")),
+            ("i1882", Advisory, format!("GIT_PAGER='less -FRX' git -C {r} -p log -1")),
+            ("i1882", Advisory, format!("git -c pager.log=more -C {r} log -1")),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (
