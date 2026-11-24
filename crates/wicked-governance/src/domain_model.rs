@@ -2093,6 +2093,12 @@ pub fn persist_domain_model_expecting(
     record
         .metadata
         .insert("req_high".to_string(), serde_json::to_value(&high)?);
+    if !previous.retired.is_empty() {
+        record.metadata.insert(
+            RETIRED_KEY.to_string(),
+            serde_json::Value::Array(previous.retired.clone()),
+        );
+    }
     // The code this build was made from (P1, operator ruling 2026-11-06): the store's indexed commit now.
     if let Some(commit) = store
         .repo_info()?
@@ -2176,6 +2182,9 @@ struct BuildRecord {
     /// The commit the code graph was indexed at when this build was written (`None` on a build from
     /// before the record carried it): what "built from code N commits old" counts from.
     code_commit: Option<String>,
+    /// Every requirement an operator retired ([`retire_requirement`], core#1698), oldest first:
+    /// the paper trail, carried into each later build's record.
+    retired: Vec<serde_json::Value>,
 }
 
 fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
@@ -2202,6 +2211,12 @@ fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
             .and_then(|v| v.as_str())
             .filter(|c| !c.is_empty())
             .map(str::to_string),
+        retired: node
+            .metadata
+            .get(RETIRED_KEY)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -2507,6 +2522,152 @@ pub fn stabilize_requirement_ids(
 /// The number of a `REQ-nnn` id.
 fn req_number(key: &str) -> Option<u32> {
     key.strip_prefix("REQ-").and_then(|n| n.parse().ok())
+}
+
+/// The build-record key of the retirement log ([`retire_requirement`]).
+const RETIRED_KEY: &str = "retired";
+
+/// What [`retire_requirement`] removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredRequirement {
+    /// The code unit the requirement was made from, gone from the index.
+    pub code_symbol: String,
+    /// Its business-rule nodes removed with it.
+    pub rules: usize,
+    /// The build generation the retirement wrote (readers see the graph change).
+    pub generation: u64,
+}
+
+/// (core#1698) Retire requirement `req` of `domain` on purpose: a requirement whose code left the
+/// index is otherwise kept across re-maps and flagged unindexed until its unit returns (#1446), so
+/// a deleted feature's row stays listed for ever. Only such a row may be retired: one whose
+/// recorded code unit is still in the index (or that recorded none) is refused, since the next
+/// build would only map it again under a new id. Every check and read happens before the write.
+/// Then, in one batch (refused, with nothing written, when another build or retire moved the
+/// generation since): the requirement and its business-rule nodes are removed; every graph node
+/// with an edge into them (its domain's `Contains`, another requirement's `References`) is
+/// rewritten without that edge, since the store removes a node's own edges but not the edges into
+/// it; and the build record moves to a new generation with the retirement on its log. The next
+/// build carries no row (it carries only rows still in the store), and the id stays retired: the
+/// record's high-water mark holds its number, so no later requirement of the domain is given it.
+pub fn retire_requirement(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    domain: &str,
+    req: &str,
+) -> anyhow::Result<RetiredRequirement> {
+    use wicked_apps_core::{synthetic_symbol, SymbolId};
+    use wicked_estate_core::Direction;
+    let record = read_build_record(&*store)?;
+    if !record.exists {
+        anyhow::bail!("no requirements graph has been built for this repository yet");
+    }
+    let nodes = previous_graph_nodes(&*store)?;
+    let Some((_, _, node)) = requirement_ids(&nodes)
+        .into_iter()
+        .find(|(d, r, _)| *d == domain && *r == req)
+    else {
+        anyhow::bail!("the requirements graph has no {domain}::{req}");
+    };
+    let Some(code) = node.metadata.get("code_symbol").and_then(|v| v.as_str()) else {
+        anyhow::bail!(
+            "{domain}::{req} records no code unit (a graph built by an older wicked-core), so \
+             whether its code left the index cannot be told; map the repository again, then retire it"
+        );
+    };
+    if store.get_node(&SymbolId::from(code))?.is_some() {
+        anyhow::bail!(
+            "the code of {domain}::{req} ({code}) is still in the index; only a requirement whose \
+             code was deleted can be retired"
+        );
+    }
+    let code = code.to_string();
+    let high = previous_req_high(&*store)?;
+    // What goes: the requirement and the rule nodes its id path owns.
+    let req_file = format!("{REQUIREMENT_FILE_PREFIX}{domain}/{req}");
+    let rule_prefix = format!("{RULE_FILE_PREFIX}{domain}/{req}/");
+    let gone: Vec<&wicked_apps_core::Node> = nodes
+        .iter()
+        .filter(|n| n.location.file == req_file || n.location.file.starts_with(&rule_prefix))
+        .collect();
+    let gone_syms: std::collections::HashSet<&str> =
+        gone.iter().map(|n| n.symbol.as_str()).collect();
+    // What stays but points at it: each such graph node with every edge it keeps.
+    let mut sources: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for n in &gone {
+        for e in store.neighbors(&n.symbol, Direction::Dependents)? {
+            if !gone_syms.contains(e.source.as_str()) {
+                sources.insert(e.source.to_string());
+            }
+        }
+    }
+    let mut rewrite = Vec::new();
+    let mut kept_edges = Vec::new();
+    for sym in &sources {
+        let Some(n) = nodes.iter().find(|n| n.symbol.as_str() == sym) else {
+            anyhow::bail!(
+                "{sym} points at {domain}::{req} but is not part of the requirements graph; \
+                 nothing was retired"
+            );
+        };
+        kept_edges.extend(
+            store
+                .neighbors(&n.symbol, Direction::Dependencies)?
+                .into_iter()
+                .filter(|e| !gone_syms.contains(e.target.as_str())),
+        );
+        rewrite.push(n.clone());
+    }
+    let generation = record.generation + 1;
+    let mut rnode = store
+        .get_node(&synthetic_symbol(BUILD_SCHEME, BUILD_ID))?
+        .ok_or_else(|| anyhow::anyhow!("the requirements graph's build record is unreadable"))?;
+    let mut log = record.retired.clone();
+    log.push(serde_json::json!({
+        "domain": domain,
+        "id": req,
+        "code_symbol": code,
+        "at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }));
+    rnode
+        .metadata
+        .insert("generation".to_string(), serde_json::json!(generation));
+    rnode
+        .metadata
+        .insert("req_high".to_string(), serde_json::to_value(&high)?);
+    rnode
+        .metadata
+        .insert(RETIRED_KEY.to_string(), serde_json::Value::Array(log));
+    let files: Vec<String> = gone
+        .iter()
+        .map(|n| n.location.file.clone())
+        .chain(rewrite.iter().map(|n| n.location.file.clone()))
+        .collect();
+    rewrite.push(rnode);
+
+    store.begin_batch()?;
+    let now = read_build_record(&*store)?.generation;
+    if now != record.generation {
+        store.commit_batch()?; // nothing written: release the write lock
+        anyhow::bail!(
+            "the requirements graph changed while {domain}::{req} was being retired (generation \
+             {now}, expected {}); nothing was retired — try again",
+            record.generation
+        );
+    }
+    for file in &files {
+        store.remove_file(file)?;
+    }
+    store.upsert_nodes(&rewrite)?;
+    store.upsert_edges(&kept_edges)?;
+    store.commit_batch()?;
+    Ok(RetiredRequirement {
+        code_symbol: code,
+        rules: gone.len() - 1,
+        generation,
+    })
 }
 
 /// The requirements graph as the estate store holds it — the source of truth
@@ -4016,6 +4177,106 @@ mod tests {
                 .0;
             assert_eq!(rows["src"][id].uncounted, Some(Uncounted::Structural));
             assert!(rows["src"][id].real);
+        }
+
+        /// core#1698: a requirement whose code was deleted is kept and flagged unindexed on every
+        /// re-map (#1446) until an operator retires it. Retire removes the row now; the next
+        /// re-map does not carry it back; its id stays retired even when the same code returns
+        /// (it takes a new id); the log survives the rebuild; a row whose code is still indexed is
+        /// refused. Falsifier: skip the removal and the rebuilt graph still lists the row.
+        #[test]
+        fn a_retired_unindexed_requirement_stays_gone_and_its_id_is_never_reused() {
+            let mut s = store();
+            let a = node(&mut s, "charge", NodeKind::Function, "billing/charge.rs");
+            let b = node(&mut s, "refund", NodeKind::Function, "billing/refund.rs");
+            map(&mut s, &a, "seat", "rule");
+            map(&mut s, &b, "seat", "rule");
+            let mut first = build_at(&s, 100);
+            stabilize_requirement_ids(&s, &mut first).unwrap();
+            persist_domain_model(&mut s, &first).unwrap();
+            let reqs = &first.domains["billing"].requirements;
+            let id_of = |sym: &wicked_apps_core::SymbolId| {
+                reqs.iter()
+                    .find(|(_, r)| r.code_symbol.as_deref() == Some(sym.as_str()))
+                    .map(|(k, _)| k.clone())
+                    .unwrap()
+            };
+            let (gone, kept) = (id_of(&a.symbol), id_of(&b.symbol));
+            // The kept requirement depends on the one retired: its `References` edge must go too.
+            let mut first = first.clone();
+            first
+                .domains
+                .get_mut("billing")
+                .unwrap()
+                .requirements
+                .get_mut(&kept)
+                .unwrap()
+                .dependencies = vec![gone.clone()];
+            persist_domain_model(&mut s, &first).unwrap();
+            let gone_sym = synthetic_symbol("requirement", &format!("billing/{gone}"));
+            assert!(!s
+                .neighbors(&gone_sym, wicked_estate_core::Direction::Dependents)
+                .unwrap()
+                .is_empty());
+            let err = retire_requirement(&mut s, "billing", &gone).unwrap_err();
+            assert!(err.to_string().contains("is still in the index"), "{err}");
+            s.remove_file("billing/charge.rs").unwrap();
+            let before = load_domain_graph_with_build(&s)
+                .unwrap()
+                .unwrap()
+                .1
+                .generation;
+            let retired = retire_requirement(&mut s, "billing", &gone).unwrap();
+            assert_eq!(retired.code_symbol, a.symbol.to_string());
+            assert_eq!(retired.generation, before + 1);
+            let (graph, build, _, _) = load_domain_graph_with_units(&s).unwrap().unwrap();
+            assert_eq!(build.generation, before + 1);
+            let listed = graph["domains"]["billing"]["requirements"]
+                .as_object()
+                .unwrap();
+            assert!(
+                !listed.contains_key(&gone) && listed.contains_key(&kept),
+                "{listed:?}"
+            );
+            assert!(
+                s.neighbors(&gone_sym, wicked_estate_core::Direction::Dependents)
+                    .unwrap()
+                    .is_empty(),
+                "no edge into the retired requirement is left behind"
+            );
+            let kept_sym = synthetic_symbol("requirement", &format!("billing/{kept}"));
+            assert!(s
+                .neighbors(&kept_sym, wicked_estate_core::Direction::Dependencies)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == wicked_apps_core::EdgeKind::SatisfiedBy));
+            // The next re-map does not carry it, and a second retire finds nothing.
+            let mut rebuilt = build_at(&s, 100);
+            stabilize_requirement_ids(&s, &mut rebuilt).unwrap();
+            assert!(!rebuilt.domains["billing"].requirements.contains_key(&gone));
+            persist_domain_model(&mut s, &rebuilt).unwrap();
+            assert!(retire_requirement(&mut s, "billing", &gone)
+                .unwrap_err()
+                .to_string()
+                .contains("has no billing::"));
+            assert_eq!(
+                read_build_record(&s).unwrap().retired.len(),
+                1,
+                "the log survives"
+            );
+            // The same code comes back: it is mapped again under a NEW id.
+            let returned = node(&mut s, "charge", NodeKind::Function, "billing/charge.rs");
+            map(&mut s, &returned, "seat", "rule");
+            let mut again = build_at(&s, 100);
+            stabilize_requirement_ids(&s, &mut again).unwrap();
+            let reqs = &again.domains["billing"].requirements;
+            let back = reqs
+                .iter()
+                .find(|(_, r)| r.code_symbol.as_deref() == Some(a.symbol.as_str()))
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            assert_ne!(back, gone, "a retired id is never handed out again");
+            assert!(reqs.contains_key(&kept));
         }
 
         #[test]
