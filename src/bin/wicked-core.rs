@@ -1471,6 +1471,14 @@ fn min_coverage_pct_arg(
 /// `model-call` (DES-j6-build D1): one prompt to the run's `claude` or `codex` seat through the Tool
 /// step's channel. Opens no store and spawns no actor: the daemon that armed the step runs the seat.
 fn model_call_cmd(args: &[String]) {
+    // A flag named with no value after it is bad input, never the default (codex r1 on #1894).
+    for name in ["--family", "--in", "--out", "--timeout-s"] {
+        if let Some(i) = args.iter().position(|a| a == name) {
+            if args.get(i + 1).is_none_or(|v| v.starts_with("--")) {
+                return fail(&format!("model-call: {name} needs a value"));
+            }
+        }
+    }
     let family = match flag(args, "--family") {
         Some(f) if wicked_core::model_call::FAMILIES.contains(&f.as_str()) => f,
         Some(f) => {

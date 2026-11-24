@@ -1,14 +1,17 @@
 //! (DES-j6-build D1, seam C0) A Tool step's model calls.
 //!
 //! A host Tool step (`domain-run`) makes prompt-in, text-out model calls, and a host process
-//! reaches no seat on its own. Every generic Tool unit is therefore armed with a channel back to
-//! the daemon that runs it: a unix socket in a fresh private directory, named to the command by
-//! [`SOCK_ENV`] and [`TOKEN_ENV`], and closed when the command exits ([`Channel`]'s drop). Each
-//! request runs as ONE seat call through the engine's own one-shot carrier
+//! reaches no seat on its own. A Tool unit of a step a SHIPPED preset declares
+//! ([`MODEL_CALL_STEPS`], [`shipped_step`]) is therefore armed with a channel back to the daemon
+//! that runs it: a unix socket in a fresh private directory, named to the command by
+//! [`SOCK_ENV`] and [`TOKEN_ENV`], and closed when the command exits ([`Channel`]'s drop). No other
+//! Tool unit is armed. Each request runs as ONE seat call through the engine's own one-shot carrier
 //! ([`crate::decision::SeatBallots`], the council's ballot path) on the daemon's step runner: under
 //! the container floor it is a seat-container call through the gateway, and under the host floor
-//! the same runner the engine's judges use. The prompt goes to the seat byte-exact (no run-context
-//! block). The client is `wicked-core model-call` ([`call_from_env`]).
+//! the same runner the engine's judges use. The call runs tool-free under the engine's own
+//! postures ([`tool_free`]); the prompt is the unit's whole task (no run-context block), and the
+//! runner adds only its posture's instruction. The client is `wicked-core model-call`
+//! ([`call_from_env`]).
 //!
 //! The wire is one JSON line each way: a [`Request`] in, a [`Reply`] out.
 //!
@@ -42,6 +45,12 @@ const STDOUT_CAP: usize = 4 * 1024 * 1024;
 const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 /// How often the listener looks for a stop between connections.
 const POLL: Duration = Duration::from_millis(100);
+/// How long a connection may take to send its request, and the reader to take the reply.
+const IO_DEADLINE: Duration = Duration::from_secs(60);
+/// The most connections one channel serves at once (a Tool step makes its calls a few at a time).
+const MAX_CONNECTIONS: usize = 16;
+/// How long a timed-out call's seat is waited for before its connection is answered.
+const REAP_BOUND: Duration = Duration::from_secs(30);
 
 /// One model call, as the client sends it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,24 +126,29 @@ impl Seats {
             .timeout_s
             .unwrap_or(DEFAULT_TIMEOUT_S)
             .clamp(1, MAX_TIMEOUT_S);
-        let Some(cli) = no_tools(cli) else {
-            return Reply::refused(format!(
-                "the `{}` seat's invocation cannot run as a tool-free model call",
-                cli.key
-            ));
-        };
-        let cli = &cli;
+        if let Some(why) = carried_prompt_refusal(
+            &cli.key,
+            req.prompt.len(),
+            crate::container_floor::container_mode(),
+        ) {
+            return Reply::refused(why);
+        }
         use wicked_council::types::BallotCarrier;
-        let carrier = crate::decision::SeatBallots::new(self.runner.clone(), Some(&self.run_id));
+        let carrier = crate::decision::SeatBallots::new(self.runner.clone(), Some(&self.run_id))
+            .model_calls();
         let task = format!("model-call-{}-{}", self.run_id, self.ord);
-        match carrier.run_ballot(
+        let out = carrier.run_ballot(
             cli,
             &task,
             &req.prompt,
             Duration::from_secs(secs),
             None,
             STDOUT_CAP,
-        ) {
+        );
+        // A seat that timed out and has not stopped is waited for here, so this connection's
+        // answer comes after the seat's end (or after the bound).
+        carrier.reaper().reap(REAP_BOUND);
+        match out {
             Ok(run) if run.exit_ok => Reply {
                 ok: true,
                 cli: Some(cli.key.clone()),
@@ -176,11 +190,18 @@ impl Seats {
 /// `(preset, step id)`. Only these are armed ([`shipped_step`]); a repo-defined Tool step never is.
 pub(crate) const MODEL_CALL_STEPS: &[(&str, &str)] = &[("domain-extraction", "domain-run")];
 
-/// Whether `unit` of a run of `preset` is a declared model-call step of a SHIPPED preset: the run's
-/// preset and the unit's step are declared in [`MODEL_CALL_STEPS`], and the unit's command is
-/// byte-for-byte the built-in step's command. A repo or user preset that reuses the name with any
-/// other command, or a registered workflow's Tool step, is not armed.
-pub(crate) fn shipped_step(preset: Option<&str>, unit: &crate::domain::WorkUnit) -> bool {
+/// Whether `unit` of a run of `preset` against `repo` is a declared model-call step of a SHIPPED
+/// preset: the run's preset and the unit's step are declared in [`MODEL_CALL_STEPS`], and the
+/// unit's command is the built-in step's command bound to the run's repo by the planner's own
+/// binder ([`crate::plan::bind_repo_paths`]), byte for byte. A preset that reuses the name with any
+/// other command, or a registered workflow's Tool step, is not armed. (A project preset that
+/// shadows the name keeping the exact command runs the shipped program, which the engine hands
+/// the garden root; it makes no call the shipped preset would not.)
+pub(crate) fn shipped_step(
+    preset: Option<&str>,
+    unit: &crate::domain::WorkUnit,
+    repo: Option<&crate::repo::RepoEntry>,
+) -> bool {
     let declared = |p: &str| MODEL_CALL_STEPS.iter().any(|(dp, _)| *dp == p);
     if !preset.is_some_and(declared) {
         return false;
@@ -190,6 +211,7 @@ pub(crate) fn shipped_step(preset: Option<&str>, unit: &crate::domain::WorkUnit)
         &crate::catalog::builtin_presets(),
         preset,
         unit,
+        repo,
     )
 }
 
@@ -198,6 +220,7 @@ fn declared_in(
     shipped: &[(&'static str, Vec<crate::plan::PlanStep>)],
     preset: Option<&str>,
     unit: &crate::domain::WorkUnit,
+    repo: Option<&crate::repo::RepoEntry>,
 ) -> bool {
     let (Some(preset), Some(step), Some(cmd)) = (preset, unit.phase_id(), unit.tool_cmd.as_ref())
     else {
@@ -206,36 +229,55 @@ fn declared_in(
     if !decl.iter().any(|(p, s)| *p == preset && *s == step) {
         return false;
     }
-    shipped
+    let Some(template) = shipped
         .iter()
         .find(|(name, _)| *name == preset)
         .and_then(|(_, steps)| steps.iter().find(|s| s.id == step))
         .and_then(|s| match &s.executor {
-            Some(crate::workflow::PhaseExecutor::Tool { cmd }) => Some(cmd),
+            Some(crate::workflow::PhaseExecutor::Tool { cmd }) => Some(cmd.clone()),
             _ => None,
         })
-        .is_some_and(|shipped_cmd| shipped_cmd == cmd)
+    else {
+        return false;
+    };
+    let mut bound = crate::domain::WorkUnit::pending(unit.id.clone(), "", unit.ord, "");
+    bound.tool_cmd = Some(template);
+    if let Some(repo) = repo {
+        crate::plan::bind_repo_paths(std::slice::from_mut(&mut bound), repo);
+    }
+    bound.tool_cmd.as_ref() == Some(cmd)
 }
 
-/// The seat as a model call runs it: prompt in, text out, no tools (DES-j6-build D1, as the J6 v3 proof
-/// ran it). Claude gets `--tools ""`; Codex gets `-s read-only` (an invocation that already names a
-/// sandbox is refused, never run with it).
-/// Both run in the call's own empty scratch tree (the unit has no workdir). Under the container
-/// floor the floor turns codex's own sandbox off (it cannot run in a seat container,
-/// `worker_sandbox::codex_sandbox_off_under_floor`), and the container is the boundary. `None` for
-/// an invocation with no `{PROMPT}` token to place the flags before, or one this cannot make tool-free.
-pub(crate) fn no_tools(cli: &crate::AgenticCli) -> Option<crate::AgenticCli> {
-    let inv = cli.headless_invocation.as_str();
-    let at = inv.find("\"{PROMPT}\"").or_else(|| inv.find("{PROMPT}"))?;
-    let flags = match cli.key.as_str() {
-        "claude" => "--tools \"\" ",
-        "codex" if inv.contains(" -s ") || inv.contains("--sandbox") => return None,
-        "codex" => "-s read-only ",
-        _ => return None,
-    };
-    let mut out = cli.clone();
-    out.headless_invocation = format!("{}{flags}{}", &inv[..at], &inv[at..]);
-    Some(out)
+/// (coord fold 2) A model call runs tool-free, as the J6 v3 proof ran it, under the engine's own
+/// postures ([`crate::write_posture::WritePosture::of`]) so the runner reconciles them with the
+/// seat's invocation and resolved trust flags at its one launch boundary:
+/// - claude is an answer-only unit, the tool-less posture: `--tools ""` (core#1257);
+/// - codex is a read-only evaluator, codex's `--sandbox read-only` lever in a per-call check
+///   scratch, the tree denied (F-036, core#503). Under the container floor the floor turns codex's
+///   own sandbox off, and the seat container is the boundary.
+pub(crate) fn tool_free(unit: &mut crate::domain::WorkUnit, family: &str) {
+    if family == "claude" {
+        unit.answer_only = true;
+    } else {
+        unit.role = crate::workflow::PhaseRole::Evaluator;
+        unit.worktree_guarded = true;
+    }
+}
+
+/// Under the container floor a prompt over [`crate::container_floor::PROMPT_ARGV_MAX`] rides a
+/// mounted file the seat is told to read (core#1228). A tool-less claude cannot read it, so such a
+/// call is refused here rather than answered without its prompt. Codex reads the file.
+fn carried_prompt_refusal(family: &str, bytes: usize, container: bool) -> Option<String> {
+    (family == "claude" && container && bytes > crate::container_floor::PROMPT_ARGV_MAX).then(
+        || {
+            format!(
+            "a {bytes}-byte prompt is carried to a seat container in a file, which a tool-free \
+             claude cannot read; under the container floor a claude model call takes at most {} \
+             bytes",
+            crate::container_floor::PROMPT_ARGV_MAX
+        )
+        },
+    )
 }
 
 /// Compare two tokens without stopping at the first difference.
@@ -258,9 +300,10 @@ fn clip(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// An armed channel. It lives as long as the Tool command; dropping it stops the listener and
-/// removes the socket's directory. A call already running finishes on its own thread (its seat is
-/// bounded by the call's budget); its answer then has no one to read it.
+/// An armed channel. It lives as long as the Tool command; dropping it stops the listener, removes
+/// the socket's directory, and stops a connection already open from starting a call. A call
+/// already running finishes on its own thread (its seat is bounded by the call's budget); its
+/// answer then has no one to read it.
 pub(crate) struct Channel {
     dir: PathBuf,
     sock: PathBuf,
@@ -316,23 +359,41 @@ pub(crate) fn arm(
         return Err(e);
     }
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let stop = Arc::new(AtomicBool::new(false));
+    // The channel owns the directory from here: an early return below removes it.
+    let channel = Channel {
+        dir,
+        sock,
+        token: token.clone(),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
     let seats = Arc::new(Seats {
         runner,
         registry,
         run_id: run_id.to_string(),
         ord,
-        token: token.clone(),
+        token,
     });
-    let stop2 = stop.clone();
+    let stop = channel.stop.clone();
+    let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new()
         .name(format!("model-call-{run_id}-{ord}"))
         .spawn(move || {
-            while !stop2.load(Ordering::SeqCst) {
+            while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let seats = seats.clone();
-                        std::thread::spawn(move || serve_one(stream, &seats));
+                        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                            open.fetch_sub(1, Ordering::SeqCst);
+                            continue; // dropped: the client sees the connection close
+                        }
+                        let (seats, halt, held) = (seats.clone(), stop.clone(), open.clone());
+                        let served = std::thread::Builder::new().spawn(move || {
+                            serve_one(stream, &seats, &halt);
+                            held.fetch_sub(1, Ordering::SeqCst);
+                        });
+                        if served.is_err() {
+                            // the stream went with the closure; the count goes back here
+                            open.fetch_sub(1, Ordering::SeqCst);
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(POLL)
@@ -341,12 +402,7 @@ pub(crate) fn arm(
                 }
             }
         })?;
-    Ok(Channel {
-        dir,
-        sock,
-        token,
-        stop,
-    })
+    Ok(channel)
 }
 
 #[cfg(not(unix))]
@@ -363,9 +419,15 @@ pub(crate) fn arm(
 }
 
 #[cfg(unix)]
-fn serve_one(stream: std::os::unix::net::UnixStream, seats: &Seats) {
+fn serve_one(stream: std::os::unix::net::UnixStream, seats: &Seats, stop: &AtomicBool) {
     let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(IO_DEADLINE));
+    let _ = stream.set_write_timeout(Some(IO_DEADLINE));
     let reply = match read_request(&stream) {
+        // A connection opened while the step ran starts no call once the step has ended.
+        Ok(_) if stop.load(Ordering::SeqCst) => {
+            Reply::refused("the Tool step that armed this channel has ended")
+        }
         Ok(req) => seats.answer(&req),
         Err(why) => Reply::refused(why),
     };
@@ -499,8 +561,15 @@ mod tests {
         }
     }
 
-    /// What a seat was handed: (assigned cli, asking run, prompt, invocation).
-    type Handed = (Option<String>, Option<String>, String, Option<String>);
+    /// What a seat was handed: (assigned cli, asking run, prompt, invocation, the write posture
+    /// the runner derives for the unit on an unbound call).
+    type Handed = (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        crate::write_posture::WritePosture,
+    );
 
     /// A seat runner that answers `<cli>: <prompt>` and records what it was handed.
     #[derive(Default)]
@@ -516,6 +585,7 @@ mod tests {
                 i.unit.parent_run_id.clone(),
                 i.unit.description.clone(),
                 i.unit.assigned_invocation.clone(),
+                crate::write_posture::WritePosture::of(&i.unit, i.workdir.is_some()),
             ));
             crate::workflow::StepOutput {
                 run_id: i.run_id.clone(),
@@ -569,15 +639,42 @@ mod tests {
         assert_eq!(seen[1].0.as_deref(), Some("codex"));
         assert!(seen.iter().all(|s| s.1.as_deref() == Some("run-1")));
         assert_eq!(seen[1].2, long);
-        // (coord fold 2) No tools: the proof's `claude --tools ""` and `codex -s read-only`.
-        assert_eq!(
-            seen[0].3.as_deref(),
-            Some("claude -p --tools \"\" \"{PROMPT}\"")
-        );
-        assert_eq!(
-            seen[1].3.as_deref(),
-            Some("codex exec --skip-git-repo-check -s read-only \"{PROMPT}\"")
-        );
+        // (coord fold 2) No tools, through the engine's own postures: claude is tool-less (the
+        // runner's `--tools ""`), codex a read-only evaluator (its `--sandbox read-only` lever in
+        // a check scratch). The seat's own invocation is handed on unchanged; the runner applies
+        // the posture to it and to the seat's resolved trust flags at its launch boundary.
+        use crate::write_posture::WritePosture;
+        assert_eq!(seen[0].4, WritePosture::ToolLess);
+        assert_eq!(seen[1].4, WritePosture::ReadOnly);
+        assert_eq!(seen[0].3.as_deref(), Some("claude -p \"{PROMPT}\""));
+        assert!(seen.iter().all(|s| s.4 != WritePosture::Full));
+    }
+
+    /// The runner's tool-less claude argv for a model call's posture: the lever is the engine's
+    /// own (`apply_tool_less_posture`), placed before an option guard and over any allowlist.
+    #[test]
+    fn a_model_call_claude_argv_is_tool_less_even_past_an_option_guard() {
+        let mut argv: Vec<String> = ["claude", "-p", "--tools", "Bash", "--", "the prompt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        crate::execute_wrapped::apply_tool_less_posture(&mut argv, Vec::new(), true, false)
+            .unwrap();
+        let guard = argv.iter().position(|a| a == "--").unwrap();
+        let tools = argv.iter().position(|a| a == "--tools").unwrap();
+        assert!(tools < guard && argv[tools + 1].is_empty(), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| *a == "--tools").count(), 1);
+    }
+
+    /// Under the container floor a claude prompt too long for one argument would ride a file a
+    /// tool-less claude cannot read: refused. Codex, and every prompt on the host floor, pass.
+    #[test]
+    fn a_container_claude_prompt_that_would_ride_a_file_is_refused() {
+        let max = crate::container_floor::PROMPT_ARGV_MAX;
+        assert!(carried_prompt_refusal("claude", max + 1, true).is_some());
+        assert!(carried_prompt_refusal("claude", max, true).is_none());
+        assert!(carried_prompt_refusal("claude", max + 1, false).is_none());
+        assert!(carried_prompt_refusal("codex", max + 1, true).is_none());
     }
 
     fn unit(step: &str, cmd: &[String]) -> crate::domain::WorkUnit {
@@ -598,46 +695,101 @@ mod tests {
             .expect("a shipped Tool step")
     }
 
-    /// (coord fold 1) A declared step of a shipped preset with the shipped command is armed; the
-    /// same step under a repo preset name, a changed command, an undeclared step, or a run with no
-    /// preset is not. A real shipped Tool step (`extract-prepare`) stands in for the declaration.
+    fn repo_at(id: &str, root: &str) -> crate::repo::RepoEntry {
+        crate::repo::RepoEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: root.to_string(),
+            default_branch: "main".to_string(),
+            registered_at: 0,
+            code_graph_db: format!("/graphs/{id}/estate.db"),
+            graph_key: id.to_string(),
+            findings: Vec::new(),
+        }
+    }
+
+    /// The unit the planner dispatches for a shipped step: its template bound to the run's repo by
+    /// the planner's own binder.
+    fn planned(
+        step: &str,
+        cmd: &[String],
+        repo: &crate::repo::RepoEntry,
+    ) -> crate::domain::WorkUnit {
+        let mut u = unit(step, cmd);
+        crate::plan::bind_repo_paths(std::slice::from_mut(&mut u), repo);
+        u
+    }
+
+    /// (coord fold 1) A declared step of a shipped preset with the shipped command, bound to the
+    /// run's repo, is armed; the same step under a repo preset name, a changed command, a command
+    /// bound to another repo, an undeclared step, or a run with no preset is not. A real shipped
+    /// Tool step (`extract-prepare`, whose command carries both repo placeholders) stands in for the
+    /// declaration.
     #[test]
     fn only_a_declared_step_of_a_shipped_preset_is_armed() {
         let step = crate::domain_extraction::EXTRACT_PREPARE_STEP;
         let cmd = shipped_cmd("domain-extraction", step);
+        assert!(cmd.iter().any(|a| a == crate::workflow::REPO_ROOT_TOKEN));
+        let repo = repo_at("app", "/src/app");
         let decl = [("domain-extraction", step)];
         let shipped = crate::catalog::builtin_presets();
         let armed = |preset: Option<&str>, u: &crate::domain::WorkUnit| {
-            declared_in(&decl, &shipped, preset, u)
+            declared_in(&decl, &shipped, preset, u, Some(&repo))
         };
-        assert!(armed(Some("domain-extraction"), &unit(step, &cmd)));
+        let real = planned(step, &cmd, &repo);
+        assert_ne!(
+            real.tool_cmd.as_ref(),
+            Some(&cmd),
+            "the planner bound the repo"
+        );
+        assert!(armed(Some("domain-extraction"), &real));
         // a repo-defined preset or workflow with the same step and command
-        assert!(!armed(Some("my-repo-flow"), &unit(step, &cmd)));
-        assert!(!armed(None, &unit(step, &cmd)));
-        // the shipped preset's name with another command (a repo preset shadowing the name)
+        assert!(!armed(Some("my-repo-flow"), &real));
+        assert!(!armed(None, &real));
+        // the shipped preset's name with another command (a preset shadowing the name)
         let mut other = cmd.clone();
         other.push("--and-more".into());
-        assert!(!armed(Some("domain-extraction"), &unit(step, &other)));
+        assert!(!armed(
+            Some("domain-extraction"),
+            &planned(step, &other, &repo)
+        ));
+        // the shipped command bound to a repo other than the run's
+        let elsewhere = planned(step, &cmd, &repo_at("other", "/src/other"));
+        assert!(!armed(Some("domain-extraction"), &elsewhere));
         // a shipped Tool step that is not declared
         assert!(!armed(
             Some("domain-extraction"),
-            &unit("domain-graph", &cmd)
+            &planned("domain-graph", &cmd, &repo)
         ));
         // production: nothing in today's presets is declared yet (C1 adds `domain-run`)
-        assert!(!shipped_step(Some("domain-extraction"), &unit(step, &cmd)));
+        assert!(!shipped_step(Some("domain-extraction"), &real, Some(&repo)));
     }
 
-    /// A seat that cannot be made tool-free is refused, never run with its tools.
+    /// A connection opened while the step ran starts no call after the step ends.
     #[test]
-    fn a_seat_that_cannot_run_tool_free_is_refused() {
-        let mut sandboxed = seat("codex");
-        sandboxed.headless_invocation = "codex exec -s workspace-write \"{PROMPT}\"".into();
-        assert!(no_tools(&sandboxed).is_none());
+    fn a_connection_left_open_starts_no_call_after_the_step_ends() {
+        use std::os::unix::net::UnixStream;
         let echo = Arc::new(Echo::default());
-        let ch = arm(echo.clone(), vec![sandboxed], "run-1", 2).unwrap();
+        let ch = arm(echo.clone(), vec![seat("claude")], "run-1", 2).unwrap();
         let (sock, token) = sock_and_token(&ch);
-        let err = call_at(&sock, &token, "codex", "p", None).unwrap_err();
-        assert!(err.contains("tool-free"), "{err}");
+        let stream = UnixStream::connect(&sock).unwrap();
+        // let the listener accept it while the channel is armed
+        std::thread::sleep(POLL * 3);
+        drop(ch);
+        let req = Request {
+            token,
+            family: "claude".into(),
+            prompt: "late".into(),
+            timeout_s: None,
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        (&stream).write_all(line.as_bytes()).unwrap();
+        let mut answer = String::new();
+        BufReader::new(&stream).read_line(&mut answer).unwrap();
+        let reply: Reply = serde_json::from_str(answer.trim_end()).unwrap();
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("has ended"));
         assert!(echo.seen.lock().unwrap().is_empty());
     }
 

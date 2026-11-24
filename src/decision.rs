@@ -62,6 +62,9 @@ pub(crate) struct SeatBallots {
     inflight: BallotReaper,
     /// How long a cancelled ballot is given to stop before its timeout is reported.
     drain: std::time::Duration,
+    /// (DES-j6-build C0) Each ballot is a Tool step's model call, run tool-free
+    /// ([`crate::model_call::tool_free`]).
+    model_calls: bool,
 }
 
 /// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
@@ -134,7 +137,14 @@ impl SeatBallots {
             parent_run_id: parent_run_id.map(str::to_string),
             inflight: BallotReaper::default(),
             drain: BALLOT_CANCEL_DRAIN,
+            model_calls: false,
         }
+    }
+
+    /// (DES-j6-build C0) Run every ballot as a tool-free model call.
+    pub(crate) fn model_calls(mut self) -> Self {
+        self.model_calls = true;
+        self
     }
 
     /// (core#1290) The handle that reaps this carrier's ballots.
@@ -207,6 +217,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         unit.parent_run_id = self.parent_run_id.clone();
         unit.assigned_cli = Some(cli.key.clone());
         unit.assigned_invocation = Some(cli.headless_invocation.clone());
+        if self.model_calls {
+            crate::model_call::tool_free(&mut unit, &cli.key);
+        }
         let input = crate::workflow::StepInput {
             base_commit: None,
             run_id: run_id.clone(),

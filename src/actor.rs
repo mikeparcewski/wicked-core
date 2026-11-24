@@ -14877,6 +14877,11 @@ fn dispatch_unit_with(
             && crate::model_call::shipped_step(
                 session.team_plan.as_ref().and_then(|p| p.preset.as_deref()),
                 unit,
+                session
+                    .repo_ref
+                    .as_deref()
+                    .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                    .as_ref(),
             ))
         .then(|| (runner.clone(), judge_registries().1));
         std::thread::spawn(move || {

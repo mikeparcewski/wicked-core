@@ -122,18 +122,20 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
         seats.clone(),
     );
     std::fs::write(dir.join("write.txt"), "Write one sentence.").unwrap();
+    // The real client, its stderr and exit code kept, so the test sees the step ran and why it
+    // failed (not merely that the run did not complete).
     let call = |family: &str, out: &str| {
         serde_json::json!([
+            "sh",
+            "-c",
+            "\"$0\" model-call --family \"$1\" --in \"$2\" --out \"$3\" --timeout-s 30 2>\"$4\"; \
+             rc=$?; echo $rc >\"$5\"; exit $rc",
             BIN,
-            "model-call",
-            "--family",
             family,
-            "--in",
             dir.join("write.txt").to_str().unwrap(),
-            "--out",
             dir.join(out).to_str().unwrap(),
-            "--timeout-s",
-            "30"
+            dir.join(format!("{out}.err")).to_str().unwrap(),
+            dir.join(format!("{out}.rc")).to_str().unwrap()
         ])
     };
     let def = serde_json::json!({
@@ -179,6 +181,18 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
     assert!(
         !matches!(end, CoreEvent::SessionCompleted { .. }),
         "the client refuses, so the step fails: {end:?}"
+    );
+    // the first Tool step ran the client, which found no channel and refused (exit 2)
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    assert_eq!(
+        read("write.out.rc").trim(),
+        "2",
+        "the client ran and refused"
+    );
+    assert!(
+        read("write.out.err").contains("WICKED_MODEL_CALL_SOCK is not set"),
+        "{}",
+        read("write.out.err")
     );
     assert!(!dir.join("write.out").exists(), "no answer was written");
     assert!(!dir.join("check.out").exists(), "no answer was written");
