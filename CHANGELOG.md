@@ -14,8 +14,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 88a6228d, carrying 73 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854.
+- **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 919f3575, carrying 74 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854, #1891.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - Pager allow-list, seat native build note and refusal memory, best-effort browser layer (core#1882, #1886, #1887, #1888) (#1891)
 
   - One seat-key parser and the reserved stand-in separator (DES-STANDIN-001 C1) (#1841)
 
