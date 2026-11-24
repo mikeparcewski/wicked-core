@@ -1328,12 +1328,9 @@ pub(crate) fn apply_and_finish_unit(
     // it instead of denying — the deterministic layer is absent (`ungatedReason` names the
     // cause), the judge still gates. The DECLARED floor keeps its fail-closed denial: a def that
     // asked for re-verification does not get a pass on a host that cannot re-verify.
-    let default_floor_refused_unsandboxed = !unit.repo_checks_floor
-        && evidence.tree_changed == Some(true)
-        && evidence
-            .repo_checks
-            .as_ref()
-            .is_some_and(|r| !r.passed && r.checks.is_empty() && r.sandbox_error.is_some());
+    let refused_unsandboxed = |r: &crate::repo_checks::RepoChecksReport| {
+        !r.passed && r.checks.is_empty() && r.sandbox_error.is_some()
+    };
     // (core#469) The denial carries its SOURCE beside the reason: a floor that did not FINISH (a
     // check hit its bound) is booked under `repo_checks_timeout`, never `repo_checks` — the gate
     // keys on it to offer extend / targeted / accept instead of retry-the-same-tree.
@@ -1356,6 +1353,17 @@ pub(crate) fn apply_and_finish_unit(
                 .filter(|r| r.tree.is_some() && r.tree.as_deref() == baseline_tree)
         })
         .flatten();
+    // (F-7R2-005, core#1873) …and the same refusal CARRIED to an attempt that left the tree as
+    // it was (a judge-only re-run, a retry with no edit): the floor still did not run on this tree,
+    // so it is disclosed again, never turned into a denial on the re-run. Without this a re-judge
+    // on a host with no OS write boundary denied `repo_checks` where the attempt that ran did not.
+    let default_floor_refused_unsandboxed = !unit.repo_checks_floor
+        && ((evidence.tree_changed == Some(true)
+            && evidence
+                .repo_checks
+                .as_ref()
+                .is_some_and(refused_unsandboxed))
+            || carried.as_ref().is_some_and(refused_unsandboxed));
     // (DES-QE-EVERY-SEAT §3.2, codex r1 on the code) A floor-fix attempt's fixing seat, read
     // BEFORE a fresh floor report replaces the request that names it.
     let floor_fixer: Option<String> = unit
@@ -1564,7 +1572,9 @@ pub(crate) fn apply_and_finish_unit(
                 ),
             ))
         }
-        None if carried.as_ref().is_some_and(|r| !r.passed) => {
+        None if carried.as_ref().is_some_and(|r| !r.passed)
+            && !default_floor_refused_unsandboxed =>
+        {
             floor_carried = true;
             let r = carried.as_ref().expect("checked");
             // (core#1186) The rework left the tree unchanged and the operator already
@@ -6431,6 +6441,104 @@ mod judge_bench_tests {
             outcome.denial.map(|d| d.source),
             units[0].assurance.clone(),
         )
+    }
+
+    /// The fold of a default-floor attempt that left the tree `t1` as it was dispatched (a
+    /// judge-only re-run), whose last floor result on `t1` is `report`. Returns the denial source.
+    fn fold_unchanged_tree(sid: &str, report: serde_json::Value) -> Option<String> {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        let unit = &mut units[0];
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(
+            serde_json::from_value(
+                serde_json::json!({"head": "h1", "tree": "t1", "taken_at_ms": 0}),
+            )
+            .unwrap(),
+        );
+        unit.repo_checks = Some(serde_json::from_value(report).unwrap());
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed: Some(false),
+            ..Default::default()
+        };
+        apply_and_finish_unit(
+            &mut store,
+            unit,
+            "the reviewed output, judged again",
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            2,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |_| {},
+            None,
+        )
+        .expect("apply")
+        .denial
+        .map(|d| d.source)
+    }
+
+    /// (F-7R2-005, core#1873) On a host with no OS write boundary the default floor is disclosed,
+    /// never denied: also when that refusal is carried to an attempt that left the tree unchanged
+    /// (a judge-only re-run). A floor whose checks RAN and failed on that tree still denies.
+    #[test]
+    fn a_carried_unsandboxed_refusal_of_the_default_floor_is_disclosed_not_denied() {
+        let refused = serde_json::json!({
+            "detected": [], "skipped": [], "passed": false, "sandbox_level": "none",
+            "sandbox_error": "no OS write boundary could be armed for the checks (Windows)",
+            "tree": "t1", "checks": [],
+        });
+        assert_ne!(
+            fold_unchanged_tree("carry-refused", refused).as_deref(),
+            Some(crate::repo_checks::DENIAL_SOURCE),
+            "the carried refusal is disclosed, not denied"
+        );
+        let failed = serde_json::json!({
+            "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
+            "tree": "t1",
+            "checks": [{"name": "test", "argv": ["cargo", "test"], "source": "t",
+                "exit_code": 101, "timed_out": false, "duration_ms": 1,
+                "stdout_tail": "", "stderr_tail": "", "failure_ids": []}],
+        });
+        assert_eq!(
+            fold_unchanged_tree("carry-failed", failed).as_deref(),
+            Some(crate::repo_checks::DENIAL_SOURCE),
+            "the control: a carried failure still denies"
+        );
     }
 
     /// (core#1186) On an unchanged tree the floor's last result stands; when the operator already
