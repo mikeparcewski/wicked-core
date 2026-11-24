@@ -3643,25 +3643,30 @@ fn collect_bash_write_targets(
     // (core#922 review) `<>FILE` opens FILE read-WRITE, and `>&WORD` with a WORD that is not a
     // descriptor sends stdout+stderr to the FILE `WORD`: both are write redirects too.
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
-    // (core#1852) Each redirect word is read up to a control operator glued to it, which the lexer
-    // leaves inside the word in a command holding an expansion (`… ${X} 2>/dev/null|head`). The
-    // lexer's split reading then scans what follows the operator as its own command, so the cut
-    // is made only where that scan judges it: the operator is followed, in the same word, by a
-    // plain program name ([`plain_program_after`]; never a reserved word, a brace group, `!`, a
-    // subshell or nothing). And never in a command holding a heredoc (a body line keeps a glued
-    // operator in both readings), a backtick (its own escape layer can make a `|` the word's
-    // literal byte), a `#` (a comment's quote is read as a quote) or an ANSI-C `$'…'` string (its
-    // `\'` is read as a closing quote), nor where a `${…}` or `$[…]` spans whitespace (a later
-    // word's `|` is that expansion's data, not an operator): there the whole word stays,
-    // unresolved or refused as on main. The boundary is defense in depth, not a shell parser (see [`bash_write_targets`]).
+    // (core#1852) The one positive form a redirect word is cut at a glued control operator: the
+    // lexer leaves the operator inside the word in a command holding an expansion
+    // (`… ${X} 2>/dev/null|head`), the part before it is a safe sink ([`is_safe_write_sink`]:
+    // `2>/dev/null`, or the spaced operand `/dev/null`), and all that follows is one plain
+    // program token ([`plain_program_after`]: `|head`, or `|` and the next word `head`), which
+    // the lexer's split reading scans as its own command. Then the junk target `/dev/null|head`
+    // is read as the sink it names. Every other spelling keeps its whole word, unresolved or
+    // refused as on main (fail closed): `>/tmp/x|head` stays `/tmp/x|head`. No cut either in a
+    // command the lexer may misread around the operator (a heredoc, a backtick, a `#`, an
+    // ANSI-C `$'…'` string, or a `${…}`/`$[…]` holding whitespace). The boundary is defense in
+    // depth, not a shell parser (see [`bash_write_targets`]).
     let cut_redirects = !["<<", "`", "#", "$'"].iter().any(|t| original.contains(t))
         && !expansion_spans_whitespace(original);
+    // A descriptor dup (`2>&1`) writes no file: it is as safe as a sink.
+    let to_sink = |word: &str| match redirect_glob(word).or_else(|| file_redirect_extra(word)) {
+        Some(target) => is_safe_write_sink(target),
+        None => is_safe_write_sink(word) || is_fd_dup_operator(word),
+    };
     let cut = |at: usize| {
         let word = toks[at];
         let prefix = before_glued_operator(word);
         // A separator next (or the end of the command) leaves nothing between to judge.
         let next = toks.get(at + 1).copied().filter(|n| !SEPS.contains(n));
-        if cut_redirects && plain_program_after(&word[prefix.len()..], next) {
+        if cut_redirects && to_sink(prefix) && plain_program_after(&word[prefix.len()..], next) {
             prefix
         } else {
             word
@@ -7074,31 +7079,34 @@ fn expansion_spans_whitespace(command: &str) -> bool {
     false
 }
 
-/// (core#1852) Does `rest` (a control operator and what follows it in one word, `|head`) go on to
-/// a plain program name, which the write scan's split reading judges as its own command? When
-/// the operator ends the word, the next word (`next`) is that program, and at the end of the
-/// command nothing follows to judge. Never a reserved word, a brace group, `!`, a subshell or any
-/// other shape the scan does not model as a program.
+/// (core#1852) Is `rest` (a control operator and what follows it in one word, `|head`) one
+/// operator and then plainly one program token, which the write scan's split reading judges as
+/// its own command? When the operator ends the word, the next word (`next`) must be that token,
+/// and at the end of the command nothing follows to judge. A token is a bare name
+/// (`[A-Za-z0-9_][A-Za-z0-9_.+-]*`), never a reserved word; anything else (a path, a glued
+/// redirect, an expansion, a brace group, `!`, a subshell) is no plain program.
 fn plain_program_after(rest: &str, next: Option<&str>) -> bool {
-    const RESERVED: [&str; 19] = [
+    const RESERVED: [&str; 17] = [
         "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
-        "in", "select", "then", "until", "while", "time", "[[", "]]",
+        "in", "select", "then", "until", "while", "time",
     ];
-    if rest.is_empty() {
-        return false;
-    }
-    let after = rest.trim_start_matches(['|', '&', ';']);
+    let after = match rest {
+        _ if rest.is_empty() => return false,
+        _ => ["||", "&&", "|", "&", ";"]
+            .iter()
+            .find_map(|op| rest.strip_prefix(op))
+            .unwrap_or(rest),
+    };
     let program = match (after.is_empty(), next) {
         (false, _) => after,
         (true, Some(next)) => next,
         (true, None) => return true,
     };
-    let name_len = program
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')))
-        .unwrap_or(program.len());
-    let name = &program[..name_len];
-    name.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/'))
-        && !RESERVED.contains(&name)
+    program.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+        && !RESERVED.contains(&program)
 }
 
 /// (core#1852) `word` up to its first unquoted, unescaped control operator (`|`, `&`, `;`) outside
@@ -16747,11 +16755,11 @@ mod boundary_tests {
         }
     }
 
-    /// core#1852: a redirect target ends at an unquoted control operator glued to it. In a command
-    /// holding `${…}` or a backtick the lexer keeps a glued `|`/`&` inside the word (core#1465), and
-    /// J6's `… 2>/dev/null|head` was refused as a write to `/dev/null|head`. The shell writes only
-    /// `/dev/null` there; `>/tmp/x|head` is still judged as `/tmp/x`, and an escaped or quoted `|`
-    /// stays part of the file's name.
+    /// core#1852: in a command holding `${…}` the lexer keeps a glued `|`/`&` inside the word
+    /// (core#1465), and J6's `… 2>/dev/null|head` was refused as a write to `/dev/null|head`. The
+    /// one positive form is cut: a safe sink (or a descriptor dup), a glued control operator, and
+    /// then plainly one program token. Every other spelling keeps its whole word as on main
+    /// (`>/tmp/x|head` is `/tmp/x|head`), and an escaped or quoted `|` stays part of the name.
     #[test]
     fn a_redirect_target_ends_at_a_glued_control_operator_1852() {
         use ShellTarget::Path as P;
@@ -16771,14 +16779,14 @@ mod boundary_tests {
             assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
             assert!(bash_write_targets(cmd).is_empty(), "{cmd:?}");
         }
+        // (coord ruling, r3) Only a sink is cut: any other target keeps its whole word, as on main.
         for (cmd, target) in [
-            ("echo x >/tmp/x|head", "/tmp/x"),
-            ("echo ${X} >/tmp/x|head", "/tmp/x"),
-            ("echo ${X} > /tmp/x&&true", "/tmp/x"),
+            ("echo ${X} >/tmp/x|head", "/tmp/x|head"),
+            ("echo ${X} > /tmp/x&&true", "/tmp/x&&true"),
             ("echo x >/tmp/a\\|b", "/tmp/a|b"),
             ("echo ${X} >/tmp/a\\|b", "/tmp/a|b"),
             ("echo ${X} >\"/tmp/a|b\"", "/tmp/a|b"),
-            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b"),
+            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b|head"),
         ] {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
@@ -16805,6 +16813,10 @@ mod boundary_tests {
             ": ${X} >/dev/null&&then touch /outside/f",
             "touch -- -${X:-unused >a|/../../outside/f }",
             "echo $[1 >a|/../../outside/f ]",
+            // Not plainly one program token after the operator: a glued redirect, a path.
+            "echo ${X} 2>/dev/null|tee>/outside/f",
+            "echo ${X} 2>/dev/null|/outside/f",
+            "echo ${X} 2>/dev/null|&tee /outside/f",
         ] {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
