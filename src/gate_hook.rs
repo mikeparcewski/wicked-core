@@ -4506,11 +4506,10 @@ fn git_config_key_inert(key: &str) -> bool {
 }
 
 /// A pager setting (`core.pager`, `pager.<cmd>`, `GIT_PAGER`) naming a pager that only prints.
+/// `less` is not one (core#1882): it runs `LESSOPEN`'s preprocessor on what git pipes into it
+/// (`|-`), and `more` and `less` read commands from their own environment.
 fn git_pager_harmless(value: &str) -> bool {
-    matches!(
-        value.trim(),
-        "" | "cat" | "less" | "more" | "less -R" | "less -FRX" | "less -FRSX"
-    )
+    matches!(value.trim(), "" | "cat")
 }
 
 /// `-c` keys that carry no command text, which a seat may set for a write in its own folder

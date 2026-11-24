@@ -2909,6 +2909,11 @@ impl Filler<'_> {
         if filled(&key) {
             return Ok(false);
         }
+        // core#1887: a refusal that cannot change within the run starts no pod again.
+        let refusal_key = format!("{}/{}/{volume}", self.place.ns, self.place.run);
+        if let Some(note) = native_refusal(&refusal_key) {
+            return Err(note);
+        }
         let name = format!("build-{volume}");
         // An earlier build of this claim that outlived its client may still write it: confirmed
         // gone first, or no build now (the seat then starts without the binding).
@@ -2941,8 +2946,11 @@ impl Filler<'_> {
             .place
             .run(&name, &["sh", "-c", &script], FILL)
             .map_err(|e| {
-                let last = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-                last.chars().take(300).collect::<String>()
+                let note = native_build_note(&e);
+                if native_build_refused(&e) {
+                    remember_native_refusal(&refusal_key, &note);
+                }
+                note
             })?;
         // Published only once the pod (and anything the build left running in it) is confirmed
         // gone: until then the claim is not handed to a seat as built.
@@ -3297,7 +3305,8 @@ const JAIL_PROBE: &str = ".wicked-jail-probe";
 
 /// (core#1406) The confined half of a native build's jail proof (`python3 -I -c`, the canary as
 /// its argument): a write-open and a `truncate(2)` of the canary must each fail with `EACCES`,
-/// Landlock's denial (any other error, such as a full or read-only claim, proves nothing).
+/// Landlock's denial (any other error, such as a full or read-only claim, proves nothing). The
+/// open refused and the truncate not is Landlock below ABI v3 (core#1886): exit 5, said apart.
 const JAIL_PROOF: &str = "import errno, os, sys
 def denied(f):
     try:
@@ -3306,7 +3315,44 @@ def denied(f):
         return e.errno == errno.EACCES
     return False
 p = sys.argv[1]
-sys.exit(0 if denied(lambda: open(p, \"a\").close()) and denied(lambda: os.truncate(p, 0)) else 4)";
+sys.exit(4 if not denied(lambda: open(p, \"a\").close()) else 0 if denied(lambda: os.truncate(p, 0)) else 5)";
+
+/// (core#1887) The exit code of a native build script's refusals that no retry within the run
+/// changes: the claim is not writable, or the jail is not proven (no Landlock, or one too old to
+/// confine truncation). A build that failed exits 1.
+const NATIVE_REFUSED: i32 = 87;
+
+/// (core#1886) The note for a native build that failed, from the build pod's `kubectl exec`
+/// stderr: the script's own reason (its last `wicked-core:` line, without the prefix), else the
+/// last line that is not kubectl's own `command terminated with exit code N`.
+fn native_build_note(err: &str) -> String {
+    let lines: Vec<&str> = err
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let note = lines
+        .iter()
+        .rev()
+        .find_map(|l| l.strip_prefix("wicked-core: "))
+        .or_else(|| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| !l.starts_with("command terminated with exit code "))
+                .copied()
+        })
+        .or_else(|| lines.last().copied())
+        .unwrap_or("");
+    note.chars().take(300).collect()
+}
+
+/// (core#1887) Whether the build pod's script refused for a reason no retry within the run
+/// changes ([`NATIVE_REFUSED`]): kubectl's own last line names the script's exit code.
+fn native_build_refused(err: &str) -> bool {
+    err.lines().rev().map(str::trim).find(|l| !l.is_empty())
+        == Some(format!("command terminated with exit code {NATIVE_REFUSED}").as_str())
+}
 
 /// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`].
 /// Trusted engine steps first: a claim already marked answers `WICKED-HIT`; otherwise each
@@ -3370,10 +3416,14 @@ pub(crate) fn native_build_script(native: &[&str]) -> String {
          ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
          trap 'rm -f {probe}' EXIT; rm -f {probe}; \
          printf x > {probe} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
-         exit 1; }}; \
-         if ! {policy} -- /bin/sh -c {prove} || [ \"$(cat {probe})\" != x ]; then \
+         exit {NATIVE_REFUSED}; }}; \
+         jail=0; {policy} -- /bin/sh -c {prove} || jail=$?; \
+         if [ \"$jail\" = 5 ]; then echo 'wicked-core: Landlock on this kernel is too old to confine \
+         truncation (it needs ABI v3, Linux 6.2 or newer); nothing is built' >&2; \
+         exit {NATIVE_REFUSED}; fi; \
+         if [ \"$jail\" != 0 ] || [ \"$(cat {probe})\" != x ]; then \
          echo 'wicked-core: Landlock is not in force in the build pod; nothing is built' >&2; \
-         exit 1; fi; rm -f {probe}; trap - EXIT; \
+         exit {NATIVE_REFUSED}; fi; rm -f {probe}; trap - EXIT; \
          if {policy} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
          else {clean}exit 1; fi",
         sh_quote(&argv[2])
@@ -3433,6 +3483,28 @@ pub(crate) fn provision_seat_node_modules(
 /// the run mounts them without a fill pod. A claim deleted with its namespace goes with the run.
 static FILLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// (core#1887) The seat claims whose native build this process saw refused for a reason no retry
+/// within the run changes (`<ns>/<run>/<claim>`), with the note it gave: a later unit of the run
+/// gets the plain claim with that note, and starts no build pod.
+static NATIVE_REFUSALS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn native_refusal(key: &str) -> Option<String> {
+    NATIVE_REFUSALS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, note)| note.clone())
+}
+
+fn remember_native_refusal(key: &str, note: &str) {
+    if let Ok(mut r) = NATIVE_REFUSALS.lock() {
+        if !r.iter().any(|(k, _)| k == key) {
+            r.push((key.to_string(), note.to_string()));
+        }
+    }
+}
+
 fn filled(key: &str) -> bool {
     FILLED.lock().is_ok_and(|f| f.iter().any(|k| k == key))
 }
@@ -3461,6 +3533,10 @@ pub(crate) fn forget_namespace(ns: &str) {
     if let Ok(mut f) = FILLED.lock() {
         let pre = format!("{ns}/");
         f.retain(|k| !k.starts_with(&pre));
+    }
+    if let Ok(mut r) = NATIVE_REFUSALS.lock() {
+        let pre = format!("{ns}/");
+        r.retain(|(k, _)| !k.starts_with(&pre));
     }
 }
 

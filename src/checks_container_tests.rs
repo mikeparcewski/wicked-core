@@ -1859,7 +1859,8 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     let canary = format!("{FILL_DIR}/{JAIL_PROBE}");
     let prove = format!(
         "printf x > {canary} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
-         exit 1; }}; if ! /floor/landrun {policy} -- /bin/sh -c {} || [ \"$(cat {canary})\" != x ]; then",
+         exit {NATIVE_REFUSED}; }}; jail=0; /floor/landrun {policy} -- /bin/sh -c {} || jail=$?; \
+         if [ \"$jail\" = 5 ]; then",
         sh_quote(&format!(
             "touch /tmp/wicked-native/.jail-granted && python3 -I -c {} {canary}",
             sh_quote(JAIL_PROOF)
@@ -1937,7 +1938,7 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         .replace(FILL_DIR, &claim.display().to_string())
         .replace("/tmp/wicked-native", &root.join("t").display().to_string())
         .replace("/floor/landrun", &landrun.display().to_string());
-    let run = |env: &[(&str, &str)]| {
+    let run_code = |env: &[(&str, &str)]| {
         // spawn-audit: test-only — runs the engine's build script against a stand-in claim, with
         // the environment cleared and only the stand-ins' variables set.
         let mut c = std::process::Command::new("sh");
@@ -1951,7 +1952,7 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         }
         let o = c.output().unwrap();
         (
-            o.status.success(),
+            o.status.code(),
             format!(
                 "{}{}",
                 String::from_utf8_lossy(&o.stdout),
@@ -1959,11 +1960,19 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
             ),
         )
     };
+    let run = |env: &[(&str, &str)]| {
+        let (code, out) = run_code(env);
+        (code == Some(0), out)
+    };
     let build = claim.join("better-sqlite3/build");
     // A jail not in force: nothing is built (the stub node never runs), no marker, no probe left.
     let refused = |env: &[(&str, &str)], why: &str| {
-        let (ok, out) = run(env);
-        assert!(!ok && out.contains(why), "{env:?}: {out}");
+        // A refusal no retry within the run changes has its own exit code (core#1887).
+        let (code, out) = run_code(env);
+        assert!(
+            code == Some(NATIVE_REFUSED) && out.contains(why),
+            "{env:?}: {code:?} {out}"
+        );
         assert!(!claim.join(NATIVE_BUILT).exists(), "{env:?}");
         assert!(
             !claim.join(JAIL_PROBE).exists(),
@@ -1991,8 +2000,9 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
     let mut rw = std::fs::metadata(&claim).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut rw, 0o755);
     std::fs::set_permissions(&claim, rw).unwrap();
-    let (ok, _) = run(&[("GYP_FAILS", "1")]);
-    assert!(!ok);
+    // A failed build is no refusal: a later unit may build again.
+    let (code, _) = run_code(&[("GYP_FAILS", "1")]);
+    assert_eq!(code, Some(1));
     assert!(
         !claim.join(NATIVE_BUILT).exists(),
         "a failed build leaves no marker"
@@ -2059,6 +2069,54 @@ fn the_jail_proof_needs_both_the_open_and_the_truncate_refused_with_eacces() {
     assert_eq!(proof(enospc, eacces).0, 4, "a full claim is no denial");
     assert_eq!(proof(eacces, enospc).0, 4);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// core#1886, core#1887: the note and the refusal read from the build pod's `kubectl exec`
+/// stderr, shaped as kubectl writes it: the script's stderr, then kubectl's own last line.
+#[test]
+fn a_native_build_note_is_the_scripts_reason_and_only_its_refusals_are_kept() {
+    let exec =
+        |stderr: &str, code: i32| format!("{stderr}\ncommand terminated with exit code {code}");
+    let jail = exec(
+        "wicked-core: Landlock is not in force in the build pod; nothing is built",
+        NATIVE_REFUSED,
+    );
+    assert_eq!(
+        native_build_note(&jail),
+        "Landlock is not in force in the build pod; nothing is built"
+    );
+    assert!(native_build_refused(&jail));
+    // node-gyp's own failure: its last line, never kubectl's; and a build may be tried again.
+    let gyp = exec(
+        "gyp ERR! build error\ngyp ERR! stack Error: `make` failed with exit code: 2\n",
+        1,
+    );
+    assert_eq!(
+        native_build_note(&gyp),
+        "gyp ERR! stack Error: `make` failed with exit code: 2"
+    );
+    assert!(!native_build_refused(&gyp));
+    // The script's last `wicked-core:` line wins over output after it.
+    let built = exec(
+        "wicked-core: no node-gyp beside npm (/usr/bin/npm)\nls: cannot access 'x': No such file",
+        1,
+    );
+    assert_eq!(
+        native_build_note(&built),
+        "no node-gyp beside npm (/usr/bin/npm)"
+    );
+    // Only kubectl's line: it is all there is to say.
+    assert_eq!(
+        native_build_note("command terminated with exit code 137"),
+        "command terminated with exit code 137"
+    );
+    // A refusal code in the build's own output is not kubectl's line.
+    let spoof = exec(
+        &format!("command terminated with exit code {NATIVE_REFUSED}"),
+        1,
+    );
+    assert!(!native_build_refused(&spoof));
+    assert!(!native_build_refused("kubectl timed out"));
 }
 
 /// core#1886, core#1887: a seat claim's native build through `build_native`, against a stand-in
