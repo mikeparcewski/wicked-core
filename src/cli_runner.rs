@@ -2551,24 +2551,11 @@ fn run_rule_check_with(
         .filter(|r| exclusions.may_reuse(r, registry))
         .cloned()
         .collect();
-    // (core#1842) The rows of the run's EARLIER gates (the review before a QE step that changed
-    // nothing), earliest first, each with what its check read; the check reuses only one that read
-    // what this one reads, under the same exclusions as every cached verdict. A later unit's row
-    // never answers an earlier one sent back.
-    let mut earlier: Vec<&crate::domain::WorkUnit> = others
-        .iter()
-        .flatten()
-        .filter(|u| u.ord < input.unit.ord)
-        .collect();
-    earlier.sort_by_key(|u| u.ord);
-    let same_change: Vec<(String, crate::rule_check::RuleVerdict)> = earlier
-        .into_iter()
-        .filter_map(|u| u.rule_check.as_ref())
-        .filter_map(|rc| rc.change_key.as_ref().map(|k| (k, &rc.rows)))
-        .flat_map(|(k, rows)| rows.iter().map(move |r| (k, r)))
-        .filter(|(_, r)| exclusions.may_reuse(r, registry))
-        .map(|(k, r)| (k.clone(), r.clone()))
-        .collect();
+    let same_change = same_change_rows(
+        others.as_deref().unwrap_or_default(),
+        input.unit.ord,
+        |r| exclusions.may_reuse(r, registry),
+    );
     let facts = crate::rule_check::job_facts(
         &input.unit.rule_steps,
         gov.project_id.as_deref(),
@@ -2915,6 +2902,28 @@ pub(crate) fn any_seat_marker() -> String {
         crate::rule_check::ANY_SEAT_MAY_JUDGE,
         crate::rule_check::FRAME_CLOSE
     )
+}
+
+/// (core#1842) The rows of the run's EARLIER gates (the review before a QE step that changed
+/// nothing), earliest first, each with what its check read; the check reuses only one that read
+/// what this one reads, under the same exclusions as every cached verdict (`may_reuse`). A later
+/// unit's row never answers an earlier one sent back.
+fn same_change_rows(
+    others: &[crate::domain::WorkUnit],
+    ord: u32,
+    may_reuse: impl Fn(&crate::rule_check::RuleVerdict) -> bool,
+) -> Vec<(String, crate::rule_check::RuleVerdict)> {
+    let mut earlier: Vec<&crate::domain::WorkUnit> =
+        others.iter().filter(|u| u.ord < ord).collect();
+    earlier.sort_by_key(|u| u.ord);
+    earlier
+        .into_iter()
+        .filter_map(|u| u.rule_check.as_ref())
+        .filter_map(|rc| rc.change_key.as_ref().map(|k| (k, &rc.rows)))
+        .flat_map(|(k, rows)| rows.iter().map(move |r| (k, r)))
+        .filter(|(_, r)| may_reuse(r))
+        .map(|(k, r)| (k.clone(), r.clone()))
+        .collect()
 }
 
 /// (codex r1, r2) What fresh rule-judge selection excludes (the creators, this unit's authors and
