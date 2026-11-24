@@ -3292,8 +3292,21 @@ pub(crate) fn seat_nm_volume(tag: &str, lock: &[u8], inputs: &[u8], native: &[&s
 /// (core#1406) The marker a seat claim's native build leaves at its top once every binding built.
 const NATIVE_BUILT: &str = ".wicked-native-built";
 
-/// (core#1406) The file a native build's jail proof tries (and must fail) to write at the claim's top.
+/// (core#1406) The canary the engine writes at a claim's top for a native build's jail proof.
 const JAIL_PROBE: &str = ".wicked-jail-probe";
+
+/// (core#1406) The confined half of a native build's jail proof (`python3 -I -c`, the canary as
+/// its argument): a write-open and a `truncate(2)` of the canary must each fail with `EACCES`,
+/// Landlock's denial (any other error, such as a full or read-only claim, proves nothing).
+const JAIL_PROOF: &str = "import errno, os, sys
+def denied(f):
+    try:
+        f()
+    except OSError as e:
+        return e.errno == errno.EACCES
+    return False
+p = sys.argv[1]
+sys.exit(0 if denied(lambda: open(p, \"a\").close()) and denied(lambda: os.truncate(p, 0)) else 4)";
 
 /// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`].
 /// Trusted engine steps first: a claim already marked answers `WICKED-HIT`; otherwise each
@@ -3305,10 +3318,13 @@ const JAIL_PROBE: &str = ".wicked-jail-probe";
 /// actions) can change nothing else in the claim (the installed packages, the nested archive, the
 /// marker). The launcher runs `--best-effort` (the ABI the kernel has; without it landrun refuses
 /// any kernel below its newest ABI) and, like the sync pod's jail, the jail is PROVEN in force
-/// before the build: under the same policy a write to the scratch succeeds and one to the claim's
-/// top is refused, else (no Landlock, or a launcher that cannot start) nothing is built. The
-/// engine marks the claim only after the build succeeded, and empties the build dirs again when
-/// it failed.
+/// before the build ([`JAIL_PROOF`]): the engine writes a canary at the claim's top (so the
+/// claim is writable outside the jail), and under the same policy a scratch write succeeds while
+/// opening the canary for writing and truncating it both fail with `EACCES` (truncation is
+/// Landlock ABI v3, so an older kernel builds nothing), and the canary is unchanged after. Any
+/// other outcome (no Landlock, a launcher that cannot start, a full or read-only claim) builds
+/// nothing. The engine marks the claim only after the build succeeded, and empties the build
+/// dirs again when it failed.
 pub(crate) fn native_build_script(native: &[&str]) -> String {
     let argv = crate::repo_checks::native_build_argv(native);
     let builds: Vec<String> = native
@@ -3345,15 +3361,19 @@ pub(crate) fn native_build_script(native: &[&str]) -> String {
     let policy = policy.join(" ");
     let probe = format!("{FILL_DIR}/{JAIL_PROBE}");
     let prove = sh_quote(&format!(
-        "touch /tmp/wicked-native/.jail-granted && ! touch {probe} 2>/dev/null"
+        "touch /tmp/wicked-native/.jail-granted && python3 -I -c {} {probe}",
+        sh_quote(JAIL_PROOF)
     ));
     format!(
         "set -e; if [ -f {FILL_DIR}/{NATIVE_BUILT} ]; then echo WICKED-HIT; exit 0; fi; \
          {clean}rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
          ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
-         if ! {policy} -- /bin/sh -c {prove}; then rm -f {probe}; \
+         trap 'rm -f {probe}' EXIT; rm -f {probe}; \
+         printf x > {probe} || {{ echo 'wicked-core: the claim is not writable; nothing is built' >&2; \
+         exit 1; }}; \
+         if ! {policy} -- /bin/sh -c {prove} || [ \"$(cat {probe})\" != x ]; then \
          echo 'wicked-core: Landlock is not in force in the build pod; nothing is built' >&2; \
-         exit 1; fi; \
+         exit 1; fi; rm -f {probe}; trap - EXIT; \
          if {policy} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
          else {clean}exit 1; fi",
         sh_quote(&argv[2])
