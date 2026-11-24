@@ -13,14 +13,6 @@
 # is a tmpfs. WICKED_SEAT_BASE_IMAGE swaps the base for a project toolchain image (Debian-based).
 ARG BASE=node:24.22.2-trixie-slim
 FROM ${BASE}
-ARG CLI
-ARG CLI_PACKAGE=
-ARG CLI_PIN=
-ARG CLI_TARBALL_MEMBER=
-ARG CLI_TARBALL_URL_AMD64=
-ARG CLI_TARBALL_SHA256_AMD64=
-ARG CLI_TARBALL_URL_ARM64=
-ARG CLI_TARBALL_SHA256_ARM64=
 # Python suites (core#1401): a seat runs `python3 -m pytest` as the floor does, from Debian's own
 # archive (pytest, PyYAML, zstandard, venv): no PyPI, no new registry.
 RUN apt-get update \
@@ -60,6 +52,16 @@ RUN mkdir -p /opt/wicked-ledger \
 # vendor signs nothing; the pin is the trust), and its one binary is installed root-owned and
 # read-only at /usr/local/bin/<cli> (agy skips its self-update on a read-only install dir, and the
 # root filesystem is read-only at run time as well).
+# The CLI's arguments are declared here, after every shared layer: each RUN after an ARG carries
+# it in its cache key, so a layer above them is built and stored once for all CLIs, not per CLI.
+ARG CLI
+ARG CLI_PACKAGE=
+ARG CLI_PIN=
+ARG CLI_TARBALL_MEMBER=
+ARG CLI_TARBALL_URL_AMD64=
+ARG CLI_TARBALL_SHA256_AMD64=
+ARG CLI_TARBALL_URL_ARM64=
+ARG CLI_TARBALL_SHA256_ARM64=
 RUN set -eu; \
     if [ -n "$CLI_PACKAGE" ]; then \
       npm install -g --no-fund --no-audit "$CLI_PACKAGE"; npm cache clean --force; \

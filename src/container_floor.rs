@@ -4615,6 +4615,30 @@ esac
                     "the {name} seat flags carry {f}: {flags}"
                 );
             }
+            // Every RUN after an ARG carries that ARG in its cache key, so a CLI argument
+            // declared above a shared layer gives each CLI image its own copy of it (about
+            // 0.9 GB for this one, per CLI, per host). The CLI arguments come only after
+            // every shared layer: the apt layers and the ledger.
+            let lines: Vec<&str> = df.lines().collect();
+            let first_cli_arg = lines
+                .iter()
+                .position(|l| l.starts_with("ARG CLI"))
+                .unwrap_or_else(|| panic!("the {name} image declares its CLI arguments"));
+            let last_shared = lines
+                .iter()
+                .rposition(|l| {
+                    l.contains("apt-get install") || l.contains("--prefix /opt/wicked-ledger")
+                })
+                .expect("shared layers");
+            assert!(
+                first_cli_arg > last_shared,
+                "the {name} image declares `{}` (line {}) before its shared layer `{}` \
+                 (line {}): that layer would be rebuilt and stored once per CLI",
+                lines[first_cli_arg],
+                first_cli_arg + 1,
+                lines[last_shared].trim(),
+                last_shared + 1
+            );
         }
         // CI runs the seat's browser and media checks under exactly this policy
         // (tests/fixtures/seat-floor/landrun-work-ro.args: the seat's grants with its fixture dir
