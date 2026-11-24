@@ -247,11 +247,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         let ballot = std::thread::spawn(move || {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::execute_wrapped::with_stdout_cap(stdout_cap, || {
-                    if on_stdin {
-                        crate::execute_wrapped::with_prompt_on_stdin(|| runner.run_unit(&input))
-                    } else {
+                    crate::execute_wrapped::with_prompt_on_stdin(on_stdin, || {
                         runner.run_unit(&input)
-                    }
+                    })
                 })
             }));
             let _ = tx.send(out);

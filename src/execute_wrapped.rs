@@ -8396,18 +8396,18 @@ thread_local! {
 }
 
 /// (DES-j6-build C0a) Run `f` with every unit the wrapped runner launches on THIS thread handed
-/// its prompt on stdin instead of argv: the prompt's bytes exactly as argv would have carried
+/// its prompt on stdin instead of argv when `on` (else on argv, as without the switch): the prompt's bytes exactly as argv would have carried
 /// them, at any size, on the host floor and in a seat pod alike, with no file pointer (a
 /// tool-less seat cannot read a file). The argv form is [`stdin_prompt_argv`]. A carried
 /// council ballot sets it for a seat that reads stdin, and for every model call.
-pub(crate) fn with_prompt_on_stdin<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_prompt_on_stdin<T>(on: bool, f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
             PROMPT_ON_STDIN.with(|c| c.set(self.0));
         }
     }
-    let _restore = Restore(PROMPT_ON_STDIN.with(|c| c.replace(true)));
+    let _restore = Restore(PROMPT_ON_STDIN.with(|c| c.replace(on)));
     f()
 }
 

@@ -227,7 +227,7 @@ fn a_150_kb_prompt_reaches_a_tool_less_claude_and_a_read_only_codex_on_stdin_byt
         let (tx, _rx) = std::sync::mpsc::channel();
         let runner = WrappedCliStepRunner::with_tx(tx);
         let out = if on_stdin {
-            with_prompt_on_stdin(|| runner.run_unit(&input))
+            with_prompt_on_stdin(true, || runner.run_unit(&input))
         } else {
             runner.run_unit(&input)
         };
