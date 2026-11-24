@@ -4197,6 +4197,10 @@ impl WrappedCliStepRunner {
             let mut seat_files: Vec<(PathBuf, String)> = Vec::new();
             let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
+            // (core#1848) The seat image pin the pod runs, held until the unit's pod is reaped so no
+            // other launch's pin cleanup removes it under this unit. Declared BEFORE `seat_cleanup`:
+            // on an early return or unwind, locals drop in reverse order, so the pod is reaped first.
+            let mut seat_pin: Option<crate::container_floor::SeatPin> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A long prompt's file (core#1228): kept until the seat has run.
@@ -4456,6 +4460,7 @@ impl WrappedCliStepRunner {
                             }
                         }
                         seat_cleanup = Some(c.cleanup);
+                        seat_pin = Some(c.seat_pin);
                         prompt_guard = c.prompt_file;
                         seat_gateway_env = c.env;
                         copilot_account = c.copilot_account;
@@ -5096,6 +5101,7 @@ impl WrappedCliStepRunner {
             self.unregister_token(input, &cancel_token);
             // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
+            drop(seat_pin.take());
             drop(scratch_guard.take());
             drop(prompt_guard.take());
             // Revoke the seat's gateway key and keep what the gateway recorded for it (each
