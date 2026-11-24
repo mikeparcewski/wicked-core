@@ -2113,21 +2113,13 @@ pub fn create_worktree_based(
         // registered". Prune drops exactly those dangling entries and touches no live worktree.
         let _ = git(repo_root, &["worktree", "prune"]);
     }
-    if let Some(parent) = wt.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "could not create the folder for this run's working copy, {}: {e}. Runs on this \
-                 repository need to create folders beside its checkout; make {} writable for this \
-                 computer's user",
-                parent.display(),
-                parent
-                    .ancestors()
-                    .find(|dir| dir.is_dir())
-                    .unwrap_or(parent)
-                    .display()
-            )
-        })?;
-    }
+    let wt = match wt.parent() {
+        Some(parent) => match create_writable_dir(parent) {
+            Ok(()) => wt,
+            Err(e) => in_clone_fallback(repo_root, &wt, parent, e)?,
+        },
+        None => wt,
+    };
     let branch = worktree_branch(run_id);
     let wt_str = wt.to_string_lossy().to_string();
     // core#431 (F-3R2-013): the base is the remote default branch's CURRENT tip when the clone
@@ -2170,6 +2162,125 @@ pub fn create_worktree_based(
     stamp_worktree_owner(&wt, run_id);
     claim_fresh_mint(&wt, run_id)?;
     Ok((wt, Some(base)))
+}
+
+/// (core#1860) `create_dir_all(dir)`, then proof that this computer's user can create an entry
+/// in it: a folder another user owns, or one on a read-only mount, passes `create_dir_all`.
+fn create_writable_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".wicked-probe-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&probe)?;
+    let _ = std::fs::remove_dir(&probe);
+    Ok(())
+}
+
+/// (core#1860) The folder beside the checkout could not be made (a checkout at a volume root,
+/// bind-mounted at `/repo`, or in a folder another user owns): the run's tree is minted inside the
+/// checkout instead, where trees lived before core#1109. Every path that finds a run's tree
+/// ([`worktree_path`], the reapers' [`all_worktrees_roots`], the sibling-tree fence) still knows
+/// that layout, and the checkout's own `info/exclude` keeps it out of the checkout's status. A
+/// `wicked-worktrees` the repository itself holds (a tracked link or file) is never followed or
+/// used: the run is refused with words that say so. Such a checkout's runs keep the one limit
+/// trees inside it always had: cargo's workspace walk from an excluded crate reaches the
+/// checkout's `Cargo.toml` (the reason for core#1109).
+fn in_clone_fallback(
+    repo_root: &str,
+    wt: &Path,
+    parent: &Path,
+    beside_error: std::io::Error,
+) -> anyhow::Result<PathBuf> {
+    let inside = in_clone_worktrees_root(repo_root);
+    let Some(fallback) = wt
+        .file_name()
+        .map(|name| inside.join(name))
+        .filter(|_| parent != inside)
+    else {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy, {}: {beside_error}. Make \
+             {} writable for this computer's user",
+            parent.display(),
+            parent
+                .ancestors()
+                .find(|dir| dir.is_dir())
+                .unwrap_or(parent)
+                .display()
+        );
+    };
+    if std::fs::symlink_metadata(&inside).is_ok_and(|m| !m.is_dir()) {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy beside the checkout, {} \
+             ({beside_error}), and {} inside it is a link or a file of the repository's own. \
+             Make {} writable for this computer's user",
+            parent.display(),
+            inside.display(),
+            parent
+                .ancestors()
+                .find(|dir| dir.is_dir())
+                .unwrap_or(parent)
+                .display()
+        );
+    }
+    if let Err(e) = create_writable_dir(&inside) {
+        anyhow::bail!(
+            "could not create the folder for this run's working copy beside the checkout, {} \
+             ({beside_error}), nor inside it, {} ({e}). Make the checkout {repo_root} writable \
+             for this computer's user",
+            parent.display(),
+            inside.display()
+        );
+    }
+    eprintln!(
+        "wicked-core: cannot create {} beside the checkout ({beside_error}); this run's tree is \
+         made inside the checkout, at {}",
+        parent.display(),
+        fallback.display()
+    );
+    exclude_in_clone_trees(repo_root);
+    Ok(fallback)
+}
+
+/// (core#1860) Keep the in-checkout trees folder out of the checkout's status: one line naming
+/// exactly that folder, anchored at the checkout's top (`/wicked-worktrees/`, or
+/// `/<subdirectory>/wicked-worktrees/` for a repository registered at a subdirectory), so a
+/// `wicked-worktrees` folder elsewhere in the repository stays visible. It is appended to the
+/// repository's own `info/exclude` (never the tracked `.gitignore`), never rewritten, so its other
+/// rules (in any encoding) survive; a file that cannot be read is left alone. Best-effort: a
+/// failure to write it is cosmetic, and two first launches at once may add the line twice.
+fn exclude_in_clone_trees(repo_root: &str) {
+    use std::io::Write;
+    let Ok((true, path, _)) = git(repo_root, &["rev-parse", "--git-path", "info/exclude"]) else {
+        return;
+    };
+    let Ok((true, prefix, _)) = git(repo_root, &["rev-parse", "--show-prefix"]) else {
+        return;
+    };
+    let entry = format!("/{prefix}{WORKTREES_DIR}/");
+    let exclude = Path::new(repo_root).join(path.trim());
+    let existing = match std::fs::read(&exclude) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return,
+    };
+    if existing
+        .split(|b| *b == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == entry.as_bytes())
+    {
+        return;
+    }
+    if let Some(dir) = exclude.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut line = Vec::new();
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        line.push(b'\n');
+    }
+    line.extend_from_slice(entry.as_bytes());
+    line.push(b'\n');
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+        .and_then(|mut f| f.write_all(&line));
 }
 
 /// Remove a run's worktree unconditionally (best-effort — a failure to clean up is logged, not
@@ -5028,6 +5139,148 @@ mod tests {
             "nothing is added to the checkout's git excludes any more"
         );
         rm_repo(&root);
+    }
+
+    /// core#1860 — a scratch folder holding one checkout, `app`, removed (permissions restored
+    /// first) when dropped. The folder's name never collides with [`git_repo`]'s.
+    #[cfg(unix)]
+    struct Holder(PathBuf);
+
+    #[cfg(unix)]
+    impl Holder {
+        fn new(tag: &str) -> (Self, PathBuf) {
+            let holder = std::env::temp_dir().join(format!(
+                "wicked-wt-holder-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            drop(Holder(holder.clone()));
+            std::fs::create_dir_all(&holder).unwrap();
+            std::fs::rename(git_repo(tag), holder.join("app")).unwrap();
+            let app = holder.join("app");
+            (Holder(holder), app)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [
+                self.0.clone(),
+                self.0.join("app.wicked"),
+                self.0.join("app.wicked").join(WORKTREES_DIR),
+            ] {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// core#1860 — the fallback's whole life: the tree is minted inside the checkout, a resume
+    /// finds it again, the checkout's own status stays clean, and a removal reaps it.
+    #[cfg(unix)]
+    fn assert_minted_inside(app: &Path, run_id: &str) {
+        let p = app.to_str().unwrap();
+        let wt = create_worktree(p, run_id).unwrap();
+        assert_eq!(wt, app.join(WORKTREES_DIR).join(run_id));
+        assert!(is_live_worktree(&wt), "{}", wt.display());
+        assert_eq!(
+            create_worktree(p, run_id).unwrap(),
+            wt,
+            "a resume reuses it"
+        );
+        let (ok, status, _) = git(p, &["status", "--porcelain"]).unwrap();
+        assert!(
+            ok && status.trim().is_empty(),
+            "the checkout stays clean: {status}"
+        );
+        let probes = std::fs::read_dir(app.join(WORKTREES_DIR))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with(".wicked-probe"))
+            })
+            .count();
+        assert_eq!(probes, 0, "no probe is left among the trees");
+        remove_worktree(p, run_id);
+        assert!(!wt.exists(), "a removal reaps it");
+    }
+
+    /// core#1860 — a checkout whose parent folder cannot be written (a volume root, a bind mount
+    /// at `/repo`, a folder another user owns) still starts runs, and so does one whose folder
+    /// beside it exists but cannot be written (left by another user's daemon): the tree is minted
+    /// inside the checkout, where trees lived before core#1109.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_whose_parent_folder_cannot_be_written_still_mints_its_run_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let ro = |dir: &Path| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap()
+        };
+        let (holder, app) = Holder::new("ro-parent");
+        ro(&holder.0);
+        if std::fs::create_dir(holder.0.join("probe")).is_ok() {
+            eprintln!("this user writes a read-only folder (root): nothing to show here");
+            return;
+        }
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        assert_minted_inside(&app, "run-ro");
+
+        let (holder, app) = Holder::new("ro-beside");
+        let beside = holder.0.join("app.wicked").join(WORKTREES_DIR);
+        std::fs::create_dir_all(&beside).unwrap();
+        ro(&beside);
+        assert_minted_inside(&app, "run-ro-beside");
+        assert_eq!(
+            std::fs::read_dir(&beside).unwrap().count(),
+            0,
+            "no probe left"
+        );
+    }
+
+    /// core#1860 — the same fallback for any user (root included): a FILE where the folder beside
+    /// the checkout would go. The checkout's existing `info/exclude` rules, in any encoding and
+    /// without a final line break, are kept; its one line is added once. A `wicked-worktrees`
+    /// the repository itself holds as a link is never followed: the run is refused and nothing is
+    /// made through it.
+    #[cfg(unix)]
+    #[test]
+    fn the_in_checkout_fallback_keeps_the_excludes_and_never_follows_a_repository_link() {
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let (holder, app) = Holder::new("file-beside");
+        std::fs::write(holder.0.join("app.wicked"), "not a folder\n").unwrap();
+        let exclude = app.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let rules: &[u8] = b"# kept \xff rule\n*.log";
+        std::fs::write(&exclude, rules).unwrap();
+        assert_minted_inside(&app, "run-file");
+        assert_minted_inside(&app, "run-file-2");
+        assert_eq!(
+            std::fs::read(&exclude).unwrap(),
+            [rules, &b"\n/wicked-worktrees/\n"[..]].concat()
+        );
+        // The line names that one folder: a `wicked-worktrees` elsewhere stays visible.
+        std::fs::create_dir_all(app.join("fixtures").join(WORKTREES_DIR)).unwrap();
+        std::fs::write(app.join("fixtures").join(WORKTREES_DIR).join("a.rs"), "x\n").unwrap();
+        let (_, status, _) = git(app.to_str().unwrap(), &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("fixtures/"), "{status}");
+
+        let (holder, app) = Holder::new("link-inside");
+        std::fs::write(holder.0.join("app.wicked"), "not a folder\n").unwrap();
+        std::fs::create_dir_all(app.join("runs")).unwrap();
+        std::fs::write(app.join("runs").join("keep"), "k\n").unwrap();
+        std::os::unix::fs::symlink("runs", app.join(WORKTREES_DIR)).unwrap();
+        let p = app.to_str().unwrap();
+        assert!(git(p, &["add", "-A"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "link"]).unwrap().0);
+        let err = create_worktree(p, "run-link").unwrap_err().to_string();
+        assert!(err.contains("a link or a file of the repository"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(app.join("runs")).unwrap().count(),
+            1,
+            "nothing is made through the link"
+        );
     }
 
     /// core#1109 — a tree an engine before the move minted INSIDE the checkout keeps working in
