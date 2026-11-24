@@ -14,8 +14,44 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.15.49** — 2026-11-23 — patch release on the train-12 re-cut 4 46cf9af4, carrying 55 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840.
+- **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 88a6228d, carrying 73 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - One seat-key parser and the reserved stand-in separator (DES-STANDIN-001 C1) (#1841)
+
+  - One preflight says which independent roles a launch is short of (DES-STANDIN-001 C2, core#1721) (#1844)
+
+  - Reuse the review's POL-2101 verdict on the same change; a seat-refused write holds the creator's gate (#1850)
+
+  - Mint run worktrees beside the checkout, not inside it (#1851)
+
+  - A cd into a chat's read-root repository is a read unless it writes (crew#1795) (#1849)
+
+  - An empty scope on the shipped domain mapping scores no code touched (core#1838); bounded council slot probe (core#1794) (#1865)
+
+  - A floor whose checks did not run for low disk asks for space and a retry (core#1846) (#1856)
+
+  - A hand-off round's floor runs only what the round changed; a check that left outputs is never reused (core#1208, core#1157) (#1866)
+
+  - The hand-off re-score reads QE's diff, an overridden floor is labelled, and an override of the targeted tests carries to the full suite (core#1709) (#1867)
+
+  - A chat's follow-up turn keeps every unchanged read-only root; arm timing says why a root was re-read (core#1747) (#1871)
+
+  - A missing host CLI's sign-in refusal ends with its npm install command (core#1845) (#1872)
+
+  - A git read is an allow-listed form; everything else writes (core#1857, #1858, #1859, #1868) (#1874)
+
+  - Every engine git runs without the Azure DevOps token and with fsmonitor off (wicked-crew#1843) (#1878)
+
+  - A seat's declared native addon is built before it starts (core#1406) (#1880)
+
+  - Headless Chromium and ffmpeg in every seat image (core#1455, core#1614) (#1879)
+
+  - The idle-timer test installs its kubectl stand-ins without a writable fd (core#1769) (#1883)
+
+  - On macOS a stopped command's group is signalled until no member is left (core#1835) (#1885)
+
+  - Stand-in review in the engine, opt-in per launch (DES-STANDIN-001 C3a) (#1854)
 
   - The reviewer is asked for POL-2101's record line; a skip names only the held rules (#1839)
 
