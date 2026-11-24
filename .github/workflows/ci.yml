@@ -287,11 +287,12 @@ jobs:
             -v "$PWD/tests/fixtures/native-build/better-sqlite3.sh:/work/native-build.sh:ro" \
             --entrypoint /usr/bin/env "$image" -i "$debian" HOME=/home/floor TMPDIR=/tmp \
             sh -euc 'sh /work/native-build.sh
-              # Landlock holds: the claim outside build/ is read-only to a confined process.
-              if /floor/landrun --ignore-missing --rox /usr --rox /bin --rox /lib --rox /lib64 --rox /etc --rox /wicked/vol -- \
-                  /bin/sh -c "echo changed > /wicked/vol/.probe" 2>/dev/null; then
-                echo "Landlock is not enforced here; this check would prove nothing" >&2; exit 1
-              fi'
+              # Landlock holds: a confined process writes its scratch, never the claim outside build/.
+              /floor/landrun --best-effort --ignore-missing --rox /usr --rox /bin --rox /lib --rox /lib64 \
+                  --rox /etc --rox /wicked/vol --rwx /tmp -- \
+                  /bin/sh -c "touch /tmp/granted && ! (echo changed > /wicked/vol/.probe) 2>/dev/null" || {
+                echo "Landlock is not enforced here; this check would prove nothing" >&2; exit 1; }
+              test ! -e /wicked/vol/.wicked-jail-probe'
           test "$(cat "$dir/t/node_modules/.probe")" = untouched
           test -f "$dir/t/node_modules/.wicked-native-built"
           # The seat: no network, the claim read-only.

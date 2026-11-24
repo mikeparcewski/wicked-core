@@ -1849,7 +1849,22 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         .nth(1)
         .and_then(|r| r.split(" -- /bin/sh").next())
         .unwrap_or_else(|| panic!("{script}"));
-    assert!(!policy.contains("--best-effort"), "{policy}");
+    // The launcher takes the ABI the kernel has, so the jail is proven in force first, under the
+    // same policy: a scratch write succeeds and a write to the claim's top is refused.
+    assert!(
+        policy.starts_with("--best-effort --ignore-missing "),
+        "{policy}"
+    );
+    let prove = format!(
+        "if ! /floor/landrun {policy} -- /bin/sh -c {}; then rm -f {FILL_DIR}/{JAIL_PROBE};",
+        sh_quote(&format!(
+            "touch /tmp/wicked-native/.jail-granted && ! touch {FILL_DIR}/{JAIL_PROBE} 2>/dev/null"
+        ))
+    );
+    assert!(
+        script.find(&prove).unwrap_or_else(|| panic!("{script}"))
+            < script.find("if /floor/landrun ").unwrap()
+    );
     assert!(policy.contains(&format!("--rox {FILL_DIR} ")), "{policy}");
     assert!(policy.contains(&format!("--rwx '{FILL_DIR}/better-sqlite3/build'")));
     let writable: Vec<&str> = policy
@@ -1893,10 +1908,15 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         &bin.join("node"),
         "#!/bin/sh\nif [ -n \"$GYP_FAILS\" ]; then mkdir -p build/Release && : > build/Release/partial.node; exit 7; fi\nif [ \"$2\" = build ]; then mkdir -p build/Release && : > build/Release/x.node; fi\nexit 0\n",
     );
+    // The stand-in launcher "enforces" by making the claim's top unwritable while its command runs
+    // (each addon's build/ stays writable); with JAIL_OPEN set it confines nothing, as a kernel
+    // without Landlock under `--best-effort` would.
     let landrun = root.join("landrun");
     crate::test_env::install_stub(
         &landrun,
-        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\n\
+         if [ -n \"$JAIL_OPEN\" ]; then exec \"$@\"; fi\n\
+         chmod a-w \"$CLAIM\"; \"$@\"; rc=$?; chmod u+w \"$CLAIM\"; exit $rc\n",
     );
     let local = script
         .replace(FILL_DIR, &claim.display().to_string())
@@ -1906,7 +1926,8 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         let mut c = std::process::Command::new("sh");
         c.args(["-c", &local])
             .env_clear()
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("CLAIM", &claim);
         for (k, v) in env {
             c.env(k, v);
         }
@@ -1921,6 +1942,12 @@ fn the_seat_claims_native_build_is_the_floors_step_confined_and_marked_only_on_s
         )
     };
     let build = claim.join("better-sqlite3/build");
+    // A jail not in force: nothing is built (the stub node never runs), no marker, no probe left.
+    let (ok, out) = run(&[("JAIL_OPEN", "1")]);
+    assert!(!ok && out.contains("Landlock is not in force"), "{out}");
+    assert!(!claim.join(NATIVE_BUILT).exists());
+    assert!(!claim.join(JAIL_PROBE).exists());
+    assert_eq!(std::fs::read_dir(&build).unwrap().count(), 0, "{out}");
     let (ok, _) = run(&[("GYP_FAILS", "1")]);
     assert!(!ok);
     assert!(

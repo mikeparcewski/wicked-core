@@ -3292,16 +3292,23 @@ pub(crate) fn seat_nm_volume(tag: &str, lock: &[u8], inputs: &[u8], native: &[&s
 /// (core#1406) The marker a seat claim's native build leaves at its top once every binding built.
 const NATIVE_BUILT: &str = ".wicked-native-built";
 
+/// (core#1406) The file a native build's jail proof tries (and must fail) to write at the claim's top.
+const JAIL_PROBE: &str = ".wicked-jail-probe";
+
 /// (core#1406) The script an offline build pod runs over a seat claim mounted at [`FILL_DIR`].
 /// Trusted engine steps first: a claim already marked answers `WICKED-HIT`; otherwise each
 /// addon's `build/` is emptied (nothing a package shipped there, or an earlier attempt left, is
 /// reused). Then the floor's own native-build step ([`crate::repo_checks::native_build_argv`]:
 /// node-gyp beside the image's npm, its own node's headers, no download, no npm lifecycle) runs
-/// under the floor's landrun, which must enforce (no best effort): the claim and the system are
-/// read-only to it, and only each addon's `build/`, the scratch and the home are writable, so the
-/// repository-installed build (gyp actions) can change nothing else in the claim (the installed
-/// packages, the nested archive, the marker). The engine marks the claim only after that step
-/// succeeded, and empties the build dirs again when it failed.
+/// under the floor's landrun: the claim and the system are read-only to it, and only each addon's
+/// `build/`, the scratch and the home are writable, so the repository-installed build (gyp
+/// actions) can change nothing else in the claim (the installed packages, the nested archive, the
+/// marker). The launcher runs `--best-effort` (the ABI the kernel has; without it landrun refuses
+/// any kernel below its newest ABI) and, like the sync pod's jail, the jail is PROVEN in force
+/// before the build: under the same policy a write to the scratch succeeds and one to the claim's
+/// top is refused, else (no Landlock, or a launcher that cannot start) nothing is built. The
+/// engine marks the claim only after the build succeeded, and empties the build dirs again when
+/// it failed.
 pub(crate) fn native_build_script(native: &[&str]) -> String {
     let argv = crate::repo_checks::native_build_argv(native);
     let builds: Vec<String> = native
@@ -3312,7 +3319,11 @@ pub(crate) fn native_build_script(native: &[&str]) -> String {
         .iter()
         .map(|b| format!("rm -rf {b} && mkdir {b}; "))
         .collect::<String>();
-    let mut policy: Vec<String> = vec!["/floor/landrun".into(), "--ignore-missing".into()];
+    let mut policy: Vec<String> = vec![
+        "/floor/landrun".into(),
+        "--best-effort".into(),
+        "--ignore-missing".into(),
+    ];
     for d in [
         "/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc", FILL_DIR,
     ] {
@@ -3331,13 +3342,20 @@ pub(crate) fn native_build_script(native: &[&str]) -> String {
     for v in ["PATH", "HOME", "TMPDIR"] {
         policy.extend(["--env".into(), v.into()]);
     }
+    let policy = policy.join(" ");
+    let probe = format!("{FILL_DIR}/{JAIL_PROBE}");
+    let prove = sh_quote(&format!(
+        "touch /tmp/wicked-native/.jail-granted && ! touch {probe} 2>/dev/null"
+    ));
     format!(
         "set -e; if [ -f {FILL_DIR}/{NATIVE_BUILT} ]; then echo WICKED-HIT; exit 0; fi; \
          {clean}rm -rf /tmp/wicked-native; mkdir -p /tmp/wicked-native; \
          ln -s {FILL_DIR} /tmp/wicked-native/node_modules; cd /tmp/wicked-native; \
-         if {} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
+         if ! {policy} -- /bin/sh -c {prove}; then rm -f {probe}; \
+         echo 'wicked-core: Landlock is not in force in the build pod; nothing is built' >&2; \
+         exit 1; fi; \
+         if {policy} -- /bin/sh -c {}; then touch {FILL_DIR}/{NATIVE_BUILT}; \
          else {clean}exit 1; fi",
-        policy.join(" "),
         sh_quote(&argv[2])
     )
 }
