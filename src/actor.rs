@@ -10348,6 +10348,7 @@ fn floor_override_gate(unit: &crate::domain::WorkUnit, source: &str) -> bool {
         && unit.member_step.is_none()
         && unit.tool_cmd.is_none()
         && !crate::deliver_lift::is_deliver_unit(unit)
+        && floor_not_run(unit).is_none()
 }
 
 /// The operator-judgment offer clause, byte-identical wherever the engine offers it (studio's
@@ -11054,6 +11055,15 @@ fn denial_gate_prompt_body(
                  RE-RUNS the `{phase}` phase from the start under the same policies (a retry; \
                  the captured output is not accepted), or reject to cancel the run{note}",
                 reason_head(reason)
+            )
+        }
+        // (core#1846) The checks never ran (the machine was short of disk): nothing failed, so
+        // the one way on is a retry once there is space; no seat, send-back or override fixes it.
+        "floor_failed" if floor_not_run(unit).is_some() => {
+            let (verb, cause) = floor_not_run(unit).map_or(("run", ""), |f| (f.verb, f.cause));
+            format!(
+                "Unit {ord}'s checks did not {verb}: {cause}. Approve to retry the step once that \
+                 is fixed (its checks run again), or reject to cancel the run{note}"
             )
         }
         "floor_failed" if floor_fix_applies(unit) => format!(
@@ -12016,6 +12026,14 @@ pub(crate) fn parked_reseat_refusal(
             "unit {ord} of run {run_id} is the PA's review of a member's step and runs on the \
              PA's seat; approve to run the review again, or reject to stop the run"
         );
+    }
+    // (core#1846) Another seat meets the same machine: the checks did not run for want of disk.
+    if let Some(f) = floor_not_run(unit) {
+        return Err(floor_not_run_refusal(
+            ord,
+            &f,
+            "moving the step to another seat",
+        ));
     }
     refuse_author_reassign(session, units, session.unit_ix, cli)?;
     // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units, parked or not.
@@ -20905,6 +20923,8 @@ pub(crate) fn confirm_gate_expecting(
 /// own repo-checks floor ran and denied it. Its note goes to a seat that can write
 /// ([`floor_fix_request`]) and only the floor re-runs; the note on the read-only phase itself
 /// would reach no seat that can act on it.
+/// (core#1846) Never at a floor whose checks did not run ([`floor_not_run`]): nothing failed
+/// for a seat to fix.
 fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
     crate::worktree_guard::applies_to(unit)
         && unit.repo_checks_floor
@@ -20913,6 +20933,63 @@ fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
             d.source == crate::repo_checks::DENIAL_SOURCE
                 || d.source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
         })
+        && floor_not_run(unit).is_none()
+}
+
+/// (core#1846) A repo-checks floor stopped by the machine (the disk was short of space), not by
+/// the change ([`floor_not_run`]).
+pub(crate) struct FloorNotRun<'a> {
+    /// The floor's own cause, without its wire prefix; it says what to do.
+    pub(crate) cause: &'a str,
+    /// `run` when no check started, `finish` when the disk stopped the floor part way.
+    pub(crate) verb: &'static str,
+}
+
+/// (core#1846) Whether `unit`'s gate is ONLY its floor stopped by the machine: a repo-checks denial
+/// whose report carries the floor's environment refusal
+/// ([`crate::repo_checks::RepoChecksReport::environment_refusal`]), where no check that ran
+/// denied the work and the gate's record says no other layer denied the attempt. `None` for every other gate (a check
+/// that failed or timed out before the stop, or a denial behind the floor, keeps the floor gate's
+/// own answers). Its gate is a retry once the machine is fixed: no seat, send-back or override
+/// answers it, since nothing said anything against the work.
+pub(crate) fn floor_not_run(unit: &crate::domain::WorkUnit) -> Option<FloorNotRun<'_>> {
+    // `None` behind the floor is an unknown record, not an empty one: another layer may have
+    // denied the attempt.
+    if unit.denial.as_ref()?.source != crate::repo_checks::DENIAL_SOURCE
+        || !unit.denials_behind.as_deref().is_some_and(|b| b.is_empty())
+    {
+        return None;
+    }
+    let report = unit.repo_checks.as_ref()?;
+    let cause = report.environment_refusal()?;
+    if report
+        .checks
+        .iter()
+        .any(|c| c.denies() && !c.environment_failure())
+    {
+        return None;
+    }
+    let started = report.checks.iter().any(|c| !c.environment_failure());
+    Some(FloorNotRun {
+        cause: cause
+            .strip_prefix(crate::repo_checks::ENVIRONMENT_REFUSAL_PREFIX)
+            .unwrap_or(cause)
+            .trim()
+            .trim_end_matches('.'),
+        verb: if started { "finish" } else { "run" },
+    })
+}
+
+/// (core#1846) The refusal every answer but a retry or a stop gets at a floor the machine stopped
+/// ([`floor_not_run`]).
+fn floor_not_run_refusal(ord: u32, f: &FloorNotRun<'_>, answer: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unit {ord}'s checks did not {}: {}. Nothing about the work failed, so {answer} would \
+         not help: free disk space on this machine, then approve to retry the step, or reject to \
+         cancel the run",
+        f.verb,
+        f.cause
+    )
 }
 
 /// (core#782) The `floor_fix` re-run for `cursor`: `note` handed to a seat DISTINCT from the
@@ -21654,6 +21731,19 @@ pub(crate) fn refuse_before_resolving(
              review again, or reject to stop the run"
         );
     }
+    // (core#1846) A floor whose checks did not run (the machine was short of disk) said nothing
+    // about the work: sending it back would rework a change no check faulted.
+    if matches!(
+        decision,
+        crate::workflow::HumanDecision::RequestChanges { .. }
+    ) && !adjudication_open
+        && !team_gate::dispute_gate_open(session)
+        && !team_gate::transport_gate_open(session)
+    {
+        if let Some((u, f)) = cursor.and_then(|u| floor_not_run(u).map(|f| (u, f))) {
+            return Err(floor_not_run_refusal(u.ord, &f, "sending the work back"));
+        }
+    }
     // (core#1719) A retry of a review whose seat is on its record as calling an author's
     // provider, with no other seat of the run able to review the work, would run on that seat
     // again and be denied the same way: refused, with the dead end in plain words.
@@ -22318,6 +22408,10 @@ fn floor_override_for(
             source.unwrap_or("nothing")
         ),
     };
+    // (core#1846) No check ran: there is no failure for the operator's judgment to override.
+    if let Some(f) = floor_not_run(u) {
+        return Err(floor_not_run_refusal(u.ord, &f, "your own judgment"));
+    }
     if u.member_step.is_some() {
         anyhow::bail!(
             "unit {} is a team member's step: its team answers its gate (approve re-runs it), \
@@ -35781,6 +35875,208 @@ mod request_changes_tests {
                 .unwrap()
                 .note,
             crate::NoteRule::Required
+        );
+    }
+
+    /// (core#1846) The floor's report when the machine is short of disk, made by the floor itself
+    /// (`repo_checks::run_floor`, whose disk guard refuses before any check runs): the test seam
+    /// stands in for a volume with 1 GiB free.
+    fn disk_refused_floor() -> crate::repo_checks::RepoChecksReport {
+        let wt = std::env::temp_dir().join(format!(
+            "wicked-1846-disk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("package.json"), r#"{"scripts":{"test":"exit 1"}}"#).unwrap();
+        // A test that turns the disk guard off (`WICKED_FLOOR_MIN_FREE_GB=0`) holds the write lock.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::repo_checks::TEST_FREE_BYTES.with(|c| c.set(1 << 30));
+        let report =
+            crate::repo_checks::run_floor(&wt, &crate::repo_checks::FloorContext::default());
+        crate::repo_checks::TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+        let _ = std::fs::remove_dir_all(&wt);
+        assert!(report.checks.is_empty(), "no check ran: {report:?}");
+        assert!(report.environment_refusal().is_some(), "{report:?}");
+        report
+    }
+
+    /// (core#1846) `unit` denied by `report` as the gate fold books a failed floor
+    /// (`pipeline.rs` `apply_and_finish_unit`: `report.denial_source()`, `report.denial_reason()`).
+    fn deny_by_floor(unit: &mut WorkUnit, report: crate::repo_checks::RepoChecksReport) {
+        let why = report.denial_reason();
+        unit.status = UnitStatus::Rejected;
+        unit.repo_checks_floor = true;
+        unit.denial = Some(UnitDenial::new(report.denial_source(), &why));
+        unit.denial_reason = Some(why);
+        unit.denials_behind = Some(Vec::new());
+        unit.repo_checks = Some(report);
+    }
+
+    /// (core#1846) A read-only phase's floor refused for low disk (cert t12r2-j4-retry): `verify`,
+    /// on a three-seat roster, its gate open.
+    fn seed_disk_refused_verify(store: &mut dyn GraphStore, run_id: &str) {
+        seed_floor_red_verify(store, run_id, "codex");
+        let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+        put_node(store, s.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        units[3].worktree_guarded = true;
+        deny_by_floor(&mut units[3], disk_refused_floor());
+        put_node(store, units[3].to_node()).unwrap();
+        open_row(store, run_id, 4, "escalation");
+    }
+
+    /// (core#1846) A floor whose checks never ran for want of disk says so, why, and that the way
+    /// on is to free space and retry, on a read-only phase and on a creator alike. It never reads
+    /// as a failed check, and offers no floor fix, no send-back and no operator judgment.
+    #[test]
+    fn a_disk_refused_floor_gate_says_the_checks_did_not_run_and_to_free_space_then_retry() {
+        let report = disk_refused_floor();
+        let mut verify = WorkUnit::pending("r:verify", "r", 4, "verify");
+        verify.role = PhaseRole::Evaluator;
+        verify.worktree_guarded = true;
+        deny_by_floor(&mut verify, report.clone());
+        assert!(floor_not_run(&verify).is_some());
+        assert!(!floor_fix_applies(&verify), "no seat can fix a full disk");
+        let mut fix = WorkUnit::pending("r:fix", "r", 3, "fix");
+        fix.role = PhaseRole::Creator;
+        deny_by_floor(&mut fix, report);
+        for u in [&verify, &fix] {
+            let reason = u.denial_reason.clone().unwrap();
+            let class = denial_class(u.denial.as_ref(), false);
+            assert_eq!(class, "floor_failed");
+            let p = denial_gate_prompt(u, class, &reason, None, "");
+            assert!(
+                p.starts_with(&format!(
+                    "Unit {}'s checks did not run: the host has 1.0 GiB free",
+                    u.ord
+                )),
+                "{p}"
+            );
+            assert!(p.contains("no check ran. Free disk space"), "{p}");
+            assert!(p.contains("Approve to retry the step"), "{p}");
+            assert!(p.ends_with("or reject to cancel the run"), "{p}");
+            for never in [
+                "failed its deterministic floor",
+                "environment:",
+                "approve with a note",
+                "operator_judgment",
+                "could not run:",
+            ] {
+                assert!(!p.contains(never), "{never}: {p}");
+            }
+        }
+        // A floor whose checks ran and failed keeps its own prompt and its floor fix.
+        let mut red = verify.clone();
+        red.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap(),
+        );
+        assert!(floor_not_run(&red).is_none());
+        assert!(floor_fix_applies(&red));
+
+        // The disk stopped the floor part way (xreview r1): a check that ran and passed first
+        // leaves it a retry, said as "did not finish"; a check that ran and FAILED first, or another
+        // layer that denied the attempt, keeps the floor gate's own answers.
+        let check = |exit: i32| -> crate::repo_checks::CheckRun {
+            serde_json::from_value(serde_json::json!({
+                "name": "lint", "argv": ["npm", "run", "lint"], "source": "package.json",
+                "exit_code": exit, "timed_out": false, "duration_ms": 900,
+                "stdout_tail": "", "stderr_tail": ""
+            }))
+            .unwrap()
+        };
+        let mut part = verify.clone();
+        part.repo_checks.as_mut().unwrap().checks.push(check(0));
+        let p = denial_gate_prompt(&part, "floor_failed", "x", None, "");
+        assert!(
+            p.starts_with("Unit 4's checks did not finish: the host has"),
+            "{p}"
+        );
+        assert!(!floor_fix_applies(&part));
+        let mut failed_first = verify.clone();
+        failed_first
+            .repo_checks
+            .as_mut()
+            .unwrap()
+            .checks
+            .push(check(1));
+        assert!(floor_not_run(&failed_first).is_none());
+        assert!(floor_fix_applies(&failed_first));
+        // xreview r2: an unknown record (`None`, from before the record existed or a same-tree
+        // retry that did not ask every layer) is not "nothing else denied".
+        for record in [
+            Some(vec![UnitDenial::new("evaluator_verdict", "FAIL")]),
+            None,
+        ] {
+            let mut behind = verify.clone();
+            behind.denials_behind = record;
+            assert!(floor_not_run(&behind).is_none());
+            assert!(floor_fix_applies(&behind));
+            let p = denial_gate_prompt(&behind, "floor_failed", "x", None, "");
+            assert!(p.contains("failed its deterministic floor"), "{p}");
+        }
+    }
+
+    /// (core#1846) The gate's published answers are a retry and a stop: no floor fix on the noted
+    /// approve, no send-back, no reassign and no operator judgment, and the engine refuses each of
+    /// those with the cause and what to do.
+    #[test]
+    fn gate_actions_disk_refused_floor_offers_only_retry_and_stop() {
+        let listed = listed_is_accepted("floor-disk-refused", &seed_disk_refused_verify);
+        let approve = action(&listed, "approve").expect("approve");
+        assert_eq!(approve.intent, "retry", "{listed:#?}");
+        assert_eq!(approve.note_intent, None, "{listed:#?}");
+        for never in [
+            "request_changes",
+            "reassign",
+            crate::workflow::OPERATOR_JUDGMENT_ACTION,
+        ] {
+            assert!(action(&listed, never).is_none(), "{never}: {listed:#?}");
+        }
+        assert!(action(&listed, "reject").is_some(), "{listed:#?}");
+
+        let run_id = format!("disk-refused-answers-{}", std::process::id());
+        let refused = |d: HumanDecision| {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_disk_refused_verify(&mut store, &run_id);
+            answer(&mut store, &run_id, d)
+                .0
+                .expect_err("refused")
+                .to_string()
+        };
+        for e in [
+            refused(HumanDecision::RequestChanges {
+                note: Some("fix it".into()),
+            }),
+            refused(HumanDecision::OperatorJudgment {
+                rationale: "the disk, not the work".into(),
+            }),
+        ] {
+            assert!(
+                e.starts_with("unit 4's checks did not run: the host has 1.0 GiB free")
+                    && e.contains("free disk space on this machine, then approve to retry"),
+                "{e}"
+            );
+        }
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        let s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let e = reseat_parked_unit(&mut store, &mut subs, &s, 4, Some("pi"))
+            .expect_err("no reassign")
+            .to_string();
+        assert!(
+            e.contains("moving the step to another seat would not help"),
+            "{e}"
         );
     }
 }
