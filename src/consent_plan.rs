@@ -329,7 +329,7 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("Decline — writes nothing"), "{s}");
-        assert!(s.contains("Not installed for: pi (unsupported)."), "{s}");
+        assert!(s.contains("Not installed for pi: unsupported."), "{s}");
         let f = event_fields(&offer);
         assert_eq!(
             f["choices"],
@@ -419,5 +419,66 @@ mod tests {
         plan["asks"] = serde_json::json!({"not": "a list"});
         let parsed = parse_plan(&plan.to_string()).expect("a non-list asks is ignored");
         assert!(parsed.asks.is_empty());
+    }
+
+    /// (garden#1543) The plan garden's `scripts/mcp/install.py` `do_plan` prints on a host with no
+    /// wicked-installer on PATH (`--dir <server> --dry-run --json`, HOME=/h; the registry origin
+    /// normalised): every requested CLI is a skipped row with the same reason.
+    const NO_INSTALLER_PLAN: &str = r#"{"dry_run":true,"key":"acme-notes","lockfile":"resolved at install","choices":[{"id":"worker_no-cli","label":"Install for workers","default":true,"writes":[{"path":"/h/.wicked/mcp-servers/acme-notes/current","what":"install root","operator_owned":false},{"path":"/h/.wicked/mcp-servers/acme-notes/installed.json","what":"the install record","operator_owned":false},{"path":"http://127.0.0.1:7701/api/v1/mcp/servers/acme-notes","what":"wicked-crew MCP tools registry entry","operator_owned":false}]},{"id":"operator_no-cli","label":"Also install into my CLIs","writes":[{"path":"/h/.wicked/mcp-servers/acme-notes/current","what":"install root","operator_owned":false},{"path":"/h/.wicked/mcp-servers/acme-notes/installed.json","what":"the install record","operator_owned":false},{"path":"http://127.0.0.1:7701/api/v1/mcp/servers/acme-notes","what":"wicked-crew MCP tools registry entry","operator_owned":false}]}],"skipped":[{"cli":"claude","why":"wicked-installer is not installed on this host. To add the server to the CLIs: decline, run npm install -g wicked-installer, then start the run again"},{"cli":"codex","why":"wicked-installer is not installed on this host. To add the server to the CLIs: decline, run npm install -g wicked-installer, then start the run again"},{"cli":"opencode","why":"wicked-installer is not installed on this host. To add the server to the CLIs: decline, run npm install -g wicked-installer, then start the run again"},{"cli":"antigravity","why":"wicked-installer is not installed on this host. To add the server to the CLIs: decline, run npm install -g wicked-installer, then start the run again"},{"cli":"pi","why":"wicked-installer is not installed on this host. To add the server to the CLIs: decline, run npm install -g wicked-installer, then start the run again"}]}"#;
+
+    #[test]
+    fn skipped_clis_that_share_a_reason_say_it_once() {
+        let offer = ConsentOffer {
+            plan_ord: Some(3),
+            plan: parse_plan(NO_INSTALLER_PLAN),
+            missing: None,
+        };
+        let s = offer_sentence(&offer, Some("/h"));
+        let why = "wicked-installer is not installed on this host. To add the server to the CLIs: \
+                   decline, run npm install -g wicked-installer, then start the run again";
+        assert!(
+            s.ends_with(&format!(
+                " Decline — writes nothing and cancels the run. \
+                 Not installed for claude, codex, opencode, antigravity, pi: {why}."
+            )),
+            "{s}"
+        );
+        assert_eq!(s.matches("not installed on this host").count(), 1, "{s}");
+        // The event keeps one row per CLI: only the sentence groups them.
+        assert_eq!(
+            event_fields(&offer)["writeTargetsSkipped"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn skipped_reasons_group_in_first_seen_order_and_a_bare_row_is_a_name() {
+        let mut plan = parse_plan(PLAN).unwrap();
+        let row = |cli: &str, why: &str| Skipped {
+            cli: cli.into(),
+            why: why.into(),
+        };
+        plan.skipped = vec![
+            row("pi", "unsupported"),
+            row("claude", ""),
+            row("codex", "unsupported."),
+            row("opencode", "no config found"),
+            row("antigravity", ""),
+        ];
+        let offer = ConsentOffer {
+            plan_ord: None,
+            plan: Some(plan),
+            missing: None,
+        };
+        let s = offer_sentence(&offer, None);
+        assert!(
+            s.ends_with(
+                " Not installed for pi, codex: unsupported. Not installed for claude, antigravity. \
+                 Not installed for opencode: no config found."
+            ),
+            "{s}"
+        );
     }
 }
