@@ -3644,15 +3644,27 @@ fn collect_bash_write_targets(
     // descriptor sends stdout+stderr to the FILE `WORD`: both are write redirects too.
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     // (core#1852) Each redirect word is read up to a control operator glued to it, which the lexer
-    // leaves inside the word in a command holding an expansion (`… ${X} 2>/dev/null|head`).
+    // leaves inside the word in a command holding an expansion (`… ${X} 2>/dev/null|head`). The
+    // lexer's split reading then scans what follows the operator as its own command. Not in a
+    // command with a heredoc (a body line keeps a glued operator in both readings, so what follows
+    // it would be scanned by neither) or a backtick (its own escape layer can make a `|` the
+    // word's literal byte): there the whole word stays, unresolved or refused as before.
+    let cut_redirects = !original.contains("<<") && !original.contains('`');
+    let cut = |word| {
+        if cut_redirects {
+            before_glued_operator(word)
+        } else {
+            word
+        }
+    };
     let mut i = 0;
     while i < toks.len() {
-        let tok = before_glued_operator(toks[i]);
+        let tok = cut(toks[i]);
         if let Some(glued) = redirect_glob(tok).or_else(|| file_redirect_extra(tok)) {
             if !glued.is_empty() {
                 targets.push(glued.to_string());
             } else if let Some(next) = toks.get(i + 1).filter(|n| !SEPS.contains(*n)) {
-                let next = before_glued_operator(next);
+                let next = cut(next);
                 if !(tok.ends_with(">&") && is_descriptor_word(next)) {
                     targets.push(next.to_string());
                 }
@@ -7060,8 +7072,14 @@ fn before_glued_operator(word: &str) -> &str {
             c if open.last() == Some(&c) => {
                 open.pop();
             }
+            // An ANSI-C `$'…'` string's `\'` does not close it, which this scan does not model:
+            // a word holding one is left whole (it is unresolved anyway).
             '|' | '&' | ';'
-                if !double && open.is_empty() && at > 0 && !matches!(before, '>' | '<') =>
+                if !double
+                    && open.is_empty()
+                    && at > 0
+                    && !matches!(before, '>' | '<')
+                    && !word[..at].contains("$'") =>
             {
                 return &word[..at];
             }
@@ -16694,6 +16712,24 @@ mod boundary_tests {
             let targets = resolved_bash_write_targets(cmd, None);
             assert!(
                 !targets.is_empty() && targets.iter().all(|t| *t == P(target.into())),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        // (codex r1) Where what follows a glued operator would be scanned by neither reading, or
+        // the `|` may be the word's own byte, the word is never cut short: a heredoc body's
+        // `$(…)` and a backtick's escape layer keep the old refusal.
+        for cmd in [
+            "cat <<EOF\n$(echo x >/dev/null|tee /outside/f)\nEOF",
+            "cat <<EOF\n$(echo x >/dev/null|tee /outside/f >/dev/null)\nEOF",
+            "echo `echo x >d\\\\|/../../outside/f`",
+            "echo ${X} `echo x >/dev/null|tee /outside/f`",
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(
+                targets.iter().any(|t| match t {
+                    ShellTarget::Path(p) => p.contains("outside") || p.contains('|'),
+                    ShellTarget::Unresolved(_) => true,
+                }),
                 "{cmd:?}: {targets:?}"
             );
         }
