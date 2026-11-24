@@ -2811,32 +2811,48 @@ fn find_exec_commands(segments: &[Vec<&str>]) -> Vec<Vec<String>> {
                     k += 1;
                 }
                 for start in &starts {
-                    let start = match GitWord::of(start) {
-                        GitWord::Known(s) => Some(s),
-                        _ => None,
-                    };
-                    out.push(
-                        command
-                            .iter()
-                            .map(|w| {
-                                if !w.contains("{}") {
-                                    return (*w).to_string();
-                                }
-                                match (GitWord::of(w), &start) {
-                                    (GitWord::Known(w), Some(s)) => {
-                                        shell_single_quoted(&w.replace("{}", s))
-                                    }
-                                    _ => FIND_PATH.to_string(),
-                                }
-                            })
-                            .collect(),
-                    );
+                    out.push(command.iter().map(|w| find_exec_word(w, start)).collect());
                 }
             }
             k += 1;
         }
     }
     out
+}
+
+/// One word of a `find -exec` command with `{}` standing for `start` (as spelled), spelled as the
+/// shell hands it to the command: decoded and single-quoted where the text settles both, a `~/`
+/// start as `"${HOME}"` and the rest (the shell expanded it before `find` ran), and [`FIND_PATH`]
+/// inside double quotes where the text does not settle the start (`--output=<dir>/{}/f` keeps its
+/// option and its literal parts).
+fn find_exec_word(word: &str, start: &str) -> String {
+    if !word.contains("{}") {
+        return word.to_string();
+    }
+    let GitWord::Known(decoded) = GitWord::of(word) else {
+        return word.replace("{}", FIND_PATH);
+    };
+    let start = match GitWord::of(start) {
+        // `~/x` unquoted: the shell expands it; `~user` is no path the text settles.
+        GitWord::Known(s) if start.starts_with("~/") => {
+            Some(format!("\"${{HOME}}\"{}", shell_single_quoted(&s[1..])))
+        }
+        GitWord::Known(_) if start.starts_with('~') => None,
+        GitWord::Known(s) => Some(shell_single_quoted(&s)),
+        _ => None,
+    };
+    let start = start.unwrap_or_else(|| format!("\"{FIND_PATH}\""));
+    decoded
+        .split("{}")
+        .map(|part| {
+            if part.is_empty() {
+                String::new()
+            } else {
+                shell_single_quoted(part)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&start)
 }
 
 /// How many start points [`find_exec_commands`] writes a command for, one each.
@@ -2860,7 +2876,8 @@ fn find_exec_ends(word: &str, before: Option<&str>) -> bool {
 /// `find`'s start points and its expression. The start points are the words after its own
 /// options (`-H`, `-L`, `-P`, `-D <opts>`, `-O<n>`, BSD's `-E`, `-X`, `-d`, `-s`, `-x` and
 /// `-f <path>`, which names one) up to the first expression word, `.` when there is none, and
-/// [`FIND_PATH`] when the expression reads more from a file (`-files0-from`).
+/// [`FIND_PATH`] when the expression, before its first action, reads more from a file
+/// (`-files0-from`).
 fn find_start_points<'a, 'w>(args: &'w [&'a str]) -> (Vec<String>, &'w [&'a str]) {
     let mut starts: Vec<String> = Vec::new();
     let mut k = 0;
@@ -2888,7 +2905,9 @@ fn find_start_points<'a, 'w>(args: &'w [&'a str]) -> (Vec<String>, &'w [&'a str]
     starts.extend(args[begin..end].iter().map(|s| (*s).to_string()));
     if args[end..]
         .iter()
-        .any(|w| strip_one_quote_layer(w) == "-files0-from")
+        .map(|w| strip_one_quote_layer(w))
+        .take_while(|w| !matches!(*w, "-exec" | "-execdir" | "-ok" | "-okdir"))
+        .any(|w| w == "-files0-from")
     {
         starts.push(FIND_PATH.to_string());
     }
@@ -2989,7 +3008,8 @@ fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOpe
                     // (`find <dir> -maxdepth 0 -execdir …`); GNU runs `.` itself in `.`.
                     let (starts, _) = find_start_points(&words[idx + 1..]);
                     for start in starts {
-                        if start != "." && start != FIND_PATH {
+                        let here = matches!(GitWord::of(&start), GitWord::Known(s) if s == ".");
+                        if !here && start != FIND_PATH {
                             out.cwds.push(format!("{start}/.."));
                         }
                         out.cwds.push(start);
@@ -4041,15 +4061,27 @@ struct XargsOptions<'a> {
     spread: Vec<String>,
     /// `-a` / `--arg-file` files it reads its input from.
     files: Vec<&'a str>,
+    /// An option word the text does not settle: it may name any replace string.
+    opaque: bool,
     /// Where the program starts in `rest`.
     program: usize,
 }
 
 fn xargs_options<'a>(rest: &[&'a str]) -> XargsOptions<'a> {
     let mut o = XargsOptions::default();
+    // A word as xargs receives it (`-rI'%'` is `-rI%`). One the text does not settle may name
+    // any replace string, so the feed is judged as appended words of any spelling too.
+    let mut decode = |word: &str| match GitWord::of(word) {
+        GitWord::Known(w) => w,
+        _ => {
+            o.opaque = true;
+            word.to_string()
+        }
+    };
+    let (mut replace, mut spread, mut files) = (Vec::new(), Vec::new(), Vec::new());
     let mut k = 0;
     while let Some(&word) = rest.get(k) {
-        let flag = strip_one_quote_layer(word);
+        let flag = decode(word);
         if flag == "--" {
             k += 1;
             break;
@@ -4058,22 +4090,30 @@ fn xargs_options<'a>(rest: &[&'a str]) -> XargsOptions<'a> {
             break;
         }
         k += 1;
+        // A glued file, as spelled in the word (an unquoted one reads as itself).
+        let tail = |glued: &str| {
+            word.strip_suffix(glued)
+                .map(|_| &word[word.len() - glued.len()..])
+        };
         if let Some(long) = flag.strip_prefix("--") {
             let (name, glued) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
+            let next = |k: &mut usize| {
+                *k += 1;
+                rest.get(*k - 1).copied()
+            };
             match name {
-                "replace" => o.replace.push(glued.unwrap_or("{}").to_string()),
-                "arg-file" | "delimiter" | "max-args" | "max-procs" | "max-chars"
-                | "process-slot-var" => {
-                    let value = glued.or_else(|| {
-                        k += 1;
-                        rest.get(k - 1).copied()
-                    });
-                    if name == "arg-file" {
-                        o.files.extend(value);
-                    }
+                "replace" => replace.push(glued.unwrap_or("{}").to_string()),
+                "arg-file" => files.extend(match glued {
+                    Some(g) => tail(g),
+                    None => next(&mut k),
+                }),
+                "delimiter" | "max-args" | "max-procs" | "max-chars" | "process-slot-var"
+                    if glued.is_none() =>
+                {
+                    next(&mut k);
                 }
                 _ => {}
             }
@@ -4084,26 +4124,22 @@ fn xargs_options<'a>(rest: &[&'a str]) -> XargsOptions<'a> {
             match c {
                 // `-i[R]`, `-e[EOF]`, `-l[N]`: an optional value, glued only.
                 'i' => {
-                    o.replace
-                        .push(if glued.is_empty() { "{}" } else { glued }.to_string());
+                    replace.push(if glued.is_empty() { "{}" } else { glued }.to_string());
                     break;
                 }
                 'e' | 'l' => break,
                 'I' | 'J' | 'a' | 'd' | 'E' | 'L' | 'n' | 'P' | 's' | 'R' | 'S' => {
-                    let value = if glued.is_empty() {
+                    let (value, spelled) = if glued.is_empty() {
                         k += 1;
-                        rest.get(k - 1).copied()
+                        let w = rest.get(k - 1).copied();
+                        (w.map(&mut decode), w)
                     } else {
-                        Some(glued)
+                        (Some(glued.to_string()), tail(glued))
                     };
                     match c {
-                        'I' => o
-                            .replace
-                            .extend(value.map(|v| strip_one_quote_layer(v).to_string())),
-                        'J' => o
-                            .spread
-                            .extend(value.map(|v| strip_one_quote_layer(v).to_string())),
-                        'a' => o.files.extend(value),
+                        'I' => replace.extend(value),
+                        'J' => spread.extend(value),
+                        'a' => files.extend(spelled),
                         _ => {}
                     }
                     break;
@@ -4112,8 +4148,9 @@ fn xargs_options<'a>(rest: &[&'a str]) -> XargsOptions<'a> {
             }
         }
     }
-    o.replace.retain(|r| !r.is_empty());
-    o.spread.retain(|r| !r.is_empty());
+    o.replace = replace.into_iter().filter(|r| !r.is_empty()).collect();
+    o.spread = spread.into_iter().filter(|r| !r.is_empty()).collect();
+    o.files = files;
     o.program = k.min(rest.len());
     o
 }
@@ -4146,7 +4183,8 @@ fn git_option_entry(entry: &str) -> (&str, GitValue) {
 }
 
 /// The options of the log / show / diff family (diff, revision and pretty options), all of which
-/// only read. Not here, so not reads: `--output` (writes a file), `--stdin`.
+/// only read. Not here, so not reads: `--output` (writes a file), `--stdin`, `--remerge-diff` and
+/// `--diff-merges=` (its `remerge` / `r` mode writes a temporary object store in the repository).
 #[rustfmt::skip]
 const GIT_REV_OPTIONS: &[&str] = &[
     "-p", "-u", "--patch", "-s", "--no-patch", "--raw", "--patch-with-raw", "-t",
@@ -4170,7 +4208,7 @@ const GIT_REV_OPTIONS: &[&str] = &[
     "-U[=]", "--unified[=]", "--output-indicator-new=", "--output-indicator-old=",
     "--output-indicator-context=", "--cached", "--staged", "--merge-base", "--no-index", "--base",
     "--ours", "--theirs", "--cc", "-c", "-m", "--dd", "--combined-all-paths",
-    "--diff-merges=", "--no-diff-merges", "-r", "--root", "--no-commit-id", "--always",
+    "--no-diff-merges", "-r", "--root", "--no-commit-id", "--always",
     // Revision walking and limiting.
     "-n=+", "--max-count=+", "--skip=+", "--since=+", "--after=+", "--until=+", "--before=+",
     "--since-as-filter=", "--max-age=", "--min-age=", "--author=+", "--committer=+",
@@ -4245,7 +4283,7 @@ const GIT_REV_PARSE_OPTIONS: &[&str] = &[
     "--git-path=+", "--show-toplevel", "--show-superproject-working-tree", "--shared-index-path",
     "--absolute-git-dir", "--is-inside-git-dir", "--is-inside-work-tree", "--is-bare-repository",
     "--is-shallow-repository", "--show-cdup", "--show-prefix", "--show-object-format=",
-    "--show-ref-format", "--since=", "--after=", "--until=", "--before=", 
+    "--show-ref-format", "--since=", "--after=", "--until=", "--before=", "--end-of-options", 
 ];
 
 #[rustfmt::skip]
@@ -4282,10 +4320,12 @@ const GIT_GREP_OPTIONS: &[&str] = &[
 ];
 
 /// `archive`. Not here, so not reads: `-o` / `--output` (writes a file), `--remote`, `--exec`.
+/// git reads those three in a first pass of its own, before the pass that gives `--format` its
+/// value, so no option here takes the next word (`--format --output=<f> tar` writes `<f>`).
 #[rustfmt::skip]
 const GIT_ARCHIVE_OPTIONS: &[&str] = &[
-    "--format=+", "-l", "--list", "-v", "--verbose", "--prefix=+", "--add-file=+",
-    "--add-virtual-file=+", "--worktree-attributes", "--mtime=+",
+    "--format=", "-l", "--list", "-v", "--verbose", "--prefix=", "--add-file=",
+    "--add-virtual-file=", "--worktree-attributes", "--mtime=",
 ];
 
 /// `fsck`. Not here, so not reads: `--lost-found` (writes into the repository).
@@ -4517,7 +4557,7 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
             dirs.extend(strip_shell_prefix(a, &format!("{name}=")));
         } else if name.starts_with("GIT_TRACE") {
             // `1`, `2`, `true`: git's own stderr; a path (or anything else): a file it writes.
-            writes = true;
+            let value = strip_one_quote_layer(value);
             let to_stderr = value.is_empty()
                 || value.chars().all(|c| c.is_ascii_digit())
                 || matches!(
@@ -4525,6 +4565,7 @@ fn git_call(args: &[&str], feed: &Feed, assignments: &[&str]) -> GitCall {
                     "true" | "false" | "yes" | "no"
                 );
             if !to_stderr {
+                writes = true;
                 traces.extend(strip_shell_prefix(a, &format!("{name}=")));
             }
         } else if name.starts_with("GIT_") && !GIT_INERT_VARIABLES.contains(&name) {
@@ -4733,8 +4774,9 @@ fn git_option(verb: &str, tables: &[&[&str]], w: &str) -> Option<(Vec<String>, O
 fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, bool) {
     let (mut writes, mut unsettled) = (false, false);
     let mut opts: Vec<String> = Vec::new();
-    // The operands, in order: a settled one as spelled, one that is a single word starting
-    // with a literal as `\0operand`, any other unsettled word as `GIT_UNSETTLED`.
+    // The operands, in order: a settled one as spelled, an operand whose rest the text does not
+    // settle as [`GIT_OPERAND`] and its literal start, any other unsettled word as
+    // [`GIT_UNSETTLED`].
     let mut operands: Vec<String> = Vec::new();
     // `next_value`: the option before takes this word. `pending`: the option before may take it.
     let (mut end, mut next_value, mut pending) = (false, false, false);
@@ -4745,11 +4787,17 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
             continue;
         }
         if end {
-            // After `--`: pathspecs and operands, whatever they spell.
-            if let GitWord::Known(a) = word {
-                operands.push(a.clone());
-            } else {
-                operands.push("\0operand".to_string());
+            // After `--`: pathspecs and operands, whatever they spell. Legacy `config` counts
+            // them: an unquoted expansion there may be no word or several.
+            match word {
+                GitWord::Known(a) => operands.push(a.clone()),
+                GitWord::Lead(_) | GitWord::Pattern(_) if verb == "config" => {
+                    unsettled = true;
+                    operands.push(GIT_UNSETTLED.to_string());
+                }
+                GitWord::One(l) | GitWord::Lead(l) | GitWord::Pattern(l) => {
+                    operands.push(format!("{GIT_OPERAND}{l}"));
+                }
             }
             continue;
         }
@@ -4760,6 +4808,12 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
                 // (core#1859 B); after an option that may take it as its value (`grep -e --`)
                 // it is no end of options either (core#1857 item 2).
                 end = verb != "stash" && !may_be_value;
+            }
+            // `rev-parse --end-of-options`: the operands follow.
+            GitWord::Known(a)
+                if a == "--end-of-options" && git_option(verb, tables, a).is_some() =>
+            {
+                end = !may_be_value;
             }
             GitWord::Known(a) if a.starts_with('-') && a != "-" => {
                 match git_option(verb, tables, a) {
@@ -4773,7 +4827,7 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
             }
             GitWord::Known(a) => operands.push(a.clone()),
             GitWord::Pattern(l) | GitWord::One(l) if !l.is_empty() && !l.starts_with('-') => {
-                operands.push("\0operand".to_string());
+                operands.push(format!("{GIT_OPERAND}{l}"));
             }
             // One word whose glued value the text does not settle (`--grep="$x"`, `-S"$x"`).
             GitWord::One(l) if git_glued_value_lead(verb, tables, l) => {}
@@ -4837,13 +4891,31 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
         _ => true,
     };
     // Whether a word the text does not settle could make it a read: anywhere for a listing
-    // option (`branch`, `tag`), where the subcommand or a mode stands for the others.
+    // option (`branch`, `tag`); for the others, where the subcommand stands (`stash "li$x"`),
+    // or (`config`) where a mode stands or when the unsettled words may be none.
+    let may_be = |subcommands: &[&str]| {
+        first.is_some_and(|f| {
+            f == GIT_UNSETTLED
+                || f.strip_prefix(GIT_OPERAND)
+                    .is_some_and(|lead| subcommands.iter().any(|s| s.starts_with(lead)))
+        })
+    };
     let could_read = match verb {
         "branch" | "tag" => operands.iter().any(|o| o == GIT_UNSETTLED),
-        "remote" | "stash" | "worktree" | "reflog" | "config" => first == Some(GIT_UNSETTLED),
+        "remote" => may_be(&["show", "get-url"]),
+        "stash" => may_be(&["list", "show"]),
+        "worktree" => may_be(&["list"]),
+        "reflog" => may_be(&["show", "exists"]),
+        "config" => {
+            may_be(&["get", "list"])
+                || (operands.iter().any(|o| o == GIT_UNSETTLED)
+                    && operands.iter().filter(|o| *o != GIT_UNSETTLED).count() <= 1)
+        }
         _ => false,
     };
-    if !reads && !could_read {
+    if !reads && could_read {
+        unsettled = true;
+    } else if !reads {
         writes = true;
     }
     (writes, unsettled)
@@ -4852,15 +4924,28 @@ fn git_rest_reads(verb: &str, tables: &[&[&str]], words: &[GitWord]) -> (bool, b
 /// Holds the place of an operand or option the text does not settle, in [`git_rest_reads`].
 const GIT_UNSETTLED: &str = "\0unsettled";
 
+/// Starts an operand whose rest the text does not settle, before its literal start.
+const GIT_OPERAND: &str = "\0operand";
+
 /// Whether `lead`, the literal start of one word whose rest the text does not settle, is an
 /// allow-listed option whose glued value has begun: `--grep=`, `-S`, `-n`.
 fn git_glued_value_lead(verb: &str, tables: &[&[&str]], lead: &str) -> bool {
     if lead.starts_with("--") {
         return lead.contains('=') && git_option(verb, tables, lead).is_some();
     }
-    lead.len() >= 2
-        && lead.starts_with('-')
-        && matches!(git_option(verb, tables, lead), Some((_, Some(_))))
+    // The option that takes the rest of the word is its last letter (`-U"$n"`, `-nS"$x"`).
+    let Some(short) = lead.strip_prefix('-').filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    matches!(git_option(verb, tables, lead), Some((names, _)) if names.len() == short.chars().count())
+        && tables
+            .iter()
+            .flat_map(|t| t.iter())
+            .map(|e| git_option_entry(e))
+            .any(|(n, v)| {
+                v != GitValue::None
+                    && n.strip_prefix('-') == short.chars().last().map(String::from).as_deref()
+            })
 }
 
 /// The files git's output options write (core#1859 C): `--output` and every abbreviation git
@@ -4956,13 +5041,15 @@ fn git_output_targets(
                     .find(|(n, _)| n.strip_prefix('-') == Some(&short[at..at + c.len_utf8()]))
                     .map(|(_, v)| v);
                 match takes {
-                    Some(GitValue::None) => {}
+                    // A flag, a count digit (`-1O<cmd>`) or a letter this list does not know:
+                    // read on, so nothing after it is missed.
+                    Some(GitValue::None) | None => {}
                     // `-e <pattern>`: the next word is a value; `-fOWNERS`: the rest is one.
                     Some(GitValue::Next) if settled && rest.is_empty() => {
                         k += 1;
                         break;
                     }
-                    _ => break,
+                    Some(_) => break,
                 }
             }
         }
@@ -5846,7 +5933,7 @@ fn unwrap_program_with_reads<'a>(
                 // place of a replace string, else appended. An outer `xargs` feeding an inner one
                 // appends to the inner one's words, so to the program's.
                 let own = xargs_options(&words[idx + 1..]);
-                feed.append |= own.replace.is_empty() && own.spread.is_empty();
+                feed.append |= own.opaque || (own.replace.is_empty() && own.spread.is_empty());
                 feed.replace.extend(own.replace);
                 feed.spread.extend(own.spread);
                 idx += 1;
@@ -10714,7 +10801,6 @@ mod tests {
             ("r1.unsettled", Fatal, format!("git -C {r} stash drop \"$x\"")),
             ("r1.output", Fatal, format!("git log $'--output={o}/victim'")),
             ("r1.output", Fatal, format!("git stash show $'--output={o}/victim'")),
-            ("r1.output", Fatal, format!("git archive -vo{o}/x.tar HEAD")),
             ("r1.xargs", Advisory, format!("echo --output={o}/v | xargs -rI% git -C {r} log % -- f")),
             ("r1.xargs", Advisory, format!("echo 1 --output=v | xargs -J % git -C {r} log -n %")),
             ("r1.xargs", Read, format!("git -C {r} ls-files | xargs -0rn1 git -C {r} log -1 --")),
@@ -10724,6 +10810,23 @@ mod tests {
             ("r1.find", Refused, "printf x | find -files0-from - -exec git -C {} branch x \\;".to_string()),
             ("r1.find", Fatal, format!("find -f {r} -maxdepth 0 -exec git -C {{}} branch x \\;")),
             ("r1.find", Read, "find src -name '*.js' -execdir git log -1 -- {} \\;".to_string()),
+            // Round 1 delta check on the fold.
+            ("r2.archive", Fatal, format!("git archive --format --output={o}/new.tar tar HEAD")),
+            ("r2.grep", Refused, format!("git grep -1O'touch {o}/victim; cat' .")),
+            ("r2.remerge", Fatal, format!("git -C {r} show -p --diff-merges=remerge HEAD")),
+            ("r2.remerge", Fatal, format!("git -C {r} log --diff-merges=r -1")),
+            ("r2.xargs", Advisory, format!("echo --output={o}/v | xargs -rI'%' git -C {r} log % -- f")),
+            ("r2.eoo", Read, format!("git -C {r} rev-parse --verify --end-of-options HEAD")),
+            ("r2.glued", Read, format!("git -C {r} diff -U\"$n\" HEAD")),
+            ("r2.trace", Read, format!("GIT_TRACE=1 git -C {r} log -1")),
+            ("r2.operand", Advisory, format!("git -C {r} stash \"li$suffix\"")),
+            ("r2.operand", Read, format!("git -C {r} config \"core.$key\"")),
+            ("r2.operand", Advisory, format!("git -C {r} config user.name $value")),
+            ("r2.operand", Fatal, format!("git -C {r} config user.name \"$value\"")),
+            ("r2.find", Refused, format!("printf x | find -files0-from - -exec git log --output={r}/{{}}/v \\;")),
+            ("r2.find", Refused, "find ~/rr -maxdepth 0 -exec git -C '{}' branch x \\;".to_string()),
+            ("r2.find", Read, "find \".\" -maxdepth 0 -execdir git branch x \\;".to_string()),
+            ("r2.find", Read, "find . -maxdepth 0 -exec git -C {} log -S '-files0-from' -1 \\;".to_string()),
             // crew#1795 runs, as on main: 6684f077 seq 716 reads; 0f8437c5 seq 1421 is the
             // read-root advisory (an interpreter after the `cd`).
             (
