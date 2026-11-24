@@ -5490,8 +5490,11 @@ mod council_tail_tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let reaper = crate::decision::BallotReaper::default();
         let seat = stopped.clone();
+        // (core#1794) The carried seat stops only when the test lets it, so every probe below
+        // knows the seat is still stopping: no wall-clock window decides the order.
+        let (let_stop, may_stop) = std::sync::mpsc::channel::<()>();
         reaper.hold(std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = may_stop.recv();
             seat.store(true, Ordering::SeqCst);
         }));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -5513,7 +5516,10 @@ mod council_tail_tests {
             !stopped.load(Ordering::SeqCst),
             "the verdict waited for a seat still stopping"
         );
-        while !stopped.load(Ordering::SeqCst) {
+        // The seat is still stopping (it waits on `let_stop`), so the slot must read busy. A
+        // zero-budget probe is sound here: a duplicate descriptor in another test's child only
+        // keeps the slot busier.
+        for _ in 0..5 {
             assert_eq!(
                 HostCouncilLock::acquire_until(&path, Instant::now()).err(),
                 Some(SlotRefused::Busy),
@@ -5521,9 +5527,19 @@ mod council_tail_tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(!stopped.load(Ordering::SeqCst));
+        let_stop.send(()).expect("the seat is waiting");
         tail.join().expect("the council tail");
+        assert!(stopped.load(Ordering::SeqCst), "the tail reaped the seat");
+        // (core#1794) The slot is a `flock` on an open file: a child another test spawns while the
+        // council holds it keeps a duplicate of that descriptor until its exec completes, so for
+        // that moment the slot still reads as held after the tail let it go. Under endpoint
+        // security an exec can wait seconds, so the probe waits on the release, bounded by the
+        // suite's failure guard (`test_env::PATIENT`); a slot the tail never released stays held
+        // past it and still fails.
         assert!(
-            HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+            HostCouncilLock::acquire_until(&path, Instant::now() + crate::test_env::PATIENT)
+                .is_ok(),
             "the slot is free once the seat is reaped"
         );
         let _ = std::fs::remove_file(&path);
