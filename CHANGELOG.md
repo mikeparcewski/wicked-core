@@ -14,6 +14,157 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 919f3575, carrying 74 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854, #1891.
+  The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - Pager allow-list, seat native build note and refusal memory, best-effort browser layer (core#1882, #1886, #1887, #1888) (#1891)
+
+  - One seat-key parser and the reserved stand-in separator (DES-STANDIN-001 C1) (#1841)
+
+  - One preflight says which independent roles a launch is short of (DES-STANDIN-001 C2, core#1721) (#1844)
+
+  - Reuse the review's POL-2101 verdict on the same change; a seat-refused write holds the creator's gate (#1850)
+
+  - Mint run worktrees beside the checkout, not inside it (#1851)
+
+  - A cd into a chat's read-root repository is a read unless it writes (crew#1795) (#1849)
+
+  - An empty scope on the shipped domain mapping scores no code touched (core#1838); bounded council slot probe (core#1794) (#1865)
+
+  - A floor whose checks did not run for low disk asks for space and a retry (core#1846) (#1856)
+
+  - A hand-off round's floor runs only what the round changed; a check that left outputs is never reused (core#1208, core#1157) (#1866)
+
+  - The hand-off re-score reads QE's diff, an overridden floor is labelled, and an override of the targeted tests carries to the full suite (core#1709) (#1867)
+
+  - A chat's follow-up turn keeps every unchanged read-only root; arm timing says why a root was re-read (core#1747) (#1871)
+
+  - A missing host CLI's sign-in refusal ends with its npm install command (core#1845) (#1872)
+
+  - A git read is an allow-listed form; everything else writes (core#1857, #1858, #1859, #1868) (#1874)
+
+  - Every engine git runs without the Azure DevOps token and with fsmonitor off (wicked-crew#1843) (#1878)
+
+  - A seat's declared native addon is built before it starts (core#1406) (#1880)
+
+  - Headless Chromium and ffmpeg in every seat image (core#1455, core#1614) (#1879)
+
+  - The idle-timer test installs its kubectl stand-ins without a writable fd (core#1769) (#1883)
+
+  - On macOS a stopped command's group is signalled until no member is left (core#1835) (#1885)
+
+  - Stand-in review in the engine, opt-in per launch (DES-STANDIN-001 C3a) (#1854)
+
+  - The reviewer is asked for POL-2101's record line; a skip names only the held rules (#1839)
+
+  - A council that never convened reads not_convened, not timeout (#1840)
+
+  - A claude seat's tool children get a signed-in record for the unit's life (wicked-garden#1365) (#1834)
+
+  - A cited path stands delimited; a paged dispute reaches a council (#1803, #1789) (#1825)
+
+  - Keep the councils' share of the final pass (#1822) (#1826)
+
+  - A required judge that was not due is on the receipt; a timed-out PA review keeps the member's output (core#1799, core#1801) (#1827)
+
+  - A gate answer names the opening it answers (#1808) (#1829)
+
+  - A host shutdown kills the install-time harness; facts dirs made private on upgrade (#1708, #1805) (#1830)
+
+  - A validator's backgrounded descendants end with its verdict (#1810) (#1831)
+
+  - Gate answers off the actor, a connection per read, one-run unit reads by name (core#1795) (#1806)
+
+  - Stop a handed-off validator when its attempt is superseded (core#1742) (#1807)
+
+  - Plan events carry each step's controls; the gate says what put the plan in its band (core#1259, core#1382) (#1809)
+
+  - Content-filter refusal stem; a stdout refusal stays last behind a chatty stderr (core#1718, core#1720) (#1811)
+
+  - Wait on the event, not a wall-clock margin, in the power voice and dispute deadline tests (core#1794) (#1812)
+
+  - Delete the ACP session registry and other ACP-only code (#1813)
+
+  - An exclusion needs the base's and the head's lists to cover their own runs (core#1767) (#1815)
+
+  - Retire the base target claim without waiting under the leaf lock (core#1714) (#1816)
+
+  - Bench a hook-silenced claude on the host floor; name each unit's scratch (core#1744, core#1758) (#1818)
+
+  - Prove gateway record follower catch-up at release, else report incomplete (core#1716) (#1819)
+
+  - An abandon verb ends one open sign-in (#1673) (#1820)
+
+  - A one-run interaction read uses the name index, never a scan of every request (core#1795) (#1824)
+
+  - Run the real-browser draft-render jail test on ubuntu and macOS (#1770)
+
+  - `repo_checks.rs` net-negative by a verbatim move into child modules (#1768)
+
+  - Re-stamp the platform lockfile entries for the published 0.15.48 (#1778)
+
+  - Wait out a fork-held duplicate of the council slot before calling it leaked (core#1794) (#1800)
+
+  - Resumed creator floors publish guarded journal checks; base runs kept per failing set; pre-floor wait named (#1152, #1217) (#1734)
+
+  - A cancel never waits on the actor; its worktree cleanup stays on the record (#1409, #1434, #1435) (#1735)
+
+  - The fold's pinned validator and creator diff, and the dispatch's project-graph vouch, run off the actor (#1739)
+
+  - A relaunch never waits on the actor for a node tree's earlier reap (#1736)
+
+  - Interactive-chat measures its revision (#1755)
+
+  - The record keeps the case set it judged (#1756)
+
+  - Run the counter directly, read-allowlist the render jail, record tool identity (#1336, #1337, #1335) (#1754)
+
+  - A unit's stored output no longer carries the host temp path of a note the seat linked; the link is kept as `wicked-core-notes/<run>/unit-<n>/<file>` (#1380). (#1751)
+
+  - A governed run on wicked-core can build `crates/wicked-core-ts` in its worktree: the root manifest excludes `wicked-worktrees` (#1109). (#1752)
+
+  - Worktree owner markers are found through the admin dir git pairs with the tree from both ends, read without following links or blocking, and stamped (off the actor) on every re-entry of a persisted tree; a fresh mint that loses its daemon claim refuses (#1436). (#1760)
+
+  - Base detection reads the held package dir; base provisions the root's native build for a member (#1110, #1408) (#1763)
+
+  - Drop a run's blocks when it ends and at shutdown; a first block reaches a launch in preparation (#1777)
+
+  - Strict snapshot for the introduced-dir read: force-added paths kept, unreadable subtree refused (#1764)
+
+  - On boot, the daemon repairs the git links of its own run worktrees after their checkout moved, so a container seat can use a pre-move tree without a manual `git worktree repair` (#1662). (#1759)
+
+  - Odd export paths keep their own attributes; in-memory core dates deliverables; memory URIs get no log root (#1765)
+
+  - Team councils exclude parties by identity and take the host council slot (#1771)
+
+  - Exclusion-guide probes — complete list, bound qualifiers, unique pass, first-alone multi (part of #1101) (#1766)
+
+  - Reap carried ballots before the host slot is released; read seat stdout byte-bounded (#1774)
+
+  - A container seat never mounts its code graph, so a project graph over 512 MiB no longer refuses every seat (#1782)
+
+  - One-port jails for the walkthrough and Linux demo recorders; captioned demo copy (#1783)
+
+  - Refuse a missing seat base before the build, ship the nopush helper, re-arm a jail whose mask dir vanished (#1784)
+
+  - **Container seats, codex:** a codex container (k8s) seat signed in with ChatGPT now recovers from an upstream 401. Its token refresh goes to the gateway's gate-hook route (`CODEX_REFRESH_TOKEN_URL_OVERRIDE`), never to auth.openai.com. The relay renews the broker's sign-in with one forced refresher pass, shared by every seat within a minute (a waiting refresh holds no gate-hook connection slot; at most 16 wait at once), and answers with no token, so the seat retries with its placeholder and the gateway sends the renewed token. An unknown key gets `invalid_grant`; a failed renewal gets a 503 naming why. The placeholder's refresh token is now the unit's key, and its JWT carries a placeholder user, so codex keeps its network policy after the reload (core#997). Every codex container seat also switches off its non-model calls with codex's own config keys: analytics, Statsig metrics (ab.chatgpt.com), the apps MCP server, the plugin system (seats install no codex plugins; their skills come from `CODEX_HOME/skills`), and the ChatGPT backend base (a closed loopback port). A seat's session no longer makes refused CONNECTs to chatgpt.com or ab.chatgpt.com (core#1478). Host seats are unchanged. (#1788)
+
+  - A steering rule whose evidence spans the parts of a large change (the code in one part, its test in another) no longer holds on every re-check. When every part was read and none broke the rule, and the parts named the files they needed, the rule is judged again on the whole diff of those files together in one call. A rule whose pages were not all shown or answered still holds. (core#1278 item 4) (#1787)
+
+  - ToolActivity frames carry the launch's seat key as cli (core#1786) (#1790)
+
+  - Hand every seat push to the nopush helper; state what a repository's own rewrite can still do (#1793)
+
+  - Run-cost refuses an unarmed launch; behavioural re-entry claim test; Windows flake (core#1343, core#1780, core#1730) (#1798)
+
+  - A lost PA review result and a first-try managed-hooks refusal get their gates (core#1748, core#1740) (#1797)
+
+  - Estate 0.35.10; AnyStore forwards the semantics restore so a re-extract keeps requirements (core#1668) (#1796)
+
+  - A scoped KEPT names each file listed as not shown, or it does not count (core#1791) (#1802)
+
+  - Stderr redaction, k8s NUL arg refusal, 0700 facts dir, push-URL filter gaps, gw test flake (#1804)
+
 - **core-ts 0.15.48** — 2026-11-22 — patch release on the train-11 cut 7c8ef169, carrying 59 PRs since 0.15.47: #1644, #1645, #1646, #1647, #1648, #1649, #1650, #1651, #1652, #1654, #1655, #1656, #1658, #1659, #1660, #1661, #1664, #1665, #1666, #1669, #1670, #1671, #1672, #1675, #1676, #1677, #1678, #1679, #1680, #1684, #1685, #1686, #1687, #1691, #1692, #1693, #1694, #1695, #1696, #1697, #1704, #1705, #1706, #1707, #1710, #1711, #1712, #1713, #1723, #1725, #1726, #1727, #1728, #1729, #1732, #1733, #1741, #1745, #1749.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 
