@@ -1362,6 +1362,8 @@ pub(crate) fn run_one_with(
         decision: None,
         logs: Vec::new(),
         reused_from: None,
+        left_outputs: Vec::new(),
+        delta: None,
     };
     let (load1, cpus) = host_load();
     result.load_band = load_band(load1, cpus);

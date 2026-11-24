@@ -5363,7 +5363,9 @@ fn core_1152_a_verify_only_check_ordered_last_runs_fresh_and_the_rest_is_reused(
 /// (core#1152, the reason core#1145 was suffix-only) A fresh check that needs what a reused check
 /// leaves in the checkout (`lint` writes an ignored `out/marker` that `e2e` reads) fails after the
 /// reuse; the floor then runs every check again from the first one with nothing reused, and passes
-/// as it did before reuse existed — saying so.
+/// as it did before reuse existed — saying so. (core#1157) `typecheck` makes `out/` first, so the
+/// inventory sees nothing NEW after `lint` (it wrote inside a listed directory) and `lint` is
+/// still reused: this guard is the backstop for what the inventory cannot see.
 #[cfg(unix)]
 #[test]
 fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reuse() {
@@ -5375,7 +5377,7 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
     let r = Core1144::new(
         "core-1152-again",
         serde_json::json!({
-            "typecheck": false,
+            "typecheck": ["sh", "-c", "mkdir -p out && echo k > out/keep"],
             "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
             "test": Core1144::NONCE,
             // A unique line per run, so the run log store counts the e2e runs (core#1191).
@@ -5429,6 +5431,263 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
         })
         .unwrap_or(0);
     assert_eq!(e2e_runs, 2, "e2e ran on the first pass, then on the second");
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1157) A shared check that writes ignored outputs (`lint` generates `out/*.test.sh`) and a
+/// verify-only check that discovers its inputs from them (`e2e` runs every `out/*.test.sh`, and
+/// passes when there are none). The creator floor records what `lint` left; the verify floor runs
+/// `lint` again instead of reusing it, so `e2e` finds the generated test and fails as a full floor
+/// in order would. Before the fix `lint` was reused, `e2e` found nothing and the floor was green.
+#[cfg(unix)]
+#[test]
+fn core_1157_a_consumer_of_a_reused_checks_ignored_outputs_runs_after_the_producer_ran_fresh() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(0.5, 4);
+    let r = Core1144::new(
+        "core-1157-vacuous",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo 'exit 1' > out/failing.test.sh && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": ["sh", "-c", "for t in out/*.test.sh; do [ -f \"$t\" ] || continue; sh \"$t\" || exit 1; done; echo e2e-ok"],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    let left = |name: &str| {
+        creator
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.left_outputs.clone())
+            .unwrap_or_else(|| panic!("`{name}` ran: {creator:#?}"))
+    };
+    assert_eq!(
+        left("lint"),
+        vec!["out/".to_string()],
+        "lint's outputs are recorded"
+    );
+    assert!(left("test").is_empty(), "test left nothing");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        !verify.passed,
+        "e2e ran with lint's generated test present and failed, never vacuously green: {verify:#?}"
+    );
+    assert_ne!(
+        stdout_of(&verify, "lint"),
+        stdout_of(&creator, "lint"),
+        "lint ran again here"
+    );
+    let e2e = verify
+        .checks
+        .iter()
+        .find(|c| c.name == "e2e")
+        .expect("e2e ran");
+    assert!(e2e.denies(), "{e2e:#?}");
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1157) The producer runs fresh and the rest is still reused: with a generated test that
+/// passes, the verify floor passes, `test` is reused from the creator floor, and `lint` (which left
+/// `out/`) runs here beside `e2e`.
+#[cfg(unix)]
+#[test]
+fn core_1157_a_check_that_left_outputs_runs_fresh_and_the_rest_is_reused() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(0.5, 4);
+    let r = Core1144::new(
+        "core-1157-fresh",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo 'exit 0' > out/ok.test.sh && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": ["sh", "-c", "n=0; for t in out/*.test.sh; do [ -f \"$t\" ] || continue; sh \"$t\" || exit 1; n=$((n+1)); done; test $n -eq 1"],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed, "{creator:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(verify.passed, "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("the reuse is disclosed");
+    assert_eq!(reuse.voided, None, "{reuse:?}");
+    assert_eq!(reuse.reused, vec!["test".to_string()]);
+    assert_eq!(reuse.fresh, vec!["lint".to_string(), "e2e".to_string()]);
+    assert_eq!(stdout_of(&verify, "test"), stdout_of(&creator, "test"));
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1208) One hand-off round of a unit's creator floor: the worktree edited by `edit`, its
+/// guarded tree, and the floor of attempt `attempt` on a clean checkout of it.
+#[cfg(unix)]
+impl Core1144 {
+    fn round(&self, edit: impl FnOnce(&Path)) -> String {
+        edit(&self.wt);
+        crate::worktree_guard::snapshot_through(&self.wt, &self.git_dir)
+            .expect("snapshot")
+            .tree
+    }
+
+    fn creator_on(&self, tree: &str, ord: u32, attempt: u32) -> RepoChecksReport {
+        let label = format!("{}-{ord}-{attempt}", self.run_id);
+        let checkout = checkout_guarded_tree(&self.wt, &self.git_dir, tree, &label).unwrap();
+        checkout.run_floor_journaled(
+            &self.ctx(FloorStage::Creator, &self.base),
+            None,
+            &FloorJournal {
+                ord,
+                attempt,
+                tree: tree.to_string(),
+                phase: Some("build".into()),
+            },
+        )
+    }
+}
+
+/// (core#1208) A stand-in related-tests runner: it echoes the files it was handed and fails when
+/// one of them holds `boom`.
+#[cfg(unix)]
+fn core_1208_repo(tag: &str) -> Core1144 {
+    Core1144::new(
+        tag,
+        serde_json::json!({
+            "typecheck": false,
+            "lint": Core1144::NONCE,
+            "test_targeted": ["sh", "-c", "for f in \"$@\"; do if grep -q boom \"$f\"; then echo \"FAIL $f\"; exit 1; fi; done; echo \"ran: $*\"", "sh", "{files}"],
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn check_of<'a>(r: &'a RepoChecksReport, name: &str) -> &'a crate::repo_checks::CheckRun {
+    r.checks
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("`{name}` ran: {r:#?}"))
+}
+
+/// (core#1208) Round 2 of a unit's creator floor changes one file: its test check runs only for
+/// that file and stands on round 1's pass for the rest, labelled; the cheap check runs fresh; the
+/// verdict matches the whole-change twin. A round that touches a config file, deletes a file, or
+/// whose narrowed run fails runs the check in full.
+#[cfg(unix)]
+#[test]
+fn core_1208_a_hand_off_rounds_floor_runs_only_what_the_round_changed() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(0.5, 4);
+    let r = core_1208_repo("core-1208-delta");
+    let t1 = r.round(|wt| std::fs::write(wt.join("a.txt"), "a1\n").unwrap());
+    let first = r.creator_on(&t1, 4, 0);
+    if first.sandbox_error.is_some() || first.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(first.passed, "{first:#?}");
+    let tt1 = check_of(&first, "test_targeted");
+    assert!(tt1.argv.iter().any(|a| a == "a.txt") && tt1.delta.is_none());
+
+    // Round 2: one more file. Only it is handed to the runner; the rest stands on round 1.
+    let t2 = r.round(|wt| std::fs::write(wt.join("b.txt"), "b1\n").unwrap());
+    let second = r.creator_on(&t2, 4, 1);
+    assert!(second.passed, "{second:#?}");
+    let tt2 = check_of(&second, "test_targeted");
+    assert!(
+        tt2.argv.iter().any(|a| a == "b.txt") && !tt2.argv.iter().any(|a| a == "a.txt"),
+        "only the round's change ran: {:?}",
+        tt2.argv
+    );
+    let d = tt2.delta.as_ref().expect("labelled as a delta");
+    assert_eq!(
+        (d.from_tree.as_str(), d.ord, d.attempt, d.changed.clone()),
+        (t1.as_str(), 4, 0, vec!["b.txt".to_string()])
+    );
+    let summary = tt2.summary();
+    assert!(
+        summary.contains("the rest of `test_targeted` passed there and is reused from it"),
+        "{summary}"
+    );
+    assert_ne!(
+        stdout_of(&second, "lint"),
+        stdout_of(&first, "lint"),
+        "the cheap check ran fresh"
+    );
+    // The whole-change twin (another unit, no earlier round): the same verdict.
+    let twin = r.creator_on(&t2, 5, 0);
+    assert!(twin.passed, "{twin:#?}");
+    let whole = check_of(&twin, "test_targeted");
+    assert!(whole.delta.is_none() && whole.argv.iter().any(|a| a == "a.txt"));
+
+    // Round 3 breaks the round's own file: the narrowed run fails, the check runs in full.
+    let t3 = r.round(|wt| std::fs::write(wt.join("b.txt"), "boom\n").unwrap());
+    let third = r.creator_on(&t3, 4, 2);
+    assert!(!third.passed, "{third:#?}");
+    let tt3 = check_of(&third, "test_targeted");
+    assert!(tt3.delta.is_none(), "{tt3:#?}");
+    assert!(
+        tt3.argv.iter().any(|a| a == "a.txt") && tt3.argv.iter().any(|a| a == "b.txt"),
+        "the full check ran after the narrowed one failed: {:?}",
+        tt3.argv
+    );
+    assert!(tt3.earlier_passes.iter().any(|(k, _)| k == "affected"));
+
+    // Round 4 (after round 3's failure, which stands for nothing): in full.
+    let t4 = r.round(|wt| std::fs::write(wt.join("b.txt"), "b2\n").unwrap());
+    let fourth = r.creator_on(&t4, 4, 3);
+    assert!(fourth.passed, "{fourth:#?}");
+    assert!(check_of(&fourth, "test_targeted").delta.is_none());
+
+    // Round 5 adds a config file every test can read: in full.
+    let t5 = r.round(|wt| std::fs::write(wt.join("vitest.config.ts"), "export {}\n").unwrap());
+    let fifth = r.creator_on(&t5, 4, 4);
+    assert!(fifth.passed, "{fifth:#?}");
+    assert!(check_of(&fifth, "test_targeted").delta.is_none());
+
+    // Round 6 deletes a file: in full.
+    let t6 = r.round(|wt| std::fs::remove_file(wt.join("vitest.config.ts")).unwrap());
+    let sixth = r.creator_on(&t6, 4, 5);
+    assert!(sixth.passed, "{sixth:#?}");
+    assert!(check_of(&sixth, "test_targeted").delta.is_none());
+
+    // Round 7, a plain edit after a full round: narrowed again, standing on round 6.
+    let t7 = r.round(|wt| std::fs::write(wt.join("c.txt"), "c1\n").unwrap());
+    let seventh = r.creator_on(&t7, 4, 6);
+    let d7 = check_of(&seventh, "test_targeted")
+        .delta
+        .clone()
+        .expect("narrowed");
+    assert_eq!((d7.from_tree, d7.attempt), (t6, 5));
+
+    // The verify floor of round 7's tree never stands on the narrowed run: it runs the check.
+    let verify_label = format!("{}-6-verify", r.run_id);
+    let checkout = checkout_guarded_tree(&r.wt, &r.git_dir, &t7, &verify_label).unwrap();
+    let verify = checkout.run_floor_journaled(
+        &r.ctx(FloorStage::Verify, &r.base),
+        None,
+        &FloorJournal {
+            ord: 6,
+            attempt: 0,
+            tree: t7.clone(),
+            phase: Some("verify".into()),
+        },
+    );
+    assert!(verify.passed, "{verify:#?}");
+    let v = check_of(&verify, "test_targeted");
+    assert!(v.reused_from.is_none() && v.delta.is_none(), "{v:#?}");
+    assert!(v.argv.iter().any(|a| a == "a.txt") && v.argv.iter().any(|a| a == "c.txt"));
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
@@ -5541,7 +5800,12 @@ fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
             dir: check.dir.clone(),
             name: check.name.clone(),
             argv: check.argv.clone(),
-            run: test_run.clone(),
+            // (core#1157) The failing test left `.wicked/checks.json`; the interrupted pass this
+            // stands for had not (a result that left files is never resumed).
+            run: CheckRun {
+                left_outputs: Vec::new(),
+                ..test_run.clone()
+            },
             guarded_under: None,
         }],
     };
@@ -5591,7 +5855,8 @@ fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
     let r = Core1144::new(
         "core-1152-journal",
         serde_json::json!({
-            "typecheck": false,
+            // (core#1157) `out/` exists before `lint` writes into it, so `lint` is still reused.
+            "typecheck": ["sh", "-c", "mkdir -p out && echo k > out/keep"],
             "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
             "test": Core1144::NONCE,
             "e2e": e2e,

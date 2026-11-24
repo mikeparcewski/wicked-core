@@ -153,6 +153,7 @@ pub fn check_run_tree(
         package_dir: None,
         run_id: Some(floor_id.clone()),
         code_graph: None,
+        files: None,
     };
     let mut report = {
         let _floor = FloorRun::start(&floor_id);

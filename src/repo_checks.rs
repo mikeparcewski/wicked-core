@@ -544,6 +544,10 @@ pub struct FloorContext {
     /// the creator floor's engine-computed affected set reads it. `None` (no graph, or a floor
     /// built without a run) runs the full suite.
     pub code_graph: Option<PathBuf>,
+    /// (core#1208) The files a targeted selection is built for in place of the change since the
+    /// base: a hand-off round's delta (the files changed since the previous round's floor). Set
+    /// only by the floor itself, on the context it detects that selection with.
+    pub(crate) files: Option<Vec<String>>,
 }
 
 /// The evidence of one check having run.
@@ -643,6 +647,17 @@ pub struct CheckRun {
     /// duration, exit and retries are that floor's. `None` on every check that ran here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<CheckReuse>,
+    /// (core#1157) What this check left in a guarded checkout that is not part of the tree: the
+    /// untracked and ignored paths (collapsed per directory, git's own listing) present after it
+    /// ran and not before. A later floor runs on a FRESH checkout that has none of them, so a
+    /// result that left any is never reused there: a check after it may read them (a generated
+    /// test file a verify-only suite loops over). Capped at [`LEFT_OUTPUTS_CAP`] names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_outputs: Vec<String>,
+    /// (core#1208) Set on a hand-off round's creator check that ran ONLY the tests the round's
+    /// change reaches, standing on the previous round's pass for the rest ([`FloorDelta`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<FloorDelta>,
     /// (DES-FLOOR-V2) The floor's decision on this check; `None` on a nested run (a re-run, a base
     /// run) and on a stored record from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -737,6 +752,11 @@ impl CheckRun {
             .as_ref()
             .map(|s| format!(" — {}", s.note()))
             .unwrap_or_default();
+        // (core#1208) A hand-off round's delta says what it ran and what it stands on.
+        let picked = match &self.delta {
+            Some(d) => format!("{picked} — {}", d.note(&self.name)),
+            None => picked,
+        };
         match self.exit_code {
             Some(c) => format!("{}: exit {c} ({secs:.1}s{more}){cls}{picked}", self.name),
             None => format!(
@@ -1087,6 +1107,45 @@ pub struct CheckReuse {
     pub attempt: u32,
 }
 
+/// (core#1208) Where a hand-off round's delta check stands for the rest of its check
+/// ([`CheckRun::delta`]): the previous round's floor of the same unit, against the same base, that
+/// passed the check on `from_tree`. This round ran only what the files changed since then reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorDelta {
+    /// The tree the previous round's floor ran on.
+    pub from_tree: String,
+    /// The creator unit's phase (`build`, `fix`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub ord: u32,
+    pub attempt: u32,
+    /// The files changed between that tree and this one (the first [`DELTA_FILES_SHOWN`]).
+    pub changed: Vec<String>,
+    /// How many files changed in all.
+    pub changed_count: usize,
+}
+
+/// At most this many of a delta's changed files are named on the check.
+pub const DELTA_FILES_SHOWN: usize = 20;
+
+impl FloorDelta {
+    /// The operator's sentence for check `name`.
+    pub fn note(&self, name: &str) -> String {
+        format!(
+            "ran only the tests reached by the {} file{} changed since the floor on tree {} ({}, \
+             unit {}, attempt {}); the rest of `{name}` passed there and is reused from it, \
+             outside this round's change",
+            self.changed_count,
+            if self.changed_count == 1 { "" } else { "s" },
+            &self.from_tree[..self.from_tree.len().min(10)],
+            self.phase.as_deref().unwrap_or("the creator floor"),
+            self.ord,
+            self.attempt,
+        )
+    }
+}
+
 impl FloorReuse {
     /// The operator's sentence for the gate's `floorNote`.
     pub fn note(&self) -> String {
@@ -1118,7 +1177,7 @@ impl FloorReuse {
 /// a check from it only when the tree, the base, the check's directory, name, argv and bound, the
 /// boundary posture and the exclusion switch all match, and the check finished there with its
 /// evidence whole — the same rule a resumed journal follows ([`reusable_run`]).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreatorFloorRecord {
     floor_policy: u32,
     tree: String,
@@ -1142,6 +1201,10 @@ struct CreatorEntry {
     argv: Vec<String>,
     #[serde(default)]
     timeout_s: Option<u64>,
+    /// (core#1208) The detected check's source (`.wicked/checks.json test_targeted`, the derived
+    /// set, …): the run's own may name an affected subset instead. Absent on an older record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     run: CheckRun,
 }
 
@@ -1174,8 +1237,69 @@ fn write_creator_record(logs: &Path, record: &CreatorFloorRecord) {
 /// not a spawn or could-not-run failure) with every log it names still whole in `logs`? Only such
 /// a result stands in for running the check again. The `install` check never does: its receipt is
 /// not its output (`node_modules`, a venv), and a guarded floor runs on a fresh checkout.
+/// (core#1157) A run that left files outside the tree in its checkout ([`CheckRun::left_outputs`])
+/// is not reusable either: the later floor's fresh checkout has none of them.
 fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
-    !is_provisioning(&check.name) && run.argv == check.argv && finished_whole(run, logs)
+    !is_provisioning(&check.name)
+        && run.argv == check.argv
+        && run.left_outputs.is_empty()
+        && finished_whole(run, logs)
+}
+
+/// (core#1157) At most this many paths are kept on [`CheckRun::left_outputs`].
+pub const LEFT_OUTPUTS_CAP: usize = 20;
+
+/// (core#1157) The untracked and ignored paths in a guarded checkout, collapsed per directory as
+/// git lists them (`--ignored=matching`: an ignored directory is one entry, never walked). The
+/// engine's own scratch (`tmp/`, where the base export lives) is not a check's output. `Err` when
+/// the checkout cannot be listed.
+pub(crate) fn untracked_inventory(
+    worktree: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let no_hooks = no_hooks_dir()?;
+    let hooks = format!("core.hooksPath={}", no_hooks.to_string_lossy());
+    let env: [(&str, &Path); 1] = [("GIT_OPTIONAL_LOCKS", Path::new("0"))];
+    let out = crate::worktree_guard::git(
+        worktree,
+        &[
+            "-c",
+            &hooks,
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=normal",
+            "--no-renames",
+        ],
+        &env,
+    )
+    .map_err(|e| format!("the checkout's files could not be listed: {e}"))?;
+    let scratch = crate::worktree_guard::ENGINE_SCRATCH_DIR;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter_map(|e| {
+            let e = std::str::from_utf8(e).ok()?;
+            let path = e.strip_prefix("?? ").or_else(|| e.strip_prefix("!! "))?;
+            let top = path.trim_end_matches('/');
+            (top != scratch && !path.starts_with(&format!("{scratch}/"))).then(|| path.to_string())
+        })
+        .collect())
+}
+
+/// (core#1157) What a check left: the paths in `after` that were not in `before`, capped. A listing
+/// that failed on either side is unknown, never "nothing": it is named, so the run is not reused.
+pub(crate) fn left_by_check(
+    before: &Result<std::collections::BTreeSet<String>, String>,
+    after: &Result<std::collections::BTreeSet<String>, String>,
+) -> Vec<String> {
+    match (before, after) {
+        (Ok(b), Ok(a)) => a.difference(b).take(LEFT_OUTPUTS_CAP).cloned().collect(),
+        (Err(e), _) | (_, Err(e)) => vec![format!("(unknown: {e})")],
+    }
 }
 
 /// Did `run` finish (not a timeout, not a spawn or could-not-run failure, a decision recorded)
@@ -1268,6 +1392,22 @@ impl CreatorSeed {
 
     /// Take the creator floor's result of `check` ([`Self::entry_for`]).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+        if let Some(left) = self
+            .record
+            .checks
+            .iter()
+            .find(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)
+            .map(|e| &e.run.left_outputs)
+            .filter(|l| !l.is_empty())
+        {
+            eprintln!(
+                "wicked-core: repo checks floor — `{}` left files outside the tree at {} ({}); \
+                 this checkout has none of them, so it runs again here",
+                check.name,
+                self.record.phase.as_deref().unwrap_or("the creator floor"),
+                left.join(", ")
+            );
+        }
         let mut run = self.entry_for(check, logs)?.run.clone();
         self.reused.push(check.name.clone());
         run.reused_from = Some(CheckReuse {
@@ -1317,6 +1457,223 @@ impl CreatorSeed {
             fresh: self.fresh,
             voided,
         })
+    }
+}
+
+/// (core#1208) The checks a hand-off round's creator floor may narrow to what the round changed: the
+/// test set. The cheap checks (install, typecheck, lint, the formatter) read the whole tree and
+/// always run in full.
+pub(crate) fn is_delta_check(name: &str) -> bool {
+    matches!(name, "test" | "test_targeted" | "cargo-test")
+}
+
+/// (core#1208) A path whose change can reach any test, so a round that touched it runs its test
+/// check in full: a manifest or lockfile, build or test configuration, the repo's floor config
+/// (`.wicked/`), a cargo build script, toolchain or `.cargo/` config, a crate root, a script the
+/// tests run through (`scripts/`), and git's own attribute and ignore files.
+pub(crate) fn reaches_any_test(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    let name = parts.last().copied().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    if dirs
+        .iter()
+        .any(|d| matches!(*d, ".wicked" | ".cargo" | "scripts"))
+    {
+        return true;
+    }
+    if matches!(
+        name,
+        "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "pnpm-workspace.yaml"
+            | "yarn.lock"
+            | ".npmrc"
+            | ".nvmrc"
+            | ".node-version"
+            | "Cargo.toml"
+            | "Cargo.lock"
+            | "build.rs"
+            | "go.mod"
+            | "go.sum"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "tox.ini"
+            | "pytest.ini"
+            | "conftest.py"
+            | "Makefile"
+            | "justfile"
+            | ".gitignore"
+            | ".gitattributes"
+    ) {
+        return true;
+    }
+    // A crate root (`src/lib.rs`, `src/main.rs`) declares the modules everything else hangs off.
+    if matches!(name, "lib.rs" | "main.rs") && dirs.last() == Some(&"src") {
+        return true;
+    }
+    [
+        "rust-toolchain",
+        "tsconfig",
+        "vitest.config",
+        "vitest.workspace",
+        "vite.config",
+        "jest.config",
+        "babel.config",
+        ".babelrc",
+        "playwright.config",
+        "requirements",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+        // A setup file (`tests/setup.ts`) is loaded by the runner's config, never imported.
+        || lower.contains("setup")
+}
+
+/// (core#1208) A hand-off round's creator floor on `T_cur` whose unit already ran a floor on
+/// `T_prev` against the same base, with the same engine, boundary and exclusion switch (that
+/// floor's published [`CreatorFloorRecord`]): its test check runs only what the files changed
+/// between the two trees reach, and stands on the previous pass for the rest.
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaPlan {
+    record: CreatorFloorRecord,
+    /// The files changed between the two trees (added or modified: anything else widens).
+    pub(crate) files: Vec<String>,
+}
+
+impl DeltaPlan {
+    /// The plan for the floor `j` runs: `Ok(None)` when its unit ran no earlier published floor on
+    /// another tree against this base; `Err(why)` when it did but this round runs in full.
+    pub(crate) fn load(
+        logs: &Path,
+        j: &FloorJournal,
+        base: &str,
+        git_dir: &Path,
+        worktree: &Path,
+        posture_level: &str,
+        exclude: bool,
+    ) -> Result<Option<Self>, String> {
+        let Ok(dir) = std::fs::read_dir(logs) else {
+            return Ok(None);
+        };
+        let record = dir
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("creator-floor-") && n.ends_with(".json")
+            })
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|raw| serde_json::from_str::<CreatorFloorRecord>(&raw).ok())
+            .filter(|r| {
+                r.ord == j.ord && r.base == base && r.attempt < j.attempt && r.tree != j.tree
+            })
+            .max_by_key(|r| r.attempt);
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let prev = format!(
+            "the floor on tree {}",
+            &record.tree[..record.tree.len().min(10)]
+        );
+        if record.floor_policy != FLOOR_POLICY_VERSION {
+            return Err(format!("{prev} ran under another engine version"));
+        }
+        if record.sandbox_level != posture_level || record.exclude != exclude {
+            return Err(format!(
+                "{prev} ran under another boundary or exclusion switch"
+            ));
+        }
+        let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+        let raw = crate::worktree_guard::git(
+            worktree,
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--name-status",
+                &record.tree,
+                &j.tree,
+            ],
+            &env,
+        )
+        .map_err(|e| format!("the files changed since {prev} could not be listed: {e}"))?;
+        let fields: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .map(|f| String::from_utf8_lossy(f).into_owned())
+            .collect();
+        let mut files = Vec::new();
+        for pair in fields.chunks(2) {
+            let [status, path] = pair else {
+                return Err(format!("the files changed since {prev} could not be read"));
+            };
+            match status.as_str() {
+                "A" | "M" => {}
+                "D" => return Err(format!("this round deleted or renamed `{path}`")),
+                _ => return Err(format!("this round changed the type of `{path}`")),
+            }
+            if reaches_any_test(path) {
+                return Err(format!(
+                    "this round changed `{path}`, which can reach any test"
+                ));
+            }
+            files.push(path.clone());
+        }
+        if files.is_empty() {
+            return Err(format!("no file changed since {prev}"));
+        }
+        Ok(Some(DeltaPlan { record, files }))
+    }
+
+    /// The previous round's result of `check` this round may stand on: the same check (directory,
+    /// name, bound and source; the argv too, except a `test_targeted`, whose `{files}` are the
+    /// change's) that finished there, passed, left nothing outside the tree, with its logs whole.
+    pub(crate) fn entry_for(&self, check: &RepoCheck, logs: &Path) -> Result<(), String> {
+        let prev = format!(
+            "the floor on tree {}",
+            &self.record.tree[..self.record.tree.len().min(10)]
+        );
+        let entry = self
+            .record
+            .checks
+            .iter()
+            .find(|e| {
+                e.dir == check.dir
+                    && e.name == check.name
+                    && e.timeout_s == check.timeout_s
+                    && e.source.as_deref() == Some(check.source.as_str())
+                    && (check.name == "test_targeted" || e.argv == check.argv)
+            })
+            .ok_or_else(|| format!("{prev} did not run `{}` as this floor does", check.name))?;
+        let run = &entry.run;
+        if run.denies() {
+            return Err(format!("`{}` did not pass on {prev}", check.name));
+        }
+        if !(run.left_outputs.is_empty() && finished_whole(run, logs)) {
+            return Err(format!(
+                "`{}`'s result on {prev} cannot stand (it left files outside the tree, or its \
+                 logs are gone)",
+                check.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// The mark a delta check that passed carries ([`CheckRun::delta`]).
+    pub(crate) fn mark(&self) -> FloorDelta {
+        FloorDelta {
+            from_tree: self.record.tree.clone(),
+            phase: self.record.phase.clone(),
+            ord: self.record.ord,
+            attempt: self.record.attempt,
+            changed: self.files.iter().take(DELTA_FILES_SHOWN).cloned().collect(),
+            changed_count: self.files.len(),
+        }
     }
 }
 
@@ -1460,7 +1817,9 @@ impl OpenJournal {
             .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
         let entry = self.prior.remove(at);
         let (run, guarded) = (entry.run, entry.guarded_under);
-        finished_whole(&run, logs).then(|| {
+        // (core#1157) A check that left files outside the tree runs again: a floor resumed on a
+        // fresh checkout has none of them.
+        (run.left_outputs.is_empty() && finished_whole(&run, logs)).then(|| {
             if let Some(r) = self.resume.as_mut() {
                 r.reused.push(check.name.clone());
             }
@@ -2715,6 +3074,9 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
 /// copied, modified, renamed) plus untracked-not-ignored files, through the PINNED git dir; the
 /// engine scratch is never a touched path. Empty when the run knows no base.
 pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some(files) = &ctx.files {
+        return Ok(files.clone());
+    }
     if let Some((root, dir)) = package_root(worktree, ctx) {
         let root_ctx = FloorContext {
             package_dir: None,
