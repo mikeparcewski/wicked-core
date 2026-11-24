@@ -307,9 +307,19 @@ jobs:
   # the default PATH, so a repository whose rust-toolchain.toml names `channel = "stable"` builds
   # with the image's own binaries (rustup would otherwise try to install `stable` into a read-only
   # RUSTUP_HOME). No other job builds images; the image tests are stubs or WICKED_CONTAINER_LIVE-gated.
+  # core#1455 / core#1614: both architectures the seats run on (Rancher Desktop on Apple silicon is
+  # arm64), since the browser and media layer comes from each architecture's own Debian archive.
   seat-toolchain:
-    name: floor + seat image toolchain (ubuntu x86_64)
-    runs-on: ubuntu-latest
+    name: floor + seat image toolchain (ubuntu ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
       - name: Checkout wicked-core
@@ -389,3 +399,91 @@ jobs:
               CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
               sh -euc 'cargo run && cargo clippy -- -D warnings && cargo fmt --check && cargo test'
           done
+
+      # core#1455, core#1614: the seat's own browser and media tools, run as a seat runs them:
+      # under the floor's own landrun with the seat's production grants
+      # (tests/fixtures/seat-floor/landrun-work-ro.args, asserted equal to landrun_prefix), the
+      # operator's uid, a read-only root, HOME and /tmp tmpfs, no network, no new privileges and no
+      # capabilities. Screens at both sizes in both themes, then stills sampled at named times from
+      # a video, as the demo review's contact sheet does (ffprobe, ffmpeg -ss).
+      - name: Build the floor image (the seat's trusted launcher and landrun)
+        run: docker build -t wicked-floor:ci - < containers/floor.Dockerfile
+
+      - name: The seat takes screenshots and samples video stills offline, under the floor
+        run: |
+          set -eu
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/floor" "$dir/work"
+          cid="$(docker create wicked-floor:ci /busybox true)"
+          docker cp "$cid:/landrun" "$dir/floor/landrun"
+          docker rm "$cid" >/dev/null
+          cat > "$dir/work/page.html" <<'EOF'
+          <!doctype html><style>html,body{margin:0;height:100%;background:#fff}
+          @media (prefers-color-scheme: dark){html,body{background:#000}}</style><p>wicked seat</p>
+          EOF
+          cat > "$dir/work/shoot.sh" <<'EOF'
+          set -eu
+          # The policy holds: a writable mount the grants do not name is refused.
+          if (echo x > /probe/x) 2>/dev/null; then
+            echo "Landlock is not enforced here; this check would prove nothing" >&2; exit 1
+          fi
+          out=/tmp/shots; mkdir -p "$out"
+          command -v chromium ffmpeg ffprobe
+          # The colour of the pixel at (x, y) of an image: "r g b".
+          pixel() {
+            ffmpeg -v error -i "$1" -vf "crop=1:1:$2:$3" -f rawvideo -pix_fmt rgb24 - \
+              | od -An -tu1 | tr -s ' ' | sed 's/^ //;s/ $//'
+          }
+          for size in 1440,700 390,844; do
+            w="${size%,*}"; h="${size#*,}"
+            for theme in light dark; do
+              f="$out/$theme-$w.png"
+              flag=; [ "$theme" = dark ] && flag=--force-dark-mode
+              timeout 60 chromium $flag --window-size="$size" --hide-scrollbars --screenshot="$f" \
+                file:///work/page.html 2>/tmp/chromium.err || { cat /tmp/chromium.err >&2; exit 1; }
+              dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$f")"
+              px="$(pixel "$f" $((w - 1)) $((h - 1)))"
+              echo "$theme $size: $dims, corner pixel $px"
+              [ "$dims" = "$size" ] || { echo "the $theme shot is $dims, not $size" >&2; exit 1; }
+              want="255 255 255"; [ "$theme" = dark ] && want="0 0 0"
+              [ "$px" = "$want" ] || { echo "the $theme shot's background is $px, not $want" >&2; exit 1; }
+            done
+          done
+          # Red for the first 2 s, blue for the next 2 s: a still at 0.5 s is red and at 2.5 s blue.
+          ffmpeg -v error -f lavfi -i color=c=red:s=320x240:r=10:d=2 -f lavfi -i color=c=blue:s=320x240:r=10:d=2 \
+            -filter_complex '[0:v][1:v]concat=n=2:v=1:a=0' -c:v mpeg4 -q:v 2 /tmp/demo.mp4
+          dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/demo.mp4)"
+          echo "video: ${dur}s"
+          case "$dur" in 4|4.0*|3.9*) ;; *) echo "the video is ${dur}s, not 4s" >&2; exit 1 ;; esac
+          for at in 0.5 2.5; do
+            f="$out/still-$at.png"
+            ffmpeg -v error -ss "$at" -i /tmp/demo.mp4 -frames:v 1 "$f"
+            test -s "$f" || { echo "no still at ${at}s" >&2; exit 1; }
+            dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$f")"
+            px="$(pixel "$f" 160 120)"
+            echo "still at ${at}s: $dims, centre pixel $px"
+            [ "$dims" = 320,240 ] || { echo "the still at ${at}s is $dims, not 320,240" >&2; exit 1; }
+            set -- $px
+            if [ "$at" = 0.5 ]; then [ "$1" -gt 200 ] && [ "$3" -lt 60 ]; else [ "$3" -gt 200 ] && [ "$1" -lt 60 ]; fi \
+              || { echo "the still at ${at}s is not from its time ($px)" >&2; exit 1; }
+          done
+          EOF
+          chmod -R a+rX "$dir"
+          mapfile -t policy < tests/fixtures/seat-floor/landrun-work-ro.args
+          docker run --rm --network none --read-only --user 1000:1000 \
+            --security-opt no-new-privileges --cap-drop ALL \
+            --tmpfs /tmp:exec --tmpfs /home/seat --tmpfs /probe:mode=1777 \
+            -v "$dir/floor:/floor:ro" -v "$dir/work:/work:ro" --entrypoint /usr/bin/env \
+            wicked-seat-claude:ci -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/home/seat TMPDIR=/tmp LANG=C.UTF-8 "${policy[@]}" -- sh /work/shoot.sh
+
+      - name: Record the seat image size and the browser and media layer's share
+        run: |
+          set -eu
+          total="$(docker image inspect -f '{{.Size}}' wicked-seat-claude:ci)"
+          layer="$(docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' wicked-seat-claude:ci \
+            | grep -m1 'chromium fonts-liberation ffmpeg' | cut -f1)"
+          test -n "$layer"
+          line="seat image (claude, ${{ matrix.arch }}): $(( total / 1000000 )) MB in total; the browser and media layer (chromium, fonts-liberation, ffmpeg) adds $layer"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
