@@ -26,6 +26,11 @@ pub(super) struct FloorInputs {
     /// (core#1392) What an operator's `targeted` re-run of this floor would run
     /// ([`targeted_selection`]'s source), read before any check ran.
     pub(super) targeted_test: Option<String>,
+    /// (core#1208) A hand-off round's delta ([`DeltaPlan`]), and the root's targeted selection
+    /// for the files changed since each earlier floor (aligned with [`DeltaPlan::from`]), read
+    /// before any check ran.
+    pub(super) delta: Option<DeltaPlan>,
+    pub(super) delta_selection: Vec<Option<RepoCheck>>,
 }
 
 /// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). With no `frozen`
@@ -190,7 +195,59 @@ pub(super) fn run_detected(
                 .ok()
                 .flatten()
                 .map(|c| c.source);
+            // (core#1208) A hand-off round's creator floor on a guarded checkout: the unit's
+            // previous published floor against this base, and what the round changed since.
+            let delta = match (
+                ctx.stage,
+                journal,
+                ctx.base_head.as_deref(),
+                ctx.git_dir.as_deref(),
+            ) {
+                (FloorStage::Creator, Some(j), Some(base), Some(git_dir))
+                    if untouched.is_some()
+                        && rerun.is_none()
+                        && waived.is_empty()
+                        && !j.tree.is_empty()
+                        && ctx.package_dir.is_none() =>
+                {
+                    DeltaPlan::load(
+                        &scratch.logs,
+                        j,
+                        base,
+                        git_dir,
+                        worktree,
+                        &scratch.posture_level(&sandbox_level),
+                        exclude,
+                    )
+                }
+                _ => Ok(None),
+            };
+            let delta = delta.unwrap_or_else(|why| {
+                eprintln!("wicked-core: repo checks floor — this round's tests run in full: {why}");
+                None
+            });
+            // The ROOT's targeted command only: a package's would run another package's tests in
+            // place of the root's (xreview r1 on #1866).
+            let delta_selection = delta
+                .iter()
+                .flat_map(|p| p.from.iter())
+                .map(|f| {
+                    let files = f.files.as_ref().ok()?;
+                    targeted_selection(
+                        worktree,
+                        &FloorContext {
+                            files: Some(files.clone()),
+                            ..ctx.clone()
+                        },
+                    )
+                    .ok()
+                    .flatten()
+                    .filter(|c| c.dir.is_empty())
+                })
+                .collect();
             FloorInputs {
+                delta,
+                delta_selection,
                 detected,
                 waived,
                 exclude,
@@ -226,6 +283,8 @@ pub(super) fn run_detected(
         e2e_paths,
         reruns,
         targeted_test,
+        delta,
+        delta_selection,
     } = inputs;
     let baseline_diff_for =
         |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
@@ -297,6 +356,24 @@ pub(super) fn run_detected(
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
     // (core#1152) The boundary this floor's runs are journaled and published under.
     let posture_level = scratch.posture_level(&sandbox_level);
+    // (core#1157) On a guarded checkout, what each check that runs here leaves outside the tree
+    // (the untracked and ignored paths new after it): such a result is never reused by a later
+    // floor, whose fresh checkout has none of it.
+    // In a container floor the checks run in the pod's copy, so that is where they are listed
+    // (xreview r1 on #1866). What the checkout held before the first check is `settled`: never
+    // walked; a directory a check creates is listed file by file after it.
+    let git_at = |args: &[&str]| match &scratch.container {
+        Some(c) => c.git_at_head(args),
+        None => git_at_checkout(worktree, args),
+    };
+    let mut settled = std::collections::BTreeSet::new();
+    let mut listed = untouched.is_some().then(|| {
+        let first = untracked_inventory(&git_at, &settled);
+        if let Ok(all) = &first {
+            settled.clone_from(all);
+        }
+        first
+    });
     for check in detected.iter() {
         // (core#1731) Once the disk watch stopped a run, no further check starts: the floor is
         // that environment refusal ([`disk_stopped`]).
@@ -352,6 +429,7 @@ pub(super) fn run_detected(
                     name: check.name.clone(),
                     argv: check.argv.clone(),
                     timeout_s: check.timeout_s,
+                    source: Some(check.source.clone()),
                     run: run.clone(),
                 });
             }
@@ -375,11 +453,39 @@ pub(super) fn run_detected(
         // A deleted, renamed-away or type-changed file (git's D/T list): what it left behind
         // cannot be mapped — the full check. A list that cannot be read: the full check too.
         let deletes = removed.as_ref().map_or(true, |r| !r.is_empty());
+        // (core#1208) A hand-off round's test check: when an earlier round's floor of this unit
+        // passed the same check in full, this round runs the root's targeted selection for the
+        // files changed since then, and stands on that pass for the rest. Its pass decides,
+        // labelled; its failure runs the check as declared, as any affected pre-pass does. Never
+        // when this run's rigor requires the full suite: the earlier pass may have been a smaller
+        // one (xreview r1 on #1866).
+        let delta_from = delta
+            .as_ref()
+            .filter(|_| {
+                ctx.stage == FloorStage::Creator
+                    && check.dir.is_empty()
+                    && is_delta_check(&check.name)
+                    && !power_full_suite(ctx)
+            })
+            .and_then(|p| match p.source_for(check, &scratch.logs) {
+                Ok(i) => Some((p, i)),
+                Err(why) => {
+                    eprintln!(
+                        "wicked-core: repo checks floor — `{}` runs in full this round: {why}",
+                        check.name
+                    );
+                    None
+                }
+            });
+        let delta_argv = delta_from
+            .and_then(|(_, i)| delta_selection.get(i).cloned().flatten())
+            .map(|c| c.argv);
         let guided = gcheck
             .as_ref()
             .ok()
             .filter(|_| {
-                ctx.stage == FloorStage::Creator
+                delta_argv.is_none()
+                    && ctx.stage == FloorStage::Creator
                     && !touched.is_empty()
                     && !deletes
                     && !power_full_suite(ctx)
@@ -388,19 +494,29 @@ pub(super) fn run_detected(
         // (core#1187) Without a guide's piece, the ENGINE computes a cargo workspace's affected
         // set from the diff (cargo's package graph + the code graph at the base): never the
         // creator's seat or the intake model. Recorded on the check either way.
-        let engine = (guided.is_none() && ctx.stage == FloorStage::Creator)
+        let engine = (delta_argv.is_none() && guided.is_none() && ctx.stage == FloorStage::Creator)
             .then(|| {
                 engine_affected(
                     worktree, held_head, check, ctx, &touched, &removed, sandbox, scratch,
                 )
             })
             .flatten();
-        let affected = match guided {
-            Some(argv) => Some((
+        let delta_mark = delta_from
+            .filter(|_| delta_argv.is_some())
+            .map(|(p, i)| p.mark(i));
+        let affected = match (delta_argv, guided) {
+            (Some(argv), _) => Some((
+                argv,
+                format!(
+                    "`{}`'s tests reached by this round's change (core#1208)",
+                    check.name
+                ),
+            )),
+            (None, Some(argv)) => Some((
                 argv,
                 format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
             )),
-            None => engine.as_ref().and_then(|p| p.argv.clone()).map(|argv| {
+            (None, None) => engine.as_ref().and_then(|p| p.argv.clone()).map(|argv| {
                 (
                     argv,
                     format!(
@@ -417,7 +533,17 @@ pub(super) fn run_detected(
                     source,
                     ..check.clone()
                 };
-                let r = run_held(worktree, held_head, &a, sandbox, scratch, Tree::Head);
+                let mut r = run_held(worktree, held_head, &a, sandbox, scratch, Tree::Head);
+                if r.passed() {
+                    r.delta = delta_mark.clone();
+                    if let Some(d) = &r.delta {
+                        eprintln!(
+                            "wicked-core: repo checks floor — `{}` {}",
+                            check.name,
+                            d.note(&check.name)
+                        );
+                    }
+                }
                 if r.passed() || r.environment_failure() {
                     r
                 } else {
@@ -668,6 +794,20 @@ pub(super) fn run_detected(
                 .map(|c| format!(" — {c}"))
                 .unwrap_or_default()
         );
+        if let Some(before) = listed.as_mut() {
+            if is_provisioning(&check.name) {
+                // What the install left (the dependency trees) every floor installs again: settled,
+                // not walked. Never reused itself, so nothing is recorded on it.
+                if let Ok(top) = outside_tree(&git_at, &[]) {
+                    settled.extend(top);
+                }
+                *before = untracked_inventory(&git_at, &settled);
+            } else {
+                let after = untracked_inventory(&git_at, &settled);
+                run.left_outputs = left_by_check(before, &after);
+                *before = after;
+            }
+        }
         failed = run.denies();
         if let Some(s) = seed.as_mut() {
             if again.is_none() {
@@ -700,6 +840,7 @@ pub(super) fn run_detected(
                 name: check.name.clone(),
                 argv: check.argv.clone(),
                 timeout_s: check.timeout_s,
+                source: Some(check.source.clone()),
                 run: run.clone(),
             });
         }

@@ -1867,6 +1867,7 @@ pub(crate) fn lift_and_reverify(
         package_dir: None,
         run_id: Some(run_id.to_string()),
         code_graph: None,
+        files: None,
     };
     // (core#417, codex r1) The deliver re-verify is a verify floor too: it runs on a clean
     // checkout of `now.tree` — the tree that ships — never the live worktree, where an ignored
@@ -3780,6 +3781,7 @@ mod tests {
             package_dir: None,
             run_id: Some("override-brick".into()),
             code_graph: None,
+            files: None,
         };
         let checkout =
             crate::repo_checks::checkout_guarded_tree(&wt, &git_dir, &tree, "override-brick-4-a0")

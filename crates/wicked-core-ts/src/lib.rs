@@ -3903,7 +3903,9 @@ mod tests {
                 "targets": ["p --lib (1 tests)"], "tests": ["p: a"], "test_count": 1,
                 "changed_symbols": 1, "reached_symbols": 2
             },
-            "reused_from": {"phase": "fix", "ord": 2, "attempt": 0}
+            "reused_from": {"phase": "fix", "ord": 2, "attempt": 0},
+            "delta": {"fromTree": "abc", "phase": "build", "ord": 2, "attempt": 0,
+                      "changed": ["src/a.ts"], "changedCount": 1}
         }))
         .expect("a check run with a decision deserializes");
         let ev = event_to_json(&CoreEvent::RepoChecksEvaluated {

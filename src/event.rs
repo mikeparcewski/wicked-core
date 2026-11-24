@@ -1767,6 +1767,14 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         v["reusedFrom"] =
             serde_json::json!({ "phase": r.phase, "ord": r.ord, "attempt": r.attempt });
     }
+    // (core#1208, additive) A hand-off round's check that ran only what the round's change
+    // reaches, and the earlier floor whose pass stands for the rest. Absent on every other check.
+    if let Some(d) = &c.delta {
+        v["delta"] = serde_json::json!({
+            "fromTree": d.from_tree, "phase": d.phase, "ord": d.ord, "attempt": d.attempt,
+            "changed": d.changed, "changedCount": d.changed_count,
+        });
+    }
     v
 }
 

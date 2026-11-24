@@ -1274,6 +1274,8 @@ fn a_failed_install_is_reported_as_a_provisioning_finding_not_a_verdict() {
             logs: Vec::new(),
             load_band: None,
             reused_from: None,
+            left_outputs: Vec::new(),
+            delta: None,
         }],
         skipped: vec!["typecheck".into(), "test".into()],
         passed: false,
@@ -5333,6 +5335,8 @@ fn run_named(name: &str, exit_code: Option<i32>, timed_out: bool) -> CheckRun {
         logs: Vec::new(),
         load_band: None,
         reused_from: None,
+        left_outputs: Vec::new(),
+        delta: None,
     }
 }
 
@@ -5688,6 +5692,8 @@ fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
         logs: Vec::new(),
         load_band: None,
         reused_from: None,
+        left_outputs: Vec::new(),
+        delta: None,
     }
 }
 

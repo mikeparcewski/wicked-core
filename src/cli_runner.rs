@@ -2218,6 +2218,7 @@ impl crate::rule_check::MachineCheck for FloorMachine<'_> {
             package_dir: None,
             run_id: Some(self.run_id.to_string()),
             code_graph: None,
+            files: None,
         };
         let mut report = crate::repo_checks::run_floor_journaled(&checkout.dir, &ctx, None, None);
         // A check that rewrote the tree it ran on proves nothing about it (codex r2).
@@ -5216,6 +5217,7 @@ fn floor_plan(
             .and_then(|g| g.code_graph_db.as_deref())
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from),
+        files: None,
     };
     let guard_tree = match guard_first_look {
         Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {

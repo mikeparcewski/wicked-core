@@ -31,6 +31,8 @@ fn run(name: &str, exit_code: i32, duration_ms: u64) -> CheckRun {
         logs: Vec::new(),
         load_band: None,
         reused_from: None,
+        left_outputs: Vec::new(),
+        delta: None,
     }
 }
 
