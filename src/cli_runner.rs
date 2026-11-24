@@ -2551,11 +2551,10 @@ fn run_rule_check_with(
         .filter(|r| exclusions.may_reuse(r, registry))
         .cloned()
         .collect();
-    let same_change = same_change_rows(
-        others.as_deref().unwrap_or_default(),
-        input.unit.ord,
-        |r| exclusions.may_reuse(r, registry),
-    );
+    let same_change =
+        same_change_rows(others.as_deref().unwrap_or_default(), input.unit.ord, |r| {
+            exclusions.may_reuse(r, registry)
+        });
     let facts = crate::rule_check::job_facts(
         &input.unit.rule_steps,
         gov.project_id.as_deref(),
@@ -2927,9 +2926,8 @@ fn same_change_rows(
         .filter_map(|rc| rc.change_key.as_ref().map(|k| (k, &rc.rows)))
         .flat_map(|(k, rows)| rows.iter().map(move |r| (k, r)))
     {
-        latest.retain(|(lk, lr)| {
-            !(*lk == k && lr.rule_id == r.rule_id && lr.rule_key == r.rule_key)
-        });
+        latest
+            .retain(|(lk, lr)| !(*lk == k && lr.rule_id == r.rule_id && lr.rule_key == r.rule_key));
         latest.push((k, r));
     }
     latest
