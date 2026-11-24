@@ -6325,3 +6325,29 @@ fn core_1709_a_targeted_failure_and_the_same_full_suite_failure_name_the_same_te
     assert_eq!(runner_root("packages", "crew"), "packages/crew");
     assert_ne!(runner_root("", ""), runner_root("", "packages/crew"));
 }
+
+/// (core#1870) A tool cache is matched as a whole path component, at any depth (a check run in a
+/// subdirectory writes its cache there); a name that only resembles one is an output like any.
+#[test]
+fn a_tool_cache_is_matched_as_a_whole_path_component_1870() {
+    for path in [
+        ".pytest_cache/",
+        ".pytest_cache/v/cache/lastfailed",
+        "pkg/.ruff_cache/",
+        "pkg/.ruff_cache/0.6.9/123",
+        "a/b/.mypy_cache/3.12/app.meta.json",
+        ".eslintcache",
+        "web/.eslintcache",
+    ] {
+        assert!(in_tool_cache(path), "{path}");
+    }
+    for path in [
+        "pytest_cache/",
+        ".pytest_cache_old/x",
+        "out/.pytest_cache.txt",
+        "out/gen.txt",
+        ".eslintcache.json",
+    ] {
+        assert!(!in_tool_cache(path), "{path}");
+    }
+}
