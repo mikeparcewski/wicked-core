@@ -1,6 +1,7 @@
-//! (DES-j6-build C0a) A prompt handed on stdin: the argv form ([`stdin_prompt_argv`]), a 150 KB
-//! prompt to a tool-less claude and a read-only (evaluator) codex through the real wrapped runner on the host
-//! floor, and the same prompt through a seat pod's `kubectl exec -i` client on the container floor.
+//! (DES-j6-build C0a) A prompt handed on stdin: the argv form ([`stdin_prompt_argv`]); a 150 KB
+//! prompt to a tool-less claude and a read-only (evaluator) codex through the real wrapped runner
+//! on the host floor; a feed the seat does not read whole; and the same prompt through a seat
+//! pod's `kubectl exec -i` client on the container floor.
 
 use super::*;
 use wicked_apps_core::spawn::SeatCli;
@@ -9,74 +10,98 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
-/// A prompt the size of J6 v3's largest writer calls (150 KB), with newlines, quotes, a leading
-/// dash and shell metacharacters, so a byte that is re-quoted, split or dropped shows.
-fn big_prompt() -> String {
-    let mut p = String::from("-not an option\n\"quoted\" 'single' $HOME `tick` \\ back\n");
-    while p.len() < 150 * 1024 {
+/// A prompt of `size` bytes or a little more, with newlines, quotes, a leading dash, shell
+/// metacharacters, non-ASCII and leading and trailing whitespace, so a byte that is re-quoted,
+/// split, trimmed or dropped shows.
+fn prompt_of(size: usize) -> String {
+    let mut p = String::from("  -not an option\n\"quoted\" 'single' $HOME `tick` \\ back\n");
+    while p.len() < size {
         p.push_str("IF PAY-HOURS > 40 MOVE 'Y' TO WS-OVERTIME. é\n");
     }
+    p.push_str("\n\n");
     p
+}
+
+/// J6 v3's largest writer calls are about 150 KB.
+fn big_prompt() -> String {
+    prompt_of(150 * 1024)
 }
 
 #[test]
 fn a_stdin_prompt_leaves_no_prompt_argument_for_claude_and_a_dash_for_codex() {
-    let mut claude = build_argv("claude -p {PROMPT}", STDIN_PROMPT_SLOT, &[]);
-    assert_eq!(stdin_prompt_argv(&mut claude, SeatCli::Claude), Ok(None));
-    assert_eq!(claude, s(&["claude", "-p"]));
-    // An option guard left last goes with the prompt (a variadic flag before it eats nothing).
-    let mut guarded = build_argv("claude --add-dir /x {PROMPT}", STDIN_PROMPT_SLOT, &[]);
-    assert_eq!(guarded.last().map(String::as_str), Some(STDIN_PROMPT_SLOT));
-    stdin_prompt_argv(&mut guarded, SeatCli::Claude).unwrap();
-    assert_eq!(guarded, s(&["claude", "--add-dir", "/x"]));
-    // A template with no placeholder (an `InputMode::Stdin` seat) gets no prompt argument either.
-    let mut bare = build_argv("claude -p --model m", STDIN_PROMPT_SLOT, &[]);
-    stdin_prompt_argv(&mut bare, SeatCli::Claude).unwrap();
-    assert_eq!(bare, s(&["claude", "-p", "--model", "m"]));
-    let mut codex = build_argv(
-        "codex exec --skip-git-repo-check {PROMPT}",
-        STDIN_PROMPT_SLOT,
-        &[],
-    );
+    let conv = |template: &str, seat| {
+        let mut argv = build_argv(template, STDIN_PROMPT_SLOT, &[]);
+        stdin_prompt_argv(&mut argv, seat).map(|p| (argv, p))
+    };
     assert_eq!(
-        stdin_prompt_argv(&mut codex, SeatCli::Codex),
-        Ok(Some("-".to_string()))
+        conv("claude -p {PROMPT}", SeatCli::Claude),
+        Ok((s(&["claude", "-p"]), None))
     );
-    assert_eq!(codex, s(&["codex", "exec", "--skip-git-repo-check", "-"]));
+    // An option guard left last goes with the prompt (a variadic flag before it eats nothing).
+    assert_eq!(
+        conv("claude --add-dir /x {PROMPT}", SeatCli::Claude),
+        Ok((s(&["claude", "--add-dir", "/x"]), None))
+    );
+    // A template with no placeholder (an `InputMode::Stdin` seat) gets no prompt argument either.
+    assert_eq!(
+        conv("claude -p --model m", SeatCli::Claude),
+        Ok((s(&["claude", "-p", "--model", "m"]), None))
+    );
+    let dash = Some("-".to_string());
+    assert_eq!(
+        conv("codex exec --skip-git-repo-check {PROMPT}", SeatCli::Codex),
+        Ok((
+            s(&["codex", "exec", "--skip-git-repo-check", "-"]),
+            dash.clone()
+        ))
+    );
     // Past an option guard, `-` is still the positional prompt (stdin).
-    let mut guarded = build_argv("codex exec {PROMPT}", STDIN_PROMPT_SLOT, &[]);
-    stdin_prompt_argv(&mut guarded, SeatCli::Codex).unwrap();
-    assert_eq!(guarded, s(&["codex", "exec", "--", "-"]));
-    // Refused: a prompt glued into a token, and agy (its carrier needs argv).
-    let mut glued = build_argv("claude --prompt={PROMPT}", STDIN_PROMPT_SLOT, &[]);
-    assert!(stdin_prompt_argv(&mut glued, SeatCli::Claude)
-        .unwrap_err()
-        .contains("own argument"));
-    let mut agy = build_argv("agy -p {PROMPT}", STDIN_PROMPT_SLOT, &[]);
-    assert!(stdin_prompt_argv(&mut agy, SeatCli::Agy)
-        .unwrap_err()
-        .contains("agy"));
+    assert_eq!(
+        conv("codex exec {PROMPT}", SeatCli::Codex),
+        Ok((s(&["codex", "exec", "--", "-"]), dash.clone()))
+    );
+    // A codex template that already reads stdin keeps its one `-`.
+    assert_eq!(
+        conv("codex exec -", SeatCli::Codex),
+        Ok((s(&["codex", "exec", "-"]), dash))
+    );
+    // Refused: a prompt joined to other text, a prompt placed twice, and every other seat.
+    let refused = |template: &str, seat| conv(template, seat).unwrap_err();
+    assert!(refused("claude --prompt={PROMPT}", SeatCli::Claude).contains("own argument"));
+    assert!(refused("claude -p {PROMPT} {PROMPT}", SeatCli::Claude).contains("2 times"));
+    assert!(refused("codex exec {PROMPT} {PROMPT}", SeatCli::Codex).contains("2 times"));
+    for (template, seat) in [
+        ("agy -p {PROMPT}", SeatCli::Agy),
+        ("pi -p {PROMPT}", SeatCli::Pi),
+        ("copilot -p {PROMPT}", SeatCli::Copilot),
+    ] {
+        assert!(
+            refused(template, seat).contains("only claude and codex"),
+            "{template}"
+        );
+    }
 }
 
-/// What a stand-in seat saw: its argv (one `[arg]` per argument, a long one as
-/// `<long crc:len>`) and its stdin (`<stdin crc:len>`, or `<no stdin>` when it is not a pipe),
-/// printed as its answer. `len` is the byte length; `crc` is taken with the digits removed, since
-/// a read-only codex's prompt names its per-attempt check scratch, whose name holds a clock.
+/// A stand-in seat: it writes each argument over 4 KB to `<dir>/<cli>.argv-prompt` (printing
+/// `[<long>]` in its place) and its stdin, when that is a pipe, to `<dir>/<cli>.stdin`, then prints
+/// its argv as `ARGV [a][b]…` and `STDIN pipe|none`.
 #[cfg(unix)]
-const STAND_IN: &str = r#"#!/bin/sh
-sum() { tr -d '0-9' | cksum | cut -d' ' -f1; }
+fn stand_in(dir: &Path, cli: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+d='{d}'
 out=""
 for a in "$@"; do
   n=$(printf '%s' "$a" | wc -c | tr -d ' ')
-  if [ "$n" -gt 4096 ]; then a="<long $(printf '%s' "$a" | sum):$n>"; fi
+  if [ "$n" -gt 4096 ]; then printf '%s' "$a" > "$d/{cli}.argv-prompt"; a="<long>"; fi
   out="$out[$a]"
 done
-if [ -p /dev/stdin ]; then
-  v=$(cat; echo .); v=${v%.}
-  i="<stdin $(printf '%s' "$v" | sum):$(printf '%s' "$v" | wc -c | tr -d ' ')>"
-else i="<no stdin>"; fi
+if [ -p /dev/stdin ]; then cat > "$d/{cli}.stdin"; i=pipe; else i=none; fi
 printf 'ARGV %s\nSTDIN %s\n' "$out" "$i"
-"#;
+"#,
+        d = dir.display()
+    )
+}
 
 #[cfg(unix)]
 fn line<'a>(out: &'a str, tag: &str) -> &'a str {
@@ -85,11 +110,37 @@ fn line<'a>(out: &'a str, tag: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {tag} line in {out}"))
 }
 
-/// Host floor: the same tool-free ballot unit, launched once with its prompt on argv and once on
-/// stdin. On stdin the seat reads the bytes argv carried (same length and checksum; claude's
-/// prompt is the same bytes, codex's differs only in its scratch's clock digits), and
-/// its argv is the argv form of the same launch: claude keeps `--tools ""` and loses only the
-/// prompt; codex keeps its evaluator sandbox and gets `-` in the prompt's place.
+/// `b` with every run of 13 or more ASCII digits as `#`: a read-only codex's check scratch is
+/// named with a nanosecond clock, the only part of a launch that differs between two launches of
+/// the same unit. Nothing else is normalized.
+#[cfg(unix)]
+fn unclocked(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let run = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if run >= 13 {
+            out.push(b'#');
+            i += run;
+        } else if run > 0 {
+            out.extend_from_slice(&b[i..i + run]);
+            i += run;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Host floor, through the real wrapped runner with stand-in `claude` and `codex` binaries, tool
+/// free as a model call runs (claude answer-only, codex a read-only evaluator):
+/// - the same unit with an 8 KB prompt, launched with it on argv and then on stdin: the seat
+///   reads on stdin exactly the bytes argv carried, and its argv is the argv launch's with only
+///   the prompt gone (claude, keeping `--tools ""`) or `-` in its place (codex, keeping its
+///   sandbox);
+/// - a 150 KB prompt (over Linux's 128 KiB argument limit) on stdin: the seat reads exactly the
+///   launch's prompt, the 8 KB launch's bytes with the 150 KB task in place of the 8 KB one.
 #[cfg(unix)]
 #[test]
 fn a_150_kb_prompt_reaches_a_tool_less_claude_and_a_read_only_codex_on_stdin_byte_exact() {
@@ -129,24 +180,21 @@ fn a_150_kb_prompt_reaches_a_tool_less_claude_and_a_read_only_codex_on_stdin_byt
         crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
         Some(dir.join("config").as_os_str()),
     );
-    let prompt = big_prompt();
-    let run = |cli: &str, on_stdin: bool| {
+    // One launch: (its printed answer, the long argv argument, its stdin), both read back and
+    // removed.
+    let run = |cli: &str, task: &str, on_stdin: bool| {
         let bin = dir.join(cli);
         if !bin.exists() {
-            crate::test_env::install_stub(&bin, STAND_IN);
+            crate::test_env::install_stub(&bin, &stand_in(&dir, cli));
         }
-        let mut unit = WorkUnit::pending(COUNCIL_BALLOT_UNIT, "council", 1, prompt.as_str());
+        let mut unit = WorkUnit::pending(COUNCIL_BALLOT_UNIT, "council", 1, task);
         unit.assigned_cli = Some(cli.to_string());
-        unit.assigned_invocation = Some(format!(
-            "{} {} {{PROMPT}}",
-            bin.display(),
-            match cli {
-                "claude" => "-p",
-                _ => "exec --skip-git-repo-check",
-            }
-        ));
-        // Tool-free, as a model call runs: claude answer-only (tool-less), codex a read-only
-        // evaluator.
+        let flags = if cli == "claude" {
+            "-p"
+        } else {
+            "exec --skip-git-repo-check"
+        };
+        unit.assigned_invocation = Some(format!("{} {flags} {{PROMPT}}", bin.display()));
         if cli == "claude" {
             unit.answer_only = true;
         } else {
@@ -155,7 +203,7 @@ fn a_150_kb_prompt_reaches_a_tool_less_claude_and_a_read_only_codex_on_stdin_byt
         }
         let input = StepInput {
             base_commit: None,
-            // One run id for both launches, so their sandbox paths match.
+            // One run id for every launch, so their sandbox paths match.
             run_id: format!("stdin-{cli}-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -184,55 +232,113 @@ fn a_150_kb_prompt_reaches_a_tool_less_claude_and_a_read_only_codex_on_stdin_byt
             "{cli} {on_stdin}: {}",
             out.output
         );
-        out.output
+        let take = |ext: &str| {
+            let p = dir.join(format!("{cli}.{ext}"));
+            let b = std::fs::read(&p).ok();
+            let _ = std::fs::remove_file(&p);
+            b
+        };
+        (out.output, take("argv-prompt"), take("stdin"))
     };
+    let small = prompt_of(8 * 1024);
+    let big = big_prompt();
     for cli in ["claude", "codex"] {
-        let on_argv = run(cli, false);
-        let on_stdin = run(cli, true);
-        let argv_a = line(&on_argv, "ARGV ");
-        let argv_b = line(&on_stdin, "ARGV ");
-        // The prompt as argv carried it: the one long argument.
-        let long = argv_a
-            .split(']')
-            .find_map(|a| a.strip_prefix("[<long "))
-            .unwrap_or_else(|| panic!("{cli}: no long argument in {argv_a}"))
-            .trim_end_matches('>')
-            .to_string();
-        let len: usize = long.rsplit(':').next().unwrap().parse().unwrap();
-        assert!(len >= prompt.len(), "{cli}: the argv prompt is {len} bytes");
-        assert_eq!(line(&on_argv, "STDIN "), "<no stdin>", "{cli}");
-        assert_eq!(
-            line(&on_stdin, "STDIN "),
-            format!("<stdin {long}>"),
+        let (out_a, argv_prompt, none) = run(cli, &small, false);
+        let (out_b, no_arg, fed) = run(cli, &small, true);
+        let argv_prompt = argv_prompt.unwrap_or_else(|| panic!("{cli}: no prompt argument"));
+        assert!(none.is_none(), "{cli}: an argv launch was fed stdin");
+        assert_eq!(line(&out_a, "STDIN "), "none", "{cli}");
+        assert!(
+            no_arg.is_none(),
+            "{cli}: a stdin launch kept a long argument"
+        );
+        assert_eq!(line(&out_b, "STDIN "), "pipe", "{cli}");
+        let fed = fed.unwrap_or_else(|| panic!("{cli}: nothing on stdin"));
+        assert!(
+            unclocked(&fed) == unclocked(&argv_prompt),
             "{cli}: stdin is not the argv prompt byte for byte"
         );
-        assert!(
-            !argv_b.contains("<long"),
-            "{cli}: a long argument is left: {argv_b}"
-        );
+        if cli == "claude" {
+            assert!(
+                fed == argv_prompt,
+                "claude: stdin differs from its argv prompt"
+            );
+        }
+        let (argv_a, argv_b) = (line(&out_a, "ARGV "), line(&out_b, "ARGV "));
         let expected = match cli {
-            "claude" => argv_a.replace(&format!("[<long {long}>]"), ""),
-            _ => argv_a.replace(&format!("[<long {long}>]"), "[-]"),
-        };
-        // (Digits aside: codex's check scratch is named with a clock.)
-        let digitless = |s: &str| {
-            s.chars()
-                .filter(|c| !c.is_ascii_digit())
-                .collect::<String>()
+            "claude" => argv_a.replace("[<long>]", ""),
+            _ => argv_a.replace("[<long>]", "[-]"),
         };
         assert_eq!(
-            digitless(argv_b),
-            digitless(&expected),
+            unclocked(argv_b.as_bytes()),
+            unclocked(expected.as_bytes()),
             "{cli}: the stdin launch's argv"
         );
         if cli == "claude" {
             assert!(argv_b.contains("[--tools][]"), "{argv_b}");
         } else {
-            // The read-only evaluator's own codex sandbox: its check scratch, the tree denied.
+            // The read-only evaluator's own codex sandbox (its check scratch, the tree denied).
             assert!(argv_b.contains("[-][--json][--sandbox]"), "{argv_b}");
         }
+        // 150 KB on stdin: the same launch with the big task in place of the small one.
+        let (_, no_arg, fed) = run(cli, &big, true);
+        assert!(no_arg.is_none(), "{cli}: the 150 KB prompt rode argv");
+        let fed = fed.unwrap_or_else(|| panic!("{cli}: nothing on stdin"));
+        let small_at = argv_prompt
+            .windows(small.len())
+            .position(|w| w == small.as_bytes())
+            .unwrap_or_else(|| panic!("{cli}: the task is not in its prompt"));
+        let mut want = argv_prompt[..small_at].to_vec();
+        want.extend_from_slice(big.as_bytes());
+        want.extend_from_slice(&argv_prompt[small_at + small.len()..]);
+        assert!(fed.len() > 150 * 1024, "{cli}: {} bytes", fed.len());
+        assert!(
+            unclocked(&fed) == unclocked(&want),
+            "{cli}: the 150 KB stdin is not the launch's prompt byte for byte"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A seat that exits 0 without reading its whole prompt has not answered it: the launch reports
+/// the short feed and fails. A descendant that holds stdin open without reading (in a session of
+/// its own, so the group kill misses it) does not keep the feed, or the launch, alive.
+#[cfg(unix)]
+#[test]
+fn a_seat_that_does_not_read_its_whole_prompt_fails_and_the_feed_ends_with_it() {
+    let emit = |_: &str| {};
+    let feed = |script: &str| {
+        // spawn-audit: test-only — a shell that reads part of its stdin.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let start = Instant::now();
+        let r = run_bounded_fed(
+            cmd,
+            Some(big_prompt().into_bytes()),
+            crate::test_env::PATIENT,
+            &emit,
+            Box::new(Passthrough),
+            None,
+        )
+        .expect("ran");
+        (r.0, r.2, start.elapsed())
+    };
+    let (code, err, _) = feed("head -c 100 >/dev/null; echo answered; exit 0");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("before it read its whole prompt"), "{err}");
+    let (code, err, took) = feed(
+        "python3 -c 'import os,sys,time\nif os.fork():\n    sys.exit(0)\nos.setsid()\n\
+         n=os.open(os.devnull,os.O_WRONLY)\nos.dup2(n,1)\nos.dup2(n,2)\ntime.sleep(30)'",
+    );
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("before it read its whole prompt"), "{err}");
+    assert!(
+        took < Duration::from_secs(20),
+        "the feed outlived its seat: {took:?}"
+    );
+    // A seat that reads it all answers as usual.
+    let (code, err, _) = feed("cat >/dev/null; echo answered");
+    assert_eq!(code, 0, "{err}");
 }
 
 /// Container floor: a seat pod's CLI argv rides the unit env file and the CLI runs under

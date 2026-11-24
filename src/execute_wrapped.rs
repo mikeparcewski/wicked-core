@@ -8421,23 +8421,24 @@ pub(crate) fn prompt_on_stdin() -> bool {
 const STDIN_PROMPT_SLOT: &str = "\u{1}wicked-prompt-on-stdin\u{1}";
 
 /// (DES-j6-build C0a) The argv of a unit whose prompt rides stdin, from the argv
-/// [`build_argv`] built with [`STDIN_PROMPT_SLOT`] as its prompt: codex is handed `-` (`codex
-/// exec` reads its prompt from stdin then); every other seat gets no prompt argument at all
-/// (claude `-p` reads stdin when none is given), and an option guard left last goes with it.
-/// Returns the prompt token as it now stands on argv (`Some("-")` or `None`), for the later
-/// steps that keep their flags clear of it. `Err` when the template glues the prompt into a
-/// token, or for agy, whose headless carrier needs its prompt on argv.
+/// [`build_argv`] built with [`STDIN_PROMPT_SLOT`] as its prompt. Two seats are converted, each by
+/// its own verified rule: claude gets no prompt argument (`claude -p` reads its prompt from stdin
+/// when none is given; `-p`/`--print` takes no value), and an option guard left last goes with
+/// it; codex gets `-` (`codex exec` reads its prompt from stdin then), or keeps the `-` its
+/// template already states. Returns the prompt token as it now stands on argv (`Some("-")` or
+/// `None`), for the later steps that keep their flags clear of it. `Err` for any other seat
+/// (each reads stdin its own way: pi trims it, copilot's `-p` needs a value, agy's carrier needs
+/// argv), and for a template that places the prompt more than once or joins it to other text.
 pub(crate) fn stdin_prompt_argv(
     argv: &mut Vec<String>,
     seat: wicked_apps_core::spawn::SeatCli,
 ) -> Result<Option<String>, String> {
     use wicked_apps_core::spawn::SeatCli;
-    if seat == SeatCli::Agy {
-        return Err(
-            "agy's headless carrier takes its prompt on the command line only; \
-                    a prompt on stdin cannot be handed to it"
-                .into(),
-        );
+    if !matches!(seat, SeatCli::Claude | SeatCli::Codex) {
+        return Err(format!(
+            "only claude and codex seats take their prompt on stdin, not {}",
+            argv.first().map(String::as_str).unwrap_or("this seat")
+        ));
     }
     if argv
         .iter()
@@ -8449,11 +8450,27 @@ pub(crate) fn stdin_prompt_argv(
                 .into(),
         );
     }
-    let Some(at) = argv.iter().position(|a| a == STDIN_PROMPT_SLOT) else {
-        return Err("the built argv has no prompt argument".into());
+    let slots: Vec<usize> = (0..argv.len())
+        .filter(|&i| argv[i] == STDIN_PROMPT_SLOT)
+        .collect();
+    let [at] = slots[..] else {
+        return Err(format!(
+            "the seat's invocation template places the prompt {} times; a prompt on stdin needs \
+             exactly one `{{PROMPT}}`",
+            slots.len()
+        ));
     };
     if seat == SeatCli::Codex {
-        argv[at] = "-".to_string();
+        // A template that already reads stdin (`codex exec -`, no placeholder): the appended slot
+        // goes, with the guard `build_argv` put before it.
+        if argv[..at].iter().any(|a| a == "-") {
+            argv.remove(at);
+            if at == argv.len() && argv.last().is_some_and(|a| a == "--") {
+                argv.pop();
+            }
+        } else {
+            argv[at] = "-".to_string();
+        }
         return Ok(Some("-".to_string()));
     }
     argv.remove(at);
@@ -8632,15 +8649,13 @@ pub(crate) fn run_bounded_fed(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
-    match (stdin, child.stdin.take()) {
-        (Some(body), Some(mut pipe)) => {
-            std::thread::spawn(move || {
-                use std::io::Write as _;
-                let _ = pipe.write_all(&body);
-            });
+    let feed = match (stdin, child.stdin.take()) {
+        (Some(body), Some(pipe)) => Some(PromptFeed::start(pipe, body)),
+        (_, pipe) => {
+            drop(pipe);
+            None
         }
-        (_, pipe) => drop(pipe),
-    }
+    };
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
@@ -8840,11 +8855,90 @@ pub(crate) fn run_bounded_fed(
         }
         k => k,
     };
+    // (C0a) The child has ended: a prompt it did not read whole is stopped here, never left
+    // blocked on a pipe a descendant holds, and an exit 0 that did not read it is no answer.
+    let unfed = feed.and_then(PromptFeed::finish);
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))
+    } else if let Some(why) = unfed.filter(|_| code == 0) {
+        Ok((
+            1,
+            out,
+            format!("(wicked-core) {why}\n{err}"),
+            usage,
+            files,
+            tools,
+        ))
     } else {
         Ok((code, out, err, usage, files, tools))
+    }
+}
+
+/// (DES-j6-build C0a) A prompt written to a child's stdin by its own thread, so a CLI that prints
+/// before it has read all of its input never deadlocks the pipes. On unix the write end is
+/// non-blocking and the thread stops when asked, so it never outlives the launch on a pipe that a
+/// descendant holds open without reading.
+struct PromptFeed {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<Result<(), String>>,
+}
+
+impl PromptFeed {
+    fn start(mut pipe: std::process::ChildStdin, body: Vec<u8>) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = pipe.as_raw_fd();
+            // SAFETY: `fd` is this process's own open write end of the child's stdin pipe, owned
+            // by `pipe` for the whole call; F_GETFL/F_SETFL only read and set its status flags.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halt = stop.clone();
+        let handle = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut at = 0;
+            while at < body.len() {
+                if halt.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match pipe.write(&body[at..]) {
+                    Ok(0) => break,
+                    Ok(n) => at += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(pipe);
+            if at == body.len() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the seat ended before it read its whole prompt on stdin ({at} of {} bytes)",
+                    body.len()
+                ))
+            }
+        });
+        PromptFeed { stop, handle }
+    }
+
+    /// Stop the feed (the child has ended) and say why the prompt was not delivered whole, if not.
+    fn finish(self) -> Option<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        match self.handle.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(why)) => Some(why),
+            Err(_) => Some("the prompt's stdin feed panicked".to_string()),
+        }
     }
 }
 

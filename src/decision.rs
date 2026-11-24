@@ -197,8 +197,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         // ballot of a carrier set to ([`SeatBallots::prompt_on_stdin`]). A seat registered to
         // read it from a file or a terminal session would get the wrong input, so it is refused
         // by name instead.
-        let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
-        if !on_stdin && cli.input_mode != InputMode::PromptArg {
+        if !matches!(cli.input_mode, InputMode::PromptArg | InputMode::Stdin) {
             return Err(SeatFailure::new(
                 if cli.input_mode == InputMode::PtySession {
                     SeatFailureKind::PtyUnsupported
@@ -212,6 +211,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
                 ),
             ));
         }
+        let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
         let run_id = ballot_run_id(task_id, &cli.key);
         let mut unit = crate::domain::WorkUnit::pending(
             crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
@@ -2205,17 +2205,22 @@ mod tests {
 
     /// codex council-r1: the seat carrier hands the prompt on the command line or on stdin, so a
     /// seat that reads it from a file or a terminal session is refused by name before anything
-    /// runs.
+    /// runs, whether or not the carrier hands every prompt on stdin.
     #[test]
     fn a_seat_ballot_refuses_a_seat_that_does_not_read_its_prompt_from_argv() {
         use wicked_council::types::{BallotCarrier, InputMode, SeatFailureKind};
         let runner = slow(0);
-        let carrier = SeatBallots::new(runner.clone(), None);
-        for mode in [
-            InputMode::AtFile,
-            InputMode::MessageFile,
-            InputMode::PtySession,
-        ] {
+        for (carrier, mode) in [false, true].into_iter().flat_map(|stdin| {
+            [
+                InputMode::AtFile,
+                InputMode::MessageFile,
+                InputMode::PtySession,
+            ]
+            .map(|m| {
+                let c = SeatBallots::new(runner.clone(), None);
+                (if stdin { c.prompt_on_stdin() } else { c }, m)
+            })
+        }) {
             let mut s = seat("pi");
             s.input_mode = mode;
             let f = carrier
