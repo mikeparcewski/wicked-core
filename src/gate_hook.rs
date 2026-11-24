@@ -3643,14 +3643,45 @@ fn collect_bash_write_targets(
     // (core#922 review) `<>FILE` opens FILE read-WRITE, and `>&WORD` with a WORD that is not a
     // descriptor sends stdout+stderr to the FILE `WORD`: both are write redirects too.
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    // (core#1852) The one positive form a redirect word is cut at a glued control operator: the
+    // lexer leaves the operator inside the word in a command holding an expansion
+    // (`… ${X} 2>/dev/null|head`), the part before it is a safe sink ([`is_safe_write_sink`]:
+    // `2>/dev/null`, or the spaced operand `/dev/null`), and all that follows is one plain
+    // program token ([`plain_program_after`]: `|head`, or `|` and the next word `head`), which
+    // the lexer's split reading scans as its own command. Then the junk target `/dev/null|head`
+    // is read as the sink it names. Every other spelling keeps its whole word, unresolved or
+    // refused as on main (fail closed): `>/tmp/x|head` stays `/tmp/x|head`. No cut either in a
+    // command the lexer may misread around the operator (a heredoc, a backtick, a `#`, an
+    // ANSI-C `$'…'` string, or a `${…}`/`$[…]` holding whitespace). The boundary is defense in
+    // depth, not a shell parser (see [`bash_write_targets`]).
+    let cut_redirects = !["<<", "`", "#", "$'"].iter().any(|t| original.contains(t))
+        && !expansion_spans_whitespace(original);
+    // A descriptor dup (`2>&1`) writes no file: it is as safe as a sink.
+    let to_sink = |word: &str| match redirect_glob(word).or_else(|| file_redirect_extra(word)) {
+        Some(target) => is_safe_write_sink(target),
+        None => is_safe_write_sink(word) || is_fd_dup_operator(word),
+    };
+    let cut = |at: usize| {
+        let word = toks[at];
+        let prefix = before_glued_operator(word);
+        // A separator next (or the end of the command) leaves nothing between to judge.
+        let next = toks.get(at + 1).copied().filter(|n| !SEPS.contains(n));
+        if cut_redirects && to_sink(prefix) && plain_program_after(&word[prefix.len()..], next) {
+            prefix
+        } else {
+            word
+        }
+    };
     let mut i = 0;
     while i < toks.len() {
-        if let Some(glued) = redirect_glob(toks[i]).or_else(|| file_redirect_extra(toks[i])) {
+        let tok = cut(i);
+        if let Some(glued) = redirect_glob(tok).or_else(|| file_redirect_extra(tok)) {
             if !glued.is_empty() {
                 targets.push(glued.to_string());
-            } else if let Some(next) = toks.get(i + 1).filter(|n| !SEPS.contains(*n)) {
-                if !(toks[i].ends_with(">&") && is_descriptor_word(next)) {
-                    targets.push((*next).to_string());
+            } else if toks.get(i + 1).is_some_and(|n| !SEPS.contains(n)) {
+                let next = cut(i + 1);
+                if !(tok.ends_with(">&") && is_descriptor_word(next)) {
+                    targets.push(next.to_string());
                 }
                 i += 1;
             }
@@ -7011,6 +7042,131 @@ fn redirect_glob(tok: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+/// (core#1852) Does a `${…}` or `$[…]` in `command` hold unquoted whitespace? Then a later
+/// whitespace word lies inside it, and a `|` there is the expansion's data, not an operator, which
+/// no single word's scan ([`before_glued_operator`]) can tell.
+fn expansion_spans_whitespace(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut open: Vec<char> = Vec::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if single {
+            single = c != '\'';
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            '$' if matches!(chars.peek(), Some('{' | '[')) => {
+                open.push(if chars.next() == Some('{') { '}' } else { ']' });
+            }
+            '{' if !open.is_empty() => open.push('}'),
+            '[' if !open.is_empty() => open.push(']'),
+            c if open.last() == Some(&c) => {
+                open.pop();
+            }
+            c if c.is_whitespace() && !double && !open.is_empty() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// (core#1852) Is `rest` (a control operator and what follows it in one word, `|head`) one
+/// operator and then plainly one program token, which the write scan's split reading judges as
+/// its own command? When the operator ends the word, the next word (`next`) must be that token,
+/// and at the end of the command nothing follows to judge. A token is a bare name
+/// (`[A-Za-z0-9_][A-Za-z0-9_.+-]*`), never a reserved word; anything else (a path, a glued
+/// redirect, an expansion, a brace group, `!`, a subshell) is no plain program.
+fn plain_program_after(rest: &str, next: Option<&str>) -> bool {
+    const RESERVED: [&str; 17] = [
+        "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
+        "in", "select", "then", "until", "while", "time",
+    ];
+    let after = match rest {
+        _ if rest.is_empty() => return false,
+        _ => ["||", "&&", "|", "&", ";"]
+            .iter()
+            .find_map(|op| rest.strip_prefix(op))
+            .unwrap_or(rest),
+    };
+    let program = match (after.is_empty(), next) {
+        (false, _) => after,
+        (true, Some(next)) => next,
+        (true, None) => return true,
+    };
+    program.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+        && !RESERVED.contains(&program)
+}
+
+/// (core#1852) `word` up to its first unquoted, unescaped control operator (`|`, `&`, `;`) outside
+/// any `${…}`, `$(…)`, `$[…]` or backtick: what the shell reads as the word before the operator.
+/// A `|` or `&` right after `>`/`<` belongs to the redirect operator (`>|`, `>&`, `<&`), and one at
+/// the very start is left alone. The whole word when it has no such operator. The lexer splits a
+/// glued operator itself except in a command holding an expansion ([`lex_shell_tokens_reading`]),
+/// whose separate whitespace reading keeps `2>/dev/null|head` as one word.
+fn before_glued_operator(word: &str) -> &str {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut open: Vec<char> = Vec::new();
+    let mut prev = '\0';
+    let mut chars = word.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let before = std::mem::replace(&mut prev, c);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if single {
+            single = c != '\'';
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            '$' if matches!(chars.peek(), Some((_, '{' | '(' | '['))) => {
+                let (_, opener) = chars.next().unwrap();
+                prev = opener;
+                open.push(match opener {
+                    '{' => '}',
+                    '(' => ')',
+                    _ => ']',
+                });
+            }
+            '`' if open.last() == Some(&'`') => {
+                open.pop();
+            }
+            '`' => open.push('`'),
+            '(' if open.last() == Some(&')') => open.push(')'),
+            '{' if open.last() == Some(&'}') => open.push('}'),
+            c if open.last() == Some(&c) => {
+                open.pop();
+            }
+            // An ANSI-C `$'…'` string's `\'` does not close it, which this scan does not model:
+            // a word holding one is left whole (it is unresolved anyway).
+            '|' | '&' | ';'
+                if !double
+                    && open.is_empty()
+                    && at > 0
+                    && !matches!(before, '>' | '<')
+                    && !word[..at].contains("$'") =>
+            {
+                return &word[..at];
+            }
+            _ => {}
+        }
+    }
+    word
 }
 
 /// (core#922 review) The write redirects [`redirect_glob`] does not model: `N<>FILE` (opens FILE
@@ -16597,6 +16753,121 @@ mod boundary_tests {
             let targets = bash_write_targets(cmd);
             assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
         }
+    }
+
+    /// core#1852: in a command holding `${…}` the lexer keeps a glued `|`/`&` inside the word
+    /// (core#1465), and J6's `… 2>/dev/null|head` was refused as a write to `/dev/null|head`. The
+    /// one positive form is cut: a safe sink (or a descriptor dup), a glued control operator, and
+    /// then plainly one program token. Every other spelling keeps its whole word as on main
+    /// (`>/tmp/x|head` is `/tmp/x|head`), and an escaped or quoted `|` stays part of the name.
+    #[test]
+    fn a_redirect_target_ends_at_a_glued_control_operator_1852() {
+        use ShellTarget::Path as P;
+        for cmd in [
+            "ls 2>/dev/null|head -5",
+            "ls 2>/dev/null||true",
+            "ls 2>/dev/null&&echo ok",
+            "ls 2>/dev/null;echo ok",
+            "for f in ${D}/*; do wc -l \"$f\"; done 2>/dev/null|head -5",
+            "ls ${D} 2> /dev/null|head -5",
+            "ls ${D} 2>/dev/null||true",
+            "ls ${D} 2>/dev/null&&echo ok",
+            "ls ${D} >/dev/null 2>&1&",
+            "ls ${D} 2>/dev/null& wait",
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
+            assert!(bash_write_targets(cmd).is_empty(), "{cmd:?}");
+        }
+        // (coord ruling, r3) Only a sink is cut: any other target keeps its whole word (judged
+        // alongside the split reading's `/tmp/x`), as on main.
+        for (cmd, target) in [
+            ("echo ${X} >/tmp/x|head", "/tmp/x|head"),
+            ("echo ${X} > /tmp/x&&true", "/tmp/x&&true"),
+            ("echo ${X} >'/tmp/a&b'|head", "/tmp/a&b|head"),
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(targets.contains(&P(target.into())), "{cmd:?}: {targets:?}");
+        }
+        // An escaped or quoted `|` is never a cut point: every reading keeps `|b` in the name
+        // (Windows also reads the escape's backslash as a path byte: `/tmp/a\\|b`).
+        for cmd in [
+            "echo x >/tmp/a\\|b",
+            "echo ${X} >/tmp/a\\|b",
+            "echo ${X} >\"/tmp/a|b\"",
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(
+                targets.contains(&P("/tmp/a|b".into()))
+                    && targets
+                        .iter()
+                        .all(|t| matches!(t, P(p) if p.starts_with("/tmp/a") && p.ends_with("|b"))),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        // (codex r1, r2) Where what follows a glued operator would not be judged as a program by
+        // either reading, or the `|` may be the word's own byte, the word is never cut short and
+        // its target is refused as on main: a heredoc body's `$(…)`, a backtick's escape layer, a
+        // comment's quote, an ANSI-C string elsewhere in the command, and a brace group, `!`, a
+        // reserved word or nothing after the operator.
+        for cmd in [
+            "cat <<EOF\n$(echo x >/dev/null|tee /outside/f)\nEOF",
+            "cat <<EOF\n$(echo x >/dev/null|tee /outside/f >/dev/null)\nEOF",
+            "echo ${X} `echo x >/dev/null|tee /outside/f`",
+            "ls `pwd` 2>/dev/null|head -5",
+            ": ${X} >/dev/null|: # '\ntouch /outside/f\n# '",
+            ": >/dev/null|printf %s $'\\''; touch /outside/f # '",
+            ": ${X} >/dev/null|{ touch /outside/f; }",
+            ": ${X} >/dev/null|! touch /outside/f",
+            ": ${X} >/dev/null&&!touch /outside/f",
+            ": ${X} >/dev/null| { touch /outside/f; }",
+            ": ${X} >/dev/null&&then touch /outside/f",
+            "touch -- -${X:-unused >a|/../../outside/f }",
+            "echo $[1 >a|/../../outside/f ]",
+            // Not plainly one program token after the operator: a glued redirect, a path.
+            "echo ${X} 2>/dev/null|tee>/outside/f",
+            "echo ${X} 2>/dev/null|/outside/f",
+            "echo ${X} 2>/dev/null|&tee /outside/f",
+        ] {
+            let targets = resolved_bash_write_targets(cmd, None);
+            assert!(
+                targets.iter().any(|t| match t {
+                    P(p) => p.contains("outside") || p.contains('|') || p.contains('&'),
+                    ShellTarget::Unresolved(w) => w.contains("outside") || w.contains('|'),
+                }),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        // The backtick's escape layer: `d\\|…` is the word's own `|` to the inner shell.
+        let targets = resolved_bash_write_targets("echo `echo x >d\\\\|/../../outside/f`", None);
+        assert!(
+            targets
+                .iter()
+                .any(|t| matches!(t, ShellTarget::Unresolved(w) if w.contains("outside"))),
+            "{targets:?}"
+        );
+        // A top-level `$(…)` needs no exclusion: the split reading judges the `tee` after the
+        // operator as its own program.
+        let targets =
+            resolved_bash_write_targets("echo ${X} $(echo x >/dev/null|tee /outside/f)", None);
+        assert!(
+            targets
+                .iter()
+                .any(|t| matches!(t, P(p) if p.starts_with("/outside/f"))),
+            "{targets:?}"
+        );
+        // A separator inside an expansion is no operator: the word is not cut short, and every
+        // reading of it stays unresolved (refused), never a literal path.
+        let targets = resolved_bash_write_targets("echo x >${X:-/tmp/a|b}", None);
+        assert!(
+            targets
+                .iter()
+                .any(|t| matches!(t, ShellTarget::Unresolved(w) if w.contains("|b")))
+                && targets
+                    .iter()
+                    .all(|t| matches!(t, ShellTarget::Unresolved(_))),
+            "{targets:?}"
+        );
     }
 
     /// core#1465: the Bash write scan reads a command after a bare line break or a glued control
