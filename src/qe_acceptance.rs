@@ -305,7 +305,7 @@ fn graph_assess(
 
 /// The run's diff signals from `base` to `tree` exactly as the QE decision reads them: the diff,
 /// the touched paths' history and their whole files.
-fn diff_signals(
+pub(crate) fn diff_signals(
     root: &Path,
     git_dir: &Path,
     base: &str,
@@ -319,20 +319,19 @@ fn diff_signals(
     Ok(signals)
 }
 
-/// (core#1709) The diff score the QE decision would give `tree` (the change from `base`, through
-/// the pinned `git_dir`, against the graph `graph_key`), and whether the change is destructive:
-/// a power checkpoint's re-score before the hand-off reads the same evidence acceptance does.
+/// (core#1709) The score the QE decision gives a diff it read ([`diff_signals`]) against the run
+/// repo's graph (`graph_key`, at `base`; `root` names the repo in a reason), and whether the
+/// change is destructive: a power checkpoint's re-score before the hand-off reads the same
+/// evidence acceptance does.
 pub(crate) fn diff_assessment(
+    signals: &ChangeSignals,
     root: &Path,
-    git_dir: &Path,
     base: &str,
-    tree: &str,
     graph_key: Option<&str>,
-) -> Result<(rs::Assessment, bool), String> {
-    let signals = diff_signals(root, git_dir, base, tree)?;
-    let a = graph_assess(&signals, root, base, graph_key);
+) -> (rs::Assessment, bool) {
+    let a = graph_assess(signals, root, base, graph_key);
     let destructive = signals.destructive || a.signals.as_ref().is_some_and(|s| s.destructive);
-    Ok((a, destructive))
+    (a, destructive)
 }
 
 /// [`decide`] with the scorer injected: `score(signals, repo_root, base_commit)` reads the graph.

@@ -6308,4 +6308,10 @@ fn core_1709_a_targeted_failure_and_the_same_full_suite_failure_name_the_same_te
         report("e2e", &[id]).failing_set(),
         Some(vec![format!("packages/crew|e2e: {id}")])
     );
+    // The qualifier is the runner's root (the check's directory joined with its `rerun` root):
+    // two runners naming files from different roots never qualify a test alike (xreview r1).
+    assert_eq!(runner_root("packages/crew", ""), "packages/crew");
+    assert_eq!(runner_root("", "packages/crew"), "packages/crew");
+    assert_eq!(runner_root("packages", "crew"), "packages/crew");
+    assert_ne!(runner_root("", ""), runner_root("", "packages/crew"));
 }

@@ -134,11 +134,14 @@ pub(super) fn on_checkpoint(
     // does (the whole worktree against the base: lines, history, whole files), never the paths
     // alone: a lowering must not rest on a thinner score than acceptance uses. When that diff
     // cannot be read the rigor is never lowered.
+    // The worker read the diff off this thread ([`crate::power::handoff_diff`]); only the graph
+    // read happens here, as it does for every checkpoint.
     let handoff_scored = (report.trigger == "pre_handoff").then(|| {
-        let (tree, git_dir) = report
-            .snapshot
-            .as_ref()
-            .ok_or("the hand-off's worktree could not be snapshotted")?;
+        let signals = match &report.handoff_diff {
+            Some(Ok(s)) => s,
+            Some(Err(why)) => return Err(why.clone()),
+            None => return Err("the build's worktree was not read at the hand-off".to_string()),
+        };
         let root = session
             .repo_ref
             .as_deref()
@@ -149,21 +152,20 @@ pub(super) fn on_checkpoint(
             .base_commit
             .as_deref()
             .ok_or("the run's base commit is unknown")?;
-        crate::qe_acceptance::diff_assessment(
+        let (assessment, destructive) = crate::qe_acceptance::diff_assessment(
+            signals,
             std::path::Path::new(&root),
-            git_dir,
             base,
-            tree,
             graph_key.as_deref(),
-        )
-        .map(|(assessment, destructive)| crate::plan_gate::Scored {
+        );
+        Ok(crate::plan_gate::Scored {
             assessment,
             destructive,
         })
     });
     let (handoff_scored, unread) = match handoff_scored {
         Some(Ok(s)) => (Some(s), None),
-        Some(Err(e)) => (None, Some(e.to_string())),
+        Some(Err(e)) => (None, Some(e)),
         None => (None, None),
     };
     let scored = if let Some(s) = handoff_scored {
@@ -1484,7 +1486,7 @@ mod held_pause_tests {
             reverts: 0,
             failed_runs: 0,
             summary: String::new(),
-            snapshot: None,
+            handoff_diff: None,
         }
     }
 
@@ -1523,8 +1525,9 @@ mod held_pause_tests {
 
     /// (core#1709) The hand-off checkpoint scores the run's DIFF as QE acceptance does, never the
     /// paths the worker listed alone: here the listed path is a doc (score 0) while the worktree
-    /// changed code, which (no code graph indexed) fails closed at the top band. A hand-off whose
-    /// worktree could not be snapshotted is never lowered, and says why.
+    /// changed code, which (no code graph indexed) fails closed at the top band. The worker reads
+    /// the diff ([`crate::power::handoff_diff`], strict snapshot); a hand-off whose diff could not
+    /// be read is never lowered from where it stands, and says why.
     #[cfg(unix)]
     #[test]
     fn the_hand_off_rescore_reads_the_same_diff_as_qe_acceptance() {
@@ -1554,23 +1557,43 @@ mod held_pause_tests {
             s.base_commit = Some(base.clone());
             s
         };
+        // The worker's read, as orchestrate makes it at `pre_handoff`, through the baseline the
+        // dispatch pinned on the unit (`snapshot_through` records the git dir it read through).
+        let mut unit =
+            crate::domain::WorkUnit::pending("pw-1709-diff:build", "pw-1709-diff", 1, "build");
+        unit.worktree_baseline =
+            Some(crate::worktree_guard::snapshot_through(&dir, &git_dir).unwrap());
+        assert!(unit.worktree_baseline.as_ref().unwrap().git_dir.is_some());
         let mut thin = report("pre_handoff");
         thin.paths = vec!["README.md".into()];
         let mut whole = thin.clone();
-        whole.snapshot = crate::worktree_guard::snapshot_through(&dir, &git_dir)
-            .ok()
-            .map(|s| (s.tree, git_dir.clone()));
-        assert!(whole.snapshot.is_some());
+        whole.handoff_diff = Some(crate::power::handoff_diff(&dir, &unit, Some(&base)));
+        let signals = whole
+            .handoff_diff
+            .clone()
+            .unwrap()
+            .expect("the diff was read");
+        assert_eq!(signals.code_files, 1, "{signals:?}");
         let id = "pw-1709-diff";
         put_node(&mut store, session(id).to_node()).unwrap();
         let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &whole).unwrap();
         let top = Rigor::of(crate::review_scale::THRESHOLDS.no_graph_score, false);
         assert_eq!(a.rigor, Some(top), "the diff's code change was scored");
         crate::power::forget_run(id);
+        // Unread (the worker's strict snapshot failed): the run stays at High, though the listed
+        // doc path alone would score it Light.
         let id = "pw-1709-unread";
-        put_node(&mut store, session(id).to_node()).unwrap();
-        let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &thin).unwrap();
-        assert_ne!(a.rigor, Some(top), "the doc path alone scores low");
+        let mut s = session(id);
+        s.power.as_mut().unwrap().rigor = Some(Rigor::High);
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut unread = thin.clone();
+        unread.handoff_diff = Some(Err("the hand-off's worktree could not be read whole".into()));
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &unread).unwrap();
+        assert_eq!(
+            a.rigor,
+            Some(Rigor::High),
+            "an unread hand-off is never lowered"
+        );
         let row = crate::domain::get_session(&store, id)
             .unwrap()
             .unwrap()
@@ -1583,7 +1606,7 @@ mod held_pause_tests {
         assert!(
             row.reasons.iter().any(|r| r.starts_with(
                 "Rigor is not lowered at the hand-off: the hand-off's \
-                     worktree could not be snapshotted"
+                     worktree could not be read whole"
             )),
             "{:?}",
             row.reasons
@@ -1604,13 +1627,13 @@ mod held_pause_tests {
         let mut s = held(id, (false, false, false, false));
         s.power.as_mut().unwrap().pause = None;
         s.power.as_mut().unwrap().orchestrator.ord = Some(1);
-        let mut build = crate::domain::WorkUnit::pending(&format!("{id}:build"), id, 1, "build");
+        let mut build = crate::domain::WorkUnit::pending(format!("{id}:build"), id, 1, "build");
         build.catalog = Some("build".into());
         build.last_attempt = Some(1);
-        let mut qe = crate::domain::WorkUnit::pending(&format!("{id}:test"), id, 2, "verify");
+        let mut qe = crate::domain::WorkUnit::pending(format!("{id}:test"), id, 2, "verify");
         qe.catalog = Some("test".into());
         let mut deliver =
-            crate::domain::WorkUnit::pending(&format!("{id}:deliver"), id, 3, "deliver");
+            crate::domain::WorkUnit::pending(format!("{id}:deliver"), id, 3, "deliver");
         deliver.catalog = Some("deliver".into());
         let judged = |ord: u32, attempt: u32| crate::assurance::OperatorJudgment {
             by: "operator".into(),

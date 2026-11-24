@@ -1812,10 +1812,10 @@ pub struct CheckpointReport {
     pub reverts: u32,
     pub failed_runs: u32,
     pub summary: String,
-    /// (core#1709) At the hand-off (`pre_handoff`) only: the worktree's whole content as a tree
-    /// (committed, uncommitted and new files) written through the unit's pinned git dir, and that
-    /// dir — what the re-score reads the run's diff from, exactly as the QE decision does.
-    pub snapshot: Option<(String, std::path::PathBuf)>,
+    /// (core#1709) At the hand-off (`pre_handoff`) only: the run's diff from its base to the
+    /// worktree's whole content, read by the worker exactly as the QE decision reads it
+    /// ([`handoff_diff`]), or why it could not be. The actor scores it against the run's graph.
+    pub(crate) handoff_diff: Option<Result<crate::review_scale::ChangeSignals, String>>,
 }
 
 // ── The worker's turn loop ───────────────────────────────────────────────────────────────────────
@@ -1930,22 +1930,31 @@ pub fn measure(
         reverts: u32::try_from(reverts).unwrap_or(u32::MAX),
         failed_runs,
         summary: summary.to_string(),
-        snapshot: None,
+        handoff_diff: None,
     }
 }
 
-/// (core#1709) The hand-off checkpoint's snapshot ([`CheckpointReport::snapshot`]): the worktree
-/// `wd` as a tree through the unit's pinned git dir, written into the repository's objects so the
-/// actor can diff it against the run's base. `None` when the unit has no pinned git dir or the
-/// worktree cannot be read.
-pub fn handoff_snapshot(
+/// (core#1709) The hand-off checkpoint's diff ([`CheckpointReport::handoff_diff`]), read on the
+/// worker thread: the worktree `wd` as a tree through the unit's pinned git dir (STRICT: a path
+/// left out or a subtree git could not read is an error, never a smaller diff), then the run's
+/// diff from `base` to it with the touched paths' history and whole files
+/// ([`crate::qe_acceptance::diff_signals`], the QE decision's own reader). `Err` says why not.
+pub(crate) fn handoff_diff(
     wd: &std::path::Path,
     unit: &crate::domain::WorkUnit,
-) -> Option<(String, std::path::PathBuf)> {
-    let git_dir = std::path::PathBuf::from(unit.worktree_baseline.as_ref()?.git_dir.as_deref()?);
-    crate::worktree_guard::snapshot_through(wd, &git_dir)
-        .ok()
-        .map(|s| (s.tree, git_dir))
+    base: Option<&str>,
+) -> Result<crate::review_scale::ChangeSignals, String> {
+    let git_dir = unit
+        .worktree_baseline
+        .as_ref()
+        .and_then(|b| b.git_dir.as_deref())
+        .map(std::path::PathBuf::from)
+        .ok_or("the build has no pinned repository to read its change through")?;
+    let base = base.ok_or("the run's base commit is unknown")?;
+    let tree = crate::worktree_guard::snapshot_through_strict(wd, &git_dir)
+        .map_err(|e| format!("the hand-off's worktree could not be read whole ({e:#})"))?
+        .tree;
+    crate::qe_acceptance::diff_signals(wd, &git_dir, base, &tree)
 }
 
 /// The worktree's per-file +/- against `base` (committed and not), for activity rows.
@@ -2327,7 +2336,8 @@ pub fn orchestrate(
                 );
                 let mut r = measure(w, start.as_deref(), trigger, turn, failed, &summary);
                 if trigger == "pre_handoff" {
-                    r.snapshot = handoff_snapshot(w, &input.unit);
+                    r.handoff_diff =
+                        Some(handoff_diff(w, &input.unit, input.base_commit.as_deref()));
                 }
                 r
             })
