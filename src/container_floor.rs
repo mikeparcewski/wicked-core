@@ -4030,6 +4030,51 @@ mod tests {
         }
     }
 
+    /// (core#1848) J4 on train 12 re-cut 3: two launches of one CLI armed on different seat image
+    /// ids, and the second one's pin cleanup removed the pin the first one's starting pod named
+    /// (`ErrImageNeverPull`, the launch failed as a seat with `image_unavailable`). A pin a launch
+    /// of this daemon still holds is never removed; once that launch lets it go, the next pin's
+    /// cleanup removes it as before.
+    #[test]
+    fn a_pin_a_launch_still_holds_is_never_removed_1848() {
+        let (dir, rt, first, log) = archived_seat(vec![], false, false);
+        let second = format!("sha256:{}", "e".repeat(64));
+        let repo = "wicked-seat-1848";
+        let pin_of = |id: &str| format!("{repo}:id-{}", &id[7..]);
+        std::fs::write(
+            dir.0.join("tags"),
+            format!("{}\n{}\n", pin_of(&first), pin_of(&second)),
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n\
+             case \"$1 $2\" in\n\
+             'tag '*) exit 0;;\n\
+             'image ls') cat '{}' ;;\n\
+             'image rm') exit 0;;\n*) exit 98;;\nesac\n",
+            log.display(),
+            dir.0.join("tags").display(),
+        );
+        crate::test_env::install_stub(&rt.cli, &script);
+        let removed = |tag: &str| {
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .any(|l| l == format!("image rm {tag}"))
+        };
+        // Launch 1 pins the first id; its pod is starting.
+        let held = pin_seat_image(&rt, &format!("{repo}:build"), &first).unwrap();
+        // Launch 2 armed on a rebuilt image: its cleanup leaves launch 1's pin alone.
+        let other = pin_seat_image(&rt, &format!("{repo}:build"), &second).unwrap();
+        assert!(!removed(&pin_of(&first)), "a held pin stays");
+        // Launch 1 ends; the next pin's cleanup removes its pin, never launch 2's held one.
+        drop(held);
+        let again = pin_seat_image(&rt, &format!("{repo}:build"), &second).unwrap();
+        assert!(removed(&pin_of(&first)), "a pin no launch holds goes");
+        assert!(!removed(&pin_of(&second)));
+        drop((other, again));
+    }
+
     #[test]
     fn pin_removes_only_older_exact_id_tags_and_cleanup_failure_is_nonfatal() {
         for fail in [false, true] {
