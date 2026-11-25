@@ -84,6 +84,7 @@ pub fn run_session(
         None,
         Vec::new(), // sync path declares no extra write roots (core#259)
         Vec::new(), // …no extra read roots either (core#294)
+        Vec::new(), // …so none optional (core#1463)
         None,       // …and no repo (above) ⇒ no project graph to bind
         None,       // sync path is unfiled ⇒ no studio project id (BC-79)
         workflow,
@@ -405,6 +406,9 @@ pub(crate) fn pre_distribute(
     // Launcher-declared extra READ-ONLY roots (core#294), same launch-time validation and same
     // persistence rationale — a resume must not silently narrow (or widen) what the run may read.
     extra_read_roots: Vec<String>,
+    // (core#1463) The entries of `extra_read_roots` the launcher declared optional, persisted
+    // beside them so a resume leaves out the same roots.
+    optional_read_roots: Vec<String>,
     // The launcher's project-graph binding, persisted on the session for the same reason: a resume
     // re-enters with no LaunchSpec, and a run whose tools silently narrow from the whole project to
     // one repo halfway through is worse than one that never had them. VERIFIED at dispatch, never
@@ -494,6 +498,7 @@ pub(crate) fn pre_distribute(
         repo_ref,
         extra_write_roots,
         extra_read_roots,
+        optional_read_roots,
         project_graph,
         project_id,
         archived_at: None,
@@ -981,6 +986,7 @@ pub(crate) fn plan_and_distribute(
     workdir: Option<String>,
     extra_write_roots: Vec<String>,
     extra_read_roots: Vec<String>,
+    optional_read_roots: Vec<String>,
     project_graph: Option<crate::project::ProjectGraphBinding>,
     // The launcher's studio project id (BC-79), forwarded to `pre_distribute` to persist on the
     // session. `None` ⇒ a repo-only (unfiled) run.
@@ -1017,6 +1023,7 @@ pub(crate) fn plan_and_distribute(
         workdir,
         extra_write_roots,
         extra_read_roots,
+        optional_read_roots,
         project_graph,
         project_id,
         workflow,
@@ -4968,6 +4975,7 @@ mod resolve_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             Some("feature"),
@@ -5094,6 +5102,7 @@ mod resolve_tests {
             false,
             Some(repo.id.clone()),
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -5495,6 +5504,7 @@ mod resolve_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -5770,6 +5780,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -5865,6 +5876,7 @@ mod judge_bench_tests {
                 Some(wd.clone()),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 None,
                 None,
                 None,
@@ -5956,6 +5968,7 @@ mod judge_bench_tests {
             false,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -6114,6 +6127,7 @@ mod judge_bench_tests {
             false,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -6286,6 +6300,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -6400,6 +6415,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -6505,6 +6521,7 @@ mod judge_bench_tests {
             false,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -6702,6 +6719,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -6826,6 +6844,7 @@ mod judge_bench_tests {
             false,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -6960,6 +6979,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
@@ -7062,6 +7082,7 @@ mod judge_bench_tests {
                 false,
                 None,
                 None,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 None,
@@ -7302,6 +7323,7 @@ mod judge_bench_tests {
                 None,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 None,
                 None,
                 None,
@@ -7426,6 +7448,7 @@ mod judge_bench_tests {
             false,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,

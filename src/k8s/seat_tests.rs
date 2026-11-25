@@ -6651,6 +6651,7 @@ fn try_warm_arm(
         deadline: Duration::from_secs(30),
         role: "judge",
         deps: None,
+        optional: &[],
     };
     seat::arm_warm(kube, &spec, vec![], checkout, Some((image, "floor")))
 }
@@ -7403,7 +7404,11 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
     let replica = tmp("optional-left-out-replica");
     let (tree, roots) = optional_chat_roots(
         &host,
-        &[("repos/alpha", 1000), ("repos/beta", 1000), ("repos/gamma", 900)],
+        &[
+            ("repos/alpha", 1000),
+            ("repos/beta", 1000),
+            ("repos/gamma", 900),
+        ],
         &["repos/beta", "repos/gamma"],
     );
     let opt: Vec<&PlanRoot> = roots.iter().filter(|r| r.optional).collect();
@@ -7441,7 +7446,11 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
     assert_eq!(names, vec![seat::LEFT_OUT_NOTE.to_string()], "{gamma:?}");
     let note = std::fs::read_to_string(gamma.join(seat::LEFT_OUT_NOTE)).unwrap();
     assert!(note.contains("left out") && note.contains("chat scoped to this repository"));
-    assert!(note.len() < 600, "the note must fit its reserve: {}", note.len());
+    assert!(
+        note.len() < 600,
+        "the note must fit its reserve: {}",
+        note.len()
+    );
     // The required root and the optional root that fit are there.
     assert_eq!(
         std::fs::read_to_string(replica.join(rep("repos/alpha")).join("lib.rs")).unwrap(),
@@ -7451,8 +7460,14 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
 
     // Turn 3, same host state: the left-out root carries no stamp, so it is decided again.
     let (_, third) = with_cap(cap, || chat_turn(&replica, &tree, &roots));
-    assert!(third.contains(&format!("{}:left-out:", rep("repos/gamma"))), "{third}");
-    assert!(!third.contains(&format!("{}:kept", rep("repos/gamma"))), "{third}");
+    assert!(
+        third.contains(&format!("{}:left-out:", rep("repos/gamma"))),
+        "{third}"
+    );
+    assert!(
+        !third.contains(&format!("{}:kept", rep("repos/gamma"))),
+        "{third}"
+    );
 }
 
 /// (core#1463) A required root never gives way: over the cap it refuses the unit as before, even
@@ -7482,15 +7497,8 @@ fn k8s_core_1463_a_required_root_over_the_cap_still_refuses() {
 fn k8s_core_1463_required_roots_are_read_before_optional_ones() {
     let host = tmp("optional-order");
     // `a` (optional) sorts before the deeper required `b/c/d` in the plan.
-    let (tree, roots) = optional_chat_roots(
-        &host,
-        &[("a", 3000), ("b/c/d", 3000)],
-        &["a"],
-    );
-    let first_repo = roots
-        .iter()
-        .position(|r| r.host == host.join("a"))
-        .unwrap();
+    let (tree, roots) = optional_chat_roots(&host, &[("a", 3000), ("b/c/d", 3000)], &["a"]);
+    let first_repo = roots.iter().position(|r| r.host == host.join("a")).unwrap();
     let required_repo = roots
         .iter()
         .position(|r| r.host == host.join("b/c/d"))
@@ -7508,8 +7516,14 @@ fn k8s_core_1463_required_roots_are_read_before_optional_ones() {
         .and_then(|p| p.detail)
         .unwrap();
     let rep = |n: &str| seat::replica_of(None, &host.join(n)).unwrap();
-    assert!(detail.contains(&format!("{}:left-out:", rep("a"))), "{detail}");
-    assert!(detail.contains(&format!("{}:1/3000/", rep("b/c/d"))), "{detail}");
+    assert!(
+        detail.contains(&format!("{}:left-out:", rep("a"))),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!("{}:1/3000/", rep("b/c/d"))),
+        "{detail}"
+    );
 }
 
 /// (core#1463) Only a plain, read-only root that does not come back can be optional.
@@ -7534,6 +7548,10 @@ fn k8s_core_1463_only_a_read_only_plain_root_is_marked_optional() {
     ];
     let (mut roots, _) = seat::plan(&tree, false, &mounts, &[], std::slice::from_ref(&rw), None);
     seat::mark_optional(&mut roots, &[tree.clone(), ro.clone(), rw.clone()]);
-    let optional: Vec<&PathBuf> = roots.iter().filter(|r| r.optional).map(|r| &r.host).collect();
+    let optional: Vec<&PathBuf> = roots
+        .iter()
+        .filter(|r| r.optional)
+        .map(|r| &r.host)
+        .collect();
     assert_eq!(optional, vec![&ro]);
 }

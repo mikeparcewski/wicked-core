@@ -213,6 +213,7 @@ fn spec(run: &str, steps: Vec<Value>) -> LaunchSpec {
         project_id: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(plan(json!({"steps": steps}))),
         deliver_step: None,

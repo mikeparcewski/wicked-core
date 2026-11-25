@@ -325,6 +325,18 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
 ///   that gate its own work — a creator that can read its evaluator's rules can write to them;
 /// - a root CONTAINING it (`~`, `/`) is an over-broad grant by construction — "ground this run in
 ///   X" names X, never the operator's whole home.
+/// (core#1463) Every optional read root must be one of the launch's `extra_read_roots`, spelled
+/// the same: marking a root optional never grants a read. Empty is always valid.
+pub fn validate_optional_read_roots(optional: &[String], extra: &[String]) -> Result<(), String> {
+    match optional.iter().find(|o| !extra.contains(o)) {
+        None => Ok(()),
+        Some(o) => Err(format!(
+            "optional_read_roots: {o} is not one of the launch's extra_read_roots (an optional \
+             read root only marks a declared read root as one the run can do without)"
+        )),
+    }
+}
+
 pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
     validate_extra_roots(
         roots,
@@ -999,6 +1011,22 @@ mod tests {
     /// rule for rule: a scratch source dir is admitted; relative, pin-tree-containing (either
     /// direction) and HOME-less declarations are refused. Read-only never relaxes the vetting —
     /// the grant is still a grant.
+    /// (core#1463) An optional read root only marks a declared read root; it never grants one.
+    #[test]
+    fn optional_read_roots_must_be_declared_read_roots() {
+        let extra = vec!["/srv/a".to_string(), "/srv/b".to_string()];
+        validate_optional_read_roots(&[], &extra).expect("none optional");
+        validate_optional_read_roots(&["/srv/b".to_string()], &extra).expect("a declared root");
+        let e = validate_optional_read_roots(&["/srv/c".to_string()], &extra).unwrap_err();
+        assert!(
+            e.contains("/srv/c") && e.contains("extra_read_roots"),
+            "{e}"
+        );
+        // Spelled the same, or refused: a different spelling of a declared root is not it.
+        assert!(validate_optional_read_roots(&["/srv/a/".to_string()], &extra).is_err());
+        assert!(validate_optional_read_roots(&["/srv/a".to_string()], &[]).is_err());
+    }
+
     #[test]
     fn extra_read_roots_validation_mirrors_the_write_rules() {
         let home = scratch("xrr_home");

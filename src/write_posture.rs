@@ -521,6 +521,7 @@ mod tests {
                 second.to_string_lossy().into_owned(),
             ],
             extra_read_roots: vec!["/somewhere/readonly".into()],
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,

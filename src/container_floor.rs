@@ -2645,6 +2645,8 @@ pub(crate) fn arm_noting(
     run_id: &str,
     ord: u32,
     read_roots: &[PathBuf],
+    optional: &[PathBuf],
+    required_reads: &[PathBuf],
     read_view: Option<&Path>,
     prompt: Option<&str>,
     gateway_dir: Option<&Path>,
@@ -2653,6 +2655,7 @@ pub(crate) fn arm_noting(
     warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
     timeout: Duration,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
+    let argv_in = argv;
     let wsl = is_wsl(
         Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists(),
         &std::fs::read_to_string("/proc/version").unwrap_or_default(),
@@ -2709,24 +2712,32 @@ pub(crate) fn arm_noting(
         .map(Path::to_path_buf)
         .or_else(|| wicked_apps_core::spawn::worker_home_base().ok());
     // The unit's mounts and the view of them, settled before any image or cluster work.
-    let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    add_read_roots(&mut mounts, read_roots);
-    let mut argv = argv.to_vec();
-    mount_argv_paths(&mut mounts, &mut argv, prompt);
-    // A member turn's repository view: read-only, or the seat does not start.
-    if let Some(view) = read_view {
-        add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    }
-    cover_gateway_dir(&mut mounts, gateway_dir)
-        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
-    // way: never in a replica, and a seat-writable tree over it is refused.
-    // From the state home the cluster settings were read from (codex r2: an offline seat has
-    // no gateway dir, and is covered all the same).
-    // (No state home is refused as `no_cluster` below, before any copy-in.)
     let engine_k8s = state_home.as_ref().map(|h| h.join("k8s"));
-    cover_gateway_dir(&mut mounts, engine_k8s.as_deref())
-        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    let (mut mounts, mut argv) = unit_mounts(
+        &spec,
+        read_roots,
+        argv,
+        prompt,
+        read_view,
+        gateway_dir,
+        engine_k8s.as_deref(),
+    )?;
+    // (core#1463) Which declared optional read roots may be left out of the copy-in: settled
+    // against a second build of the same mounts from the REQUIRED read roots only.
+    let optional = if optional.is_empty() {
+        Vec::new()
+    } else {
+        let (required, _) = unit_mounts(
+            &spec,
+            required_reads,
+            argv_in,
+            prompt,
+            read_view,
+            gateway_dir,
+            engine_k8s.as_deref(),
+        )?;
+        settle_optional(&mounts, &required, optional)
+    };
     // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
         Some(p) => match &warm {
@@ -2979,6 +2990,7 @@ pub(crate) fn arm_noting(
         },
         role,
         deps: deps.as_deref(),
+        optional: &optional,
     };
     // (core#1491) A pod that did not become ready (or was held for the node) is retried after a
     // backoff, each time a fresh Sandbox; any other refusal is final.
@@ -3326,6 +3338,71 @@ pub(crate) fn add_read_view(mounts: &mut Vec<Mount>, view: &Path) -> Result<Path
         rw: false,
     });
     Ok(p)
+}
+
+/// The unit's mounts from its floor `spec` and `read_roots`, with the argv re-spelled at their
+/// mounted paths: the floor plan, the read roots, the argv path options, a member's read view and
+/// the covered gateway and cluster-credential directories, in that order. One definition, so the
+/// required-only build that settles the optional read roots (core#1463) is the same build.
+#[allow(clippy::too_many_arguments)]
+fn unit_mounts(
+    spec: &crate::worker_sandbox::SeatFloor,
+    read_roots: &[PathBuf],
+    argv: &[String],
+    prompt: Option<&str>,
+    read_view: Option<&Path>,
+    gateway_dir: Option<&Path>,
+    engine_k8s: Option<&Path>,
+) -> Result<(Vec<Mount>, Vec<String>), (FloorUnarmed, String)> {
+    let mut mounts = mount_plan(spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    add_read_roots(&mut mounts, read_roots);
+    let mut argv = argv.to_vec();
+    mount_argv_paths(&mut mounts, &mut argv, prompt);
+    // A member turn's repository view: read-only, or the seat does not start.
+    if let Some(view) = read_view {
+        add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    }
+    cover_gateway_dir(&mut mounts, gateway_dir)
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
+    // way: never in a replica, and a seat-writable tree over it is refused.
+    // From the state home the cluster settings were read from (codex r2: an offline seat has
+    // no gateway dir, and is covered all the same).
+    // (No state home is refused as `no_cluster` below, before any copy-in.)
+    cover_gateway_dir(&mut mounts, engine_k8s)
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    Ok((mounts, argv))
+}
+
+/// (core#1463) The declared optional read roots that may be left out of a unit's copy-in, as the
+/// canonical paths the copy-in plan holds. `mounts` is the unit's real mount set; `required` is
+/// the same set built from the required read roots only, where no optional root can absorb a
+/// required path (a read root, an argv file, a view) into its bind. An optional root stays
+/// optional only when it is a read-only bind of `mounts` and no destination of `required` is it
+/// or lies under it; otherwise it is required (fail-closed).
+pub(crate) fn settle_optional(
+    mounts: &[Mount],
+    required: &[Mount],
+    optional: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for o in optional {
+        let Some(o) = crate::worker_sandbox::canon_lenient(o) else {
+            continue;
+        };
+        let bound = mounts
+            .iter()
+            .any(|m| matches!(m, Mount::Bind { path, rw: false } if *path == o));
+        let needed = required.iter().any(|m| {
+            let d = crate::worker_sandbox::canon_lenient(m.dst())
+                .unwrap_or_else(|| m.dst().to_path_buf());
+            d.starts_with(&o)
+        });
+        if bound && !needed && !out.contains(&o) {
+            out.push(o);
+        }
+    }
+    out
 }
 
 pub(crate) fn add_read_roots(mounts: &mut Vec<Mount>, read_roots: &[PathBuf]) {
@@ -4361,6 +4438,8 @@ esac
                     &format!("run-{scenario}"),
                     1,
                     &[],
+                    &[],
+                    &[],
                     None,
                     None,
                     Some(&gateway),
@@ -4571,6 +4650,8 @@ esac
             &argv,
             "run-1461",
             2,
+            &[],
+            &[],
             &[],
             None,
             Some("draft it"),
@@ -7197,6 +7278,74 @@ esac
 
     /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
     /// container launch, never over a mask.
+    /// (core#1463) An optional read root stays optional only when nothing the unit requires lies in
+    /// it. Both builds are the real mount steps (`add_read_roots`, `mount_argv_paths`): the unit's
+    /// mounts from every read root, and the required-only build, where nothing optional can absorb
+    /// a required path into its bind.
+    #[cfg(unix)]
+    #[test]
+    fn core_1463_an_optional_read_root_holding_a_required_path_stays_required() {
+        let base = tmp("opt");
+        let tree = base.join("wt");
+        let (free, holds_root, holds_file, both) = (
+            base.join("repos/free"),
+            base.join("repos/holds-root"),
+            base.join("repos/holds-file"),
+            base.join("repos/both"),
+        );
+        for d in [&tree, &free, &holds_root.join("skills"), &holds_file, &both] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(holds_file.join("prompt.md"), "system").unwrap();
+        let link = base.join("free-link");
+        std::os::unix::fs::symlink(&free, &link).unwrap();
+        let optional = vec![
+            link.clone(),
+            holds_root.clone(),
+            holds_file.clone(),
+            both.clone(),
+        ];
+        // What the unit reads beyond the optional roots: a skills root inside one of them, and a
+        // root the launch also declared optional.
+        let required_reads = vec![holds_root.join("skills"), both.clone()];
+        let argv = vec![
+            "claude".to_string(),
+            "--system-prompt-file".to_string(),
+            holds_file.join("prompt.md").to_string_lossy().into_owned(),
+            "-p".to_string(),
+            "hi".to_string(),
+        ];
+        let build = |reads: &[PathBuf]| {
+            let mut mounts = vec![Mount::Bind {
+                path: tree.clone(),
+                rw: true,
+            }];
+            add_read_roots(&mut mounts, reads);
+            let mut argv = argv.clone();
+            mount_argv_paths(&mut mounts, &mut argv, Some("hi"));
+            mounts
+        };
+        let all: Vec<PathBuf> = optional
+            .iter()
+            .chain(required_reads.iter())
+            .cloned()
+            .collect();
+        let mounts = build(&all);
+        let required = build(&required_reads);
+        // The real mounts coalesce: the skills root and the prompt file ride their repository.
+        assert!(!mounts.iter().any(|m| m.dst() == holds_root.join("skills")));
+        assert!(!mounts
+            .iter()
+            .any(|m| m.dst() == holds_file.join("prompt.md")));
+        assert_eq!(
+            settle_optional(&mounts, &required, &optional),
+            vec![free.canonicalize().unwrap()],
+            "only the root nothing required lies in may be left out (by its canonical path)"
+        );
+        // With nothing declared optional there is nothing to settle.
+        assert!(settle_optional(&mounts, &required, &[]).is_empty());
+    }
+
     #[test]
     fn read_roots_are_mounted_read_only_unless_covered_or_masked() {
         let base = tmp("rr");

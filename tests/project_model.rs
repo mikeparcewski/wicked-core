@@ -96,6 +96,7 @@ fn spec(session_id: &str, hc: HumanConfirm, project_id: Option<String>) -> Launc
         project_id,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

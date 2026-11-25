@@ -195,6 +195,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         extra_write_roots: Vec::new(),
         // Same per-RUN fill for the read mirror (core#294).
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_id: None,
         repo_id: None,
         apps: None,
@@ -1484,6 +1485,7 @@ pub(crate) fn run(
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
                     extra_write_roots: _, // legacy sync path widens nothing (core#259)
                     extra_read_roots: _, // …and reads no wider either (core#294)
+                    optional_read_roots: _, // …so it leaves none out (core#1463)
                     // Legacy path has no repo and therefore no project graph to bind; it also
                     // never reaches the governed dispatch that would read one.
                     project_graph: _,
@@ -1643,6 +1645,12 @@ pub(crate) fn run(
                     crate::path_policy::validate_extra_read_roots(
                         &spec.extra_read_roots,
                         home.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    // (core#1463) An optional read root is one of those, never a root of its own.
+                    crate::path_policy::validate_optional_read_roots(
+                        &spec.optional_read_roots,
+                        &spec.extra_read_roots,
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                     // (WT-C2) The evidence root is a write root of the jailed walkthrough tool:
@@ -1909,6 +1917,7 @@ pub(crate) fn run(
                         repo_ref: repo_ref.clone(),
                         extra_write_roots: spec.extra_write_roots.clone(),
                         extra_read_roots: spec.extra_read_roots.clone(),
+                        optional_read_roots: spec.optional_read_roots.clone(),
                         project_graph: spec.project_graph.clone(),
                         project_id: spec.project_id.clone(),
                         archived_at: None,
@@ -2142,6 +2151,7 @@ pub(crate) fn run(
                     workdir,
                     spec.extra_write_roots.clone(),
                     spec.extra_read_roots.clone(),
+                    spec.optional_read_roots.clone(),
                     spec.project_graph.clone(),
                     spec.project_id.clone(),
                     spec.workflow.as_deref(),
@@ -2374,6 +2384,7 @@ pub(crate) fn run(
                         workdir.clone(),
                         spec.extra_write_roots.clone(),
                         spec.extra_read_roots.clone(),
+                        spec.optional_read_roots.clone(),
                         spec.project_graph.clone(),
                         spec.project_id.clone(),
                         workflow.as_deref(),
@@ -6005,6 +6016,12 @@ pub(crate) fn launch_run_inner(
         // The read mirror (core#294): same judgement, same synchronous refusal.
         crate::path_policy::validate_extra_read_roots(&spec.extra_read_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        // (core#1463) Same judgement of the optional read roots.
+        crate::path_policy::validate_optional_read_roots(
+            &spec.optional_read_roots,
+            &spec.extra_read_roots,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
         // (WT-C2) The evidence root: same judgement, same synchronous refusal.
         crate::walkthrough::validate_evidence_root(spec.evidence_root.as_deref(), home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -6068,6 +6085,7 @@ pub(crate) fn launch_run_inner(
         workdir,
         spec.extra_write_roots.clone(),
         spec.extra_read_roots.clone(),
+        spec.optional_read_roots.clone(),
         spec.project_graph.clone(),
         spec.project_id.clone(),
         workflow.as_deref(),
@@ -14633,6 +14651,7 @@ fn dispatch_unit_with(
                     .collect()
             },
             extra_read_roots: session.extra_read_roots.clone(),
+            optional_read_roots: session.optional_read_roots.clone(),
             // BC-79: the run's studio project, from the SESSION (persisted at launch), so a
             // resume/redrive re-arms the same scope. Threaded to the worker env as
             // `WICKED_RUN_PROJECT` by `estate_provenance_env`; `None` for a repo-only run.
@@ -19513,6 +19532,7 @@ fn replan_for_accepted_edit(
         session.workdir.clone(),
         session.extra_write_roots.clone(),
         session.extra_read_roots.clone(),
+        session.optional_read_roots.clone(),
         session.project_graph.clone(),
         session.project_id.clone(),
         Some(&def_id),
@@ -24192,6 +24212,7 @@ pub(crate) mod sessions_detail_fold_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -24525,6 +24546,7 @@ mod gate_pause_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -24850,6 +24872,7 @@ mod terminal_gate_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -25190,6 +25213,7 @@ retry the deliver phase";
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -25985,6 +26009,7 @@ mod substance_gate_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -28028,6 +28053,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -28111,6 +28137,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -29575,6 +29602,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -29723,6 +29751,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -30431,6 +30460,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -36503,6 +36533,7 @@ mod code_evidence_floor_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -37142,6 +37173,7 @@ mod deliverable_floor_tests {
             repo_ref: None,
             extra_write_roots: write_roots,
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -37992,6 +38024,7 @@ mod seat_failover_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40113,6 +40146,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40227,6 +40261,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40332,6 +40367,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40694,6 +40730,7 @@ mod terminal_worktree_reap_tests {
             repo_ref: Some(entry.id),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -41678,6 +41715,7 @@ mod terminal_worktree_reap_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -41874,6 +41912,7 @@ mod worker_code_graph_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -42347,6 +42386,7 @@ mod project_graph_binding_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -43105,6 +43145,7 @@ mod phase_boundary_governance_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -43577,6 +43618,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44364,6 +44406,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44431,6 +44474,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: Some("r".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44516,6 +44560,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -45731,6 +45776,7 @@ mod dead_seat_park_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -45872,6 +45918,7 @@ mod plan_gate_confirm_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46415,6 +46462,7 @@ mod catalog_alias_governance_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46542,6 +46590,7 @@ mod consent_plan_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46822,6 +46871,7 @@ mod work_author_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -47244,6 +47294,7 @@ mod council_ballot_tests {
             repo_ref: Some("proof-repo".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,

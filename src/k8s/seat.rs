@@ -458,6 +458,10 @@ pub(crate) struct PlanRoot {
     /// (core#1747) Bound read-only: no seat writes it, so the replica keeps its copy between
     /// units under a stamp while its host state is unchanged ([`RepoStamps`]).
     pub(crate) ro: bool,
+    /// (core#1463) A read root the launcher declared optional (`optional_read_roots`) and no
+    /// required path lies in: when it does not fit the copy-in's caps it is left out, its replica
+    /// holding only [`LEFT_OUT_NOTE`] ([`mark_optional`]).
+    pub(crate) optional: bool,
 }
 
 impl PlanRoot {
@@ -581,6 +585,7 @@ pub(crate) fn plan(
             masks: root_masks,
             repo,
             ro: !*rw,
+            optional: false,
         });
     }
     let mut file_roots: Vec<(PathBuf, (Vec<String>, bool))> = files.into_iter().collect();
@@ -598,6 +603,7 @@ pub(crate) fn plan(
             masks: Vec::new(),
             repo: false,
             ro: !rw,
+            optional: false,
         });
     }
     // Parents before their nested roots (a nested root lands inside its parent's copy).
@@ -1408,6 +1414,31 @@ pub(crate) fn mark_homes(roots: &mut [PlanRoot], seat_dirs: &[PathBuf], scratch:
     }
 }
 
+/// (core#1463) The settled optional read roots among `roots` (canonical host paths, settled by
+/// `container_floor::settle_optional`) become optional: only a plain, read-only root that does not
+/// come back can be left out of a copy-in.
+pub(crate) fn mark_optional(roots: &mut [PlanRoot], optional: &[PathBuf]) {
+    for r in roots.iter_mut() {
+        r.optional = r.mode == Mode::Plain && r.ro && !r.back && optional.contains(&r.host);
+    }
+}
+
+/// (core#1463) The file a left-out optional root holds in the replica instead of its contents.
+pub(crate) const LEFT_OUT_NOTE: &str = "WICKED-LEFT-OUT.txt";
+/// What each optional root reserves of the copy-in's byte cap for its note.
+pub(crate) const NOTE_RESERVE: u64 = 1024;
+
+/// (core#1463) The note a left-out optional root carries: what happened and what to do.
+pub(crate) fn left_out_note(read: u64) -> String {
+    format!(
+        "This repository was left out of this turn's read-only copy: the copy is capped at {} MiB \
+         and this repository did not fit (about {} MiB were read before the cap). Its files are not \
+         in this container. Ask about it in a chat scoped to this repository.\n",
+        STREAM_LIMIT >> 20,
+        read.div_ceil(1 << 20)
+    )
+}
+
 /// Namespaces whose sync pod a cut codec call left unconfirmed gone (codex b2-seat #5): no codec
 /// runs there, and no new copy-in starts, until its deletion is confirmed.
 static SYNC_SUSPECT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -1667,6 +1698,8 @@ fn replica_git(
 thread_local! {
     /// (tests) Plain roots read from the host, and replica `.git`s built, on this thread.
     pub(crate) static HOST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// (tests, core#1463) A smaller copy-in byte cap on this thread, so a test can pass it.
+    pub(crate) static TEST_STREAM_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     pub(crate) static SIG_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static FRESH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static GIT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2113,9 +2146,29 @@ fn copy_in_stream_with(
     let mut seed_used: u64 = 0;
     // How long each root took on the host (k8s-final arm timing), by replica path.
     let mut took: HashMap<String, u128> = HashMap::new();
-    for r in roots {
+    // (core#1463) Each optional root left out, with the bytes read before it passed a cap.
+    let mut left: HashMap<String, u64> = HashMap::new();
+    // (core#1463) Every root is read against the caps less one note per optional root, so the
+    // notes of the roots left out always fit; with no optional root the caps are unchanged.
+    let k = roots.iter().filter(|r| r.optional).count();
+    #[cfg(test)]
+    let cap = TEST_STREAM_LIMIT.with(|c| c.get()).unwrap_or(STREAM_LIMIT);
+    #[cfg(not(test))]
+    let cap = STREAM_LIMIT;
+    let limit = cap.saturating_sub(k as u64 * NOTE_RESERVE);
+    let max_entries = sync::MAX_ENTRIES.saturating_sub(k);
+    // Required roots first (in plan order, parents before nested roots), then the optional ones:
+    // a root the launcher can do without never takes the budget a required one needs. No required
+    // root lies under an optional one (`container_floor::settle_optional`).
+    let ordered = roots
+        .iter()
+        .filter(|r| !r.optional)
+        .chain(roots.iter().filter(|r| r.optional));
+    for r in ordered {
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
+        let (budget_before, count_before) = (budget, count);
+        let mut left_out = false;
         if r.stamped() {
             match stamps.keep(&replica) {
                 Ok(()) => {
@@ -2183,12 +2236,14 @@ fn copy_in_stream_with(
         if let Some((_, Some(hit))) = &cached {
             for e in hit {
                 count += 1;
-                if count > sync::MAX_ENTRIES {
-                    return Err(format!(
-                        "the unit's copy-in has more than {} files",
-                        sync::MAX_ENTRIES
-                    )
-                    .into());
+                if count > max_entries {
+                    if r.optional {
+                        left_out = true;
+                        break;
+                    }
+                    return Err(
+                        format!("the unit's copy-in has more than {max_entries} files").into(),
+                    );
                 }
                 let size = if e.kind == sync::Kind::Link {
                     256
@@ -2196,9 +2251,13 @@ fn copy_in_stream_with(
                     e.data.len() as u64
                 };
                 budget += size.max(e.path.len() as u64);
-                if budget > STREAM_LIMIT {
+                if budget > limit {
+                    if r.optional {
+                        left_out = true;
+                        break;
+                    }
                     return Err(format!(
-                        "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
+                        "the unit's copy-in is larger than {limit} bytes (at {})",
                         r.host.join(&e.path).display()
                     )
                     .into());
@@ -2212,24 +2271,28 @@ fn copy_in_stream_with(
         let read_now = !matches!(&cached, Some((_, Some(_))));
         for p in rels
             .iter()
-            .filter(|_| read_now)
+            .filter(|_| read_now && !left_out)
             .filter(|p| !r.skip.iter().any(|s| sync::under(p, s)))
             .filter(|p| !no_git || !p.split('/').any(sync::is_git_name))
         {
             // As many entries as a write-back may carry, or refused now (codex b2-sync #16): a
             // unit is never armed on a tree it could not bring back.
             count += 1;
-            if count > sync::MAX_ENTRIES {
-                return Err(format!(
-                    "the unit's copy-in has more than {} files",
-                    sync::MAX_ENTRIES
-                )
-                .into());
+            if count > max_entries {
+                if r.optional {
+                    left_out = true;
+                    break;
+                }
+                return Err(format!("the unit's copy-in has more than {max_entries} files").into());
             }
             budget += sync::entry_size(&r.host, p).max(p.len() as u64);
-            if budget > STREAM_LIMIT {
+            if budget > limit {
+                if r.optional {
+                    left_out = true;
+                    break;
+                }
                 return Err(format!(
-                    "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
+                    "the unit's copy-in is larger than {limit} bytes (at {})",
                     r.host.join(p).display()
                 )
                 .into());
@@ -2245,6 +2308,35 @@ fn copy_in_stream_with(
         #[cfg(test)]
         if read_now && r.mode == Mode::Plain {
             HOST_READS.with(|c| c.set(c.get() + 1));
+        }
+        if left_out {
+            // (core#1463) Left out: what was read is dropped and the root is sent as one note. A
+            // plain root mirrors the replica to what it is sent, so a copy an earlier turn kept is
+            // removed with its stamp, and the root, sent with no key, is decided again next turn.
+            let read = budget - budget_before;
+            let note = left_out_note(read).into_bytes();
+            budget = budget_before + (note.len() as u64).max(LEFT_OUT_NOTE.len() as u64);
+            count = count_before + 1;
+            eprintln!(
+                "wicked-core: the optional read root {} is left out of this copy-in: it passed the \
+                 copy-in's caps ({read} bytes read)",
+                r.host.display()
+            );
+            left.insert(replica.clone(), read);
+            // Counted as left out, not as re-read.
+            resent.remove(&replica);
+            took.insert(replica.clone(), t_root.elapsed().as_millis());
+            stream.push(Root {
+                replica: replica.clone(),
+                mode: Mode::Plain,
+                entries: vec![Entry {
+                    kind: sync::Kind::File,
+                    path: LEFT_OUT_NOTE.to_string(),
+                    data: note,
+                }],
+            });
+            plan_roots.push((replica, r.clone()));
+            continue;
         }
         // Signed again after the read, once for the read cache and the stamp alike: what was read
         // is the state both name only when the signature did not move under the read.
@@ -2274,7 +2366,7 @@ fn copy_in_stream_with(
         // `.git` a seat planted in the replica, so its hooks never reach a later unit.
         if r.mode == Mode::Tree && r.host == tree && with_git {
             let t_git = Instant::now();
-            let rebuilt = replica_git(tree, &r.masks, STREAM_LIMIT - budget)?;
+            let rebuilt = replica_git(tree, &r.masks, limit.saturating_sub(budget))?;
             took.insert(format!("{replica}/.git"), t_git.elapsed().as_millis());
             let (sha, git_entries) = match rebuilt {
                 Some((sha, entries)) => (Some(sha), entries),
@@ -2285,11 +2377,10 @@ fn copy_in_stream_with(
                 .iter()
                 .map(|e| (e.data.len() + e.path.len()) as u64)
                 .sum::<u64>();
-            if budget > STREAM_LIMIT {
-                return Err(format!(
-                    "the unit's copy-in is larger than {STREAM_LIMIT} bytes (its .git)"
-                )
-                .into());
+            if budget > limit {
+                return Err(
+                    format!("the unit's copy-in is larger than {limit} bytes (its .git)").into(),
+                );
             }
             {
                 let gr = format!("{replica}/.git");
@@ -2309,6 +2400,7 @@ fn copy_in_stream_with(
                         masks: Vec::new(),
                         repo: false,
                         ro: false,
+                        optional: false,
                     },
                 ));
                 base = sha;
@@ -2353,7 +2445,7 @@ fn copy_in_stream_with(
     // (core#1747: `:re-read:no-stamp|changed|writer|unsigned`).
     super::clock::mark_with(
         "copy_in_read",
-        Some(read_detail(&stream, &took, &kept, &resent)),
+        Some(read_detail(&stream, &took, &kept, &resent, &left)),
     );
     Ok((sync::encode(&stream), plan, base, baseline, tracked))
 }
@@ -2366,17 +2458,24 @@ pub(crate) fn read_detail(
     took: &HashMap<String, u128>,
     kept: &[String],
     resent: &HashMap<String, Resent>,
+    left: &HashMap<String, u64>,
 ) -> String {
     let sent = stream.iter().map(|r| {
-        let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
         let ms = took.get(&r.replica).copied().unwrap_or(0);
+        // (core#1463) A left-out optional root says so, with the bytes read before the cap.
+        if let Some(read) = left.get(&r.replica) {
+            return format!("{}:left-out:{read}/{ms}ms", r.replica);
+        }
+        let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
         let why = resent
             .get(&r.replica)
             .map(|w| format!(":re-read:{}", w.as_str()))
             .unwrap_or_default();
         format!("{}:{}/{}/{}ms{why}", r.replica, r.entries.len(), bytes, ms)
     });
+    let left_out = (!left.is_empty()).then(|| format!("left-out {};", left.len()));
     std::iter::once(format!("kept {} re-read {};", kept.len(), resent.len()))
+        .chain(left_out)
         .chain(sent)
         .chain(kept.iter().cloned())
         .collect::<Vec<_>>()
@@ -2548,6 +2647,8 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) role: &'a str,
     /// The run's read-only `node_modules` claim for the tree (B14), when one was filled.
     pub(crate) deps: Option<&'a str>,
+    /// (core#1463) The settled optional read roots (canonical): left out when over the caps.
+    pub(crate) optional: &'a [PathBuf],
 }
 
 /// The pod's state as the bound-pod gate reads it (pure).
@@ -3215,6 +3316,7 @@ fn arm_physical(
     // plain, so it is selected below and removed at settle, never kept in the replica.
     let mut roots = roots;
     mark_homes(&mut roots, s.seat_dirs, s.scratch);
+    mark_optional(&mut roots, s.optional);
     let mut reset_dirs: Vec<PathBuf> = s.seat_dirs.to_vec();
     reset_dirs.extend(
         pod_mounts

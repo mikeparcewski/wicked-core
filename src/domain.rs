@@ -131,6 +131,12 @@ pub struct AgentSession {
     /// never what they may write. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub extra_read_roots: Vec<String>,
+    /// (core#1463) The launch's optional read roots (a subset of [`Self::extra_read_roots`]),
+    /// persisted for the same reason: a resume leaves out the same roots the launch allowed.
+    /// `#[serde(default)]`: an older session has none, so every read root stays required; empty
+    /// is not written, so a session with none stays byte-identical to an older row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_read_roots: Vec<String>,
     /// The project code graph the launcher bound this run to, if any (see
     /// [`crate::project::ProjectGraphBinding`]). Persisted on the session for the same reason
     /// `extra_write_roots` is (core#259): a resume/redrive re-enters through the actor with no
@@ -2914,6 +2920,7 @@ mod tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -3051,6 +3058,24 @@ mod tests {
             normalize_exclude_seats(&[" codex ".into(), "".into(), "pi".into(), "codex".into()]),
             ["codex", "pi"]
         );
+    }
+
+    /// (core#1463) The launch's optional read roots persist on the session (a resume leaves out the
+    /// same roots), an older row reads none, and none is not written.
+    #[test]
+    fn optional_read_roots_persist_and_an_older_session_has_none() {
+        let s = sample_session();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("optional_read_roots").is_none(), "{v}");
+        let mut set = sample_session();
+        set.extra_read_roots = vec!["/srv/a".into(), "/srv/b".into()];
+        set.optional_read_roots = vec!["/srv/b".into()];
+        let back = AgentSession::from_node(&set.to_node()).expect("from_node");
+        assert_eq!(back.optional_read_roots, ["/srv/b"]);
+        let mut old = serde_json::to_value(&set).unwrap();
+        old.as_object_mut().unwrap().remove("optional_read_roots");
+        let back: AgentSession = serde_json::from_value(old).unwrap();
+        assert!(back.optional_read_roots.is_empty());
     }
 
     #[test]
