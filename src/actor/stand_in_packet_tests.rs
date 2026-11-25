@@ -34,6 +34,7 @@ fn session(run_id: &str) -> AgentSession {
         repo_ref: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         project_id: None,
         archived_at: None,

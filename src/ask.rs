@@ -530,6 +530,7 @@ mod tests {
                 repo_ref: None,
                 extra_write_roots: vec![],
                 extra_read_roots: vec![],
+                optional_read_roots: Vec::new(),
                 project_graph: None,
                 project_id: None,
                 archived_at: None,

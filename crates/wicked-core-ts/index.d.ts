@@ -86,6 +86,14 @@ export interface LaunchOptions {
    */
   extraReadRoots?: Array<string>
   /**
+   * The entries of `extraReadRoots` the run can do without (core#1463). On the container floor, one that
+   * does not fit the unit's copy-in caps is left out of the unit's copy (its directory holds only a
+   * note saying so) instead of refusing the unit. It grants no read: each entry must equal an entry of
+   * `extraReadRoots`, or the launch is REJECTED. A root another source also requires is never left
+   * out. Omit to keep every read root required.
+   */
+  optionalReadRoots?: Array<string>
+  /**
    * The PROJECT code graph this run's governed workers should query, instead of the run repo's
    * own graph — one database holding every member repo of the project, so a worker's
    * SearchEntity / BlastRadius / TraverseGraph can see the whole project rather than one repo.

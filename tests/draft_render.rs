@@ -296,6 +296,7 @@ fn run(name: &str, texts: &[&str]) -> Run {
         project_id: None,
         extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(plan),
         deliver_step: None,

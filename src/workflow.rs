@@ -213,6 +213,12 @@ pub struct GovernanceContext {
     /// older peers) means the read boundary stays exactly the evidence-derived assembly.
     #[serde(default)]
     pub extra_read_roots: Vec<String>,
+    /// (core#1463) The entries of [`Self::extra_read_roots`] the launcher declared optional: the
+    /// container floor may leave one out of a unit's copy-in when it does not fit the caps.
+    /// `#[serde(default)]`: a task from an older peer has none (every read root required); empty
+    /// is not written, so a task with none serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_read_roots: Vec<String>,
     /// The studio PROJECT id this governed run is filed into (`AgentSession::project_id`, BC-79),
     /// when the launch named one. Carried here — beside [`Self::code_graph_db`], which is the
     /// run's project *code graph* — so the per-unit worker-env build can stamp it as

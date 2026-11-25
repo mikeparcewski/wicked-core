@@ -4328,6 +4328,37 @@ impl WrappedCliStepRunner {
                     &homes,
                     self.operational_home.as_deref(),
                 );
+                // (core#1463) The launch's optional read roots, and what the unit reads WITHOUT
+                // them: the same assembly with only those launch entries dropped, so a path any
+                // other source also names (skills, a promoted write root, the gate list) stays
+                // required whatever its spelling. The floor settles the optional set from both.
+                let optional: Vec<String> = input
+                    .governance
+                    .as_ref()
+                    .map(|g| g.optional_read_roots.clone())
+                    .unwrap_or_default();
+                let required_reads = if optional.is_empty() {
+                    Vec::new()
+                } else {
+                    let required_gov = input.governance.as_ref().map(|g| {
+                        let mut g = g.clone();
+                        g.extra_read_roots.retain(|r| !optional.contains(r));
+                        g
+                    });
+                    seat_read_roots(
+                        required_gov.as_ref(),
+                        handed.map(|s| s.root.clone()),
+                        gov_env
+                            .iter()
+                            .flat_map(|g| {
+                                g.read_roots_except(self.operational_home.as_deref(), &optional)
+                            })
+                            .collect(),
+                        &homes,
+                        self.operational_home.as_deref(),
+                    )
+                };
+                let optional: Vec<PathBuf> = optional.iter().map(PathBuf::from).collect();
                 // A claude unit's gate hook runs on the host, reached through the gateway's hook
                 // route; without the relay (or a gateway to route it) its tool calls would run
                 // unjudged. An offline seat has no gateway at all (agy gw-r1 F-02): refused up
@@ -4406,6 +4437,8 @@ impl WrappedCliStepRunner {
                     &input.run_id,
                     input.unit.ord,
                     &read_roots,
+                    &optional,
+                    &required_reads,
                     member_view.as_deref(),
                     argv_prompt.as_deref(),
                     gateway_dir.as_deref(),
@@ -6346,13 +6379,42 @@ impl GovLaunch {
             &self.extra_read_roots,
             self.skills_root.as_deref(),
         );
+        self.add_promoted_write_roots(&mut roots, operational_home);
+        roots
+    }
+
+    /// [`Self::read_roots`] without the launch-declared read roots named in `except` (core#1463:
+    /// the optional ones, to settle which of them no other source requires). The same assembly,
+    /// handed fewer launch entries.
+    fn read_roots_except(
+        &self,
+        operational_home: Option<&Path>,
+        except: &[String],
+    ) -> Vec<PathBuf> {
+        let extras: Vec<String> = self
+            .extra_read_roots
+            .iter()
+            .filter(|r| !except.contains(r))
+            .cloned()
+            .collect();
+        let mut roots = assemble_read_roots(
+            self.code_graph_db.as_deref(),
+            operational_home,
+            &extras,
+            self.skills_root.as_deref(),
+        );
+        self.add_promoted_write_roots(&mut roots, operational_home);
+        roots
+    }
+
+    /// The run's declared write roots, promoted to reads, joined onto `roots`.
+    fn add_promoted_write_roots(&self, roots: &mut Vec<PathBuf>, operational_home: Option<&Path>) {
         let homes = declared_root_state_homes(operational_home, self.skills_root.as_deref());
         for r in promoted_write_roots(&self.extra_write_roots, &homes) {
             if !roots.contains(&r) {
                 roots.push(r);
             }
         }
-        roots
     }
 }
 
@@ -10521,6 +10583,7 @@ mod tests {
             code_graph_db: Some(db.to_string_lossy().into_owned()),
             extra_write_roots: Vec::new(),
             extra_read_roots: vec!["/abs/extra".to_string()],
+            optional_read_roots: Vec::new(),
             project_id: Some("proj-a".to_string()),
             repo_id: None,
             apps: None,
@@ -11148,6 +11211,7 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,
@@ -11450,6 +11514,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -11630,6 +11695,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -12146,6 +12212,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -12342,6 +12409,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -12724,6 +12792,7 @@ mod tests {
             ),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,
@@ -12971,6 +13040,7 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_id: project.map(str::to_string),
             repo_id: None,
             apps: None,
@@ -13709,6 +13779,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -15705,6 +15776,7 @@ mod tests {
                 code_graph_db: Some(graph_db.to_string()),
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -15741,6 +15813,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -16409,6 +16482,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: vec![author.to_string_lossy().into_owned()],
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -19410,6 +19484,7 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: vec!["/srv/grounding".to_string()],
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,
@@ -19608,6 +19683,7 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,
@@ -21679,6 +21755,7 @@ mod project_graph_end_to_end_tests {
             workflow: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: pg,
             plan: None,
             deliver_step: None,
@@ -21830,6 +21907,7 @@ mod ask_config_tests {
             code_graph_db: None,
             extra_write_roots: vec![],
             extra_read_roots: vec![],
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
             apps: None,

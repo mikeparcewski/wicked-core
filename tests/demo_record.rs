@@ -247,6 +247,7 @@ fn run_with(name: &str, mode: &str, plant: bool, gated: bool) -> Run {
         project_id: None,
         extra_write_roots: vec![root.join("plan").to_string_lossy().into_owned()],
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(plan),
         deliver_step: None,

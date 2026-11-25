@@ -28,6 +28,7 @@ fn an_in_memory_core_creates_no_event_log_directory() {
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

@@ -95,6 +95,7 @@ fn spec(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         workflow: Some("c957-build-review".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,
