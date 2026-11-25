@@ -19300,43 +19300,11 @@ for f in sorted(pathlib.Path(".").iterdir()):
  else: files[f.name]=text(f)
 print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -"#;
         // The builder's refused Bash call on the train-14 proof daemon (run record
-        // `apps-steering-rules-project-d40721c09526`, `denial.refused_before_run[0].command`).
-        const T14_BUILDER_COMMAND: &str = r#"mkdir -p queries
-echo '{"from": "steering", "group": "kind"}' > queries/rules_by_type.json
-echo '{"from": "steering", "limit": 50}' > queries/rules_list.json
-cat > apps.json <<'E'
-{
-  "schema": "wicked.apps/v1",
-  "name": "Steering Rules by Type",
-  "pages": [
-    {
-      "id": "page-1",
-      "title": "Steering Rules",
-      "components": [
-        {"id": "rules_by_type_chart", "type": "chart", "chart": "bar", "title": "Steering rules by type", "box": {"x": 0, "y": 0, "w": 12, "h": 5}, "data": {"query": "rules_by_type"}, "x": "key", "series": [{"column": "count", "label": "Rules"}]},
-        {"id": "rules_table", "type": "table", "title": "Steering rules", "box": {"x": 0, "y": 5, "w": 12, "h": 8}, "data": {"query": "rules_list"}, "columns": [{"column": "title", "label": "Rule"}, {"column": "kind", "label": "Type"}, {"column": "severity", "label": "Severity"}, {"column": "content", "label": "Statement"}], "pageSize": 10}
-      ]
-    }
-  ],
-  "queries": [
-    {"id": "rules_by_type", "source": "estate", "kind": "recall", "output": [{"name": "key", "type": "string"}, {"name": "count", "type": "integer"}]},
-    {"id": "rules_list", "source": "estate", "kind": "recall", "output": [{"name": "title", "type": "string"}, {"name": "kind", "type": "string"}, {"name": "severity", "type": "string"}, {"name": "content", "type": "string"}]}
-  ],
-  "actions": [],
-  "linkHosts": []
-}
-E
-python3 -c 'import json,pathlib
-def text(f):
- try: return f.read_text(encoding="utf-8") if f.is_file() and not f.is_symlink() else None
- except (UnicodeError,OSError): return None
-files={}
-for f in sorted(pathlib.Path(".").iterdir()):
- if f.name in (".git","tmp"): continue
- if f.name=="queries" and f.is_dir() and not f.is_symlink():
-  files.update({str(q):text(q) for q in sorted(f.iterdir())})
- else: files[f.name]=text(f)
-print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file - | head -c 1500"#;
+        // `apps-steering-rules-project-d40721c09526`, `denial.refused_before_run[0].command`), kept
+        // as a fixture: its heredoc closes a JSON object on a bare `}` line, which would end this
+        // module early for the source scanners that strip test items (`production`).
+        const T14_BUILDER_COMMAND: &str =
+            include_str!("../tests/fixtures/crew-1935-apps-builder-command.txt");
         assert!(T14_BUILDER_COMMAND.contains(APPS_SELF_CHECK_COMMAND));
 
         let wicked_home =
