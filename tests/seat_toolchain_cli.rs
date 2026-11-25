@@ -50,7 +50,11 @@ set -eu
 cd "$SEAT_TEST_ROOT"
 case "$1" in
   version) echo 29.5.3 ;;
+  # The operator base is pinned by id for its seat build (core#1043): the tag and the listing of
+  # older pins succeed and change nothing here.
+  tag) ;;
   image)
+    if [ "$2" = ls ]; then exit 0; fi
     test "$2" = inspect
     for tag do :; done
     test -f "$tag"
