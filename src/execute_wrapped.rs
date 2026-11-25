@@ -7927,7 +7927,8 @@ fn managed_hooks_only_refusal_reason(source: &std::path::Path) -> String {
 /// configuration home's `remote-settings.json`), which a container seat never carries: its home
 /// is seeded with preferences only (`container_floor::seed_container_settings`), and its claude
 /// never fetches or applies one, because the gateway base URL makes the session ineligible for
-/// server-managed settings and the floor pins `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=0`
+/// server-managed settings and every claude seat routed to the gateway is handed
+/// `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=0`
 /// (core#1823, `seat_gateway::seat_env_for`).
 fn managed_hooks_remedy(
     source: &std::path::Path,

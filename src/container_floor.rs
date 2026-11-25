@@ -5618,6 +5618,10 @@ esac
         assert!(env
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://agw:4005"));
+        // core#1823: the arming route hands the claude seat the first-party pin too.
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL" && v == "0"));
         assert!(!env
             .iter()
             .any(|(k, _)| k == "ANTHROPIC_API_KEY" || k == "CLAUDE_CODE_OAUTH_TOKEN"));

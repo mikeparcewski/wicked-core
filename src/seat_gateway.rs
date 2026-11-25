@@ -955,7 +955,9 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
 
 /// Claude Code's switch that makes a custom base URL count as first party, which makes the session
 /// eligible for the organization's server-managed settings (core#1823). Pinned off on every claude
-/// seat routed to the gateway.
+/// seat routed to the gateway, to "0": Claude Code 2.1.296 parses it as a boolean (probed in the
+/// seat image: 0 keeps the gateway session ineligible, 1 makes it eligible), and a value that is
+/// set at all also stops a server-delivered "assume first party" document from applying.
 pub(crate) const CLAUDE_ASSUME_FIRST_PARTY_ENV: &str = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL";
 
 /// codex's override of its token endpoint (codex 0.162.1 `login/src/auth/manager.rs`
@@ -2611,6 +2613,19 @@ mod tests {
                 get("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"),
                 Some("0"),
                 "{kind:?}: {env:?}"
+            );
+        }
+        // Only claude reads it: no other seat is handed it.
+        for (cli, kind) in [
+            ("codex", CredentialKind::CodexApiKey),
+            ("codex", CredentialKind::CodexChatgpt),
+            ("pi", CredentialKind::ProviderKey),
+            ("opencode", CredentialKind::ProviderKey),
+        ] {
+            let env = seat_env_for_sign_in(cli, &SeatSignIn::from(kind), "wk-test-PLACEHOLDER");
+            assert!(
+                !env.iter().any(|(k, _)| k == CLAUDE_ASSUME_FIRST_PARTY_ENV),
+                "{cli} {kind:?}: {env:?}"
             );
         }
     }
