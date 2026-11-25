@@ -4492,6 +4492,10 @@ impl WrappedCliStepRunner {
                                 return isolation_refusal(input, &why);
                             }
                         }
+                        for note in &c.notes {
+                            eprintln!("wicked-core: unit {}: {note}", input.unit.ord);
+                            crate::cli_runner::engine_note(emit, note);
+                        }
                         seat_cleanup = Some(c.cleanup);
                         seat_pin = Some(c.seat_pin);
                         prompt_guard = c.prompt_file;

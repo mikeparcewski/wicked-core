@@ -219,12 +219,15 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "seat-image",
-        "wicked-core seat-image build [<cli>...|all] | \
-         seat-image status [--json] [<cli>...]\n  \
+        "wicked-core seat-image build [--layers <ids>|detect:<dir>] [<cli>...|all] | \
+         seat-image status [--json] [--layers <ids>|detect:<dir>] [<cli>...]\n  \
          Build or report the images governed seats use in Kubernetes pods. The container CLI \
          (docker, podman, nerdctl) builds images into the store shared with the local cluster \
          (imagePullPolicy: Never). A missing WICKED_SEAT_BASE_IMAGE is rebuilt from \
-         WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object.",
+         WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object. --layers \
+         names toolchain layers (go, java, python; rust and node are in the base) or detects \
+         them from a checkout, so an operator can pre-build a repository's seat images; a run \
+         detects its own. WICKED_SEAT_LAYERS=off turns detection off.",
     ),
     (
         "seat-login",

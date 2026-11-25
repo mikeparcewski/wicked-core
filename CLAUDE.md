@@ -40,7 +40,13 @@ inspects a seat image before an arm (a short-lived helper running only the floor
 `wicked-core seat-image build|status` to build or report images. Every seat image builds on the
 embedded checks floor recipe as a named stage (the engine also ensures the standalone checks
 image, rebuilding it if removed; `WICKED_SEAT_BASE_IMAGE` overrides), which links the pinned Rust
-toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` file is not applied. A seat unit's
+toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` file is not applied. A unit's seat
+image also carries the toolchain layers its tree needs (`src/seat_layers.rs`, core#1043: `go.mod` ->
+Debian's Go, `pom.xml`/Gradle -> OpenJDK 21 + Maven, `pyproject.toml`, `requirements*.txt`, `setup.py`, `uv.lock` or `Pipfile` -> uv),
+detected at arm from marker files and composed above the seat recipe's `ARG CLI`; never on an
+operator base; `WICKED_SEAT_LAYERS=off` turns detection off. A layer set that does not build never
+blocks a unit: it runs on the plain seat image with a note naming the layers, the build error and the
+`seat-image build <cli> --layers <ids>` retry. A new layered build removes the older images of its set. A seat unit's
 `CARGO_HOME` always lives under `<worker home>/seat-build/<cli>` in the per-run, per-CLI replica
 (never seeded or written back). A full-posture unit's `CARGO_TARGET_DIR` lives there too; a fenced
 unit keeps its per-unit `scratch/target`, removed at settle.

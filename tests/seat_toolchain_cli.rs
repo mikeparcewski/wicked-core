@@ -14,7 +14,13 @@ fn arm_hermetic_emit_spool() {
 }
 
 fn build(root: &Path, base: Option<&str>) -> String {
+    build_with_id(root, base, 0)
+}
+
+/// [`build`], with the runtime reporting image id `id` for every image it has.
+fn build_with_id(root: &Path, base: Option<&str>, id: u32) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wicked-core"));
+    cmd.env("SEAT_TEST_IMAGE_ID", id.to_string());
     cmd.args(["seat-image", "build", "claude"])
         .env("WICKED_CONTAINER_RUNTIME", root.join("docker"))
         .env("SEAT_TEST_ROOT", root)
@@ -44,11 +50,15 @@ set -eu
 cd "$SEAT_TEST_ROOT"
 case "$1" in
   version) echo 29.5.3 ;;
+  # The operator base is pinned by id for its seat build (core#1043): the tag and the listing of
+  # older pins succeed and change nothing here.
+  tag) ;;
   image)
+    if [ "$2" = ls ]; then exit 0; fi
     test "$2" = inspect
     for tag do :; done
     test -f "$tag"
-    printf 'sha256:%064d\n' 0
+    printf 'sha256:%064d\n' "${SEAT_TEST_IMAGE_ID:-0}"
     ;;
   build)
     tag=
@@ -94,19 +104,35 @@ esac
     assert_eq!(recipe.matches("ARG RUST_TOOLCHAIN=").count(), 1);
     assert_eq!(recipe.matches("https://sh.rustup.rs").count(), 1);
 
-    // An explicit checks base must produce the same seat tag as the default base.
-    assert_eq!(first, build(&root, Some(tags[1])));
+    // (core#1043) The same image named as an operator base is keyed by its image id: its own seat
+    // tag, and a new one when the base is rebuilt under the same name. The default base's tag is
+    // the one it always was.
+    let seat_line = |out: &str| {
+        out.lines()
+            .find(|l| l.starts_with("claude: built "))
+            .unwrap_or_else(|| panic!("{out}"))
+            .to_string()
+    };
+    let operator = build(&root, Some(tags[1]));
+    assert_ne!(seat_line(&first), seat_line(&operator));
+    let rebuilt = build_with_id(&root, Some(tags[1]), 1);
+    assert_ne!(seat_line(&operator), seat_line(&rebuilt));
     assert_eq!(first, build(&root, None));
     let reused = std::fs::read_to_string(root.join("builds")).unwrap();
-    assert_eq!(reused.lines().count(), 5, "{reused}");
+    assert_eq!(reused.lines().count(), 6, "{reused}");
     assert_eq!(reused.lines().filter(|t| *t == tags[1]).count(), 1);
+    assert_eq!(
+        reused.lines().filter(|t| *t == tags[2]).count(),
+        2,
+        "{reused}"
+    );
 
     // Retain the seat image, as a GC may remove only its base. The next build must repair it.
     std::fs::remove_file(root.join(tags[1])).unwrap();
     assert_eq!(first, build(&root, None));
     let repaired = std::fs::read_to_string(root.join("builds")).unwrap();
     assert_eq!(
-        repaired.lines().skip(5).collect::<Vec<_>>(),
+        repaired.lines().skip(6).collect::<Vec<_>>(),
         [tags[1], tags[2]],
         "{repaired}"
     );

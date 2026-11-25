@@ -143,6 +143,7 @@ mod seat_bench;
 mod seat_credentials;
 mod seat_deps;
 mod seat_gateway;
+mod seat_layers;
 mod seat_login;
 mod seat_refresh;
 mod seat_secret_guard;
