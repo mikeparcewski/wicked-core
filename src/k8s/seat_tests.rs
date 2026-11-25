@@ -1608,6 +1608,7 @@ fn k8s_the_production_plan_packs_and_unpacks_through_the_pod_codec() {
         masks: vec![".env".into()],
         repo: false,
         ro: false,
+        optional: false,
     };
     let plan = seat::codec_plan(&[("w".into(), &r)]).to_string();
     let stream = sync::encode(&[Root {
@@ -1793,6 +1794,7 @@ fn k8s_a_refusal_in_a_later_root_leaves_every_earlier_root_unchanged() {
         masks,
         repo: false,
         ro: false,
+        optional: false,
     };
     let ra = plain(&a, Vec::new());
     let rb = plain(&b, vec!["secret.txt".into()]);
@@ -1941,6 +1943,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
     assert!(e.detail.contains("larger than"), "{}", e.detail);
@@ -2104,6 +2107,7 @@ fn k8s_links_in_two_roots_cannot_combine_into_an_escape() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let outer = plain(&root, vec!["sub".into()]);
     let inner = plain(&root.join("sub"), Vec::new());
@@ -2137,6 +2141,7 @@ fn k8s_a_host_link_the_write_back_replaces_is_not_followed() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     // `a` becomes a directory; `b -> a/../out` then resolves to `out`, inside the root.
     let plans: Vec<seat::RootPlan<'_>> = vec![(
@@ -3150,6 +3155,7 @@ fn k8s_copy_in_snapshots_host_tracked_paths_for_each_tree() {
                 masks: Vec::new(),
                 repo: false,
                 ro: false,
+                optional: false,
             })
             .collect();
         let (_, _, _, baseline, tracked) =
@@ -3431,6 +3437,7 @@ fn k8s_a_file_replacing_a_directory_with_unseen_contents_is_refused_before_any_c
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let plans: Vec<seat::RootPlan<'_>> = vec![(
         &r,
@@ -4047,6 +4054,7 @@ fn k8s_a_seeded_cache_is_not_sent_again() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let rep = seat::replica_of(None, &cache).unwrap();
     let first = seat::copy_in_stream(
@@ -4536,6 +4544,7 @@ fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let (stream, _, _, baseline, _) =
         seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap();
@@ -4585,6 +4594,7 @@ fn k8s_the_fenced_scratch_is_no_home_and_goes_at_settle() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let mut roots = vec![mk("/w/home"), mk("/w/scratch")];
     let dirs = [PathBuf::from("/w/home"), PathBuf::from("/w/scratch")];
@@ -4771,6 +4781,7 @@ fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let body = |r: &PlanRoot| {
         let (b, _, _, _, _) = seat::copy_in_stream(
@@ -4838,6 +4849,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let git_of = |r: &PlanRoot| {
         let (b, _, base, _, _) =
@@ -4864,6 +4876,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         masks: vec!["b.txt".into()],
         repo: false,
         ro: false,
+        optional: false,
         ..tree.clone()
     };
     let (_, g4) = git_of(&masked);
@@ -5022,6 +5035,7 @@ fn k8s_a_unit_bound_to_an_oversized_project_graph_arms_without_copying_it() {
         code_graph_db: Some(db.to_string_lossy().into_owned()),
         extra_write_roots: Vec::new(),
         extra_read_roots: vec![extra.to_string_lossy().into_owned()],
+        optional_read_roots: Vec::new(),
         project_id: Some("proj-a".to_string()),
         repo_id: None,
         apps: None,
@@ -5140,6 +5154,7 @@ fn k8s_a_refused_copy_in_is_reported_as_copy_in_refused() {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     let (why, e) = seat::copy_in(&kube, "ns", None, &data, &[r], false).unwrap_err();
     assert_eq!(why, FloorUnarmed::CopyInRefused, "{e}");
@@ -5194,6 +5209,7 @@ fn partial_clone(host: &Path) -> (PathBuf, PathBuf, PlanRoot) {
         masks: Vec::new(),
         repo: false,
         ro: false,
+        optional: false,
     };
     (source, part, root)
 }
@@ -5884,6 +5900,7 @@ fn k8s_skills_generation_signs_without_a_walk_and_reuses_its_read() {
         masks: vec![],
         repo: false,
         ro: false,
+        optional: false,
     };
     seat::SIG_WALKS.with(|n| n.set(0));
     let before = seat::HOST_READS.with(|n| n.get());
@@ -5923,6 +5940,7 @@ fn repo_stamp_fixture() -> (PathBuf, PathBuf, PlanRoot) {
         masks: vec![],
         repo: true,
         ro: false,
+        optional: false,
     };
     (host, replica, r)
 }
@@ -7175,6 +7193,7 @@ fn warm_seed_copy_bypasses_the_old_replica_stamp_and_restores_trusted_contents()
         masks: vec![],
         repo: false,
         ro: false,
+        optional: false,
     };
     let rep = seat::replica_of(Some("warm-test"), &dir).unwrap();
     let seeded = [rep].into_iter().collect();
@@ -7244,6 +7263,7 @@ fn pr_c2_dependency_pack_prunes_before_sizing_or_validating() {
         masks: vec![],
         repo: false,
         ro: false,
+        optional: false,
     };
     let refs = [("w".into(), &want)];
     let plan = seat::pack_plan(&refs, Some(&want.host)).to_string();
@@ -7320,4 +7340,200 @@ fn finalize_refuses_a_seat_argument_holding_a_nul_1750() {
         panic!("a NUL argument is refused");
     };
     assert_eq!(err, "a seat argument holds a NUL");
+}
+
+/// (core#1463) The roots of an "All repos" chat unit: a scratch tree, a seat home, and read-only
+/// repositories, as `seat::plan` makes them from the mounts `container_floor` builds for one.
+#[cfg(unix)]
+fn optional_chat_roots(
+    host: &Path,
+    repos: &[(&str, usize)],
+    optional: &[&str],
+) -> (PathBuf, Vec<PlanRoot>) {
+    let tree = host.join("chats/c1");
+    let home = host.join("worker/homes/claude");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(tree.join("AGENTS.md"), "scope").unwrap();
+    let mut mounts = vec![
+        PlanMount::Bind {
+            path: home.clone(),
+            rw: true,
+        },
+        PlanMount::Bind {
+            path: tree.clone(),
+            rw: false,
+        },
+    ];
+    for (name, size) in repos {
+        let repo = host.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("lib.rs"), "x".repeat(*size)).unwrap();
+        git_in(&repo, &["add", "lib.rs"]);
+        mounts.push(PlanMount::Bind {
+            path: repo,
+            rw: false,
+        });
+    }
+    let (mut roots, _) = seat::plan(&tree, true, &mounts, &[], &[], None);
+    seat::mark_homes(&mut roots, std::slice::from_ref(&home), None);
+    let optional: Vec<PathBuf> = optional.iter().map(|n| host.join(n)).collect();
+    seat::mark_optional(&mut roots, &optional);
+    (tree, roots)
+}
+
+/// Run `f` with the copy-in's byte cap at `cap` on this thread.
+#[cfg(unix)]
+fn with_cap<T>(cap: u64, f: impl FnOnce() -> T) -> T {
+    seat::TEST_STREAM_LIMIT.with(|c| c.set(Some(cap)));
+    let out = f();
+    seat::TEST_STREAM_LIMIT.with(|c| c.set(None));
+    out
+}
+
+/// (core#1463) An "All repos" chat whose optional repositories pass the copy-in's cap arms: the
+/// required roots and the optional ones that fit are copied, the one that does not is left out with
+/// a note in its place, the arm timing says so, and a copy an earlier turn kept is removed (its
+/// stamp with it), so the seat never reads a stale repository.
+#[cfg(unix)]
+#[test]
+fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
+    let host = tmp("optional-left-out");
+    let replica = tmp("optional-left-out-replica");
+    let (tree, roots) = optional_chat_roots(
+        &host,
+        &[("repos/alpha", 1000), ("repos/beta", 1000), ("repos/gamma", 900)],
+        &["repos/beta", "repos/gamma"],
+    );
+    let opt: Vec<&PlanRoot> = roots.iter().filter(|r| r.optional).collect();
+    assert_eq!(opt.len(), 2, "{roots:?}");
+    let rep = |n: &str| seat::replica_of(None, &host.join(n)).unwrap();
+
+    // Turn 1, room for all: every repository is copied and kept.
+    let (_, first) = with_cap(64 * 1024, || chat_turn(&replica, &tree, &roots));
+    assert!(!first.contains("left-out"), "{first}");
+    assert_eq!(
+        std::fs::read_to_string(replica.join(rep("repos/gamma")).join("lib.rs")).unwrap(),
+        "x".repeat(900)
+    );
+
+    // Turn 2: gamma grew past what is left of the cap (two optional roots reserve 2 KiB).
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(host.join("repos/gamma/lib.rs"), "y".repeat(3000)).unwrap();
+    let cap = 2 * seat::NOTE_RESERVE + 2500;
+    let (body, second) = with_cap(cap, || chat_turn(&replica, &tree, &roots));
+    assert!(second.contains("left-out 1;"), "{second}");
+    assert!(
+        second.contains(&format!("{}:left-out:", rep("repos/gamma"))),
+        "{second}"
+    );
+    assert!(
+        !body.windows(3000).any(|w| w == "y".repeat(3000).as_bytes()),
+        "the left-out repository was sent"
+    );
+    let gamma = replica.join(rep("repos/gamma"));
+    let names: Vec<String> = std::fs::read_dir(&gamma)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != ".git")
+        .collect();
+    assert_eq!(names, vec![seat::LEFT_OUT_NOTE.to_string()], "{gamma:?}");
+    let note = std::fs::read_to_string(gamma.join(seat::LEFT_OUT_NOTE)).unwrap();
+    assert!(note.contains("left out") && note.contains("chat scoped to this repository"));
+    assert!(note.len() < 600, "the note must fit its reserve: {}", note.len());
+    // The required root and the optional root that fit are there.
+    assert_eq!(
+        std::fs::read_to_string(replica.join(rep("repos/alpha")).join("lib.rs")).unwrap(),
+        "x".repeat(1000)
+    );
+    assert!(replica.join(rep("repos/beta")).join("lib.rs").exists());
+
+    // Turn 3, same host state: the left-out root carries no stamp, so it is decided again.
+    let (_, third) = with_cap(cap, || chat_turn(&replica, &tree, &roots));
+    assert!(third.contains(&format!("{}:left-out:", rep("repos/gamma"))), "{third}");
+    assert!(!third.contains(&format!("{}:kept", rep("repos/gamma"))), "{third}");
+}
+
+/// (core#1463) A required root never gives way: over the cap it refuses the unit as before, even
+/// with optional roots in the plan.
+#[cfg(unix)]
+#[test]
+fn k8s_core_1463_a_required_root_over_the_cap_still_refuses() {
+    let host = tmp("optional-required-over");
+    let (tree, roots) = optional_chat_roots(
+        &host,
+        &[("repos/alpha", 5000), ("repos/beta", 10)],
+        &["repos/beta"],
+    );
+    let err = with_cap(seat::NOTE_RESERVE + 4000, || {
+        seat::copy_in_stream(None, &tree, &roots, false, &Default::default())
+    })
+    .err()
+    .expect("a required root over the cap refuses the unit");
+    assert!(matches!(err.why, FloorUnarmed::CopyInRefused), "{err:?}");
+    assert!(err.detail.contains("larger than"), "{}", err.detail);
+}
+
+/// (core#1463) Required roots are read before optional ones, whatever the plan's order: an optional
+/// repository listed first never takes the budget a required one needs.
+#[cfg(unix)]
+#[test]
+fn k8s_core_1463_required_roots_are_read_before_optional_ones() {
+    let host = tmp("optional-order");
+    // `a` (optional) sorts before the deeper required `b/c/d` in the plan.
+    let (tree, roots) = optional_chat_roots(
+        &host,
+        &[("a", 3000), ("b/c/d", 3000)],
+        &["a"],
+    );
+    let first_repo = roots
+        .iter()
+        .position(|r| r.host == host.join("a"))
+        .unwrap();
+    let required_repo = roots
+        .iter()
+        .position(|r| r.host == host.join("b/c/d"))
+        .unwrap();
+    assert!(first_repo < required_repo, "{roots:?}");
+    super::clock::begin();
+    let out = with_cap(seat::NOTE_RESERVE + 4000, || {
+        seat::copy_in_stream(None, &tree, &roots, false, &Default::default())
+    });
+    let (phases, _) = super::clock::take().unwrap();
+    out.expect("the required root fits once the optional one gives way");
+    let detail = phases
+        .into_iter()
+        .find(|p| p.name == "copy_in_read")
+        .and_then(|p| p.detail)
+        .unwrap();
+    let rep = |n: &str| seat::replica_of(None, &host.join(n)).unwrap();
+    assert!(detail.contains(&format!("{}:left-out:", rep("a"))), "{detail}");
+    assert!(detail.contains(&format!("{}:1/3000/", rep("b/c/d"))), "{detail}");
+}
+
+/// (core#1463) Only a plain, read-only root that does not come back can be optional.
+#[test]
+fn k8s_core_1463_only_a_read_only_plain_root_is_marked_optional() {
+    let tree = PathBuf::from("/h/tree");
+    let ro = PathBuf::from("/h/ro");
+    let rw = PathBuf::from("/h/rw");
+    let mounts = vec![
+        PlanMount::Bind {
+            path: tree.clone(),
+            rw: true,
+        },
+        PlanMount::Bind {
+            path: ro.clone(),
+            rw: false,
+        },
+        PlanMount::Bind {
+            path: rw.clone(),
+            rw: true,
+        },
+    ];
+    let (mut roots, _) = seat::plan(&tree, false, &mounts, &[], std::slice::from_ref(&rw), None);
+    seat::mark_optional(&mut roots, &[tree.clone(), ro.clone(), rw.clone()]);
+    let optional: Vec<&PathBuf> = roots.iter().filter(|r| r.optional).map(|r| &r.host).collect();
+    assert_eq!(optional, vec![&ro]);
 }
