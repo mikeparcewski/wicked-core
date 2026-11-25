@@ -1369,6 +1369,71 @@ fn a_gate_edit_that_changes_a_step_that_ran_is_refused_by_name() {
     assert_eq!(r.state, held, "the run keeps its plan");
 }
 
+/// (core#1925 follow-up F2) The "already ran" refusal names what changed in the words a person
+/// sees in studio's plan editor ("worker pool", "time budget"), not the wire keys (`pool`,
+/// `budget_secs`), joined as a sentence.
+#[test]
+fn a_ran_step_refusal_names_the_changes_in_plain_words() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1","instructions":"Answer it differently.",
+             "pool":3,"budget_secs":600},
+            {"catalog":"build","id":"build"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    match &r.outcome {
+        Outcome::Refused { reason } => {
+            assert!(
+                reason.contains("its instructions, time budget and worker pool can't change"),
+                "{reason}"
+            );
+            assert!(!reason.contains('_'), "no wire key in the words: {reason}");
+            assert!(!reason.contains("pool,"), "{reason}");
+        }
+        o => panic!("{}", describe(o)),
+    }
+    assert_eq!(r.state, held, "the run keeps its plan");
+}
+
+/// (core#1925 follow-up F2) Every step field a person can set has words of its own (the plan's
+/// field table, less the step id and the engine's own record fields), each a noun phrase that
+/// reads after "its"; an unknown key still reads without underscores.
+#[test]
+fn every_step_field_has_a_plain_word() {
+    use crate::plan::{FieldRule, STEP_FIELD_RULES};
+    for (key, rule) in STEP_FIELD_RULES {
+        if *key == "id" || matches!(rule, FieldRule::Record) {
+            continue;
+        }
+        let words = super::known_field_words(key)
+            .unwrap_or_else(|| panic!("the step field `{key}` has no words for a person"));
+        assert!(!words.contains('_'), "{key}: {words}");
+        assert!(
+            !words.starts_with("whether"),
+            "{key} reads after \"its\": {words}"
+        );
+    }
+    for (key, word) in [
+        ("validator_pin", "validator"),
+        ("pool", "worker pool"),
+        ("catalog", "step type"),
+        ("depends_on", "inputs"),
+        ("executes_code", "runs-code setting"),
+        ("some_new_field", "some new field"),
+    ] {
+        assert_eq!(super::field_words(key), word, "{key}");
+    }
+}
+
 /// (core#1925, codex DES r1) "Ran" is not only the prefix before the cursor: a step a rewind moved
 /// behind it ran too, and is refused the same way.
 #[test]
@@ -1664,7 +1729,7 @@ fn a_gate_edit_changes_only_a_checks_instructions() {
         refused_naming(
             &r,
             &held,
-            "step `review` is a check; only its instructions can change",
+            "step `review` is a check; only its instructions can change at the gate, or add a new step",
         );
     }
 }
