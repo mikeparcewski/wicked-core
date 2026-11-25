@@ -1738,11 +1738,7 @@ pub(crate) fn apply_and_finish_unit(
             if stand_in_hold {
                 return crate::domain::UnitDenial::new(
                     crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
-                    format!(
-                        "the run requires a judge ({}) and no helper that did not build the work \
-                         can be it: {why}",
-                        crate::assurance::JUDGE
-                    ),
+                    judge_stand_in_hold_reason(why),
                 );
             }
             crate::domain::UnitDenial::new(
@@ -2075,12 +2071,7 @@ pub(crate) fn apply_and_finish_unit(
             (
                 Some(crate::domain::UnitDenial::new(
                     crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
-                    format!(
-                        "{QE_STAND_IN_HOLD_PREFIX}{}) and no helper that did not build the work \
-                         can review its evidence: {}",
-                        crate::assurance::QE_ACCEPTANCE,
-                        d.reason
-                    ),
+                    qe_stand_in_hold_reason(&d.reason),
                 )),
                 None,
             )
@@ -3164,12 +3155,28 @@ fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String 
 /// (DES-STANDIN-001 §3.10, T-R11) How the QE reviewer's `stand_in_needed` hold begins: the same
 /// source as the judge's, so this prefix (written only by the QE arm of the fold) tells the two
 /// layers apart when an earlier hold is weighed against the layers this attempt asked again.
-const QE_STAND_IN_HOLD_PREFIX: &str = "the run requires QE acceptance (";
+const QE_STAND_IN_HOLD_PREFIX: &str = "The job needs a QE review of its evidence, and no helper ";
+
+/// How the QE hold began before core#1930: a hold an engine persisted in those words (a run that
+/// waits at its gate across an upgrade) is still the QE layer's.
+const QE_STAND_IN_HOLD_PREFIX_BEFORE_1930: &str = "the run requires QE acceptance (";
+
+/// The judge's `stand_in_needed` hold. (core#1930 F7) The stand-in gate prompt shows it as
+/// written, so it is a person's sentence: a capital first word, and no engine token.
+fn judge_stand_in_hold_reason(why: &str) -> String {
+    format!("The job needs a judge, and no helper that did not build the work can be it: {why}")
+}
+
+/// The QE reviewer's `stand_in_needed` hold, in a person's words like the judge's.
+fn qe_stand_in_hold_reason(why: &str) -> String {
+    format!("{QE_STAND_IN_HOLD_PREFIX}that did not build the work can do it: {why}")
+}
 
 /// The QE reviewer's `stand_in_needed` hold, not the judge's (see [`QE_STAND_IN_HOLD_PREFIX`]).
 fn is_qe_stand_in_hold(d: &crate::domain::UnitDenial) -> bool {
     d.source == crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED
-        && d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX)
+        && (d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX)
+            || d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX_BEFORE_1930))
 }
 
 /// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
@@ -8509,11 +8516,65 @@ mod guarded_read_step_tests {
 }
 
 #[cfg(test)]
+mod stand_in_hold_words_tests {
+    use super::{is_qe_stand_in_hold, judge_stand_in_hold_reason, qe_stand_in_hold_reason};
+    use crate::domain::{UnitDenial, WorkUnit};
+
+    /// (core#1930 F7) The stand-in gate prompt shows a hold's reason as written, so the holds
+    /// read as a person's sentence: a capital first word, no engine token.
+    #[test]
+    fn the_stand_in_holds_read_as_a_persons_sentence_in_the_gate_prompt() {
+        let unit = WorkUnit::pending("r:3", "r", 3, "review");
+        let qe = crate::actor::stand_in_gate::prompt(
+            &unit,
+            &qe_stand_in_hold_reason("no isolated QE reviewer could run"),
+            "",
+        );
+        assert_eq!(
+            qe,
+            "Unit 3: it is held before it runs. The job needs a QE review of its evidence, and \
+             no helper that did not build the work can do it: no isolated QE reviewer could run. \
+             Use a stand-in (for this job, or for every job), sign another helper in and approve \
+             to retry, or reject to stop the run"
+        );
+        let judge = crate::actor::stand_in_gate::prompt(
+            &unit,
+            &judge_stand_in_hold_reason("no distinct seat"),
+            "",
+        );
+        assert!(
+            judge.contains(
+                "The job needs a judge, and no helper that did not build the work can be it: \
+                 no distinct seat."
+            ),
+            "{judge}"
+        );
+        for words in [qe, judge] {
+            assert!(
+                !words.contains("qe_acceptance") && !words.contains("(judge)"),
+                "{words}"
+            );
+        }
+    }
+
+    /// A QE hold an engine wrote before core#1930 is still the QE layer's.
+    #[test]
+    fn a_qe_hold_in_the_words_before_core_1930_is_still_the_qe_layers() {
+        let hold =
+            |reason: String| UnitDenial::new(crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED, reason);
+        assert!(is_qe_stand_in_hold(&hold(qe_stand_in_hold_reason("x"))));
+        assert!(is_qe_stand_in_hold(&hold(
+            "the run requires QE acceptance (qe_acceptance) and no helper that did not build \
+             the work can review its evidence: x"
+                .into()
+        )));
+        assert!(!is_qe_stand_in_hold(&hold(judge_stand_in_hold_reason("x"))));
+    }
+}
+
+#[cfg(test)]
 mod denials_behind_tests {
-    use super::{
-        denials_behind_after_fold, standing_denials, FoldRefresh, PriorFold,
-        QE_STAND_IN_HOLD_PREFIX,
-    };
+    use super::{denials_behind_after_fold, standing_denials, FoldRefresh, PriorFold};
     use crate::domain::UnitDenial;
 
     fn d(source: &str) -> UnitDenial {
@@ -8586,7 +8647,7 @@ mod denials_behind_tests {
     fn a_qe_stand_in_hold_is_refreshed_by_the_qe_review_not_the_judge() {
         let qe_hold = UnitDenial::new(
             crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
-            format!("{QE_STAND_IN_HOLD_PREFIX}qe_acceptance) and no helper that did not build"),
+            super::qe_stand_in_hold_reason("no helper that did not build"),
         );
         let judge_hold = d(crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED);
         let prior_with = |hold: &UnitDenial| PriorFold {
