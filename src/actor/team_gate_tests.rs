@@ -3372,6 +3372,30 @@ fn an_accepted_edit_applies_only_after_its_gate_decided_lands() {
     assert_eq!(unit_ids(&e, "r9h"), EDITED_UNITS);
 }
 
+/// (core#1925) Each unit records the plan revision it ran under: after an edit accepted at the
+/// plan gate (rev 2), the units the run released ran from rev 2, and the run view says so.
+#[test]
+fn units_record_the_plan_rev_they_ran_under() {
+    let rig = rig("prrev");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "prr");
+    let s = e.core.confirm_gate("prr", the_edit()).unwrap();
+    assert_ne!(s, SessionStatus::AwaitingHuman);
+    wait_status(&e, "prr", SessionStatus::Completed);
+    assert_eq!(plan_revs(&e, "prr"), (2, 2));
+    let revs: Vec<(String, Option<u32>)> = e
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.session.id == "prr")
+        .flat_map(|v| v.units)
+        .map(|u| (u.id.clone(), u.plan_rev))
+        .collect();
+    assert_eq!(revs.len(), EDITED_UNITS.len(), "{revs:?}");
+    assert!(revs.iter().all(|(_, r)| *r == Some(2)), "{revs:?}");
+}
+
 /// Round 9 (2): the edit's `gate.decided` fails past the bound → the run pauses
 /// `team_transport` with the edit still staged: the old plan and units untouched. "Continue
 /// without team" then applies the edit, un-teamed.
