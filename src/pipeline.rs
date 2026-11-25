@@ -3994,10 +3994,17 @@ fn stand_in_judge_key<'a>(
     agent_verdict: Option<&'a crate::validator::AgentVerdict>,
     rules: Option<&'a crate::rule_check::RuleCheckReport>,
 ) -> Option<&'a str> {
-    let _ = rules;
+    let is_stand_in = |k: &&str| wicked_apps_core::spawn::seat_id::is_stand_in(k);
     agent_verdict
         .and_then(|v| v.judge_cli.as_deref())
-        .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
+        .filter(is_stand_in)
+        .or_else(|| {
+            rules?
+                .rows
+                .iter()
+                .filter_map(|r| r.judge.as_deref())
+                .find(is_stand_in)
+        })
 }
 
 /// (core#1799) Why the engine's judge did not run at `unit`'s gate, as the receipt says it: the
@@ -4341,6 +4348,22 @@ fn gate_receipt(
     // (DES-RULE-CHECK-001 S2) Every rule in force with its verdict; deny-dominates reads them.
     if let Some(rc) = f.rules {
         r.rules = rc.rows.clone();
+        // (DES-STANDIN-001 §3.6, core#1944) Rules the run's judge stand-in ruled: the canonical
+        // `rule_judge` role, filled by that stand-in (the same binding, so one helper). A `~` key
+        // the run never recorded claims nothing.
+        if let (Some(roles), Some(b)) = (
+            roles.as_mut(),
+            rc.rows
+                .iter()
+                .find_map(|row| crate::standin::binding_for(run, row.judge.as_deref())),
+        ) {
+            let mut answered = b.clone();
+            answered.role = crate::standin::Role::RuleJudge;
+            answered.state = crate::standin::STATE_ANSWERED.to_string();
+            answered.ord = Some(unit.ord);
+            answered.attempt = Some(attempt);
+            roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+        }
         match (&rc.note, rc.rows.is_empty()) {
             (Some(why), true) => r.skip(
                 crate::rule_check::INSTRUMENT,
