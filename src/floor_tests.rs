@@ -2985,17 +2985,24 @@ fn without_exclusion_the_retry_runs_before_the_base_and_a_pass_skips_the_base() 
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// The switch reads exactly `on` or `1`: nothing trimmed, nothing case-folded.
+/// (core#1101 item 3, operator decision 2026-11-25) Exclusion is ON by default: unset, `on` or `1`
+/// enable it; exactly `off` or `0` turn it off. Any other value is read as off, as an unknown value
+/// always was (the switch fails toward escalating, never toward excluding): nothing trimmed,
+/// nothing case-folded.
 #[test]
-fn the_exclusion_switch_reads_exactly_on_or_1() {
+fn the_exclusion_switch_is_on_by_default_and_off_only_when_asked() {
     for (v, on) in [
-        (None, false),
+        (None, true),
         (Some("on"), true),
         (Some("1"), true),
+        (Some("off"), false),
+        (Some("0"), false),
+        (Some("OFF"), false),
         (Some("ON"), false),
         (Some("true"), false),
         (Some(" on"), false),
         (Some("1\n"), false),
+        (Some(""), false),
     ] {
         assert_eq!(exclusion_from(v), on, "{v:?}");
     }
