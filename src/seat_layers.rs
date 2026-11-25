@@ -222,20 +222,34 @@ fn marker_matches(marker: &str, name: &str) -> bool {
     }
 }
 
-/// The ids of the layers whose markers name a regular file directly in `dir`.
-fn scan(dir: &Path, found: &mut BTreeSet<&'static str>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// The most entries [`detect`] reads in any one directory: a repository's root and its top-level
+/// directories hold far fewer; past it the rest of that directory is not read.
+const MAX_ENTRIES: usize = 4096;
+
+/// Up to [`MAX_ENTRIES`] entries of `dir` as (name, is a regular file, is a directory), never
+/// following a link (`DirEntry::file_type` does not), sorted by name.
+fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        // `DirEntry::file_type` does not follow a link: a linked marker is not a marker.
-        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+    let mut out: Vec<(String, bool, bool)> = read
+        .flatten()
+        .take(MAX_ENTRIES)
+        .filter_map(|e| {
+            let t = e.file_type().ok()?;
+            Some((e.file_name().to_str()?.to_string(), t.is_file(), t.is_dir()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Add the ids of the layers whose markers name one of `files`.
+fn mark(files: &[(String, bool, bool)], found: &mut BTreeSet<&'static str>) {
+    for (name, file, _) in files {
+        if !file {
             continue;
         }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
         for layer in CATALOG {
             if layer.markers.iter().any(|m| marker_matches(m, name)) {
                 found.insert(layer.id);
@@ -244,24 +258,23 @@ fn scan(dir: &Path, found: &mut BTreeSet<&'static str>) {
     }
 }
 
-/// The layers `tree` needs: marker files at its root and in its immediate subdirectories (not
-/// hidden, not dependency or build output, at most [`MAX_SUBDIRS`]), in catalog order.
+/// The layers `tree` needs: marker files (regular files, never a link) at its root and in its
+/// immediate subdirectories (not hidden, not dependency or build output, the first
+/// [`MAX_SUBDIRS`] by name), reading at most [`MAX_ENTRIES`] entries of each directory and
+/// stopping once every layer is found; in catalog order. Names only: no file is opened.
 pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
     let mut found = BTreeSet::new();
-    scan(tree, &mut found);
-    if let Ok(entries) = std::fs::read_dir(tree) {
-        let subdirs = entries
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| !n.starts_with('.') && !SKIP_DIRS.contains(&n))
-            })
-            .take(MAX_SUBDIRS);
-        for entry in subdirs {
-            scan(&entry.path(), &mut found);
+    let root = entries(tree);
+    mark(&root, &mut found);
+    let subdirs = root
+        .iter()
+        .filter(|(n, _, dir)| *dir && !n.starts_with('.') && !SKIP_DIRS.contains(&n.as_str()))
+        .take(MAX_SUBDIRS);
+    for (name, _, _) in subdirs {
+        if found.len() == CATALOG.len() {
+            break;
         }
+        mark(&entries(&tree.join(name)), &mut found);
     }
     CATALOG.iter().filter(|l| found.contains(l.id)).collect()
 }
@@ -316,6 +329,21 @@ pub(crate) fn tag_parts(layers: &[&Layer]) -> Vec<String> {
         .collect()
 }
 
+/// The Dockerfile instructions `built` (layers that build, in catalog order) add, labelled
+/// `wicked.seat.layers`.
+pub(crate) fn layer_block(built: &[&Layer]) -> String {
+    let ids: Vec<&str> = built.iter().map(|l| l.id).collect();
+    let mut block = format!(
+        "# wicked seat toolchain layers (core#1043): {}\n",
+        ids.join(",")
+    );
+    for l in built {
+        block.push_str(l.recipe);
+    }
+    block.push_str(&format!("LABEL wicked.seat.layers=\"{}\"\n", ids.join(",")));
+    block
+}
+
 /// `dockerfile` (a seat recipe) with the built layers' recipes inserted just before its
 /// `ARG CLI` line, labelled `wicked.seat.layers`. Unchanged when no layer builds.
 pub(crate) fn compose(dockerfile: &str, layers: &[&Layer]) -> String {
@@ -323,15 +351,7 @@ pub(crate) fn compose(dockerfile: &str, layers: &[&Layer]) -> String {
     if built.is_empty() {
         return dockerfile.to_string();
     }
-    let ids: Vec<&str> = built.iter().map(|l| l.id).collect();
-    let mut block = format!(
-        "# wicked seat toolchain layers (core#1043): {}\n",
-        ids.join(",")
-    );
-    for l in &built {
-        block.push_str(l.recipe);
-    }
-    block.push_str(&format!("LABEL wicked.seat.layers=\"{}\"\n", ids.join(",")));
+    let block = layer_block(&built);
     let mut out = String::with_capacity(dockerfile.len() + block.len());
     let mut placed = false;
     for line in dockerfile.split_inclusive('\n') {
@@ -443,15 +463,38 @@ mod tests {
         std::fs::create_dir_all(t.join("a/b")).unwrap();
         std::fs::write(t.join("a/b/build.gradle"), "").unwrap();
         std::fs::create_dir_all(t.join("package.json")).unwrap();
+        // Live links, to a real marker and to a directory holding one, are not followed.
         #[cfg(unix)]
-        {
+        let elsewhere = {
             let elsewhere = tree("detect-link-target");
             std::fs::write(elsewhere.join("pom.xml"), "").unwrap();
+            std::fs::write(elsewhere.join("go.work"), "").unwrap();
             std::os::unix::fs::symlink(elsewhere.join("pom.xml"), t.join("pom.xml")).unwrap();
             std::os::unix::fs::symlink(&elsewhere, t.join("linked")).unwrap();
-            std::fs::remove_dir_all(&elsewhere).ok();
-        }
+            assert!(t.join("pom.xml").is_file() && t.join("linked/pom.xml").is_file());
+            elsewhere
+        };
         assert_eq!(ids(&detect(&t)), vec!["go", "python", "rust"]);
+        #[cfg(unix)]
+        std::fs::remove_dir_all(&elsewhere).unwrap();
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    /// Only the first [`MAX_SUBDIRS`] subdirectories by name are read, whatever order the file
+    /// system lists them in, so one tree always detects the same layers.
+    #[test]
+    fn detection_reads_a_bounded_sorted_set_of_subdirectories() {
+        let t = tree("bounded");
+        for i in 0..MAX_SUBDIRS {
+            std::fs::create_dir_all(t.join(format!("d{i:04}"))).unwrap();
+        }
+        std::fs::write(t.join("d0000/go.mod"), "").unwrap();
+        // Past the bound by name: never read.
+        std::fs::create_dir_all(t.join("zz")).unwrap();
+        std::fs::write(t.join("zz/pom.xml"), "").unwrap();
+        for _ in 0..3 {
+            assert_eq!(ids(&detect(&t)), vec!["go"]);
+        }
         std::fs::remove_dir_all(&t).unwrap();
     }
 
@@ -539,6 +582,23 @@ mod tests {
         let py = by_id("python").recipe;
         assert!(py.find("sha256sum -c -").unwrap() < py.find("tar -xzf").unwrap());
         assert_eq!(py.matches("sum=").count(), 2);
+    }
+
+    /// CI builds the layers on the seat image from this fixture and runs each toolchain offline
+    /// on the default PATH (ci.yml `seat-toolchain`); it is the engine's own block, byte for byte.
+    /// `WICKED_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_ci_layer_fixture_is_the_block_the_engine_composes() {
+        let want = layer_block(&built(&parse("go,java,python").unwrap()));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/seat-layers/go-java-python.Dockerfile");
+        if std::env::var_os("WICKED_WRITE_FIXTURES").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &want).unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(got, want, "regenerate with WICKED_WRITE_FIXTURES=1");
+        assert!(compose("ARG CLI\n", &parse("go,java,python").unwrap()).starts_with(&want));
     }
 
     #[test]

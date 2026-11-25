@@ -654,9 +654,11 @@ pub(crate) fn seat_image_tag(
     Some(format!("wicked-seat-{cli}:{}", content_tag(&parts)))
 }
 
-/// [`seat_image_tag`] on `base` as the runtime has it now: an operator base keyed by its image
-/// id when the runtime answers for it (else by its name), and composed with no layer (the
-/// operator's base is the toolchain).
+/// The seat image a launch may REUSE on `base`: [`seat_image_tag`] with the default base's
+/// layers, or an operator base keyed by the image id the runtime reports for it now, composed with
+/// no layer (the operator's base is the toolchain). `None` for an operator base whose id the
+/// runtime does not report: nothing cached is reused then (codex r1 on core#1043), the build path
+/// settles the base and builds.
 fn seat_tag_on(
     rt: &Runtime,
     cli: &str,
@@ -664,8 +666,8 @@ fn seat_tag_on(
     layers: &[&crate::seat_layers::Layer],
 ) -> Option<String> {
     if base.operator {
-        let id = image_id(rt, &base.image);
-        seat_image_tag(cli, &base.image, id.as_deref(), &[])
+        let id = image_id(rt, &base.image)?;
+        seat_image_tag(cli, &base.image, Some(&id), &[])
     } else {
         seat_image_tag(cli, &base.image, None, layers)
     }
@@ -818,14 +820,33 @@ fn build_seat_image_on(
         );
         build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[]).map_err(no_image)?;
     }
-    // Keyed after the base is settled: an operator base rebuilt just now has its new id.
-    let tag = seat_tag_on(rt, cli, base, layers).expect("package exists");
+    // Keyed after the base is settled (an operator base rebuilt just now has its new id), and built
+    // FROM a pin of exactly that id, held through the build: an operator rebuild of the base's name
+    // meanwhile cannot land under this id's tag (codex r1 on core#1043). A base whose id the runtime
+    // does not report is built on by name and keyed by name: a fresh build, which no later launch
+    // reuses ([`seat_tag_on`]).
     let mut args = vec![format!("CLI={cli}")];
-    let dockerfile = if base.operator {
-        args.push(format!("BASE={}", base.image));
-        SEAT_DOCKERFILE.to_string()
+    let mut _base_pin: Option<SeatPin> = None;
+    let (tag, dockerfile) = if base.operator {
+        let (tag, from) = match image_id(rt, &base.image) {
+            Some(id) => {
+                let pin = pin_seat_image(rt, &base.image, &id).map_err(no_image)?;
+                let from = pin.tag().to_string();
+                _base_pin = Some(pin);
+                (seat_image_tag(cli, &base.image, Some(&id), &[]), from)
+            }
+            None => (
+                seat_image_tag(cli, &base.image, None, &[]),
+                base.image.clone(),
+            ),
+        };
+        args.push(format!("BASE={from}"));
+        (tag.expect("package exists"), SEAT_DOCKERFILE.to_string())
     } else {
-        crate::seat_layers::compose(&default_seat_dockerfile(), layers)
+        (
+            seat_image_tag(cli, &base.image, None, layers).expect("package exists"),
+            crate::seat_layers::compose(&default_seat_dockerfile(), layers),
+        )
     };
     args.extend(package.build_args());
     build_image(rt, &dockerfile, &tag, &args).map_err(|e| {
@@ -1454,18 +1475,18 @@ fn ensure_seat_image_with(
         )
     })?;
     static BUILD: Mutex<()> = Mutex::new(());
-    let tag = seat_tag_on(rt, cli, base, layers).expect("package exists");
-    if image_present(rt, &tag) {
+    if let Some(tag) = seat_tag_on(rt, cli, base, layers).filter(|t| image_present(rt, t)) {
         return Ok((tag, None));
     }
     let start = Instant::now();
     let _one = BUILD.lock();
-    if image_present(rt, &tag) {
+    // Keyed again under the lock: another unit may have rebuilt the base and built on it.
+    if let Some(tag) = seat_tag_on(rt, cli, base, layers).filter(|t| image_present(rt, t)) {
         // Another unit built it while this one waited.
         let waited = start.elapsed();
         return Ok((tag, (waited >= BUILD_WAIT_NOTE).then_some(waited)));
     }
-    eprintln!("wicked-core: building seat image {tag} (it is not on the container runtime)");
+    eprintln!("wicked-core: building the {cli} seat image (it is not on the container runtime)");
     let built = build_seat_image_on(rt, cli, package, base, layers)?;
     Ok((built, Some(start.elapsed())))
 }
@@ -2801,8 +2822,8 @@ pub(crate) fn arm_noting(
     // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
     // (core#1043) The toolchains the unit's tree needs, composed onto its seat image; none on an
-    // operator base, which is the operator's toolchain.
-    let layers = if configured_base().is_some() {
+    // operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's toolchain.
+    let layers = if configured_base().is_some() || image_override(cli).is_some() {
         Vec::new()
     } else {
         crate::seat_layers::for_tree(&spec.tree)
@@ -3799,10 +3820,12 @@ fn image_status_with(
                 .clone()
                 .or_else(|| seat_image_tag(cli, &base_image, base_id.as_deref(), layers))?;
             let s = state(&image, over.is_some());
+            // An operator base the runtime reports no id for has no reusable seat image yet.
+            let unkeyed = over.is_none() && cfg.base.is_some() && base_id.is_none();
             Some(SeatImageState {
                 cli: cli.clone(),
                 image,
-                present: s.present,
+                present: s.present && !unkeyed,
                 operator_image: over.is_some(),
             })
         })
@@ -5156,7 +5179,11 @@ esac
             .find(&format!("-t {tag} -"))
             .expect("the seat image was built");
         assert!(base_build < seat_build, "{calls}");
-        assert!(calls.contains("--build-arg BASE=seat-base:rust"), "{calls}");
+        // (core#1043) Built FROM a pin of the rebuilt base's exact id.
+        assert!(
+            calls.contains(&format!("--build-arg BASE=seat-base:id-{}", "b".repeat(64))),
+            "{calls}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

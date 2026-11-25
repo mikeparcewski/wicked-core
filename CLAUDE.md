@@ -42,7 +42,7 @@ embedded checks floor recipe as a named stage (the engine also ensures the stand
 image, rebuilding it if removed; `WICKED_SEAT_BASE_IMAGE` overrides), which links the pinned Rust
 toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` file is not applied. A unit's seat
 image also carries the toolchain layers its tree needs (`src/seat_layers.rs`, core#1043: `go.mod` ->
-Debian's Go, `pom.xml`/Gradle -> OpenJDK 21 + Maven, `pyproject.toml`/`requirements*.txt` -> uv),
+Debian's Go, `pom.xml`/Gradle -> OpenJDK 21 + Maven, `pyproject.toml`, `requirements*.txt`, `setup.py`, `uv.lock` or `Pipfile` -> uv),
 detected at arm from marker files and composed above the seat recipe's `ARG CLI`; never on an
 operator base; `WICKED_SEAT_LAYERS=off` turns detection off. A seat unit's
 `CARGO_HOME` always lives under `<worker home>/seat-build/<cli>` in the per-run, per-CLI replica
