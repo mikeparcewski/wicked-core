@@ -649,4 +649,51 @@ mod tests {
         let none: Vec<String> = Vec::new();
         assert_eq!(uncovered(&[by_id("rust")], &none)[0].1.len(), 3);
     }
+
+    /// (core#1043 part 2) A repo turns a detected layer off; the rest still compose, and the
+    /// daemon's `off` still wins.
+    #[test]
+    fn a_repo_turns_a_detected_layer_off() {
+        let t = tree("repo-off");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(ids(&for_tree_except(&t, None, &[])), ["go", "rust"]);
+        assert_eq!(
+            ids(&for_tree_except(&t, None, &["go".to_string()])),
+            ["rust"]
+        );
+        assert_eq!(
+            ids(&for_tree_except(&t, None, &["java".to_string()])),
+            ["go", "rust"],
+            "a layer the tree does not need changes nothing"
+        );
+        assert!(for_tree_except(&t, Some("off"), &[]).is_empty());
+    }
+
+    /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.
+    #[test]
+    fn a_repos_layer_rows_say_what_turned_a_layer_off() {
+        let t = tree("repo-rows");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        let view = |off: &[&str], setting: Option<&str>, operator_base: bool| {
+            let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
+            rows(&t, &off, setting, operator_base)
+                .into_iter()
+                .map(|r| (r.id, r.enabled, r.off_by))
+                .collect::<Vec<_>>()
+        };
+        let on = |id: &str| (id.to_string(), true, None);
+        let off = |id: &str, by: &str| (id.to_string(), false, Some(by.to_string()));
+        assert_eq!(view(&[], None, false), [on("go"), on("rust")]);
+        assert_eq!(view(&["go"], None, false), [off("go", "repo"), on("rust")]);
+        assert_eq!(
+            view(&["go"], Some("off"), false),
+            [off("go", "daemon"), off("rust", "daemon")]
+        );
+        assert_eq!(
+            view(&[], None, true),
+            [off("go", "operator_base"), off("rust", "operator_base")]
+        );
+    }
 }

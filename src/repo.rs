@@ -7024,4 +7024,70 @@ mod discard_minted_tests {
         assert!(!ok, "the branch is gone");
         rm_repo(&repo);
     }
+
+    /// (core#1043 part 2) A registered repo shows the toolchain layers its seats get, and keeps the
+    /// ones a person turned off: through a re-read and a re-registration, ids checked against the
+    /// catalog, and the list dispatch hands the unit's governance.
+    #[test]
+    fn a_repo_shows_its_seat_layers_and_keeps_the_ones_turned_off() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("layers1043");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let spec = || RepoSpec {
+            name: "Layers 1043".into(),
+            root_path: root.to_string_lossy().into_owned(),
+            registered_at: 0,
+        };
+        let rows = |e: &RepoEntry| {
+            e.seat_layers
+                .iter()
+                .map(|r| (r.id.clone(), r.enabled, r.off_by.clone()))
+                .collect::<Vec<_>>()
+        };
+        let entry = register_repo(&mut store, spec()).unwrap();
+        assert_eq!(
+            rows(&entry),
+            [
+                ("go".to_string(), true, None),
+                ("rust".to_string(), true, None)
+            ]
+        );
+        assert!(entry.seat_layers_off.is_empty());
+
+        let set = set_seat_layers_off(&mut store, &entry.id, &["go".into(), "go".into()]).unwrap();
+        assert_eq!(set.seat_layers_off, ["go"]);
+        let read = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(
+            rows(&read),
+            [
+                ("go".to_string(), false, Some("repo".to_string())),
+                ("rust".to_string(), true, None)
+            ]
+        );
+        assert_eq!(seat_layers_off_for(&store, Some(&entry.id)), ["go"]);
+        assert!(seat_layers_off_for(&store, None).is_empty());
+        let again = register_repo(&mut store, spec()).unwrap();
+        assert_eq!(
+            again.seat_layers_off,
+            ["go"],
+            "re-registering keeps the switch"
+        );
+
+        let err = set_seat_layers_off(&mut store, &entry.id, &["cobol".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cobol"), "{err}");
+        let err = set_seat_layers_off(&mut store, "no-such-repo", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no-such-repo"), "{err}");
+        let cleared = set_seat_layers_off(&mut store, &entry.id, &[]).unwrap();
+        assert!(cleared.seat_layers_off.is_empty());
+        assert!(rows(&cleared).iter().all(|(_, on, _)| *on));
+        rm_repo(&root);
+    }
 }
