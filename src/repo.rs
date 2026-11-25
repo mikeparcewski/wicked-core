@@ -506,6 +506,11 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
         .collect())
 }
 
+/// (core#1933) The repo list a person sees. Scaffold for the red test: today's `list_repos`.
+pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
+    list_repos(store)
+}
+
 /// Read one registered repo by id.
 pub fn get_repo(store: &dyn GraphRead, repo_id: &str) -> anyhow::Result<Option<RepoEntry>> {
     match store.get_node(&synthetic_symbol(REPO_ENTRY, repo_id))? {
@@ -7128,6 +7133,75 @@ mod discard_minted_tests {
         let (ok, _, _) = git(&root, &["rev-parse", "--verify", "--quiet", &branch]).unwrap();
         assert!(!ok, "the branch is gone");
         rm_repo(&repo);
+    }
+
+    /// (core#1933, W8) Only the person-facing reads detect a repo's seat layers. The engine's own
+    /// reads (`get_repo`, `list_repos`, which every dispatch makes several of) and dispatch's read
+    /// of the switch (`seat_layers_off_for`) list no directory, and their rows are empty rather
+    /// than the copy stored in the record. The repo list a person sees (`list_repos_shown`) reuses
+    /// one detection across polls, and detects again once that is forgotten (the TTL).
+    #[test]
+    fn repo_reads_do_not_rescan_the_checkout_1933() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let reads = || crate::seat_layers::DIR_READS.with(|n| n.get());
+        let root = git_repo("scan1933");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        for sub in ["api", "web", "docs"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Scan 1933".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let set = set_seat_layers_off(&mut store, &entry.id, &["rust".into()]).unwrap();
+        assert_eq!(
+            set.seat_layers.len(),
+            1,
+            "the setter's reply shows the rows"
+        );
+        crate::seat_layers::forget_detected(&root);
+
+        let before = reads();
+        for _ in 0..5 {
+            let e = get_repo(&store, &entry.id).unwrap().unwrap();
+            assert!(
+                e.seat_layers.is_empty(),
+                "not the stored copy: {:?}",
+                e.seat_layers
+            );
+            let all = list_repos(&store).unwrap();
+            assert!(all.iter().all(|e| e.seat_layers.is_empty()));
+            assert_eq!(seat_layers_off_for(&store, Some(&entry.id)), ["rust"]);
+        }
+        assert_eq!(reads() - before, 0, "the engine's reads list no directory");
+
+        let shown = |store: &dyn GraphRead| -> Vec<String> {
+            let all = list_repos_shown(store).unwrap();
+            all[0].seat_layers.iter().map(|r| r.id.clone()).collect()
+        };
+        let before = reads();
+        for _ in 0..5 {
+            assert_eq!(shown(&store), ["rust"]);
+        }
+        let one_detection = reads() - before;
+        assert!(
+            (1..=4).contains(&one_detection),
+            "5 polls reuse one detection (the root and its 3 subdirectories): {one_detection}"
+        );
+
+        // Past the TTL the next poll detects again and shows a new marker.
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        crate::seat_layers::forget_detected(&root);
+        assert_eq!(shown(&store), ["go", "rust"]);
+        rm_repo(&root);
     }
 
     /// (core#1043 part 2) A registered repo shows the toolchain layers its seats get, and keeps the

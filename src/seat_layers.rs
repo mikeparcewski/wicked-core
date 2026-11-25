@@ -242,6 +242,8 @@ fn first_by_name(listed: impl Iterator<Item = (String, bool, bool)>) -> Vec<(Str
 /// `dir`'s entries as (name, is a regular file, is a directory), never following a link
 /// (`DirEntry::file_type` does not): the first [`MAX_ENTRIES`] by name ([`first_by_name`]).
 fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
+    #[cfg(test)]
+    DIR_READS.with(|n| n.set(n.get() + 1));
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -249,6 +251,12 @@ fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
         let t = e.file_type().ok()?;
         Some((e.file_name().to_str()?.to_string(), t.is_file(), t.is_dir()))
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (core#1933) The directories [`detect`] listed on this thread, for tests that count them.
+    pub(crate) static DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Add the ids of the layers whose markers name one of `files`.
@@ -285,6 +293,10 @@ pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
     }
     CATALOG.iter().filter(|l| found.contains(l.id)).collect()
 }
+
+/// (core#1933) Scaffold for the red test: nothing is cached yet.
+#[cfg(test)]
+pub(crate) fn forget_detected(_tree: &Path) {}
 
 /// [`detect`] unless `setting` ([`LAYERS_ENV`]'s value) is `off`.
 pub(crate) fn for_tree_with(tree: &Path, setting: Option<&str>) -> Vec<&'static Layer> {
