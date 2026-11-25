@@ -19225,6 +19225,103 @@ mod boundary_tests {
         );
     }
 
+    /// crew#1935: an app's own worktree sits under `WICKED_HOME` (crew `apps/store.ts`
+    /// `wickedHomeDir('WICKED_CREW_APPS_ROOT', 'apps')`), and `WICKED_HOME` is one of the store
+    /// locations the raw-SQLite arm guards ([`graph_store_paths`]). Every path-shaped word of an
+    /// interpreter's program text (`.`, `f.name`) resolved from the worktree "into the store", so
+    /// crew's own taught apps self-check was refused as a raw SQLite open of the graph and no
+    /// Apps build landed (train 14, rows 15/16). The unit's own tree is never the store: a home
+    /// that HOLDS the worktree names the store only through a path that lands outside the tree.
+    #[test]
+    fn an_apps_worktree_under_wicked_home_runs_crews_self_check_1935() {
+        // crew `packages/crew/src/apps/turns.ts:46` APPS_SELF_CHECK_COMMAND, byte for byte.
+        const APPS_SELF_CHECK_COMMAND: &str = r#"python3 -c 'import json,pathlib
+def text(f):
+ try: return f.read_text(encoding="utf-8") if f.is_file() and not f.is_symlink() else None
+ except (UnicodeError,OSError): return None
+files={}
+for f in sorted(pathlib.Path(".").iterdir()):
+ if f.name in (".git","tmp"): continue
+ if f.name=="queries" and f.is_dir() and not f.is_symlink():
+  files.update({str(q):text(q) for q in sorted(f.iterdir())})
+ else: files[f.name]=text(f)
+print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -"#;
+        // The builder's refused Bash call on the train-14 proof daemon (run record
+        // `apps-steering-rules-project-d40721c09526`, `denial.refused_before_run[0].command`).
+        const T14_BUILDER_COMMAND: &str = r#"mkdir -p queries
+echo '{"from": "steering", "group": "kind"}' > queries/rules_by_type.json
+echo '{"from": "steering", "limit": 50}' > queries/rules_list.json
+cat > apps.json <<'E'
+{
+  "schema": "wicked.apps/v1",
+  "name": "Steering Rules by Type",
+  "pages": [
+    {
+      "id": "page-1",
+      "title": "Steering Rules",
+      "components": [
+        {"id": "rules_by_type_chart", "type": "chart", "chart": "bar", "title": "Steering rules by type", "box": {"x": 0, "y": 0, "w": 12, "h": 5}, "data": {"query": "rules_by_type"}, "x": "key", "series": [{"column": "count", "label": "Rules"}]},
+        {"id": "rules_table", "type": "table", "title": "Steering rules", "box": {"x": 0, "y": 5, "w": 12, "h": 8}, "data": {"query": "rules_list"}, "columns": [{"column": "title", "label": "Rule"}, {"column": "kind", "label": "Type"}, {"column": "severity", "label": "Severity"}, {"column": "content", "label": "Statement"}], "pageSize": 10}
+      ]
+    }
+  ],
+  "queries": [
+    {"id": "rules_by_type", "source": "estate", "kind": "recall", "output": [{"name": "key", "type": "string"}, {"name": "count", "type": "integer"}]},
+    {"id": "rules_list", "source": "estate", "kind": "recall", "output": [{"name": "title", "type": "string"}, {"name": "kind", "type": "string"}, {"name": "severity", "type": "string"}, {"name": "content", "type": "string"}]}
+  ],
+  "actions": [],
+  "linkHosts": []
+}
+E
+python3 -c 'import json,pathlib
+def text(f):
+ try: return f.read_text(encoding="utf-8") if f.is_file() and not f.is_symlink() else None
+ except (UnicodeError,OSError): return None
+files={}
+for f in sorted(pathlib.Path(".").iterdir()):
+ if f.name in (".git","tmp"): continue
+ if f.name=="queries" and f.is_dir() and not f.is_symlink():
+  files.update({str(q):text(q) for q in sorted(f.iterdir())})
+ else: files[f.name]=text(f)
+print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file - | head -c 1500"#;
+        assert!(T14_BUILDER_COMMAND.contains(APPS_SELF_CHECK_COMMAND));
+
+        let wicked_home =
+            std::env::temp_dir().join(format!("wicked-1935-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wicked_home);
+        let wt = wicked_home.join(
+            "apps/steering-rules-project.wicked/wicked-worktrees/\
+             apps-steering-rules-project-d40721c09526",
+        );
+        std::fs::create_dir_all(wt.join("queries")).unwrap();
+        std::fs::write(wicked_home.join("memory.db"), "fixture").unwrap();
+        let store = [wicked_home.clone()];
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let judge = |command: &str| {
+            boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+                None,
+                true,
+                &store,
+            )
+        };
+
+        // The gate hook's whole judgement allows crew's self-check, alone and as the builder ran it.
+        for command in [APPS_SELF_CHECK_COMMAND, T14_BUILDER_COMMAND] {
+            assert_eq!(judge(command), None, "{command}");
+        }
+
+        let _ = std::fs::remove_dir_all(&wicked_home);
+    }
+
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
     /// judged exactly as the evidence-derived read roots are. Reads inside it pass; a WRITE into it
     /// stays a fatal escape — a read root never widens write scope; reads outside every root stay
