@@ -44,7 +44,9 @@ toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` fi
 image also carries the toolchain layers its tree needs (`src/seat_layers.rs`, core#1043: `go.mod` ->
 Debian's Go, `pom.xml`/Gradle -> OpenJDK 21 + Maven, `pyproject.toml`, `requirements*.txt`, `setup.py`, `uv.lock` or `Pipfile` -> uv),
 detected at arm from marker files and composed above the seat recipe's `ARG CLI`; never on an
-operator base; `WICKED_SEAT_LAYERS=off` turns detection off. A seat unit's
+operator base; `WICKED_SEAT_LAYERS=off` turns detection off. A layer set that does not build never
+blocks a unit: it runs on the plain seat image with a note naming the layers, the build error and the
+`seat-image build <cli> --layers <ids>` retry. A new layered build removes the older images of its set. A seat unit's
 `CARGO_HOME` always lives under `<worker home>/seat-build/<cli>` in the per-run, per-CLI replica
 (never seeded or written back). A full-posture unit's `CARGO_TARGET_DIR` lives there too; a fenced
 unit keeps its per-unit `scratch/target`, removed at settle.

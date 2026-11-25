@@ -718,7 +718,26 @@ pub(crate) fn build_seat_image(
 ) -> Result<String, String> {
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
-    build_seat_image_on(rt, cli, package, &SeatBase::from_env(), layers).map_err(|(_, e)| e)
+    let base = SeatBase::from_env();
+    let built = build_seat_image_on(rt, cli, package, &base, layers).map_err(|(_, e)| e)?;
+    reclaim_after_build(rt, &base, &built, layers);
+    Ok(built)
+}
+
+/// [`reclaim_superseded_layer_images`] after `built` was built on the default base with layers.
+fn reclaim_after_build(
+    rt: &Runtime,
+    base: &SeatBase,
+    built: &str,
+    layers: &[&crate::seat_layers::Layer],
+) {
+    let ids: Vec<&str> = crate::seat_layers::built(layers)
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    if !base.operator && !ids.is_empty() {
+        reclaim_superseded_layer_images(rt, built, &ids.join(","));
+    }
 }
 
 /// The base the seat images build on: the operator's own ([`BASE_IMAGE_ENV`], with its recipe
@@ -1438,7 +1457,7 @@ pub(crate) fn build_image(
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
     ensure_seat_image_noting(rt, cli, &[])
-        .map(|(tag, _)| tag)
+        .map(|(tag, _, _)| tag)
         .map_err(|(_, e)| e)
 }
 
@@ -1446,12 +1465,141 @@ pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, Strin
 /// first use, or a runtime's image cleanup deleted it) and had to be built, by this call or by
 /// another unit it waited for, for the unit's note. `Err` carries the arm's typed reason.
 /// `layers` are the unit's toolchain layers ([`crate::seat_layers`]); none on an operator base.
+/// The third value is the unit's note when its layers did not build ([`ensure_layered_seat_image`]).
 pub(crate) fn ensure_seat_image_noting(
     rt: &Runtime,
     cli: &str,
     layers: &[&crate::seat_layers::Layer],
-) -> Result<(String, Option<Duration>), (FloorUnarmed, String)> {
-    ensure_seat_image_with(rt, cli, image_override(cli), &SeatBase::from_env(), layers)
+) -> Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)> {
+    ensure_layered_seat_image(rt, cli, image_override(cli), &SeatBase::from_env(), layers)
+}
+
+/// (coord R2 F1 on core#1043) The layered seat images that failed to build in this process, by
+/// tag, with the build's error: a later unit runs on the plain image without building the set
+/// again, unless the image has since appeared (an operator's `seat-image build --layers`).
+static FAILED_LAYER_SETS: Mutex<std::collections::BTreeMap<String, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// [`ensure_seat_image_with`] for a unit with toolchain layers. A toolchain layer never blocks a
+/// run: when the layered image cannot be built, the unit runs on the plain seat image and the
+/// third value is its note (the layers, the build's own last words, the command to retry). An
+/// error is the plain image's own.
+fn ensure_layered_seat_image(
+    rt: &Runtime,
+    cli: &str,
+    over: Option<String>,
+    base: &SeatBase,
+    layers: &[&crate::seat_layers::Layer],
+) -> Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)> {
+    let built = crate::seat_layers::built(layers);
+    if over.is_some() || built.is_empty() {
+        return ensure_seat_image_with(rt, cli, over, base, layers).map(|(t, w)| (t, w, None));
+    }
+    let failed = |tag: &str| {
+        FAILED_LAYER_SETS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(tag)
+            .cloned()
+    };
+    let key = seat_tag_on(rt, cli, base, layers);
+    let known = key
+        .as_deref()
+        .and_then(|k| failed(k).filter(|_| !image_present(rt, k)));
+    let error = match known {
+        Some(e) => e,
+        None => match ensure_seat_image_with(rt, cli, None, base, layers) {
+            Ok((tag, waited)) => return Ok((tag, waited, None)),
+            Err((_, e)) => {
+                eprintln!(
+                    "wicked-core: the {cli} seat image's toolchain layers did not build: {e}"
+                );
+                if let Some(k) = key {
+                    FAILED_LAYER_SETS
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(k, e.clone());
+                }
+                e
+            }
+        },
+    };
+    let (tag, waited) = ensure_seat_image_with(rt, cli, None, base, &[])?;
+    Ok((tag, waited, Some(layer_fallback_note(cli, &built, &error))))
+}
+
+/// The note of a unit whose layers did not build: which, the build's last line, how to retry.
+fn layer_fallback_note(cli: &str, built: &[&crate::seat_layers::Layer], error: &str) -> String {
+    let ids: Vec<&str> = built.iter().map(|l| l.id).collect();
+    let last = error.rsplit(" | ").next().unwrap_or(error).trim();
+    let last: String = last.chars().take(400).collect();
+    format!(
+        "[engine — seat toolchain] this repository's {} toolchain layer{} did not build, so this \
+         unit runs on the plain {cli} seat image without {}. The build said: {last}. To retry \
+         with the layers: `wicked-core seat-image build {cli} --layers {}` (a later unit uses the \
+         image once it is built). `WICKED_SEAT_LAYERS=off` turns layer detection off.",
+        ids.join(", "),
+        if ids.len() == 1 { "" } else { "s" },
+        if ids.len() == 1 { "it" } else { "them" },
+        ids.join(",")
+    )
+}
+
+/// (coord R2 F2 on core#1043) After `current` (a layered seat image) is built, remove the older
+/// content tags of the same CLI and layer set (`wicked.seat.layers` = `ids`): a CLI pin bump or
+/// a recipe change would otherwise leave one image per layer set behind. Pins (`:id-<hex>`)
+/// are [`cleanup_seat_image_pins`]'s, and every removal runs under the pins' lock: a tag a
+/// launch holds is never removed, and removing a tag whose image a pin still names only untags it.
+fn reclaim_superseded_layer_images(rt: &Runtime, current: &str, ids: &str) {
+    let Some((repo, _)) = current.rsplit_once(':') else {
+        return;
+    };
+    let mut list = rt.cmd();
+    list.args([
+        "image",
+        "ls",
+        "--filter",
+        &format!("label=wicked.seat.layers={ids}"),
+        "--format",
+        "{{.Repository}}:{{.Tag}}",
+        repo,
+    ]);
+    let result = crate::k8s::run_bounded(list, None, rt.bound(PROBE_TIMEOUT));
+    if !result.ok() {
+        eprintln!(
+            "wicked-core: cannot list older layered seat images: {}",
+            result.err_text()
+        );
+        return;
+    }
+    for tag in String::from_utf8_lossy(&result.stdout).lines() {
+        let Some((tag_repo, suffix)) = tag.rsplit_once(':') else {
+            continue;
+        };
+        if tag_repo != repo
+            || tag == current
+            || suffix.len() != current.len() - repo.len() - 1
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let held = seat_pins_held();
+        if held.contains_key(tag) {
+            continue;
+        }
+        let mut remove = rt.cmd();
+        remove.args(["image", "rm", tag]);
+        let result = crate::k8s::run_bounded(remove, None, rt.bound(PROBE_TIMEOUT));
+        drop(held);
+        if !result.ok() {
+            eprintln!(
+                "wicked-core: cannot remove superseded seat image {tag}: {}",
+                result.err_text()
+            );
+        }
+    }
 }
 
 /// A wait on another unit's build shorter than this is not a rebuild worth a note.
@@ -1488,6 +1636,7 @@ fn ensure_seat_image_with(
     }
     eprintln!("wicked-core: building the {cli} seat image (it is not on the container runtime)");
     let built = build_seat_image_on(rt, cli, package, base, layers)?;
+    reclaim_after_build(rt, base, &built, layers);
     Ok((built, Some(start.elapsed())))
 }
 
@@ -2828,16 +2977,23 @@ pub(crate) fn arm_noting(
     } else {
         crate::seat_layers::for_tree(&spec.tree)
     };
-    let (image, built_in) = ensure_seat_image_noting(&rt, cli, &layers)?;
+    let (image, built_in, fell_back) = ensure_seat_image_noting(&rt, cli, &layers)?;
     // Egress is never widened for a layer: the unit is told which of its hosts the allowlist
-    // lacks (an offline seat chose no egress at all).
-    let notes: Vec<String> = (!offline_seats())
-        .then(|| {
-            crate::seat_layers::egress_note(&layers, &crate::seat_gateway::egress_hosts_from_env())
-        })
-        .flatten()
-        .into_iter()
-        .collect();
+    // lacks (an offline seat chose no egress at all). A unit whose layers did not build is told
+    // that instead (coord R2 F1).
+    let notes: Vec<String> = match fell_back {
+        Some(note) => vec![note],
+        None => (!offline_seats())
+            .then(|| {
+                crate::seat_layers::egress_note(
+                    &layers,
+                    &crate::seat_gateway::egress_hosts_from_env(),
+                )
+            })
+            .flatten()
+            .into_iter()
+            .collect(),
+    };
     if let Some(waited) = built_in {
         on_built(&image, waited);
     }
@@ -5411,7 +5567,11 @@ esac
         )
         .unwrap();
         let ls = dir.join("listed");
-        std::fs::write(&ls, listed.iter().map(|p| format!("{p}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &ls,
+            listed.iter().map(|p| format!("{p}\n")).collect::<String>(),
+        )
+        .unwrap();
         crate::test_env::install_stub(
             &rt,
             &format!(

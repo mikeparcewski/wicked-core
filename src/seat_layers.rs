@@ -222,26 +222,33 @@ fn marker_matches(marker: &str, name: &str) -> bool {
     }
 }
 
-/// The most entries [`detect`] reads in any one directory: a repository's root and its top-level
-/// directories hold far fewer; past it the rest of that directory is not read.
+/// The most entries [`detect`] keeps of any one directory, the first by name: a repository's root
+/// and its top-level directories hold far fewer.
 const MAX_ENTRIES: usize = 4096;
 
-/// Up to [`MAX_ENTRIES`] entries of `dir` as (name, is a regular file, is a directory), never
-/// following a link (`DirEntry::file_type` does not), sorted by name.
+/// The most entries [`detect`] lists in any one directory before it sorts them, so a directory
+/// a seat filled with names cannot make detection slow. Below it the kept set is the first
+/// [`MAX_ENTRIES`] by name, whatever order the filesystem lists them in.
+const MAX_LISTED: usize = 65536;
+
+/// The first [`MAX_ENTRIES`] of `listed` by name, of at most [`MAX_LISTED`] read.
+fn first_by_name(listed: impl Iterator<Item = (String, bool, bool)>) -> Vec<(String, bool, bool)> {
+    let mut out: Vec<(String, bool, bool)> = listed.take(MAX_LISTED).collect();
+    out.sort();
+    out.truncate(MAX_ENTRIES);
+    out
+}
+
+/// `dir`'s entries as (name, is a regular file, is a directory), never following a link
+/// (`DirEntry::file_type` does not): the first [`MAX_ENTRIES`] by name ([`first_by_name`]).
 fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(String, bool, bool)> = read
-        .flatten()
-        .take(MAX_ENTRIES)
-        .filter_map(|e| {
-            let t = e.file_type().ok()?;
-            Some((e.file_name().to_str()?.to_string(), t.is_file(), t.is_dir()))
-        })
-        .collect();
-    out.sort();
-    out
+    first_by_name(read.flatten().filter_map(|e| {
+        let t = e.file_type().ok()?;
+        Some((e.file_name().to_str()?.to_string(), t.is_file(), t.is_dir()))
+    }))
 }
 
 /// Add the ids of the layers whose markers name one of `files`.
@@ -260,7 +267,7 @@ fn mark(files: &[(String, bool, bool)], found: &mut BTreeSet<&'static str>) {
 
 /// The layers `tree` needs: marker files (regular files, never a link) at its root and in its
 /// immediate subdirectories (not hidden, not dependency or build output, the first
-/// [`MAX_SUBDIRS`] by name), reading at most [`MAX_ENTRIES`] entries of each directory and
+/// [`MAX_SUBDIRS`] by name), keeping the first [`MAX_ENTRIES`] entries of each directory by name and
 /// stopping once every layer is found; in catalog order. Names only: no file is opened.
 pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
     let mut found = BTreeSet::new();
