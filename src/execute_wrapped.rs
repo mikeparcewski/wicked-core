@@ -3362,6 +3362,24 @@ impl WrappedCliStepRunner {
         // the CLI that will run it — and so admission knows WHICH CLI it is admitting for.
         let binary = template_binary(&invocation);
         let is_claude = binary_is_claude(&binary);
+        // (DES-STANDIN-001 §3.4, core#1881) A host-floor stand-in this template cannot keep out of
+        // its base's sessions is refused HERE, before any seat dir, skills copy or scratch exists.
+        if wicked_apps_core::spawn::seat_id::is_stand_in(&cli_key)
+            && !uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            )
+        {
+            if let Err(why) = host_stand_in_admits(
+                &invocation,
+                wicked_apps_core::spawn::SeatCli::from_binary(&binary),
+            ) {
+                return StepOutput {
+                    output: format!("(the stand-in's launch was refused: {why})"),
+                    ..posture_refusal(input, &why)
+                };
+            }
+        }
         // On the wrapped path the CLI IS the carrier, so its lever (v3.2) is the CLI's own.
         let worker_cli =
             crate::skills_snapshot::WorkerCli::for_binaries(&binary, &binary, &cli_key);
@@ -3963,6 +3981,25 @@ impl WrappedCliStepRunner {
         if seat_cli == wicked_apps_core::spawn::SeatCli::Codex {
             apply_seat_posture(&mut argv, &codex_shell_pins());
         }
+        // (DES-STANDIN-001 §3.4, core#1881) A stand-in on the HOST floor runs in its base's CLI
+        // home, where the base's credential lives: it keeps no session there and reads no
+        // auto-memory its base's builder turns wrote (a container stand-in has a home of its own,
+        // `seat_home_leaf`). A CLI with no such switch is refused, never run sharing the stores.
+        let host_stand_in_env = if wicked_apps_core::spawn::seat_id::is_stand_in(&cli_key)
+            && !uses_container_seat(runs_in_seat(input), container)
+        {
+            match host_stand_in_fresh(&mut argv, &invocation, seat_cli) {
+                Ok(env) => env,
+                Err(why) => {
+                    return StepOutput {
+                        output: format!("(the stand-in's launch was refused: {why})"),
+                        ..posture_refusal(input, &why)
+                    }
+                }
+            }
+        } else {
+            Vec::new()
+        };
         if input.governance.is_some() && !ask_enabled {
             eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
@@ -4742,6 +4779,10 @@ impl WrappedCliStepRunner {
             // delivery and applied here AFTER `hardened()`: this seat's own configuration-home
             // variable set, every foreign one stripped, the inherit hatch touching nothing.
             seat_config.apply(&mut cmd);
+            // (core#1881) A host-floor stand-in's no-memory switch, after the seat's own variables.
+            for (k, v) in &host_stand_in_env {
+                cmd.env(k, v);
+            }
             // The env half of the claude unit's `CLAUDE.md` (its tree rides `--add-dir`, see
             // `inject_isolation_flags`): claude reads an additional directory's instruction files
             // only with this set. Never on a team member turn: its additional directory is the
@@ -7638,6 +7679,156 @@ pub(crate) fn apply_no_code_posture(
     }
     apply_seat_posture(argv, &flags);
     Ok(p.lever)
+}
+
+/// (core#1881) Claude Code's switch that turns its auto-memory off, reads and writes alike.
+pub(crate) const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
+/// (core#1881) The template options that would put a stand-in back into a session its base's
+/// builder left: each CLI's resume / continue / named-session selectors (bare or `--opt=value`).
+/// Codex's selector is its `resume` subcommand (`codex exec resume …`), matched as a token.
+fn stand_in_resume_selectors(cli: wicked_apps_core::spawn::SeatCli) -> &'static [&'static str] {
+    use wicked_apps_core::spawn::SeatCli;
+    match cli {
+        SeatCli::Claude => &[
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--session-id",
+            "--fork-session",
+            "--from-pr",
+        ],
+        SeatCli::Codex => &["resume", "--last"],
+        SeatCli::Pi => &["--resume", "-r", "--continue", "-c", "--session"],
+        _ => &[],
+    }
+}
+
+/// (core#1881) The trusted template's own tokens: every token of `invocation` but the placeholders
+/// (`{PROMPT}`, `{SKILLS}`), which the argv fills with text no option check may read.
+fn template_literals(invocation: &str) -> Vec<String> {
+    tokenize(invocation)
+        .into_iter()
+        .filter(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .collect()
+}
+
+/// (DES-STANDIN-001 §3.4, core#1881) Whether a HOST-floor stand-in may launch on this template at
+/// all, decided before anything is written for it (no seat dirs, no skills, no scratch): its CLI
+/// must have a no-store switch (claude, codex as `exec`, pi), and no literal token of the TRUSTED
+/// template may select a session (`--resume`, `--continue`, `exec resume`, … — before or after a
+/// placeholder). See [`host_stand_in_fresh`].
+pub(crate) fn host_stand_in_admits(
+    invocation: &str,
+    cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<(), String> {
+    use wicked_apps_core::spawn::SeatCli;
+    let literals = template_literals(invocation);
+    let selectors = stand_in_resume_selectors(cli);
+    if let Some(sel) = literals.iter().skip(1).find(|t| {
+        selectors
+            .iter()
+            .any(|s| *t == s || (s.starts_with("--") && t.starts_with(&format!("{s}="))))
+    }) {
+        return Err(format!(
+            "the stand-in's {cli:?} template selects a session of its own (`{sel}`); a stand-in \
+             starts fresh, so it never resumes one its base's builder left"
+        ));
+    }
+    match cli {
+        SeatCli::Claude | SeatCli::Pi => Ok(()),
+        SeatCli::Codex if codex_template_exec(invocation).is_some() => Ok(()),
+        SeatCli::Codex => Err(
+            "a codex stand-in runs only as `codex exec` on the host floor (`--ephemeral` keeps it \
+             out of its base's session store); this template has no `exec`, so it runs only in a \
+             seat container (the container floor)"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "a stand-in on {other:?} would run in its base's home on the host floor and could \
+             read the session store its base's builder left there; it runs only in a seat \
+             container (the container floor)"
+        )),
+    }
+}
+
+/// The trusted codex template's `exec`: its index among the tokens before the first placeholder,
+/// and which `exec` token it is there (the first, unless an option's value also spells `exec`).
+fn codex_template_exec(invocation: &str) -> Option<(usize, usize)> {
+    let template = tokenize(invocation);
+    let prefix: Vec<&String> = template
+        .iter()
+        .take_while(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .collect();
+    let at = prefix
+        .iter()
+        .position(|t| *t == "exec")
+        .filter(|&i| i > 0)?;
+    Some((at, prefix[..=at].iter().filter(|t| **t == "exec").count()))
+}
+
+/// (DES-STANDIN-001 §3.4, core#1881) A HOST-floor stand-in shares its base's CLI home: the
+/// credential lives there (claude's keychain entry is even keyed by its config dir), so the home
+/// cannot move. What must not be shared is what the base's builder turns left there: the session
+/// store and the auto-memory. Each CLI's own switch keeps the stand-in from saving a session or
+/// loading the memory, and the credential is untouched, so the base stays signed in:
+/// - claude: `--no-session-persistence` (nothing saved, nothing to resume) and auto-memory off
+///   ([`CLAUDE_DISABLE_AUTO_MEMORY_ENV`]); it never resumes (core#1863);
+/// - codex: `--ephemeral` right after the template's `exec` (no session files);
+/// - pi: `--no-session`.
+///
+/// [`host_stand_in_admits`] first (the launch checks it before anything is written; this repeats
+/// it). Only the TRUSTED template's tokens count: the argv also holds the untrusted prompt, which
+/// may spell any option (as [`inject_codex_write_roots`] reads it). Codex's `exec` is found in the
+/// argv as the same `exec` token the template names, at or before its template index (the posture
+/// may have dropped a global option before it, `-C <dir>`). Returns the environment to set. The
+/// switches stop the stand-in INHERITING its base's sessions and memory; the host floor is no read
+/// jail for any seat (the container floor gives a stand-in a home of its own).
+pub(crate) fn host_stand_in_fresh(
+    argv: &mut Vec<String>,
+    invocation: &str,
+    cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    host_stand_in_admits(invocation, cli)?;
+    let literals = template_literals(invocation);
+    match cli {
+        SeatCli::Claude | SeatCli::Pi => {
+            let flag = if cli == SeatCli::Claude {
+                "--no-session-persistence"
+            } else {
+                "--no-session"
+            };
+            if !literals.iter().any(|t| t == flag) {
+                apply_seat_posture(argv, &[flag.to_string()]);
+            }
+        }
+        SeatCli::Codex => {
+            let (at, nth) = codex_template_exec(invocation).ok_or("no `exec` in the template")?;
+            let exec = argv
+                .iter()
+                .enumerate()
+                .take(at + 1)
+                .skip(1)
+                .filter(|(_, a)| *a == "exec")
+                .nth(nth - 1)
+                .map(|(i, _)| i)
+                .ok_or_else(|| {
+                    "the codex stand-in's argv lost the template's `exec`; refused, never run \
+                     sharing its base's session store"
+                        .to_string()
+                })?;
+            if !literals.iter().any(|t| t == "--ephemeral") {
+                argv.insert(exec + 1, "--ephemeral".to_string());
+            }
+        }
+        _ => unreachable!("host_stand_in_admits refused every other CLI"),
+    }
+    Ok(match cli {
+        SeatCli::Claude => vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")],
+        _ => Vec::new(),
+    })
 }
 
 /// The `-c` pin that keeps a codex seat's command shell from being a login shell
@@ -15362,6 +15553,319 @@ mod tests {
         );
         assert!(!plain.contains("context document"), "{plain}");
         publish(&run, None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (core#1881) A host-floor stand-in keeps no session in its base's home and reads no
+    /// auto-memory there: each CLI's own switch, read off the TRUSTED template; a template that
+    /// selects a session is refused; any other CLI refused.
+    #[test]
+    fn a_host_stand_in_runs_with_its_clis_no_session_switches() {
+        use wicked_apps_core::spawn::SeatCli;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut claude = s(&["/opt/bin/claude", "-p", "--", "the prompt"]);
+        let env = host_stand_in_fresh(
+            &mut claude,
+            "/opt/bin/claude -p -- {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
+        assert_eq!(
+            claude,
+            s(&[
+                "/opt/bin/claude",
+                "-p",
+                "--no-session-persistence",
+                "--",
+                "the prompt"
+            ])
+        );
+        assert_eq!(env, vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]);
+        // A template that states it: one flag, never two.
+        let mut stated = s(&["/opt/bin/claude", "-p", "--no-session-persistence", "x"]);
+        host_stand_in_fresh(
+            &mut stated,
+            "/opt/bin/claude -p --no-session-persistence {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
+        assert_eq!(
+            stated,
+            s(&["/opt/bin/claude", "-p", "--no-session-persistence", "x"])
+        );
+        // A PROMPT that spells the switch is no switch: it is still added.
+        let mut spelled = s(&["/opt/bin/claude", "-p", "--no-session-persistence"]);
+        host_stand_in_fresh(&mut spelled, "/opt/bin/claude -p {PROMPT}", SeatCli::Claude).unwrap();
+        assert_eq!(
+            spelled
+                .iter()
+                .filter(|a| *a == "--no-session-persistence")
+                .count(),
+            2
+        );
+        let mut codex = s(&["/opt/bin/codex", "exec", "--", "the prompt"]);
+        assert!(host_stand_in_fresh(
+            &mut codex,
+            "/opt/bin/codex exec -- {PROMPT}",
+            SeatCli::Codex
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            codex,
+            s(&["/opt/bin/codex", "exec", "--ephemeral", "--", "the prompt"])
+        );
+        // codex r1: global options with values before `exec` (`-c k=v`, `-m model`).
+        let mut global = s(&[
+            "/opt/bin/codex",
+            "-c",
+            "model=m",
+            "-m",
+            "o3",
+            "exec",
+            "--skip-git-repo-check",
+            "the prompt",
+        ]);
+        host_stand_in_fresh(
+            &mut global,
+            "/opt/bin/codex -c model=m -m o3 exec --skip-git-repo-check {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            global,
+            s(&[
+                "/opt/bin/codex",
+                "-c",
+                "model=m",
+                "-m",
+                "o3",
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "the prompt"
+            ])
+        );
+        // codex delta: the posture dropped a global option before `exec` (`-C <dir>`): the
+        // template's `exec` is still found, at an earlier index.
+        let mut stripped = s(&["/opt/bin/codex", "exec", "the prompt"]);
+        host_stand_in_fresh(
+            &mut stripped,
+            "/opt/bin/codex -C /repo exec {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            stripped,
+            s(&["/opt/bin/codex", "exec", "--ephemeral", "the prompt"])
+        );
+        let mut pi = s(&["/opt/bin/pi", "-p", "the prompt"]);
+        host_stand_in_fresh(&mut pi, "/opt/bin/pi -p {PROMPT}", SeatCli::Pi).unwrap();
+        assert_eq!(pi, s(&["/opt/bin/pi", "-p", "the prompt", "--no-session"]));
+        // codex outside `exec` has no `--ephemeral`: refused, even when the PROMPT says `exec`.
+        for (argv, tpl) in [
+            (
+                s(&["/opt/bin/codex", "the prompt"]),
+                "/opt/bin/codex {PROMPT}",
+            ),
+            (s(&["/opt/bin/codex", "exec"]), "/opt/bin/codex {PROMPT}"),
+        ] {
+            let mut argv = argv;
+            let before = argv.clone();
+            assert!(host_stand_in_fresh(&mut argv, tpl, SeatCli::Codex).is_err());
+            assert_eq!(argv, before, "nothing added");
+        }
+        // codex r1: a template that selects a session of its own is refused, every spelling.
+        for (cli, tpl) in [
+            (SeatCli::Claude, "/opt/bin/claude -p --resume abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p --resume=abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p -r abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p --continue {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p -c {PROMPT}"),
+            (
+                SeatCli::Claude,
+                "/opt/bin/claude -p --session-id u {PROMPT}",
+            ),
+            (SeatCli::Codex, "/opt/bin/codex exec resume --last {PROMPT}"),
+            (SeatCli::Codex, "/opt/bin/codex exec resume abc {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --continue {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p -r {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --session /x.jsonl {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --session=/x.jsonl {PROMPT}"),
+            // codex delta: a selector AFTER a placeholder is a template token too.
+            (SeatCli::Claude, "/opt/bin/claude -p {PROMPT} --resume abc"),
+            (
+                SeatCli::Claude,
+                "/opt/bin/claude -p {SKILLS} --continue {PROMPT}",
+            ),
+            (SeatCli::Pi, "/opt/bin/pi -p {PROMPT} --session /x.jsonl"),
+        ] {
+            let mut argv = tokenize(&tpl.replace("{PROMPT}", "the prompt"));
+            let why = host_stand_in_fresh(&mut argv, tpl, cli).unwrap_err();
+            assert!(why.contains("selects a session"), "{tpl}: {why}");
+        }
+        // The same words in the PROMPT select nothing: the stand-in runs.
+        let mut prompt_says = s(&["/opt/bin/claude", "-p", "--resume"]);
+        host_stand_in_fresh(
+            &mut prompt_says,
+            "/opt/bin/claude -p {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
+        // codex's `-c` is a config override, not a selector.
+        let mut config = s(&["/opt/bin/codex", "-c", "k=v", "exec", "p"]);
+        host_stand_in_fresh(
+            &mut config,
+            "/opt/bin/codex -c k=v exec {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
+        for cli in [
+            SeatCli::Copilot,
+            SeatCli::Opencode,
+            SeatCli::Agy,
+            SeatCli::Other,
+        ] {
+            let mut argv = s(&["/opt/bin/x", "the prompt"]);
+            let why = host_stand_in_fresh(&mut argv, "/opt/bin/x {PROMPT}", cli).unwrap_err();
+            assert!(why.contains("container floor"), "{why}");
+            assert_eq!(argv, s(&["/opt/bin/x", "the prompt"]), "nothing added");
+        }
+    }
+
+    /// (core#1881) END-TO-END through `run_unit` on the host floor: a codex stand-in runs
+    /// `exec --ephemeral` on its base's home and the base's own turn does not; a copilot stand-in
+    /// is refused before it spawns.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_stand_in_unit_runs_ephemeral_and_its_base_does_not() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let _host = VarGuard::unset(crate::container_floor::SEAT_FLOOR_ENV);
+        let home = std::env::temp_dir().join(format!(
+            "wicked-host-stand-in-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = fake_cli(&dir, "codex");
+        let copilot = fake_cli(&dir, "copilot");
+        let run = |key: &str, invocation: String| {
+            let mut u = WorkUnit::pending("s:review", "s", 2, "review the work");
+            u.role = crate::workflow::PhaseRole::Evaluator;
+            u.assigned_cli = Some(key.to_string());
+            u.assigned_invocation = Some(invocation);
+            let input = StepInput {
+                base_commit: None,
+                run_id: "run-host-stand-in".to_string(),
+                unit_ix: 1,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            WrappedCliStepRunner::default().run_unit(&input)
+        };
+        // codex delta: a refused stand-in writes nothing first (no seat dir, no skills, no
+        // scratch): on a fresh home the worker home is still absent after both refusals.
+        let worker = home.join(".wicked-worker");
+        let resumed = run("codex~1", format!("{codex} exec resume --last {{PROMPT}}"));
+        assert_eq!(resumed.status, StepStatus::Failed, "{}", resumed.output);
+        assert!(
+            resumed.output.contains("selects a session"),
+            "{}",
+            resumed.output
+        );
+        let refused = run("copilot~1", format!("{copilot} -p {{PROMPT}}"));
+        assert_eq!(refused.status, StepStatus::Failed, "{}", refused.output);
+        assert!(
+            refused.output.contains("container floor") && !refused.output.contains("ARGV="),
+            "{}",
+            refused.output
+        );
+        assert!(
+            !worker.exists(),
+            "a refused stand-in wrote its seat home first"
+        );
+        let stand_in = run("codex~1", format!("{codex} exec {{PROMPT}}"));
+        assert_eq!(stand_in.status, StepStatus::Ok, "{}", stand_in.output);
+        // codex delta: a global option the read-only posture drops before `exec` (`-C <dir>`).
+        let rooted = run(
+            "codex~1",
+            format!("{codex} -C {} exec {{PROMPT}}", dir.display()),
+        );
+        assert_eq!(rooted.status, StepStatus::Ok, "{}", rooted.output);
+        assert!(rooted.output.contains("--ephemeral"), "{}", rooted.output);
+        assert!(
+            stand_in.output.contains("--ephemeral"),
+            "{}",
+            stand_in.output
+        );
+        let base = run("codex", format!("{codex} exec {{PROMPT}}"));
+        assert_eq!(base.status, StepStatus::Ok, "{}", base.output);
+        assert!(!base.output.contains("--ephemeral"), "{}", base.output);
+        // claude: the switch on the argv and auto-memory off in the CHILD's environment.
+        let _no_mem = VarGuard::unset(CLAUDE_DISABLE_AUTO_MEMORY_ENV);
+        let claude = dir.join("claude");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &claude,
+                "#!/bin/sh\necho \"ARGV=[$*] MEM=[$CLAUDE_CODE_DISABLE_AUTO_MEMORY]\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let claude = claude.to_string_lossy().into_owned();
+        let stand_in = run("claude~1", format!("{claude} -p {{PROMPT}}"));
+        assert_eq!(stand_in.status, StepStatus::Ok, "{}", stand_in.output);
+        assert!(
+            stand_in.output.contains("--no-session-persistence")
+                && stand_in.output.contains("MEM=[1]"),
+            "{}",
+            stand_in.output
+        );
+        let base = run("claude", format!("{claude} -p {{PROMPT}}"));
+        assert_eq!(base.status, StepStatus::Ok, "{}", base.output);
+        assert!(
+            !base.output.contains("--no-session-persistence") && base.output.contains("MEM=[]"),
+            "{}",
+            base.output
+        );
+        // A stand-in whose template resumes a session is refused before it spawns.
+        let resumed = run("claude~1", format!("{claude} -p --resume abc {{PROMPT}}"));
+        assert_eq!(resumed.status, StepStatus::Failed, "{}", resumed.output);
+        assert!(
+            resumed.output.contains("selects a session") && !resumed.output.contains("ARGV="),
+            "{}",
+            resumed.output
+        );
+        // The worker home holds the base's home only: no `~`-named directory.
+        let mut tilde = Vec::new();
+        let mut stack = vec![worker.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().contains('~') {
+                    tilde.push(e.path());
+                }
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(e.path());
+                }
+            }
+        }
+        assert!(tilde.is_empty(), "{tilde:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
