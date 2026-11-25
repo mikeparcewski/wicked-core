@@ -294,9 +294,59 @@ pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
     CATALOG.iter().filter(|l| found.contains(l.id)).collect()
 }
 
-/// (core#1933) Scaffold for the red test: nothing is cached yet.
+/// (core#1933) How long [`detect_cached`] reuses a checkout's detection.
+const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// (core#1933) The most checkout roots [`detect_cached`] remembers.
+const DETECT_CACHE_MAX: usize = 256;
+
+/// (core#1933) Each checkout root's last detection: when it ran, and its layer ids.
+static DETECTED: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, (std::time::Instant, Vec<&'static str>)>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// (core#1933) [`detect`] for the repo list a person sees, reused for [`DETECT_TTL`]: a marker
+/// added or removed in the checkout shows within that time. Not for the arm, which detects on the
+/// unit's own worktree every time.
+pub(crate) fn detect_cached(tree: &Path) -> Vec<&'static Layer> {
+    let cache = || DETECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if let Some((at, ids)) = cache().get(tree) {
+        if now.duration_since(*at) < DETECT_TTL {
+            return CATALOG.iter().filter(|l| ids.contains(&l.id)).collect();
+        }
+    }
+    let layers = detect(tree);
+    let mut cache = cache();
+    if cache.len() >= DETECT_CACHE_MAX && !cache.contains_key(tree) {
+        cache.retain(|_, (at, _)| now.duration_since(*at) < DETECT_TTL);
+        if cache.len() >= DETECT_CACHE_MAX {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            }
+        }
+    }
+    cache.insert(
+        tree.to_path_buf(),
+        (now, layers.iter().map(|l| l.id).collect()),
+    );
+    layers
+}
+
+/// (core#1933) Forget `tree`'s detection, as [`DETECT_TTL`] passing would.
 #[cfg(test)]
-pub(crate) fn forget_detected(_tree: &Path) {}
+pub(crate) fn forget_detected(tree: &Path) {
+    DETECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(tree);
+}
 
 /// [`detect`] unless `setting` ([`LAYERS_ENV`]'s value) is `off`.
 pub(crate) fn for_tree_with(tree: &Path, setting: Option<&str>) -> Vec<&'static Layer> {
@@ -331,7 +381,7 @@ pub(crate) fn rows(
     operator_base: bool,
 ) -> Vec<crate::repo::RepoSeatLayer> {
     let daemon_off = setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
-    detect(tree)
+    detect_cached(tree)
         .into_iter()
         .map(|l| {
             let off_by = if operator_base {

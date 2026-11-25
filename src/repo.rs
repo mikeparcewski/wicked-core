@@ -78,10 +78,12 @@ pub struct RepoEntry {
     /// Today's codes: [`FINDING_IN_TREE_CODE_GRAPH_IGNORED`], [`FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE`].
     #[serde(default)]
     pub findings: Vec<RepoFinding>,
-    /// (core#1043 part 2) The toolchain layers this repo's seats get, for the repo card —
-    /// **derived on every read like `findings`**, never authoritative in the record: the layers
-    /// detected in the registered checkout (`seat_layers::detect`), in catalog order, each with
-    /// whether it is on and what turned it off. Always serialized (an array, possibly empty).
+    /// (core#1043 part 2) The toolchain layers this repo's seats get, for the repo card: the
+    /// layers detected in the registered checkout (`seat_layers::detect`), in catalog order, each
+    /// with whether it is on and what turned it off. Never authoritative in the record.
+    /// (core#1933) Derived only on the reads a person sees ([`list_repos_shown`], and the replies of
+    /// [`register_repo`] and [`set_seat_layers_off`]); empty on the engine's own reads
+    /// ([`get_repo`], [`list_repos`]), so a dispatch lists no directory. Always serialized.
     #[serde(default)]
     pub seat_layers: Vec<RepoSeatLayer>,
     /// (core#1043 part 2) The layer ids a person turned off for this repo
@@ -170,7 +172,9 @@ impl FromNode for RepoEntry {
             code_graph_db_and_findings(&entry.id, &entry.root_path, &entry.graph_key);
         entry.code_graph_db = code_graph_db;
         entry.findings = findings;
-        entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
+        // (core#1933) Only the person-facing reads derive the rows ([`list_repos_shown`]); the
+        // engine's own reads carry none, and never the copy stored in the record.
+        entry.seat_layers = Vec::new();
         Ok(entry)
     }
 }
@@ -506,9 +510,15 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
         .collect())
 }
 
-/// (core#1933) The repo list a person sees. Scaffold for the red test: today's `list_repos`.
+/// (core#1933) The repo list a person sees (`Core::list_repos`): [`list_repos`] with each repo's
+/// [`RepoEntry::seat_layers`] rows, whose detection is reused for a few seconds
+/// (`seat_layers::detect_cached`), so a studio poll does not rescan every checkout.
 pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
-    list_repos(store)
+    let mut repos = list_repos(store)?;
+    for entry in &mut repos {
+        entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
+    }
+    Ok(repos)
 }
 
 /// Read one registered repo by id.
@@ -7239,7 +7249,8 @@ mod discard_minted_tests {
 
         let set = set_seat_layers_off(&mut store, &entry.id, &["go".into(), "go".into()]).unwrap();
         assert_eq!(set.seat_layers_off, ["go"]);
-        let read = get_repo(&store, &entry.id).unwrap().unwrap();
+        // The list a person sees (core#1933: the engine's own reads carry no rows).
+        let read = list_repos_shown(&store).unwrap().remove(0);
         assert_eq!(
             rows(&read),
             [

@@ -3029,7 +3029,7 @@ pub(crate) fn run(
                 let _ = reply.send(crate::repo::set_seat_layers_off(&mut store, &repo_id, &off));
             }
             Command::ListRepos { reply } => {
-                let _ = reply.send(crate::repo::list_repos(&store));
+                let _ = reply.send(crate::repo::list_repos_shown(&store));
             }
             Command::RejudgeReadiness { run_id, reply } => {
                 let _ = reply.send(rejudge_readiness(&store, &run_id));
