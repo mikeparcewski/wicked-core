@@ -7400,8 +7400,9 @@ fn with_cap<T>(cap: u64, f: impl FnOnce() -> T) -> T {
 #[cfg(unix)]
 #[test]
 fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
-    let host = tmp("optional-left-out");
-    let replica = tmp("optional-left-out-replica");
+    // (No "left-out" in the fixture's own path: the arm detail names it.)
+    let host = tmp("optional-omitted");
+    let replica = tmp("optional-omitted-replica");
     let (tree, roots) = optional_chat_roots(
         &host,
         &[

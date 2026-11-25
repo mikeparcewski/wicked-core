@@ -6368,11 +6368,19 @@ impl GovLaunch {
     /// be able to read it. A read-only unit gets them mounted read-only and its gate hook admits the
     /// reads; what it may WRITE is unchanged (`write_posture::unit_admitted_roots`).
     fn read_roots(&self, operational_home: Option<&Path>) -> Vec<PathBuf> {
-        self.read_roots_except(operational_home, &[])
+        let mut roots = assemble_read_roots(
+            self.code_graph_db.as_deref(),
+            operational_home,
+            &self.extra_read_roots,
+            self.skills_root.as_deref(),
+        );
+        self.add_promoted_write_roots(&mut roots, operational_home);
+        roots
     }
 
     /// [`Self::read_roots`] without the launch-declared read roots named in `except` (core#1463:
-    /// the optional ones, to settle which of them no other source requires).
+    /// the optional ones, to settle which of them no other source requires). The same assembly,
+    /// handed fewer launch entries.
     fn read_roots_except(
         &self,
         operational_home: Option<&Path>,
@@ -6390,13 +6398,18 @@ impl GovLaunch {
             &extras,
             self.skills_root.as_deref(),
         );
+        self.add_promoted_write_roots(&mut roots, operational_home);
+        roots
+    }
+
+    /// The run's declared write roots, promoted to reads, joined onto `roots`.
+    fn add_promoted_write_roots(&self, roots: &mut Vec<PathBuf>, operational_home: Option<&Path>) {
         let homes = declared_root_state_homes(operational_home, self.skills_root.as_deref());
         for r in promoted_write_roots(&self.extra_write_roots, &homes) {
             if !roots.contains(&r) {
                 roots.push(r);
             }
         }
-        roots
     }
 }
 
