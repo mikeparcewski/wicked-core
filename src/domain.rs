@@ -1584,7 +1584,7 @@ pub struct WorkUnit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt: Option<u32>,
     /// (core#1925) The accepted plan revision this unit was LAST DISPATCHED under (written by
-    /// `dispatch_unit` beside `last_attempt`), so the run view says which plan a unit's work came
+    /// `dispatch_unit_with` beside `last_attempt`), so the run view says which plan a unit's work came
     /// from after an edit at a gate. `None` until the unit has been dispatched; never cleared by a
     /// rewind (it is also the record that the unit ran, which a gate edit reads).
     #[serde(default, skip_serializing_if = "Option::is_none")]

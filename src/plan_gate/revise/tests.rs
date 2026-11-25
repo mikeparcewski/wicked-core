@@ -1294,12 +1294,12 @@ fn a_gate_edit_amends_the_instructions_of_a_held_step() {
     );
 }
 
-/// (core#1925) …and a new catalog on a step that carries no check (the probe's `produce` draft
-/// made an `understand`): the step is re-catalogued, and the fields the person left out keep the
-/// held values. A `build` step carries its entry's evidence-floor validator, so it is a check and
-/// keeps its catalog.
+/// (core#1925) A step's catalog entry carries contracts the engine enforces by catalog, so a
+/// gate edit that moves a step to another entry is refused by name (the issue's other answer),
+/// for the probe's `produce` draft as for a `build` with its evidence floor; the fields a
+/// person may change keep working (above).
 #[test]
-fn a_gate_edit_recatalogues_a_held_step_that_carries_no_check() {
+fn a_gate_edit_that_recatalogues_a_held_step_is_refused_by_name() {
     let hc = HumanConfirm::None;
     let held = held_with(
         &hc,
@@ -1318,14 +1318,11 @@ fn a_gate_edit_recatalogues_a_held_step_that_carries_no_check() {
         0,
     )
     .unwrap();
-    assert!(
-        matches!(r.outcome, Outcome::Accepted { .. }),
-        "{}",
-        describe(&r.outcome)
+    refused_naming(
+        &r,
+        &held,
+        "step `draft` can't change from `produce` to `understand` at the gate",
     );
-    let draft = accepted_step(&r, "draft");
-    assert_eq!(draft.catalog, "understand");
-    assert_eq!(draft.instructions.as_deref(), Some("Write the page."));
     let held = held_first_creator(&hc);
     let r = revise(
         "r",
@@ -1340,7 +1337,7 @@ fn a_gate_edit_recatalogues_a_held_step_that_carries_no_check() {
         0,
     )
     .unwrap();
-    refused_naming(&r, &held, "step `build` is a `build` check");
+    refused_naming(&r, &held, "step `build` can't change from `build`");
 }
 
 /// (core#1925) A step that already ran cannot be changed at the gate: the whole edit is refused,
@@ -1470,28 +1467,51 @@ fn a_gate_edit_reinstructs_a_held_review() {
     );
 }
 
-/// (core#1925) An amended plan carries the launch's declared deliverables on its last creator
-/// step, as `decide` does for an edit at the launch gate: a re-catalogued creator keeps them, and
-/// an edit that leaves no step to write them is refused.
+/// (core#1925) A step never drops a deliverable at the gate: the launch's declared deliverables
+/// ride a creator step from launch (`decide`), and a catalog never changes, so they stay put.
 #[test]
-fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
+fn a_gate_edit_cannot_drop_a_steps_deliverable() {
     let hc = HumanConfirm::None;
-    let mut held = held_with(
+    let held = held_with(
         &hc,
-        r#"[{"catalog":"produce","id":"build"},{"catalog":"review","id":"review","depends_on":["build"]}]"#,
+        r#"[{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
     );
-    held.deliverables = vec!["docs/out.md".to_string()];
-    let edit = |build: serde_json::Value| {
-        gate_edit(json!([
-            {"catalog":"understand","id":"answer-1"},
-            build,
-            {"catalog":"review","id":"review"}
-        ]))
-    };
     let r = revise(
         "r",
         &held,
-        edit(json!({"catalog":"build","id":"build"})),
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","id":"build","required_deliverables":[]}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(
+        &r,
+        &held,
+        "step `build` can't drop its deliverable `docs/out.md`",
+    );
+}
+
+/// (core#1925, pi r2) A restatement that names no id amends the held step of its catalog entry,
+/// and adds no second one.
+#[test]
+fn a_gate_edit_without_ids_amends_the_step_of_its_catalog() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"draft","instructions":"Write the page."}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","instructions":"Write the page and a billing epic."}
+        ])),
         &["answer-1".into()],
         &hc,
         Some(1),
@@ -1503,25 +1523,37 @@ fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
         "{}",
         describe(&r.outcome)
     );
+    let steps = &r.state.accepted.as_ref().unwrap().steps.steps;
     assert_eq!(
-        accepted_step(&r, "build").required_deliverables.as_deref(),
-        Some(&["docs/out.md".to_string()][..])
+        steps.iter().filter(|s| s.catalog == "produce").count(),
+        1,
+        "{steps:?}"
     );
-    let r = revise(
-        "r",
-        &held,
-        edit(json!({"catalog":"understand","id":"build"})),
-        &["answer-1".into()],
-        &hc,
-        Some(1),
-        0,
-    )
-    .unwrap();
-    match &r.outcome {
-        Outcome::Refused { reason } => assert!(reason.contains("deliverables"), "{reason}"),
-        o => panic!("{}", describe(o)),
+    assert_eq!(
+        accepted_step(&r, "draft").instructions.as_deref(),
+        Some("Write the page and a billing epic.")
+    );
+}
+
+/// (core#1925, codex r2) The steps the actor holds to a floor by catalog carry a check.
+#[test]
+fn the_actors_catalog_floors_carry_a_check() {
+    for catalog in [
+        crate::editor_conformance::CATALOG,
+        crate::demo_record::PROBE_CATALOG,
+        crate::demo_record::RECORD_CATALOG,
+    ] {
+        let step = PlanStep {
+            catalog: catalog.to_string(),
+            ..PlanStep::default()
+        };
+        assert!(super::carries_check(&step), "{catalog}");
     }
-    assert_eq!(r.state, held, "the run keeps its plan");
+    let produce = PlanStep {
+        catalog: "produce".to_string(),
+        ..PlanStep::default()
+    };
+    assert!(!super::carries_check(&produce));
 }
 
 fn refused_naming(r: &Revised, held: &TeamPlanState, needle: &str) {
@@ -1570,14 +1602,26 @@ fn a_gate_edit_cannot_drop_a_dependency_of_a_step_without_a_check() {
     let hc = HumanConfirm::None;
     let held = held_with(
         &hc,
-        r#"[{"catalog":"build","id":"build","depends_on":["answer-1"]}]"#,
+        r#"[{"catalog":"produce","id":"build","depends_on":["answer-1"]}]"#,
+    );
+    let build = held
+        .pending
+        .as_ref()
+        .unwrap()
+        .steps
+        .steps
+        .iter()
+        .find(|s| s.id == "build");
+    assert!(
+        !super::carries_check(build.unwrap()),
+        "a step without a check"
     );
     let r = revise(
         "r",
         &held,
         gate_edit(json!([
             {"catalog":"understand","id":"answer-1"},
-            {"catalog":"build","id":"build","depends_on":[]}
+            {"catalog":"produce","id":"build","depends_on":[]}
         ])),
         &["answer-1".into()],
         &hc,
@@ -1613,70 +1657,4 @@ fn a_gate_edit_may_raise_a_checks_gate() {
         describe(&r.outcome)
     );
     assert!(accepted_step(&r, "review").gate.is_some());
-}
-
-/// (core#1925, codex r1 on the fix, P1) The launch's deliverables never move onto a creator step
-/// that already ran, where no unit would judge them: an edit that would put them there is refused.
-#[test]
-fn a_gate_edit_never_moves_the_deliverables_onto_a_step_that_ran() {
-    let hc = HumanConfirm::None;
-    let mut held = held_with(
-        &hc,
-        r#"[{"catalog":"produce","id":"early"},{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
-    );
-    held.deliverables = vec!["docs/out.md".to_string()];
-    let r = revise_with_ran(
-        "r",
-        &held,
-        gate_edit(json!([
-            {"catalog":"understand","id":"answer-1"},
-            {"catalog":"produce","id":"early"},
-            {"catalog":"understand","id":"build"}
-        ])),
-        &["answer-1".into()],
-        &["answer-1".into(), "early".into()],
-        &hc,
-        Some(1),
-        0,
-    )
-    .unwrap();
-    refused_naming(&r, &held, "the step `early` already ran");
-}
-
-/// (core#1925, codex r1 on the fix) An edit whose only amendment the plan's normalization undoes
-/// (dropping a launch deliverable the plan then re-applies) changes nothing: "adds no step".
-#[test]
-fn a_gate_edit_whose_amendment_normalizes_away_adds_no_step() {
-    let hc = HumanConfirm::None;
-    let mut held = held_with(
-        &hc,
-        r#"[{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
-    );
-    held.deliverables = vec!["docs/out.md".to_string()];
-    let steps: Vec<Value> = held
-        .pending
-        .as_ref()
-        .unwrap()
-        .steps
-        .steps
-        .iter()
-        .map(|s| {
-            let mut v = serde_json::to_value(super::without_provenance(s)).unwrap();
-            if s.id == "build" {
-                v["required_deliverables"] = json!([]);
-            }
-            v
-        })
-        .collect();
-    let r = revise(
-        "r",
-        &held,
-        gate_edit(Value::Array(steps)),
-        &["answer-1".into()],
-        &hc,
-        Some(1),
-        0,
-    )
-    .unwrap();
-    refused_naming(&r, &held, "adds no step");
 }
