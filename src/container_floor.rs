@@ -2655,7 +2655,6 @@ pub(crate) fn arm_noting(
     warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
     timeout: Duration,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
-    let argv_in = argv;
     let wsl = is_wsl(
         Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists(),
         &std::fs::read_to_string("/proc/version").unwrap_or_default(),
@@ -2734,10 +2733,12 @@ pub(crate) fn arm_noting(
     let optional = if optional.is_empty() {
         Vec::new()
     } else {
+        // The real build's argv: its path options already name what that build resolved and
+        // mounted, so a link retargeted since cannot move them (codex 1463r2 #2).
         let (required, _) = unit_mounts(
             &spec,
             &required_resolved,
-            argv_in,
+            &argv,
             prompt,
             read_view,
             gateway_dir,
@@ -7454,6 +7455,55 @@ esac
         assert_eq!(required, [PathBuf::from("/t1")]);
         // An unresolvable path is dropped (never optional), the resolved one is the same.
         assert_eq!(optional, [PathBuf::from("/t1")]);
+    }
+
+    /// (core#1463, codex 1463r2 #2) The required-only build reads the argv the real build
+    /// rewrote, so an argv path spelled through a link that is retargeted between the builds still
+    /// names what the real build mounted: the optional root holding it stays required.
+    #[cfg(unix)]
+    #[test]
+    fn core_1463_the_required_build_reads_the_real_builds_argv() {
+        let base = tmp("opt-argv");
+        let (tree, a, b, link) = (
+            base.join("wt"),
+            base.join("repos/a"),
+            base.join("repos/b"),
+            base.join("link"),
+        );
+        for d in [&tree, &a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("prompt.md"), "a").unwrap();
+        std::fs::write(b.join("prompt.md"), "b").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let build = |reads: &[PathBuf], argv: &[String]| {
+            let mut mounts = vec![Mount::Bind {
+                path: tree.clone(),
+                rw: true,
+            }];
+            add_read_roots(&mut mounts, reads);
+            let mut argv = argv.to_vec();
+            mount_argv_paths(&mut mounts, &mut argv, None);
+            (mounts, argv)
+        };
+        let argv = vec![
+            "claude".to_string(),
+            "--system-prompt-file".to_string(),
+            link.join("prompt.md").to_string_lossy().into_owned(),
+        ];
+        let optional = vec![a.canonicalize().unwrap()];
+        let (mounts, real_argv) = build(&optional, &argv);
+        // The link moves between the two builds.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        let (required, _) = build(&[], &real_argv);
+        assert!(
+            settle_optional(&mounts, &required, &optional).is_empty(),
+            "the prompt file the real argv names is inside the optional root: it stays required"
+        );
+        // Re-reading the original argv would follow the moved link and leave the root out.
+        let (moved, _) = build(&[], &argv);
+        assert_eq!(settle_optional(&mounts, &moved, &optional), optional);
     }
 
     /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every

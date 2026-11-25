@@ -138,9 +138,10 @@ fn engine_on(db: &str, cfg: TeamConfig) -> Engine {
 }
 
 /// (core#1916) A launch reads the seat floor from the process environment
-/// (`container_floor::host_floor_chosen`, via `distribute::launch_benched`). Tests that set
-/// `WICKED_SEAT_FLOOR` hold `ENV_LOCK` for writing, so a launch here holds it for reading: it
-/// never sees another test's floor.
+/// (`container_floor::host_floor_chosen`, via `distribute::launch_benched`), once in `launch_run`
+/// and again when the actor plans the run after `launch_run` has returned. Tests that set
+/// `WICKED_SEAT_FLOOR` hold `ENV_LOCK` for writing, so a launch here holds it for reading until a
+/// `ping` (queued behind the planning) comes back: it never sees another test's floor.
 fn floor_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
     crate::test_env::ENV_LOCK
         .read()
@@ -194,6 +195,8 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 /// Poll until `cond` holds, generously (slow Windows runners), returning early.
@@ -1742,6 +1745,9 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             qe_acceptance: Default::default(),
         })
         .unwrap();
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
+    drop(_floor);
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
     collect(&e, &mut evs);
     e.core
@@ -1926,6 +1932,8 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 fn member_engine(
@@ -3159,6 +3167,8 @@ fn launch_plan_run(e: &Engine, run: &str) {
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 fn open_gate_kinds(db: &str, run: &str) -> Vec<String> {
@@ -3728,7 +3738,7 @@ fn try_launch_plan(
     deliver_step: Option<crate::PlanStep>,
 ) -> anyhow::Result<String> {
     let _floor = floor_read_lock();
-    e.core.launch_run(LaunchSpec {
+    let launched = e.core.launch_run(LaunchSpec {
         base_ref: None,
         project_id: None,
         problem: "add SSO login".into(),
@@ -3754,7 +3764,12 @@ fn try_launch_plan(
         voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
-    })
+    });
+    // (core#1916) Planning runs after launch_run returns; the ping waits for it under the lock.
+    if launched.is_ok() {
+        e.core.ping();
+    }
+    launched
 }
 
 fn runs(e: &Engine) -> usize {
