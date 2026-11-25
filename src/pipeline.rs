@@ -7176,6 +7176,7 @@ mod judge_bench_tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             None,
