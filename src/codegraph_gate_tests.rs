@@ -23,7 +23,9 @@ fn core_reads_the_codegraph_gate_store() {
     };
     let store = wicked_apps_core::open_store_ro(Some(&db)).expect("the gate store opens");
 
-    // Every edge decodes, including the `Other(..)` kinds, with codegraph's provenance.
+    // Every edge decodes, with codegraph's provenance, for every kind the import maps: the ones
+    // codegraph 1.6.4 emits, and (from estate's synthetic-kinds.sql, `codegraph:synthetic`)
+    // Overrides, Returns, HasType and Other("exports"), which it never emits.
     let edges = store.all_edges().expect("every edge decodes");
     let bound: BTreeSet<String> = edges
         .iter()
@@ -38,6 +40,10 @@ fn core_reads_the_codegraph_gate_store() {
         EdgeKind::References,
         EdgeKind::Instantiates,
         EdgeKind::Other("decorates".into()),
+        EdgeKind::Overrides,
+        EdgeKind::Returns,
+        EdgeKind::HasType,
+        EdgeKind::Other("exports".into()),
     ] {
         assert!(
             bound.contains(&format!("{k:?}")),
