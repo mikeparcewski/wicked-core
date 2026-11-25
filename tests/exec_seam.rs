@@ -479,6 +479,12 @@ fn a_dispatched_but_uncompleted_task_re_runs_after_a_restart() {
             "the run reached Executing (a unit was dispatched)"
         );
         let bus = BusDb::open(&bus_db).unwrap();
+        // `Executing` is persisted before the dispatch's bus event is written, so wait for the event
+        // rather than read it once: on a slow runner (Windows CI) the single read raced it.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while bus.poll(TASK_DISPATCHED, 0, 100).unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(
             bus.poll(TASK_DISPATCHED, 0, 100).unwrap().len(),
             1,
