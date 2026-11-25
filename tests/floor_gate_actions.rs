@@ -273,6 +273,7 @@ fn launch(core: &Core, name: &str, repo: &Path, sid: &str) -> std::sync::mpsc::R
         workflow: Some("bug-def".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

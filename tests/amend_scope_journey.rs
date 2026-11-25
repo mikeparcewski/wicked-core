@@ -166,6 +166,7 @@ fn launch(core: &Core, run: &str) -> std::sync::mpsc::Receiver<CoreEvent> {
         workflow: Some("asj".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

@@ -132,6 +132,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

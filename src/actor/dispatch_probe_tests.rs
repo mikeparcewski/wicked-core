@@ -155,6 +155,7 @@ fn launch_with(f: &Fixture, run: &str, human_confirm: crate::HumanConfirm) {
             workflow: Some("probe-one".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,

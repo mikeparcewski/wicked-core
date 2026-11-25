@@ -263,6 +263,7 @@ fn spec(run: &str, clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         project_id: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(two_answers()),
         deliver_step: None,

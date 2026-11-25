@@ -1586,6 +1586,7 @@ fn launch_from_event(
         extra_write_roots: Vec::new(),
         // Same rule for read roots (core#294): none in v1, and never implicit.
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         // No project filing on this path (above), so there is no project whose graph to bind:
         // workers get the run repo's own graph. Binding one would mean minting an estate label
         // here, and the label rule belongs to whoever owns the project graph — not the bus bridge.

@@ -168,6 +168,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             workflow: Some(format!("{run}:plan-1")),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -1714,6 +1715,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             workflow: Some("t616k:plan-1".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -1896,6 +1898,7 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
             workflow: Some(format!("{run}:plan-1")),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -2591,6 +2594,16 @@ impl StepRunner for MemberTimesOutTwice {
     }
 }
 
+/// How many `awaitingHuman` events `run` emitted at `ord`.
+fn awaiting_at(evs: &[CoreEvent], run: &str, ord: u32) -> usize {
+    evs.iter()
+        .filter(|ev| {
+            matches!(ev, CoreEvent::AwaitingHuman { session, ord: o, .. }
+                if session == run && *o == ord)
+        })
+        .count()
+}
+
 /// The `gateSeq` of the newest `awaitingHuman` for `run` at `ord`.
 fn last_gate_seq(evs: &[CoreEvent], run: &str, ord: u32) -> u32 {
     evs.iter()
@@ -2643,8 +2656,13 @@ fn an_answer_for_an_earlier_opening_at_the_same_ord_is_refused_gate_changed() {
     e.core
         .confirm_gate_expecting("t6gs", approve(None), None, Some(expect(first)))
         .expect("the answer for the open gate is taken");
+    // Wait for the second opening's own awaitingHuman, not only for the status: right after the
+    // answer the status can still read the first opening's AwaitingHuman (Windows CI, core#1918).
+    wait_for("the write gate to open a second time", || {
+        collect(&e, &mut evs);
+        awaiting_at(&evs, "t6gs", WRITE) >= 2
+    });
     wait_status(&e, "t6gs", SessionStatus::AwaitingHuman);
-    collect(&e, &mut evs);
     let second = last_gate_seq(&evs, "t6gs", WRITE);
     assert!(
         second > first,
@@ -3124,6 +3142,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             workflow: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: Some(steps(serde_json::json!({
                 "steps": [{"catalog": "build", "id": "build"}],
@@ -3722,6 +3741,7 @@ fn try_launch_plan(
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(steps(body)),
         deliver_step,
@@ -3884,6 +3904,7 @@ fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

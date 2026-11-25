@@ -561,6 +561,7 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
         deadline: Duration::from_secs(600),
         role: "seat",
         deps: None,
+        optional: &[],
     };
 
     // B11: a creator unit.

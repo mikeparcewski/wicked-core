@@ -531,6 +531,14 @@ pub struct LaunchSpec {
     /// config/pin tree) — an invalid root fails the launch loudly with no session persisted.
     /// Empty means the read boundary stays exactly the evidence-derived assembly.
     pub extra_read_roots: Vec<String>,
+    /// (core#1463) The entries of [`Self::extra_read_roots`] this run can do without: on the
+    /// container floor, one that does not fit the copy-in's caps is left out of the unit's replica
+    /// (its directory holds only a note saying so) instead of refusing the unit. It widens nothing:
+    /// each entry must equal an entry of `extra_read_roots`, or the launch is refused
+    /// ([`crate::path_policy::validate_optional_read_roots`]). A root another source also requires
+    /// (skills, a write root, a file the unit is handed) is never left out. Empty = every read root
+    /// is required (the default).
+    pub optional_read_roots: Vec<String>,
     /// The PROJECT code graph this run's governed workers should query instead of the run repo's
     /// own graph — the launcher's answer to "where is this project's graph, and what is this run's
     /// repo called in it" ([`crate::project::ProjectGraphBinding`]).

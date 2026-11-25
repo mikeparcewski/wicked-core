@@ -520,6 +520,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         workflow: Some("domain-extraction".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         // wicked-core#1338: crew's repo-scoped launches (and studio's wizard) send a deliver step.

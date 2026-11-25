@@ -6,8 +6,10 @@
 //! client: the engine arms no channel for it, so the client refuses (`WICKED_MODEL_CALL_SOCK is
 //! not set`), no seat runs and no answer is written.
 //!
-//! Were the channel armed, the seat registry would be the engine's own (built-ins plus the user
-//! `clis.toml` under `$HOME`), so run this test with `HOME` pointed at a scratch directory.
+//! Were the channel armed, its seats would be the run's own launch roster less the run's benches
+//! (core#1905, `model_call::admission`), never the daemon's whole registry. The engine still reads
+//! the user `clis.toml` under `$HOME` for the launch, so run this test with `HOME` pointed at a
+//! scratch directory.
 #![cfg(unix)]
 
 use std::sync::{Arc, Mutex};
@@ -175,6 +177,7 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
         workflow: Some("test-model-call".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

@@ -188,6 +188,7 @@ fn spec(run_id: &str) -> LaunchSpec {
         workflow: Some("run-cost".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,
