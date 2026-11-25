@@ -664,7 +664,8 @@ fn seat_tag_on(
     layers: &[&crate::seat_layers::Layer],
 ) -> Option<String> {
     if base.operator {
-        seat_image_tag(cli, &base.image, None, &[])
+        let id = image_id(rt, &base.image);
+        seat_image_tag(cli, &base.image, id.as_deref(), &[])
     } else {
         seat_image_tag(cli, &base.image, None, layers)
     }

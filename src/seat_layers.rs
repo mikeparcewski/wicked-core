@@ -247,8 +247,23 @@ fn scan(dir: &Path, found: &mut BTreeSet<&'static str>) {
 /// The layers `tree` needs: marker files at its root and in its immediate subdirectories (not
 /// hidden, not dependency or build output, at most [`MAX_SUBDIRS`]), in catalog order.
 pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
-    let _ = (tree, MAX_SUBDIRS, SKIP_DIRS, scan as fn(&Path, &mut BTreeSet<&'static str>));
-    Vec::new()
+    let mut found = BTreeSet::new();
+    scan(tree, &mut found);
+    if let Ok(entries) = std::fs::read_dir(tree) {
+        let subdirs = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| !n.starts_with('.') && !SKIP_DIRS.contains(&n))
+            })
+            .take(MAX_SUBDIRS);
+        for entry in subdirs {
+            scan(&entry.path(), &mut found);
+        }
+    }
+    CATALOG.iter().filter(|l| found.contains(l.id)).collect()
 }
 
 /// [`detect`] unless `setting` ([`LAYERS_ENV`]'s value) is `off`.
@@ -267,8 +282,21 @@ pub(crate) fn for_tree(tree: &Path) -> Vec<&'static Layer> {
 /// The layers a comma-separated id list names (`seat-image --layers`), in catalog order; empty or
 /// `none` names none. An id the catalog does not have is refused by name.
 pub(crate) fn parse(list: &str) -> Result<Vec<&'static Layer>, String> {
-    let _ = list;
-    Ok(Vec::new())
+    if list.trim().eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut wanted = BTreeSet::new();
+    for id in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !CATALOG.iter().any(|l| l.id == id) {
+            let known: Vec<&str> = CATALOG.iter().map(|l| l.id).collect();
+            return Err(format!(
+                "no seat layer `{id}` (the layers are {})",
+                known.join(", ")
+            ));
+        }
+        wanted.insert(id);
+    }
+    Ok(CATALOG.iter().filter(|l| wanted.contains(l.id)).collect())
 }
 
 /// The layers of `layers` that change the image, in catalog order.
@@ -282,15 +310,44 @@ pub(crate) fn built<'a>(layers: &[&'a Layer]) -> Vec<&'a Layer> {
 /// What the layers add to a seat image's tag: each built layer's id and recipe. Empty when no
 /// layer builds, so a seat image without layers keeps the tag it always had.
 pub(crate) fn tag_parts(layers: &[&Layer]) -> Vec<String> {
-    let _ = layers;
-    Vec::new()
+    built(layers)
+        .iter()
+        .map(|l| format!("layer:{}\n{}", l.id, l.recipe))
+        .collect()
 }
 
 /// `dockerfile` (a seat recipe) with the built layers' recipes inserted just before its
 /// `ARG CLI` line, labelled `wicked.seat.layers`. Unchanged when no layer builds.
 pub(crate) fn compose(dockerfile: &str, layers: &[&Layer]) -> String {
-    let _ = layers;
-    dockerfile.to_string()
+    let built = built(layers);
+    if built.is_empty() {
+        return dockerfile.to_string();
+    }
+    let ids: Vec<&str> = built.iter().map(|l| l.id).collect();
+    let mut block = format!(
+        "# wicked seat toolchain layers (core#1043): {}\n",
+        ids.join(",")
+    );
+    for l in &built {
+        block.push_str(l.recipe);
+    }
+    block.push_str(&format!("LABEL wicked.seat.layers=\"{}\"\n", ids.join(",")));
+    let mut out = String::with_capacity(dockerfile.len() + block.len());
+    let mut placed = false;
+    for line in dockerfile.split_inclusive('\n') {
+        if !placed && line.trim_end() == "ARG CLI" {
+            out.push_str(&block);
+            placed = true;
+        }
+        out.push_str(line);
+    }
+    if !placed {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&block);
+    }
+    out
 }
 
 /// Whether the allowlist entry `pattern` admits `host`: the same name, or a `*.` suffix wildcard
@@ -309,8 +366,21 @@ pub(crate) fn uncovered<'a>(
     layers: &[&'a Layer],
     allowlist: &[String],
 ) -> Vec<(&'a str, Vec<&'a str>)> {
-    let _ = (layers, allowlist, covered as fn(&str, &str) -> bool);
-    Vec::new()
+    if allowlist.iter().any(|h| h == "*") {
+        return Vec::new();
+    }
+    layers
+        .iter()
+        .filter_map(|l| {
+            let missing: Vec<&str> = l
+                .hosts
+                .iter()
+                .copied()
+                .filter(|h| !allowlist.iter().any(|p| covered(h, p)))
+                .collect();
+            (!missing.is_empty()).then_some((l.id, missing))
+        })
+        .collect()
 }
 
 /// The note a unit gets when the daemon's allowlist does not admit its layers' hosts.
