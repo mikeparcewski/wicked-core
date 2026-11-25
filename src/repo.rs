@@ -418,17 +418,20 @@ pub fn set_seat_layers_off(
     let Some(mut entry) = get_repo(store, repo_id)? else {
         anyhow::bail!("no registered repo `{repo_id}`");
     };
-    let layers = crate::seat_layers::parse(&off.join(",")).map_err(|why| anyhow::anyhow!(why))?;
-    // `parse` reads `none` as no layer; a list naming it is not a layer id.
-    if let Some(none) = off.iter().find(|o| o.trim().eq_ignore_ascii_case("none")) {
-        anyhow::bail!("no seat layer `{none}`");
+    // Each element is one catalog id, checked as given: not a comma list, not blank, not `none`
+    // (the env parser's words), so a bad request is refused and the stored list is unchanged.
+    let mut ids = Vec::with_capacity(off.len());
+    for id in off {
+        if !crate::seat_layers::is_layer_id(id) {
+            anyhow::bail!("{}", crate::seat_layers::unknown_layer(id));
+        }
+        ids.push(id.clone());
     }
-    let mut ids: Vec<String> = layers.iter().map(|l| l.id.to_string()).collect();
     ids.sort();
     ids.dedup();
     entry.seat_layers_off = ids;
     put_node(store, entry.to_node())?;
-    // The stored record never carries the derived rows; the caller gets them as a read would.
+    // The caller gets the rows as the next read derives them.
     entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
     Ok(entry)
 }
@@ -7187,6 +7190,14 @@ mod discard_minted_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no-such-repo"), "{err}");
+        // (round 1, codex P2) Each element is one id as given: a comma list, a blank, a padded id
+        // or the env parser's `none` is refused, and the stored list is unchanged.
+        for bad in ["go,rust", "", " ", ",", " go", "none"] {
+            let err = set_seat_layers_off(&mut store, &entry.id, &[bad.into()]);
+            assert!(err.is_err(), "`{bad}` is not a layer id");
+            let kept = get_repo(&store, &entry.id).unwrap().unwrap();
+            assert_eq!(kept.seat_layers_off, ["go"], "`{bad}` left the list as it was");
+        }
         let cleared = set_seat_layers_off(&mut store, &entry.id, &[]).unwrap();
         assert!(cleared.seat_layers_off.is_empty());
         assert!(rows(&cleared).iter().all(|(_, on, _)| *on));

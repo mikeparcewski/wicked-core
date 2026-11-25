@@ -348,16 +348,23 @@ pub(crate) fn parse(list: &str) -> Result<Vec<&'static Layer>, String> {
     }
     let mut wanted = BTreeSet::new();
     for id in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if !CATALOG.iter().any(|l| l.id == id) {
-            let known: Vec<&str> = CATALOG.iter().map(|l| l.id).collect();
-            return Err(format!(
-                "no seat layer `{id}` (the layers are {})",
-                known.join(", ")
-            ));
+        if !is_layer_id(id) {
+            return Err(unknown_layer(id));
         }
         wanted.insert(id);
     }
     Ok(CATALOG.iter().filter(|l| wanted.contains(l.id)).collect())
+}
+
+/// `id` is exactly a layer id in the catalog (no trimming, no list).
+pub(crate) fn is_layer_id(id: &str) -> bool {
+    CATALOG.iter().any(|l| l.id == id)
+}
+
+/// The refusal of `id`, which is not a layer, naming the layers there are.
+pub(crate) fn unknown_layer(id: &str) -> String {
+    let known: Vec<&str> = CATALOG.iter().map(|l| l.id).collect();
+    format!("no seat layer `{id}` (the layers are {})", known.join(", "))
 }
 
 /// The layers of `layers` that change the image, in catalog order.

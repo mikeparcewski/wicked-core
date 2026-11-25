@@ -1008,8 +1008,6 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
-            seat_layers: Vec::new(),
-            seat_layers_off: Vec::new(),
         }
     }
 
