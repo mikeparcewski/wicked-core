@@ -294,9 +294,50 @@ pub(crate) fn for_tree_with(tree: &Path, setting: Option<&str>) -> Vec<&'static 
     detect(tree)
 }
 
-/// [`for_tree_with`] this daemon's [`LAYERS_ENV`].
-pub(crate) fn for_tree(tree: &Path) -> Vec<&'static Layer> {
-    for_tree_with(tree, std::env::var(LAYERS_ENV).ok().as_deref())
+/// (core#1043 part 2) [`for_tree_with`] without the layers a repo turned off (its
+/// `RepoEntry::seat_layers_off`, carried to the arm on the unit's governance). An id the tree
+/// does not need changes nothing.
+pub(crate) fn for_tree_except(
+    tree: &Path,
+    setting: Option<&str>,
+    off: &[String],
+) -> Vec<&'static Layer> {
+    for_tree_with(tree, setting)
+        .into_iter()
+        .filter(|l| !off.iter().any(|o| o == l.id))
+        .collect()
+}
+
+/// (core#1043 part 2) The repo card's rows for the checkout at `tree`: every layer it is detected
+/// to need, in catalog order, and what turned one off. `off` is the repo's own switch; `setting`
+/// is [`LAYERS_ENV`]'s value and `operator_base` whether the operator set a seat base image, either
+/// of which turns every layer off for every repo.
+pub(crate) fn rows(
+    tree: &Path,
+    off: &[String],
+    setting: Option<&str>,
+    operator_base: bool,
+) -> Vec<crate::repo::RepoSeatLayer> {
+    let daemon_off = setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    detect(tree)
+        .into_iter()
+        .map(|l| {
+            let off_by = if operator_base {
+                Some("operator_base")
+            } else if daemon_off {
+                Some("daemon")
+            } else if off.iter().any(|o| o == l.id) {
+                Some("repo")
+            } else {
+                None
+            };
+            crate::repo::RepoSeatLayer {
+                id: l.id.to_string(),
+                enabled: off_by.is_none(),
+                off_by: off_by.map(str::to_string),
+            }
+        })
+        .collect()
 }
 
 /// The layers a comma-separated id list names (`seat-image --layers`), in catalog order; empty or
@@ -307,16 +348,23 @@ pub(crate) fn parse(list: &str) -> Result<Vec<&'static Layer>, String> {
     }
     let mut wanted = BTreeSet::new();
     for id in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if !CATALOG.iter().any(|l| l.id == id) {
-            let known: Vec<&str> = CATALOG.iter().map(|l| l.id).collect();
-            return Err(format!(
-                "no seat layer `{id}` (the layers are {})",
-                known.join(", ")
-            ));
+        if !is_layer_id(id) {
+            return Err(unknown_layer(id));
         }
         wanted.insert(id);
     }
     Ok(CATALOG.iter().filter(|l| wanted.contains(l.id)).collect())
+}
+
+/// `id` is exactly a layer id in the catalog (no trimming, no list).
+pub(crate) fn is_layer_id(id: &str) -> bool {
+    CATALOG.iter().any(|l| l.id == id)
+}
+
+/// The refusal of `id`, which is not a layer, naming the layers there are.
+pub(crate) fn unknown_layer(id: &str) -> String {
+    let known: Vec<&str> = CATALOG.iter().map(|l| l.id).collect();
+    format!("no seat layer `{id}` (the layers are {})", known.join(", "))
 }
 
 /// The layers of `layers` that change the image, in catalog order.
@@ -648,5 +696,52 @@ mod tests {
         // No egress at all: every host is missing.
         let none: Vec<String> = Vec::new();
         assert_eq!(uncovered(&[by_id("rust")], &none)[0].1.len(), 3);
+    }
+
+    /// (core#1043 part 2) A repo turns a detected layer off; the rest still compose, and the
+    /// daemon's `off` still wins.
+    #[test]
+    fn a_repo_turns_a_detected_layer_off() {
+        let t = tree("repo-off");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(ids(&for_tree_except(&t, None, &[])), ["go", "rust"]);
+        assert_eq!(
+            ids(&for_tree_except(&t, None, &["go".to_string()])),
+            ["rust"]
+        );
+        assert_eq!(
+            ids(&for_tree_except(&t, None, &["java".to_string()])),
+            ["go", "rust"],
+            "a layer the tree does not need changes nothing"
+        );
+        assert!(for_tree_except(&t, Some("off"), &[]).is_empty());
+    }
+
+    /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.
+    #[test]
+    fn a_repos_layer_rows_say_what_turned_a_layer_off() {
+        let t = tree("repo-rows");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        let view = |off: &[&str], setting: Option<&str>, operator_base: bool| {
+            let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
+            rows(&t, &off, setting, operator_base)
+                .into_iter()
+                .map(|r| (r.id, r.enabled, r.off_by))
+                .collect::<Vec<_>>()
+        };
+        let on = |id: &str| (id.to_string(), true, None);
+        let off = |id: &str, by: &str| (id.to_string(), false, Some(by.to_string()));
+        assert_eq!(view(&[], None, false), [on("go"), on("rust")]);
+        assert_eq!(view(&["go"], None, false), [off("go", "repo"), on("rust")]);
+        assert_eq!(
+            view(&["go"], Some("off"), false),
+            [off("go", "daemon"), off("rust", "daemon")]
+        );
+        assert_eq!(
+            view(&[], None, true),
+            [off("go", "operator_base"), off("rust", "operator_base")]
+        );
     }
 }

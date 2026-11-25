@@ -2853,6 +2853,27 @@ fn carry_prompt_scoped(
     Ok(Some(CarriedPrompt { file, _dir: guard }))
 }
 
+/// (core#1043) The toolchain layers composed onto the seat image of a unit whose tree is `tree`:
+/// none on an operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's
+/// toolchain. (part 2) Not the layers the run's repo turned off (`layers_off`, from the unit's
+/// governance).
+fn arm_layers(
+    tree: &Path,
+    cli: &str,
+    layers_off: &[String],
+) -> Vec<&'static crate::seat_layers::Layer> {
+    if configured_base().is_some() || image_override(cli).is_some() {
+        return Vec::new();
+    }
+    crate::seat_layers::for_tree_except(
+        tree,
+        std::env::var(crate::seat_layers::LAYERS_ENV)
+            .ok()
+            .as_deref(),
+        layers_off,
+    )
+}
+
 /// Arm a seat pod, calling `on_built(image, waited)` as soon as its image had to be built for this
 /// unit (it was missing), whatever the rest of the arming decides.
 #[allow(clippy::too_many_arguments)]
@@ -2871,6 +2892,7 @@ pub(crate) fn arm_noting(
     before_copy: &mut dyn FnMut(&MountView) -> Result<(), String>,
     warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
     timeout: Duration,
+    layers_off: &[String],
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let argv_in = argv;
     let wsl = is_wsl(
@@ -2992,13 +3014,7 @@ pub(crate) fn arm_noting(
     before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    // (core#1043) The toolchains the unit's tree needs, composed onto its seat image; none on an
-    // operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's toolchain.
-    let layers = if configured_base().is_some() || image_override(cli).is_some() {
-        Vec::new()
-    } else {
-        crate::seat_layers::for_tree(&spec.tree)
-    };
+    let layers = arm_layers(&spec.tree, cli, layers_off);
     let (image, built_in, fell_back) = ensure_seat_image_noting(&rt, cli, &layers)?;
     // Egress is never widened for a layer: the unit is told which of its hosts the allowlist
     // lacks (an offline seat chose no egress at all). A unit whose layers did not build is told
@@ -3960,7 +3976,7 @@ fn layers_arg(
 }
 
 /// [`BASE_IMAGE_ENV`], when the operator set one.
-fn configured_base() -> Option<String> {
+pub(crate) fn configured_base() -> Option<String> {
     std::env::var(BASE_IMAGE_ENV)
         .ok()
         .map(|b| b.trim().to_string())
@@ -4756,6 +4772,7 @@ esac
                     &mut |_| Ok(()),
                     None,
                     crate::workflow::unit_timeout_ceiling(),
+                    &[],
                 ) else {
                     panic!("stub refuses submission");
                 };
@@ -4969,6 +4986,7 @@ esac
             &mut before_copy,
             None,
             crate::workflow::unit_timeout_ceiling(),
+            &[],
         );
         match out {
             Err((why, detail)) => {
@@ -4993,6 +5011,49 @@ esac
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1043 part 2, round 1 codex P2) The arm composes the tree's layers less the ones the
+    /// run's repo turned off; an operator base or image still wins over both.
+    #[test]
+    fn the_arm_leaves_out_the_layers_a_repo_turned_off() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let keys = [
+            BASE_IMAGE_ENV,
+            "WICKED_SEAT_IMAGE_CLAUDE",
+            crate::seat_layers::LAYERS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        let dir = RemoveOnDrop(tmp(&format!(
+            "arm-layers-{}",
+            uuid::Uuid::new_v4().simple()
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.0.join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.0.join("go.mod"), "module x\n").unwrap();
+        let ids = |off: &[&str]| -> Vec<&'static str> {
+            let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
+            arm_layers(&dir.0, "claude", &off)
+                .iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        assert_eq!(ids(&[]), ["go", "rust"]);
+        assert_eq!(ids(&["go"]), ["rust"], "the repo turned go off");
+        assert!(ids(&["go", "rust"]).is_empty());
+        std::env::set_var("WICKED_SEAT_IMAGE_CLAUDE", "seat:operator");
+        assert!(ids(&[]).is_empty(), "an operator image is the toolchain");
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     /// One failed (or slow) attempt is not the outcome: the second attempt answers, after one

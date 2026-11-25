@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
+  core seam). `RepoEntry.seat_layers` is derived on every read from the registered checkout: one row
+  `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
+  or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
+  `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,
+  re-registration keeps them, and `[]` clears them. Dispatch hands the list to each unit on
+  `GovernanceContext.seat_layers_off`, and the container arm leaves those layers out of the seat image. All
+  fields are additive.
+
 - **A person's edit at a mid-run plan gate reaches the plan and the units that run** (core#1925). An edit that
   restates a held step now amends it, field by field: what the person sets replaces the held value, and what they
   leave out keeps it. Before, the edit added nothing for a restated step id, so the accepted rev was the held plan

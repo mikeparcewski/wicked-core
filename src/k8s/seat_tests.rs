@@ -5038,6 +5038,7 @@ fn k8s_a_unit_bound_to_an_oversized_project_graph_arms_without_copying_it() {
         optional_read_roots: Vec::new(),
         project_id: Some("proj-a".to_string()),
         repo_id: None,
+        seat_layers_off: Vec::new(),
         apps: None,
     };
     // A codex seat (no gate-hook roots) and a claude seat whose gate-hook roots name the graph.

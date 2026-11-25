@@ -2544,6 +2544,7 @@ mod tests {
                 optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                seat_layers_off: Vec::new(),
                 human_confirm: HumanConfirm::All,
                 apps: None,
             }),
@@ -2613,6 +2614,7 @@ mod tests {
                 optional_read_roots: Vec::new(),
                 project_id: project.map(str::to_string),
                 repo_id: repo.map(str::to_string),
+                seat_layers_off: Vec::new(),
                 human_confirm: HumanConfirm::None,
                 apps: None,
             })

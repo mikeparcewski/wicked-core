@@ -250,6 +250,12 @@ pub struct GovernanceContext {
     /// `#[serde(default)]` so an older peer's `DispatchedTask` still deserializes (as `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<String>,
+    /// (core#1043 part 2) The seat layer ids the run's repo turned off
+    /// (`RepoEntry::seat_layers_off`), filled per unit at dispatch like `repo_id`: the container
+    /// arm leaves them out of the seat image it composes. `#[serde(default)]` (none) so an older
+    /// peer's `DispatchedTask` still deserializes; absent on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_layers_off: Vec<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

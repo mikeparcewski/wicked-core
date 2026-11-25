@@ -1205,3 +1205,32 @@ fn wait_status_done(e: &Engine, run: &str) {
         view(e, run).session.status == SessionStatus::Completed
     });
 }
+
+/// (core#1043 part 2) The layers a person turned off for a repo ride each of its units'
+/// governance from dispatch, where the arm drops them from the seat image.
+#[test]
+fn a_repos_layers_turned_off_ride_its_units_governance() {
+    let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let record = seen.clone();
+    let w = Worker::scripted(move |i, _| {
+        record.lock().unwrap().push(
+            i.governance
+                .as_ref()
+                .map(|g| g.seat_layers_off.clone())
+                .unwrap_or_default(),
+        );
+        hold()
+    });
+    let e = engine("layersoff", w.clone());
+    let (repo_id, _) = repo(&e, "layers-off");
+    let entry = e
+        .core
+        .set_repo_seat_layers_off(&repo_id, vec!["go".into()])
+        .unwrap();
+    assert_eq!(entry.seat_layers_off, ["go"]);
+    put(&e, "lo", json!([{"catalog": "understand", "id": "answer"}]));
+    launch_preset(&e, "lo", "lo", Some(&repo_id), HumanConfirm::None);
+    wait_for("a unit dispatched", || !seen.lock().unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap()[0], ["go"]);
+    release_all(&w);
+}

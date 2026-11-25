@@ -1006,6 +1006,8 @@ mod tests {
             code_graph_db: format!("/graphs/{id}/estate.db"),
             graph_key: id.to_string(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         }
     }
 

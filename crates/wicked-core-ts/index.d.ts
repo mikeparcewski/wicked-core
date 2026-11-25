@@ -638,6 +638,13 @@ export declare class Core {
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
   /**
+   * (core#1043 part 2) Turn seat layers off for a repo: `offJson` is a JSON array of layer ids
+   * (`[]` turns every layer back on). Resolves to the updated `RepoEntry` JSON object, whose
+   * `seat_layers` rows (`{id, enabled, off_by}`) show the result. Rejects naming an unknown
+   * layer id or repo.
+   */
+  setRepoSeatLayersOff(repoId: string, offJson: string): Promise<string>
+  /**
    * Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
    * plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's
    * scope; `createdBy` defaults to `api`. Resolves to the stored `Preset` JSON object
