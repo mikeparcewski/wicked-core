@@ -14,8 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Reading a repo no longer rescans its checkout** (core#1933, the core#1932 follow-up). Since core#1932
+  every `get_repo` and `list_repos` detected the repo's seat layers on the checkout inside the actor, listing
+  up to 257 directories: several times per dispatched unit, and once per repo on each studio poll. Now only
+  the reads a person sees derive `RepoEntry.seat_layers` (`Core::list_repos`, and the replies of
+  `register_repo` and `set_repo_seat_layers_off`). The engine's own reads carry no rows and list no
+  directory, and none serves the copy stored in the record. The list's detection is reused for 10 seconds
+  per checkout, so a marker added or removed shows within 10 seconds.
+
 - **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
-  core seam). `RepoEntry.seat_layers` is derived on every read from the registered checkout: one row
+  core seam). `RepoEntry.seat_layers` is derived from the registered checkout on the reads a person sees
+  (core#1933): one row
   `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
   or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
   `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,

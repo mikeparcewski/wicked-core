@@ -242,6 +242,8 @@ fn first_by_name(listed: impl Iterator<Item = (String, bool, bool)>) -> Vec<(Str
 /// `dir`'s entries as (name, is a regular file, is a directory), never following a link
 /// (`DirEntry::file_type` does not): the first [`MAX_ENTRIES`] by name ([`first_by_name`]).
 fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
+    #[cfg(test)]
+    DIR_READS.with(|n| n.set(n.get() + 1));
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -249,6 +251,12 @@ fn entries(dir: &Path) -> Vec<(String, bool, bool)> {
         let t = e.file_type().ok()?;
         Some((e.file_name().to_str()?.to_string(), t.is_file(), t.is_dir()))
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (core#1933) The directories [`detect`] listed on this thread, for tests that count them.
+    pub(crate) static DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Add the ids of the layers whose markers name one of `files`.
@@ -286,6 +294,65 @@ pub(crate) fn detect(tree: &Path) -> Vec<&'static Layer> {
     CATALOG.iter().filter(|l| found.contains(l.id)).collect()
 }
 
+/// (core#1933) How long [`detect_cached`] reuses a checkout's detection.
+const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// (core#1933) The most checkout roots [`detect_cached`] remembers.
+const DETECT_CACHE_MAX: usize = 256;
+
+/// (core#1933) A checkout root's last detection: when it ran, and its layer ids.
+type Detected = (std::time::Instant, Vec<&'static str>);
+
+/// (core#1933) Each checkout root's last detection.
+static DETECTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Detected>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// (core#1933) [`detect`] for the repo list a person sees, reused for [`DETECT_TTL`]: a marker
+/// added or removed in the checkout shows within that time. Not for the arm, which detects on the
+/// unit's own worktree every time.
+pub(crate) fn detect_cached(tree: &Path) -> Vec<&'static Layer> {
+    detect_cached_at(tree, std::time::Instant::now())
+}
+
+/// [`detect_cached`] at the time `now`.
+fn detect_cached_at(tree: &Path, now: std::time::Instant) -> Vec<&'static Layer> {
+    let cache = || DETECTED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, ids)) = cache().get(tree) {
+        if now.saturating_duration_since(*at) < DETECT_TTL {
+            return CATALOG.iter().filter(|l| ids.contains(&l.id)).collect();
+        }
+    }
+    let layers = detect(tree);
+    let mut cache = cache();
+    if cache.len() >= DETECT_CACHE_MAX && !cache.contains_key(tree) {
+        cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < DETECT_TTL);
+        if cache.len() >= DETECT_CACHE_MAX {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            }
+        }
+    }
+    cache.insert(
+        tree.to_path_buf(),
+        (now, layers.iter().map(|l| l.id).collect()),
+    );
+    layers
+}
+
+/// (core#1933) Forget `tree`'s detection, as [`DETECT_TTL`] passing would.
+#[cfg(test)]
+pub(crate) fn forget_detected(tree: &Path) {
+    DETECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(tree);
+}
+
 /// [`detect`] unless `setting` ([`LAYERS_ENV`]'s value) is `off`.
 pub(crate) fn for_tree_with(tree: &Path, setting: Option<&str>) -> Vec<&'static Layer> {
     if setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off")) {
@@ -319,7 +386,7 @@ pub(crate) fn rows(
     operator_base: bool,
 ) -> Vec<crate::repo::RepoSeatLayer> {
     let daemon_off = setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
-    detect(tree)
+    detect_cached(tree)
         .into_iter()
         .map(|l| {
             let off_by = if operator_base {
@@ -716,6 +783,31 @@ mod tests {
             "a layer the tree does not need changes nothing"
         );
         assert!(for_tree_except(&t, Some("off"), &[]).is_empty());
+    }
+
+    /// (core#1933, round 1 codex/pi P2) The repo card's detection is reused until the TTL passes,
+    /// then runs again and shows a marker added or removed meanwhile.
+    #[test]
+    fn the_cards_detection_is_reused_until_the_ttl_passes() {
+        let t = tree("ttl");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        let reads = || DIR_READS.with(|n| n.get());
+        let t0 = std::time::Instant::now();
+        assert_eq!(ids(&detect_cached_at(&t, t0)), ["rust"]);
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        let before = reads();
+        let just_inside = t0 + DETECT_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(ids(&detect_cached_at(&t, just_inside)), ["rust"], "reused");
+        assert_eq!(reads(), before, "a reuse lists no directory");
+        let t1 = t0 + DETECT_TTL;
+        assert_eq!(ids(&detect_cached_at(&t, t1)), ["go", "rust"], "added");
+        assert!(reads() > before, "the TTL passed: detected again");
+        std::fs::remove_file(t.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            ids(&detect_cached_at(&t, t1 + DETECT_TTL)),
+            ["go"],
+            "removed"
+        );
     }
 
     /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.

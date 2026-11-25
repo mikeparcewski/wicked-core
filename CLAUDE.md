@@ -45,7 +45,7 @@ image also carries the toolchain layers its tree needs (`src/seat_layers.rs`, co
 Debian's Go, `pom.xml`/Gradle -> OpenJDK 21 + Maven, `pyproject.toml`, `requirements*.txt`, `setup.py`, `uv.lock` or `Pipfile` -> uv),
 detected at arm from marker files and composed above the seat recipe's `ARG CLI`; never on an
 operator base; `WICKED_SEAT_LAYERS=off` turns detection off. A repo shows its layers on
-`RepoEntry.seat_layers` (derived on read from the registered checkout: `{id, enabled, off_by}`) and a person
+`RepoEntry.seat_layers` (derived from the registered checkout on the reads a person sees: `Core::list_repos`, `register_repo` and the setter; empty on the engine's own `get_repo`/`list_repos`, core#1933: `{id, enabled, off_by}`, detection reused for 10 s) and a person
 turns one off for that repo with `Core::set_repo_seat_layers_off` (persisted `seat_layers_off`, handed to each unit
 on `GovernanceContext.seat_layers_off` at dispatch, left out at arm). A layer set that does not build never
 blocks a unit: it runs on the plain seat image with a note naming the layers, the build error and the
