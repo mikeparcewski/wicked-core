@@ -2988,23 +2988,39 @@ fn without_exclusion_the_retry_runs_before_the_base_and_a_pass_skips_the_base() 
 /// (core#1101 item 3, operator decision 2026-11-25) Exclusion is ON by default: unset, `on` or `1`
 /// enable it; exactly `off` or `0` turn it off. Any other value is read as off, as an unknown value
 /// always was (the switch fails toward escalating, never toward excluding): nothing trimmed,
-/// nothing case-folded.
+/// nothing case-folded. Read from `std::env::var`'s own result, so a value that is not Unicode is
+/// off, never mistaken for unset (round 1, codex P2).
 #[test]
 fn the_exclusion_switch_is_on_by_default_and_off_only_when_asked() {
+    use std::env::VarError;
+    let mut cases: Vec<(Result<String, VarError>, bool)> = vec![(Err(VarError::NotPresent), true)];
     for (v, on) in [
-        (None, true),
-        (Some("on"), true),
-        (Some("1"), true),
-        (Some("off"), false),
-        (Some("0"), false),
-        (Some("OFF"), false),
-        (Some("ON"), false),
-        (Some("true"), false),
-        (Some(" on"), false),
-        (Some("1\n"), false),
-        (Some(""), false),
+        ("on", true),
+        ("1", true),
+        ("off", false),
+        ("0", false),
+        ("OFF", false),
+        ("ON", false),
+        ("true", false),
+        (" on", false),
+        ("1\n", false),
+        ("", false),
     ] {
-        assert_eq!(exclusion_from(v), on, "{v:?}");
+        cases.push((Ok(v.to_string()), on));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        cases.push((
+            Err(VarError::NotUnicode(std::ffi::OsString::from_vec(vec![
+                b'o', 0xff,
+            ]))),
+            false,
+        ));
+    }
+    for (v, on) in cases {
+        let shown = format!("{v:?}");
+        assert_eq!(exclusion_from(v), on, "{shown}");
     }
 }
 

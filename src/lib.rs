@@ -3268,7 +3268,8 @@ mod test_harness_hygiene {
     #[ctor::ctor(unsafe)]
     fn arm_hermetic_emit_spool() {
         wicked_apps_core::emit::hermetic_test_spool();
-        // The floor's exclusion ships OFF; its tests exercise it ON (one test pins it off).
+        // The floor's exclusion is ON by default (core#1101); pinned ON here so an operator's own
+        // `WICKED_FLOOR_EXCLUDE` never changes what the tests exercise (one test pins it off).
         std::env::set_var(crate::repo_checks::FLOOR_EXCLUDE_ENV, "on");
     }
 }

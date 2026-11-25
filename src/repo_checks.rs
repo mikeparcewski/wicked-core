@@ -9057,17 +9057,18 @@ pub(crate) fn exclusion_enabled() -> bool {
     if let Some(on) = test_seam::exclusion() {
         return on;
     }
-    match std::env::var(FLOOR_EXCLUDE_ENV) {
-        Ok(v) => exclusion_from(Some(&v)),
-        Err(std::env::VarError::NotPresent) => exclusion_from(None),
-        // Not Unicode: an unknown value, so off.
-        Err(std::env::VarError::NotUnicode(_)) => false,
-    }
+    exclusion_from(std::env::var(FLOOR_EXCLUDE_ENV))
 }
 
-/// The switch's value: unset, or exactly `on` or `1` (never trimmed, never case-folded), is on.
-fn exclusion_from(value: Option<&str>) -> bool {
-    matches!(value, None | Some("on") | Some("1"))
+/// The switch from the variable exactly as `std::env::var` reads it: unset, or exactly `on` or `1`
+/// (never trimmed, never case-folded), is on. A value that is not Unicode is an unknown value, so
+/// off.
+fn exclusion_from(var: Result<String, std::env::VarError>) -> bool {
+    match var {
+        Ok(v) => v == "on" || v == "1",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => false,
+    }
 }
 
 /// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
