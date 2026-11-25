@@ -41,8 +41,8 @@ pub(crate) use preview::preview_plan;
 pub use preview::PlanPreview;
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, hold_rescore, parse_send_back_plan,
-    path_scored_diff, plan_lines_of, revise, send_back, send_back_def, send_back_prompt,
-    with_scoring, Change, DiffRescore, Outcome, PlanLines, ScoreScope,
+    path_scored_diff, plan_lines_of, revise, revise_with_ran, send_back, send_back_def,
+    send_back_prompt, with_scoring, Change, DiffRescore, Outcome, PlanLines, ScoreScope,
 };
 pub(crate) use scope::{
     decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,

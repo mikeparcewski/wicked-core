@@ -125,6 +125,7 @@ mod tests {
             default_floor: false,
             repo_checks: None,
             last_attempt: None,
+            plan_rev: None,
             rework_of: None,
             rework_amendment: None,
             advice_scope: None,

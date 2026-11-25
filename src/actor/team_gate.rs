@@ -3776,6 +3776,8 @@ pub(super) fn revise_units(
                     k.repeat_choice = o.repeat_choice.clone();
                 }
                 k.last_attempt = o.last_attempt.max(floor);
+                // (core#1925) …and the plan revision it last ran under.
+                k.plan_rev = o.plan_rev;
                 // (core#1543) …and what its launches were observed calling: a retained unit keeps
                 // its provider history (codex on the re-land).
                 k.observed_providers = o.observed_providers.clone();
