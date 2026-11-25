@@ -914,6 +914,7 @@ mod tests {
             default_floor: false,
             repo_checks: None,
             last_attempt: None,
+            plan_rev: None,
             rework_of: None,
             rework_amendment: None,
             advice_scope: None,
@@ -1539,8 +1540,10 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
+            seat_layers_off: Vec::new(),
             apps: None,
         });
         let out = runner.run_unit(&input);
@@ -1572,8 +1575,10 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                seat_layers_off: Vec::new(),
                 apps: None,
             })
         };
@@ -1684,8 +1689,10 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                seat_layers_off: Vec::new(),
                 apps: None,
             })
         };

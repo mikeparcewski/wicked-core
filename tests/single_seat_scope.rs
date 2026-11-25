@@ -132,6 +132,7 @@ fn a_feature_launch_on_one_seat_fails_at_the_scope_boundary_naming_the_cause() {
         project_id: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

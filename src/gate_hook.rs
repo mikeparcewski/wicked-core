@@ -19996,6 +19996,14 @@ mod boundary_tests {
             "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
              skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
         );
+        // (core#1463) The required-only build drops only the optional launch entries from the
+        // SAME assembly.
+        assert!(
+            launcher.contains(
+                "assemble_read_roots(self.code_graph_db.as_deref(),operational_home,&extras,self.skills_root.as_deref()"
+            ),
+            "the required-only read roots no longer ride the one shared assembly (core#1463)"
+        );
         assert!(
             launcher.contains(".flat_map(|g|g.read_roots(self.operational_home.as_deref()))"),
             "the seat container no longer mounts the gate hook's read roots when it arms, so a \

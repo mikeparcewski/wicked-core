@@ -380,6 +380,44 @@ jobs:
               done
             '
 
+      # core#1043: the toolchain layers the engine composes into a Go, Java or Python repository's
+      # seat image (src/seat_layers.rs; the fixture is the engine's own block, pinned by a lockstep
+      # test) build on the seat image, and each toolchain works offline on Debian's default PATH with
+      # no image env, as a seat runs it. Both architectures: the uv tarball is pinned per arch.
+      - name: The seat toolchain layers build and run on the default PATH
+        run: |
+          set -eu
+          { echo 'FROM wicked-seat-claude:ci'; cat tests/fixtures/seat-layers/go-java-python.Dockerfile; } \
+            > "$RUNNER_TEMP/layers.Dockerfile"
+          docker build -t wicked-seat-claude-layers:ci - < "$RUNNER_TEMP/layers.Dockerfile"
+          # A uv tarball that does not match its pin fails the build at the check, before tar.
+          sed 's/sum=[0-9a-f]\{64\}/sum=0000000000000000000000000000000000000000000000000000000000000000/' \
+            "$RUNNER_TEMP/layers.Dockerfile" > "$RUNNER_TEMP/bad-sum.Dockerfile"
+          if docker build --progress=plain - < "$RUNNER_TEMP/bad-sum.Dockerfile" > "$RUNNER_TEMP/bad-sum.log" 2>&1; then
+            echo "a uv tarball with the wrong sha256 was installed" >&2; exit 1
+          fi
+          grep -q 'uv.tar.gz: FAILED' "$RUNNER_TEMP/bad-sum.log" || { tail -40 "$RUNNER_TEMP/bad-sum.log" >&2; exit 1; }
+          test "$(docker image inspect -f '{{index .Config.Labels "wicked.seat.layers"}}' wicked-seat-claude-layers:ci)" = go,java,python
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/go" "$dir/java"
+          printf 'module tiny\n\ngo 1.21\n' > "$dir/go/go.mod"
+          printf 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("go", 1+2) }\n' > "$dir/go/main.go"
+          printf 'public class Hello { public static void main(String[] a) { System.out.println("java " + (1 + 2)); } }\n' \
+            > "$dir/java/Hello.java"
+          chmod -R a+rwX "$dir"
+          docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
+            -v "$dir:/work:ro" --entrypoint /usr/bin/env wicked-seat-claude-layers:ci \
+            -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp TMPDIR=/tmp \
+            sh -euc '
+              test "$(go env GOTOOLCHAIN)" = auto
+              cd /work/go && go build -o /tmp/tiny . && test "$(/tmp/tiny)" = "go 3"
+              cd /work/java && javac -d /tmp/j Hello.java && test "$(java -cp /tmp/j Hello)" = "java 3"
+              mvn -v
+              uv --version && uvx --version
+              uv venv --offline --python /usr/bin/python3 /tmp/venv
+              test "$(/tmp/venv/bin/python -c "print(1 + 2)")" = 3
+              echo "go, java and python layers work on the default PATH"'
+
       - name: A crate with rust-toolchain.toml channel = "stable" builds in both images
         run: |
           set -eu

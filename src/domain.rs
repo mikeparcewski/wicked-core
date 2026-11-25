@@ -131,6 +131,12 @@ pub struct AgentSession {
     /// never what they may write. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub extra_read_roots: Vec<String>,
+    /// (core#1463) The launch's optional read roots (a subset of [`Self::extra_read_roots`]),
+    /// persisted for the same reason: a resume leaves out the same roots the launch allowed.
+    /// `#[serde(default)]`: an older session has none, so every read root stays required; empty
+    /// is not written, so a session with none stays byte-identical to an older row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_read_roots: Vec<String>,
     /// The project code graph the launcher bound this run to, if any (see
     /// [`crate::project::ProjectGraphBinding`]). Persisted on the session for the same reason
     /// `extra_write_roots` is (core#259): a resume/redrive re-enters through the actor with no
@@ -1577,6 +1583,12 @@ pub struct WorkUnit {
     /// phase-id / `task.dispatched` wedge; a never-run unit stays at attempt 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt: Option<u32>,
+    /// (core#1925) The accepted plan revision this unit was LAST DISPATCHED under (written by
+    /// `dispatch_unit_with` beside `last_attempt`), so the run view says which plan a unit's work came
+    /// from after an edit at a gate. `None` until the unit has been dispatched; never cleared by a
+    /// rewind (it is also the record that the unit ran, which a gate edit reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_rev: Option<u32>,
     /// (DES-L1 PR-1B) The ord of the Evaluator unit whose REJECTED review this creator re-run must
     /// address (`request_changes`): its transcript is handed to the seat as prior context at
     /// dispatch. Cleared when the unit is approved.
@@ -1979,6 +1991,18 @@ pub enum RoutingInfo {
 }
 
 impl WorkUnit {
+    /// (core#1925) The unit was dispatched at least once: a dispatch stamp (`plan_rev`, or
+    /// `last_attempt` for a unit dispatched before `plan_rev` existed; neither is cleared by a
+    /// rewind) or a finished status. `Distributed` alone is not proof: distribution assigns every
+    /// planned unit a seat before any runs (`pipeline::apply_distributions`). Conservative: a
+    /// unit planned fresh on an ord that ran inherits that ord's attempt floor and reads as
+    /// dispatched.
+    pub fn was_dispatched(&self) -> bool {
+        self.plan_rev.is_some()
+            || self.last_attempt.is_some()
+            || matches!(self.status, UnitStatus::Done | UnitStatus::Rejected)
+    }
+
     /// Build a fresh `Pending` unit for the plan.
     pub fn pending(
         id: impl Into<String>,
@@ -2058,6 +2082,7 @@ impl WorkUnit {
             default_floor: false,
             repo_checks: None,
             last_attempt: None,
+            plan_rev: None,
             rework_of: None,
             rework_amendment: None,
             advice_scope: None,
@@ -2914,6 +2939,7 @@ mod tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -3007,6 +3033,8 @@ mod tests {
             registered_at: 1,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let run = AgentSession {
             id: "under-b".to_string(),
@@ -3051,6 +3079,24 @@ mod tests {
             normalize_exclude_seats(&[" codex ".into(), "".into(), "pi".into(), "codex".into()]),
             ["codex", "pi"]
         );
+    }
+
+    /// (core#1463) The launch's optional read roots persist on the session (a resume leaves out the
+    /// same roots), an older row reads none, and none is not written.
+    #[test]
+    fn optional_read_roots_persist_and_an_older_session_has_none() {
+        let s = sample_session();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("optional_read_roots").is_none(), "{v}");
+        let mut set = sample_session();
+        set.extra_read_roots = vec!["/srv/a".into(), "/srv/b".into()];
+        set.optional_read_roots = vec!["/srv/b".into()];
+        let back = AgentSession::from_node(&set.to_node()).expect("from_node");
+        assert_eq!(back.optional_read_roots, ["/srv/b"]);
+        let mut old = serde_json::to_value(&set).unwrap();
+        old.as_object_mut().unwrap().remove("optional_read_roots");
+        let back: AgentSession = serde_json::from_value(old).unwrap();
+        assert!(back.optional_read_roots.is_empty());
     }
 
     #[test]

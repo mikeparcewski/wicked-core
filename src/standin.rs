@@ -476,24 +476,7 @@ pub(crate) fn judge_offer(
     if benched.iter().any(|b| seat_id::credential(&b.cli) == base) {
         return None;
     }
-    // (§3.7) Why, from the run's facts: a helper lost during the run; else only one helper on the
-    // run; else fewer helpers than the judge needs (every other one built the work or shares it).
-    let credentials: std::collections::BTreeSet<&str> =
-        run_seats.iter().map(|k| seat_id::credential(k)).collect();
-    let reason = match benched.first() {
-        Some(b) => Reason::LostMidRun {
-            seat: display_name(roster, &b.cli),
-            cause: b.reason.clone(),
-        },
-        None if credentials.len() <= 1 => Reason::OnlyOneHelper {
-            cli: display_name(roster, &base),
-        },
-        None => Reason::HelpersShort {
-            signed_in: credentials.len(),
-            need: 1,
-            have: 0,
-        },
-    };
+    let reason = reason_from_run(roster, run_seats, benched, &base);
     match fill(FillRequest {
         role: Role::Judge,
         need: 1,
@@ -514,6 +497,33 @@ pub(crate) fn judge_offer(
             b
         }),
         Fill::NeedConsent(_) | Fill::NoUsableBase(..) => None,
+    }
+}
+
+/// (§3.7) Why one role on the run has no independent helper, from the run's facts: a helper lost
+/// during the run; else only one helper on the run; else fewer helpers than the role needs (every
+/// other one built the work or shares it). `base` is the credential the stand-in would run on.
+pub(crate) fn reason_from_run(
+    roster: &[crate::AgenticCli],
+    run_seats: &[String],
+    benched: &[crate::domain::BenchedSeat],
+    base: &str,
+) -> Reason {
+    let credentials: std::collections::BTreeSet<&str> =
+        run_seats.iter().map(|k| seat_id::credential(k)).collect();
+    match benched.first() {
+        Some(b) => Reason::LostMidRun {
+            seat: display_name(roster, &b.cli),
+            cause: b.reason.clone(),
+        },
+        None if credentials.len() <= 1 => Reason::OnlyOneHelper {
+            cli: display_name(roster, base),
+        },
+        None => Reason::HelpersShort {
+            signed_in: credentials.len(),
+            need: 1,
+            have: 0,
+        },
     }
 }
 

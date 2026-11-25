@@ -6942,6 +6942,7 @@ fn core_1611_disk_refusal_gate_advice_names_disk_space_not_sandbox_installation(
         None,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         None,
         None,
         None,

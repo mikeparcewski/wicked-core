@@ -49,6 +49,7 @@ fn launch_preset_with_qe(
             workflow: Some(workflow.into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -341,6 +342,7 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
         workflow: workflow.map(str::to_string),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan,
         deliver_step: None,
@@ -396,6 +398,7 @@ fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(plan(json!({"steps": [
             {"catalog": "understand", "id": "pa-scope"},
@@ -1090,6 +1093,7 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             workflow: Some(workflow.into()),
             extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -1200,4 +1204,63 @@ fn wait_status_done(e: &Engine, run: &str) {
     wait_for(&format!("{run} to complete"), || {
         view(e, run).session.status == SessionStatus::Completed
     });
+}
+
+/// (core#1043 part 2) The layers a person turned off for a repo ride each of its units'
+/// governance from dispatch, where the arm drops them from the seat image.
+#[test]
+fn a_repos_layers_turned_off_ride_its_units_governance() {
+    let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let record = seen.clone();
+    let w = Worker::scripted(move |i, _| {
+        record.lock().unwrap().push(
+            i.governance
+                .as_ref()
+                .map(|g| g.seat_layers_off.clone())
+                .unwrap_or_default(),
+        );
+        hold()
+    });
+    let e = engine("layersoff", w.clone());
+    let (repo_id, _) = repo(&e, "layers-off");
+    let entry = e
+        .core
+        .set_repo_seat_layers_off(&repo_id, vec!["go".into()])
+        .unwrap();
+    assert_eq!(entry.seat_layers_off, ["go"]);
+    put(&e, "lo", json!([{"catalog": "understand", "id": "answer"}]));
+    launch_preset(&e, "lo", "lo", Some(&repo_id), HumanConfirm::None);
+    wait_for("a unit dispatched", || !seen.lock().unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap()[0], ["go"]);
+    release_all(&w);
+}
+
+/// (core#1933, round 1 codex P2) The repo list a person gets (`Core::list_repos`, the binding's
+/// `listRepos`) carries the seat-layer rows, with the switch applied; the engine's own reads do not.
+#[test]
+fn the_repo_list_a_person_sees_shows_the_seat_layers_1933() {
+    let e = engine("layerslist", Worker::scripted(|_, _| hold()));
+    let (path, _) = git_repo(&e.rig.dir);
+    std::fs::write(path.join("go.mod"), "module x\n").unwrap();
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "layers-list".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    e.core
+        .set_repo_seat_layers_off(&entry.id, vec!["go".into()])
+        .unwrap();
+    let listed = e.core.list_repos().unwrap();
+    let shown = &listed
+        .iter()
+        .find(|r| r.id == entry.id)
+        .unwrap()
+        .seat_layers;
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].id, "go");
+    assert!(!shown[0].enabled);
+    assert_eq!(shown[0].off_by.as_deref(), Some("repo"));
 }

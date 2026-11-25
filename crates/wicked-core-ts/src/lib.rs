@@ -781,6 +781,12 @@ pub struct LaunchOptions {
     /// an invalid root REJECTS the launch with no session persisted. Omit for the default
     /// evidence-derived read boundary.
     pub extra_read_roots: Option<Vec<String>>,
+    /// The entries of `extraReadRoots` the run can do without (core#1463). On the container floor, one that
+    /// does not fit the unit's copy-in caps is left out of the unit's copy (its directory holds only a
+    /// note saying so) instead of refusing the unit. It grants no read: each entry must equal an entry of
+    /// `extraReadRoots`, or the launch is REJECTED. A root another source also requires is never left
+    /// out. Omit to keep every read root required.
+    pub optional_read_roots: Option<Vec<String>>,
     /// The PROJECT code graph this run's governed workers should query, instead of the run repo's
     /// own graph — one database holding every member repo of the project, so a worker's
     /// SearchEntity / BlastRadius / TraverseGraph can see the whole project rather than one repo.
@@ -964,6 +970,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         project_id: o.project_id,
         extra_write_roots: o.extra_write_roots.unwrap_or_default(),
         extra_read_roots: o.extra_read_roots.unwrap_or_default(),
+        optional_read_roots: o.optional_read_roots.unwrap_or_default(),
         project_graph: o.project_graph.map(|g| wicked_core::ProjectGraphBinding {
             db_path: g.db_path,
             repo_label: g.repo_label,
@@ -2034,6 +2041,24 @@ impl Core {
         task(move || {
             let repos = core.list_repos().map_err(err)?;
             serde_json::to_string(&repos).map_err(err)
+        })
+    }
+
+    /// (core#1043 part 2) Turn seat layers off for a repo: `offJson` is a JSON array of layer ids
+    /// (`[]` turns every layer back on). Resolves to the updated `RepoEntry` JSON object, whose
+    /// `seat_layers` rows (`{id, enabled, off_by}`) show the result. Rejects naming an unknown
+    /// layer id or repo.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_repo_seat_layers_off(
+        &self,
+        repo_id: String,
+        off_json: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let off: Vec<String> = serde_json::from_str(&off_json).map_err(err)?;
+            let entry = core.set_repo_seat_layers_off(&repo_id, off).map_err(err)?;
+            serde_json::to_string(&entry).map_err(err)
         })
     }
 

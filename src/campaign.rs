@@ -113,6 +113,7 @@ impl RunSpec {
             // and no read widening either (core#294).
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             // Unfiled (above) ⇒ no project graph. A campaign node's workers see their own repo,
             // which is what a campaign fans out over anyway.
             project_graph: None,
@@ -2603,6 +2604,7 @@ mod tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -2775,6 +2777,7 @@ mod tests {
                 repo_ref: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 project_graph: None,
                 project_id: None,
                 archived_at: None,

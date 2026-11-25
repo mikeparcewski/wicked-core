@@ -633,6 +633,7 @@ fn the_straight_through_path_refuses_every_qe_word() {
             workflow: Some("qe-one".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,

@@ -20,6 +20,34 @@ Two release tracks share this file, newest entry first regardless of track:
   required probe. `off` or `0` turns it off (and so does any other value, as before): a red base then escalates
   as `base_red_unseparated`. The four exclusion-only fixes the switch waited for shipped in #1766.
 
+- **Reading a repo no longer rescans its checkout** (core#1933, the core#1932 follow-up). Since core#1932
+  every `get_repo` and `list_repos` detected the repo's seat layers on the checkout inside the actor, listing
+  up to 257 directories: several times per dispatched unit, and once per repo on each studio poll. Now only
+  the reads a person sees derive `RepoEntry.seat_layers` (`Core::list_repos`, and the replies of
+  `register_repo` and `set_repo_seat_layers_off`). The engine's own reads carry no rows and list no
+  directory, and none serves the copy stored in the record. The list's detection is reused for 10 seconds
+  per checkout, so a marker added or removed shows within 10 seconds.
+
+- **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
+  core seam). `RepoEntry.seat_layers` is derived from the registered checkout on the reads a person sees
+  (core#1933): one row
+  `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
+  or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
+  `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,
+  re-registration keeps them, and `[]` clears them. Dispatch hands the list to each unit on
+  `GovernanceContext.seat_layers_off`, and the container arm leaves those layers out of the seat image. All
+  fields are additive.
+
+- **A person's edit at a mid-run plan gate reaches the plan and the units that run** (core#1925). An edit that
+  restates a held step now amends it, field by field: what the person sets replaces the held value, and what they
+  leave out keeps it. Before, the edit added nothing for a restated step id, so the accepted rev was the held plan
+  unchanged, or the edit was refused as "the proposal adds no step". The edit is refused by name when it changes a
+  step that was ever dispatched, moves a step to another catalog entry, clears or swaps a validator pin, drops a
+  deliverable or an input a step read, or changes a check-bearing step beyond its instructions. The refusal names
+  the changes in the words studio shows (worker pool, validator, time budget) and says what the person can do
+  instead. Additive `WorkUnit.plan_rev`: the accepted plan revision a unit was last dispatched under (absent until
+  dispatch, kept through a rewind).
+
 - **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 919f3575, carrying 74 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854, #1891.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 

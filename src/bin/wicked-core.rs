@@ -219,12 +219,15 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "seat-image",
-        "wicked-core seat-image build [<cli>...|all] | \
-         seat-image status [--json] [<cli>...]\n  \
+        "wicked-core seat-image build [--layers <ids>|detect:<dir>] [<cli>...|all] | \
+         seat-image status [--json] [--layers <ids>|detect:<dir>] [<cli>...]\n  \
          Build or report the images governed seats use in Kubernetes pods. The container CLI \
          (docker, podman, nerdctl) builds images into the store shared with the local cluster \
          (imagePullPolicy: Never). A missing WICKED_SEAT_BASE_IMAGE is rebuilt from \
-         WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object.",
+         WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object. --layers \
+         names toolchain layers (go, java, python; rust and node are in the base) or detects \
+         them from a checkout, so an operator can pre-build a repository's seat images; a run \
+         detects its own. WICKED_SEAT_LAYERS=off turns detection off.",
     ),
     (
         "seat-login",
@@ -666,6 +669,7 @@ fn main() {
                 project_id: flag(&args, "--project"),
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                optional_read_roots: Vec::new(),
                 // Stub self-test path — no worker, so nothing would read a graph anyway.
                 project_graph: None,
                 plan: None,
@@ -985,6 +989,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         project_id: flag(args, "--project"),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         // `--project` files the run; it does NOT bind a project graph, and this CLI deliberately
         // has no flag that would. The graph's location, its membership and its estate labels are
         // the launcher's to know (see `project::ProjectGraphBinding`), and an operator CLI that

@@ -348,6 +348,7 @@ fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&st
             workflow: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: Some(p),
             deliver_step: None,
@@ -1734,6 +1735,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
             workflow: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: Some(p),
             deliver_step: None,
@@ -1937,6 +1939,166 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
     );
     assert!(payloads(&e, "nn", tev::PLAN_REFUSED).is_empty());
     release_all(&w);
+}
+
+/// (core#1925) The b7-crew probe's shape, end to end. At the mid-run gate the PA's `PLAN+` opened
+/// (`answer-1` ran), the person's edit restates the launch's own `answer-2` and the proposal's
+/// `docs` with new instructions. The units that then run carry those instructions, and each unit
+/// records the plan rev it was dispatched under: `answer-1` the launch's, the others the person's.
+#[test]
+fn a_mid_run_gate_edit_reaches_the_units_that_run_1925() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"docs"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("ge1925", w.clone());
+    launch(
+        &e,
+        "ge",
+        HumanConfirm::None,
+        plan(json!({"steps": [
+            {"catalog": "understand", "id": "answer-1"},
+            {"catalog": "understand", "id": "answer-2"}
+        ]})),
+    );
+    e.wait_awaiting("ge", "plan_approval", 1);
+    let status = e
+        .core
+        .confirm_gate(
+            "ge",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [
+                    {"catalog": "understand", "id": "answer-1"},
+                    {"catalog": "produce", "id": "docs",
+                     "instructions": "Write the page. Also add an epic for billing."},
+                    {"catalog": "understand", "id": "answer-2",
+                     "instructions": "Name the billing epic in the answer."}
+                ]})),
+                note: None,
+            },
+        )
+        .expect("the edit is an answer");
+    assert_ne!(status, crate::SessionStatus::Failed);
+    wait_for("docs and answer-2 to dispatch", || {
+        let calls = e.worker.calls();
+        ["ge:docs", "ge:answer-2"]
+            .iter()
+            .all(|u| calls.iter().any(|c| c.2 == *u))
+    });
+    assert!(payloads(&e, "ge", tev::PLAN_REFUSED).is_empty());
+    let accepted = payloads(&e, "ge", tev::PLAN_ACCEPTED);
+    let last = accepted.last().unwrap();
+    assert_eq!(last["by"], "human");
+    let rev = last["plan_rev"].as_u64().map(|r| r as u32);
+    let units = view(&e, "ge").units;
+    let unit = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("ge:{id}"))
+            .unwrap_or_else(|| panic!("no unit {id}"))
+    };
+    assert!(
+        unit("docs")
+            .description
+            .contains("Also add an epic for billing."),
+        "{}",
+        unit("docs").description
+    );
+    assert!(
+        unit("answer-2")
+            .description
+            .contains("Name the billing epic in the answer."),
+        "{}",
+        unit("answer-2").description
+    );
+    assert_eq!(unit("answer-1").plan_rev, Some(1));
+    assert_eq!(unit("docs").plan_rev, rev);
+    assert_eq!(unit("answer-2").plan_rev, rev);
+    release_all(&w);
+}
+
+/// (core#1925, pi r1 on the fix) End to end, an edit at the mid-run gate that changes a step that
+/// ran is refused by name, and the run keeps its plan.
+#[test]
+fn a_mid_run_gate_edit_to_a_step_that_ran_is_refused_1925() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"docs"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("gr1925", w.clone());
+    launch(
+        &e,
+        "gr",
+        HumanConfirm::None,
+        plan(json!({"steps": [
+            {"catalog": "understand", "id": "answer-1"},
+            {"catalog": "understand", "id": "answer-2"}
+        ]})),
+    );
+    e.wait_awaiting("gr", "plan_approval", 1);
+    let before: Vec<String> = view(&e, "gr").units.iter().map(|u| u.id.clone()).collect();
+    let _ = e.core.confirm_gate(
+        "gr",
+        HumanDecision::EditPlan {
+            plan: plan(json!({"steps": [
+                {"catalog": "understand", "id": "answer-1", "instructions": "Answer it again."},
+                {"catalog": "produce", "id": "docs"},
+                {"catalog": "understand", "id": "answer-2"}
+            ]})),
+            note: None,
+        },
+    );
+    wait_for("the edit's refusal", || {
+        payloads(&e, "gr", tev::PLAN_REFUSED).iter().any(|p| {
+            p["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("the step `answer-1` already ran"))
+        })
+    });
+    let after: Vec<String> = view(&e, "gr").units.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(after, before, "the run keeps its units");
+    assert!(
+        !e.worker.calls().iter().any(|c| c.2 == "gr:answer-2"),
+        "nothing ran past the gate"
+    );
+    release_all(&w);
+}
+
+/// (core#1925, codex r1 on the fix) Distribution assigns every planned unit a seat before any
+/// runs, so `Distributed` is not "ran"; a dispatch stamp is, and survives a rewind's reset.
+#[test]
+fn a_unit_was_dispatched_by_its_stamps_not_by_distribution_1925() {
+    use crate::domain::{UnitStatus, WorkUnit};
+    let mut u = WorkUnit::pending("r:a", "r", 1, "a");
+    assert!(!u.was_dispatched());
+    u.status = UnitStatus::Distributed;
+    assert!(!u.was_dispatched(), "a seat was assigned, nothing ran");
+    // Dispatched before `plan_rev` existed, then reset by a rewind.
+    u.status = UnitStatus::Pending;
+    u.last_attempt = Some(0);
+    assert!(u.was_dispatched());
+    u.last_attempt = None;
+    u.plan_rev = Some(2);
+    assert!(u.was_dispatched());
+    u.plan_rev = None;
+    u.status = UnitStatus::Rejected;
+    assert!(u.was_dispatched());
 }
 
 /// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for

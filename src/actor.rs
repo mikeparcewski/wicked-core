@@ -195,8 +195,10 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         extra_write_roots: Vec::new(),
         // Same per-RUN fill for the read mirror (core#294).
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_id: None,
         repo_id: None,
+        seat_layers_off: Vec::new(),
         apps: None,
     })
 }
@@ -1247,6 +1249,8 @@ pub(crate) fn run(
     // threshold that no live turn holds, so another engine's live views on the same temp dir
     // are never touched).
     crate::acp_runner::sweep_stale_member_views();
+    // (C1) Model-call channel directories a daemon that is gone left behind (never a live one's).
+    crate::model_call::sweep_stale();
 
     // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): the launch poller `Core::spawn*` arms (when
     // `WICKED_BUS_DB` is set) on the caller's thread while this one starts, with a bounded handshake —
@@ -1484,6 +1488,7 @@ pub(crate) fn run(
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
                     extra_write_roots: _, // legacy sync path widens nothing (core#259)
                     extra_read_roots: _, // …and reads no wider either (core#294)
+                    optional_read_roots: _, // …so it leaves none out (core#1463)
                     // Legacy path has no repo and therefore no project graph to bind; it also
                     // never reaches the governed dispatch that would read one.
                     project_graph: _,
@@ -1643,6 +1648,12 @@ pub(crate) fn run(
                     crate::path_policy::validate_extra_read_roots(
                         &spec.extra_read_roots,
                         home.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    // (core#1463) An optional read root is one of those, never a root of its own.
+                    crate::path_policy::validate_optional_read_roots(
+                        &spec.optional_read_roots,
+                        &spec.extra_read_roots,
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                     // (WT-C2) The evidence root is a write root of the jailed walkthrough tool:
@@ -1909,6 +1920,7 @@ pub(crate) fn run(
                         repo_ref: repo_ref.clone(),
                         extra_write_roots: spec.extra_write_roots.clone(),
                         extra_read_roots: spec.extra_read_roots.clone(),
+                        optional_read_roots: spec.optional_read_roots.clone(),
                         project_graph: spec.project_graph.clone(),
                         project_id: spec.project_id.clone(),
                         archived_at: None,
@@ -2142,6 +2154,7 @@ pub(crate) fn run(
                     workdir,
                     spec.extra_write_roots.clone(),
                     spec.extra_read_roots.clone(),
+                    spec.optional_read_roots.clone(),
                     spec.project_graph.clone(),
                     spec.project_id.clone(),
                     spec.workflow.as_deref(),
@@ -2374,6 +2387,7 @@ pub(crate) fn run(
                         workdir.clone(),
                         spec.extra_write_roots.clone(),
                         spec.extra_read_roots.clone(),
+                        spec.optional_read_roots.clone(),
                         spec.project_graph.clone(),
                         spec.project_id.clone(),
                         workflow.as_deref(),
@@ -3007,8 +3021,15 @@ pub(crate) fn run(
             Command::UnregisterRepo { repo_id, reply } => {
                 let _ = reply.send(unregister_repo(&mut store, &repo_id));
             }
+            Command::SetRepoSeatLayersOff {
+                repo_id,
+                off,
+                reply,
+            } => {
+                let _ = reply.send(crate::repo::set_seat_layers_off(&mut store, &repo_id, &off));
+            }
             Command::ListRepos { reply } => {
-                let _ = reply.send(crate::repo::list_repos(&store));
+                let _ = reply.send(crate::repo::list_repos_shown(&store));
             }
             Command::RejudgeReadiness { run_id, reply } => {
                 let _ = reply.send(rejudge_readiness(&store, &run_id));
@@ -6005,6 +6026,12 @@ pub(crate) fn launch_run_inner(
         // The read mirror (core#294): same judgement, same synchronous refusal.
         crate::path_policy::validate_extra_read_roots(&spec.extra_read_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        // (core#1463) Same judgement of the optional read roots.
+        crate::path_policy::validate_optional_read_roots(
+            &spec.optional_read_roots,
+            &spec.extra_read_roots,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
         // (WT-C2) The evidence root: same judgement, same synchronous refusal.
         crate::walkthrough::validate_evidence_root(spec.evidence_root.as_deref(), home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -6068,6 +6095,7 @@ pub(crate) fn launch_run_inner(
         workdir,
         spec.extra_write_roots.clone(),
         spec.extra_read_roots.clone(),
+        spec.optional_read_roots.clone(),
         spec.project_graph.clone(),
         spec.project_id.clone(),
         workflow.as_deref(),
@@ -13562,7 +13590,7 @@ fn dispatch_unit_with(
     is_acp: bool,
     probe: Option<Box<DispatchProbe>>,
 ) -> anyhow::Result<bool> {
-    let session = crate::domain::get_session(store, run_id)?
+    let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     // (DES-TEAMING-002 T3, round 10) THE dispatch guard: no unit runs past a held plan, or ahead
     // of the accepted rev's `plan.accepted` on a teamed run — whichever path asked.
@@ -13671,6 +13699,17 @@ fn dispatch_unit_with(
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
+    }
+    // (core#1925) …and the accepted plan revision it is dispatched under (a team run's; a run
+    // with no team plan has none).
+    let plan_rev = session
+        .team_plan
+        .as_ref()
+        .map(|t| t.accepted_rev)
+        .filter(|r| *r > 0);
+    let plan_rev_changed = plan_rev.is_some() && unit.plan_rev != plan_rev;
+    if plan_rev_changed {
+        unit.plan_rev = plan_rev;
     }
     // DES-TEAMING-002 P1: a team unit of an un-teamed run carries `transport: none` in its
     // snapshot BEFORE its turn starts — stamped from the run's persisted state, never the worker.
@@ -13785,6 +13824,7 @@ fn dispatch_unit_with(
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
+        || plan_rev_changed
         || advice_scope_changed
         || team_changed
     {
@@ -13967,6 +14007,57 @@ fn dispatch_unit_with(
         } else {
             Vec::new()
         };
+        // (DES-STANDIN-001 §3.2, T-R11) No real seat can review the QE evidence: a consented,
+        // stand-in-aware run seats a stand-in reviewer, persisted on the run's contract and
+        // announced before the reviewer runs. A real seat always wins (only an empty list asks).
+        if stamped.qe_reviewer_seats.is_empty() && crate::qe_acceptance::review::applies(&stamped) {
+            let registry = crate::registry_roster();
+            let launch = launch_roster(&session)?;
+            let roster: Vec<crate::AgenticCli> = if launch.is_empty() {
+                session
+                    .clis
+                    .iter()
+                    .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
+                    .collect()
+            } else {
+                launch
+            };
+            if let Some((seat, binding)) = crate::qe_acceptance::review::stand_in_reviewer(
+                &session,
+                &units,
+                &stamped,
+                session.attempt,
+                &roster,
+                &registry,
+            ) {
+                if let Some(mut fresh) = crate::domain::get_session(store, run_id)? {
+                    if !fresh
+                        .assurance
+                        .stand_ins
+                        .iter()
+                        .any(|b| b.key == binding.key)
+                    {
+                        let display = binding.display().to_string();
+                        fresh.assurance.stand_ins.push(binding.clone());
+                        crate::standin::note_label(&mut fresh.assurance, &binding, &display);
+                        put_node(store, fresh.to_node())?;
+                        // (codex r1 on b7-standin) The rest of this dispatch (the judge's
+                        // stand-in offer) mints its slot from the binding just taken.
+                        session.assurance = fresh.assurance.clone();
+                        emit(
+                            subscribers,
+                            CoreEvent::StandInSeated {
+                                session: run_id.to_string(),
+                                ord: Some(unit.ord),
+                                label: crate::standin::label(&binding, &display),
+                                binding,
+                            },
+                        );
+                    }
+                }
+                stamped.qe_reviewer_seats = vec![seat];
+            }
+        }
         // (rig run 1d372696) What the run's own floor proved on the tree this QE unit starts on.
         // The tree is read FRESH here (xreview on #1211): the baseline is kept across a
         // restart's redispatch, so it may not be the tree this attempt starts on. No reading, no note.
@@ -14633,6 +14724,7 @@ fn dispatch_unit_with(
                     .collect()
             },
             extra_read_roots: session.extra_read_roots.clone(),
+            optional_read_roots: session.optional_read_roots.clone(),
             // BC-79: the run's studio project, from the SESSION (persisted at launch), so a
             // resume/redrive re-arms the same scope. Threaded to the worker env as
             // `WICKED_RUN_PROJECT` by `estate_provenance_env`; `None` for a repo-only run.
@@ -14640,6 +14732,9 @@ fn dispatch_unit_with(
             // core#1018: the run's registered repo, from the session like the project above, so the
             // worker env carries `WICKED_RUN_REPO` and the estate relay can scope to it.
             repo_id: session.repo_ref.clone(),
+            // (core#1043 part 2) …and the layers that repo turned off, read at dispatch, so a
+            // change applies from the next unit; the arm leaves them out of the seat image.
+            seat_layers_off: crate::repo::seat_layers_off_for(&*store, session.repo_ref.as_deref()),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
             // (DES-APPS-001 K0, narrowed by DES-KNOWLEDGE-DATA-001 §9.3) An Apps run's units get no
@@ -14871,19 +14966,26 @@ fn dispatch_unit_with(
         let apps_unarmed = apps_tool && apps_channel.is_none();
         // (DES-j6-build D1, C0) A declared Tool step of a SHIPPED preset can ask the daemon's own
         // seats for a model call (`wicked-core model-call`); a repo-defined Tool step cannot
-        // ([`crate::model_call::shipped_step`]). The step runner and the seat registry it is armed
-        // with are read here on the actor (the registry as the judges read it).
+        // ([`crate::model_call::shipped_step`]; the repo is read only for a declared step). The
+        // step runner and the run's seats (core#1905, [`model_call_admission`]) are read here on
+        // the actor.
         let model_calls = (run_env.is_some()
             && crate::model_call::shipped_step(
                 session.team_plan.as_ref().and_then(|p| p.preset.as_deref()),
                 unit,
-                session
-                    .repo_ref
-                    .as_deref()
-                    .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-                    .as_ref(),
+                || {
+                    session
+                        .repo_ref
+                        .as_deref()
+                        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                },
             ))
-        .then(|| (runner.clone(), judge_registries().1));
+        .then(|| {
+            (
+                runner.clone(),
+                model_call_admission(&session, in_process_governance().is_some()),
+            )
+        });
         std::thread::spawn(move || {
             let (_apps_token, _apps_binding, apps_env) = match apps_channel {
                 Some((t, b, env)) => (Some(t), Some(b), env),
@@ -15101,9 +15203,13 @@ fn dispatch_unit_with(
                         // (DES-j6-build D1, C0) The model-call channel lives until the command
                         // exits (this scope); a channel that could not be armed leaves the
                         // variables unset, and the client says so.
-                        let _model_call = model_calls.as_ref().and_then(|(r, reg)| {
-                            match crate::model_call::arm(r.clone(), reg.clone(), &input.run_id, ord)
-                            {
+                        let _model_call = model_calls.as_ref().and_then(|(r, admit)| {
+                            match crate::model_call::arm(
+                                r.clone(),
+                                admit.clone(),
+                                &input.run_id,
+                                ord,
+                            ) {
                                 Ok(ch) => Some(ch),
                                 Err(e) => {
                                     eprintln!(
@@ -15117,6 +15223,12 @@ fn dispatch_unit_with(
                         if let Some(ch) = &_model_call {
                             run_vars.extend(ch.env());
                         }
+                        // (core#1906) The channel closes when the command's own process exits,
+                        // not when its output pipes drain: a descendant that kept a pipe open does
+                        // not keep the step's calls running.
+                        let _close_on_exit = _model_call
+                            .as_ref()
+                            .map(|ch| ChildExitHook::set(Box::new(ch.closer())));
                         // (core#802) The garden root the run was admitted against rides every
                         // generic Tool unit as `WICKED_GARDEN_ROOT`, so a def runs
                         // `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from the
@@ -17364,7 +17476,7 @@ impl ToolRunEnv {
 /// What stopped a Tool child before it exited on its own (core#500 / F-BM-008): the pid of the
 /// process-group leader the engine killed, the invalidation signal the child observed, and how
 /// long it had run.
-struct ToolKilled {
+pub(crate) struct ToolKilled {
     pid: u32,
     reason: &'static str,
     ran_ms: u64,
@@ -17507,6 +17619,48 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
     }
 }
 
+thread_local! {
+    /// (core#1906) What runs once when the Tool command this thread runs has exited
+    /// ([`ChildExitHook`]).
+    static CHILD_EXIT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// (core#1906) A hook the Tool runner fires when the command's own process exits, before it waits
+/// for the command's output pipes to drain ([`run_tool_cmd`]). Set on the thread that runs the
+/// command; cleared when this guard drops.
+pub(crate) struct ChildExitHook;
+
+impl ChildExitHook {
+    pub(crate) fn set(f: Box<dyn Fn()>) -> Self {
+        CHILD_EXIT.with(|h| *h.borrow_mut() = Some(f));
+        ChildExitHook
+    }
+
+    fn fire() {
+        if let Some(f) = CHILD_EXIT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+impl Drop for ChildExitHook {
+    fn drop(&mut self) {
+        CHILD_EXIT.with(|h| h.borrow_mut().take());
+    }
+}
+
+/// (core#1905) The seats `session`'s model calls may use ([`crate::model_call::admission`]): its
+/// launch roster (the instances and the launcher's health probe, [`launch_roster`]), less the run's
+/// own benches and its launch benches as the ballot rule reads them ([`council_roster`]). A run
+/// with no launch roster has no seat to call.
+fn model_call_admission(session: &AgentSession, contained: bool) -> crate::model_call::Admission {
+    let roster = launch_roster(session).unwrap_or_default();
+    let launch_bench =
+        crate::distribute::launch_benched(&roster, session.repo_ref.is_some(), contained);
+    crate::model_call::admission(&roster, &session.benched_seats, &launch_bench)
+}
+
 /// Spawn a Tool command and poll it to completion the way `execute_wrapped::run_bounded` polls a
 /// seat (core#500 / F-BM-008): the child runs in its OWN process group (unix), the loop wakes
 /// every 50 ms, and `stop()` returning `Some(reason)` — the run's launch identity was invalidated
@@ -17531,7 +17685,7 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
 // index, or any def's) is bounded by that tree's index budget ([`crate::index_budget`]), the same
 // one a launch's base re-index and the repo watcher's re-index get. Every other step is unbounded,
 // as before.
-fn run_tool_cmd(
+pub(crate) fn run_tool_cmd(
     cmd: &[String],
     workdir: Option<&str>,
     extra_env: &[(String, String)],
@@ -17798,6 +17952,9 @@ fn run_tool_cmd_jailed_once(
                 }
             }
         };
+        // (core#1906) The command's own process is gone: before waiting on its pipes (a
+        // descendant may hold them open), end what was tied to its life.
+        ChildExitHook::fire();
         (
             out_h.join().unwrap_or_default(),
             err_h.join().unwrap_or_default(),
@@ -19318,9 +19475,10 @@ fn stage_edit(
     now: i64,
 ) -> anyhow::Result<StagedEdit> {
     let run_id = session.id.as_str();
-    // (DES-TEAMING-002 T4, §8.7) An edit at a MID-RUN plan gate (units already ran): the plan
-    // only grows, so the edit's steps are ADDED to the held plan and the units before the cursor
-    // are kept as they ran — never a whole-plan replace that would re-plan finished work.
+    // (DES-TEAMING-002 T4, §8.7) An edit at a MID-RUN plan gate (units already ran): the edit's
+    // new steps are ADDED to the held plan, the held steps it restates that never ran are
+    // amended (core#1925), and the units that ran are kept as they ran — never a whole-plan
+    // replace that would re-plan finished work.
     let units = crate::domain::session_units(&*store, run_id)?;
     let cursor = session.unit_ix.min(units.len());
     if cursor > 0 {
@@ -19328,7 +19486,15 @@ fn stage_edit(
             .iter()
             .map(|u| u.phase_id().unwrap_or_default().to_string())
             .collect();
-        let r = crate::plan_gate::revise(
+        // (core#1925) Every step that was ever dispatched — the done prefix and a step a
+        // `request_changes` rewind moved back behind the cursor — never changes at the gate.
+        let ran: Vec<String> = units
+            .iter()
+            .filter(|u| u.was_dispatched())
+            .map(|u| u.phase_id().unwrap_or_default().to_string())
+            .chain(done.iter().cloned())
+            .collect();
+        let r = crate::plan_gate::revise_with_ran(
             run_id,
             state,
             crate::plan_gate::Change::Steps {
@@ -19343,6 +19509,7 @@ fn stage_edit(
                 scoring: None,
             },
             &done,
+            &ran,
             &session.human_confirm,
             pending.reviewing_ord,
             now,
@@ -19547,6 +19714,7 @@ fn replan_for_accepted_edit(
         session.workdir.clone(),
         session.extra_write_roots.clone(),
         session.extra_read_roots.clone(),
+        session.optional_read_roots.clone(),
         session.project_graph.clone(),
         session.project_id.clone(),
         Some(&def_id),
@@ -20484,6 +20652,18 @@ pub(crate) fn confirm_gate_expecting(
                 grant,
                 actor.as_deref(),
             )? {
+                // (T-R11) A QE unit held for its reviewer: the unit runs again, and its dispatch
+                // seats the reviewer (a real helper first, else the stand-in the grant allows).
+                stand_in_gate::Answered::Run
+                    if crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .is_some_and(stand_in_gate::qe_reviewer_held) =>
+                {
+                    crate::workflow::HumanDecision::Approve {
+                        amend: None,
+                        amend_scope: crate::workflow::AmendScope::Cursor,
+                    }
+                }
                 // (T-R12) A check held after its seat ran (a missing judge): only the judge runs
                 // again, on the reviewed attempt's output and tree; no seat is re-dispatched.
                 stand_in_gate::Answered::Run
@@ -24226,6 +24406,7 @@ pub(crate) mod sessions_detail_fold_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -24559,6 +24740,7 @@ mod gate_pause_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -24884,6 +25066,7 @@ mod terminal_gate_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -25224,6 +25407,7 @@ retry the deliver phase";
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -26019,6 +26203,7 @@ mod substance_gate_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -28062,6 +28247,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -28145,6 +28331,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -29609,6 +29796,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -29757,6 +29945,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -30465,6 +30654,7 @@ mod request_changes_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -36537,6 +36727,7 @@ mod code_evidence_floor_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -37176,6 +37367,7 @@ mod deliverable_floor_tests {
             repo_ref: None,
             extra_write_roots: write_roots,
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -38026,6 +38218,7 @@ mod seat_failover_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40147,6 +40340,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40261,6 +40455,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40366,6 +40561,7 @@ mod def_gate_disclosure_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -40728,6 +40924,7 @@ mod terminal_worktree_reap_tests {
             repo_ref: Some(entry.id),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -41712,6 +41909,7 @@ mod terminal_worktree_reap_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -41880,6 +42078,8 @@ mod worker_code_graph_tests {
             registered_at: 0,
             code_graph_db: String::new(), // derived on read; the value written here is irrelevant
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -41908,6 +42108,7 @@ mod worker_code_graph_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -42338,6 +42539,8 @@ mod project_graph_binding_tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -42381,6 +42584,7 @@ mod project_graph_binding_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -43139,6 +43343,7 @@ mod phase_boundary_governance_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -43611,6 +43816,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44398,6 +44604,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44465,6 +44672,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: Some("r".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -44550,6 +44758,7 @@ mod turn_timeout_vs_cancel_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -45765,6 +45974,7 @@ mod dead_seat_park_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -45906,6 +46116,7 @@ mod plan_gate_confirm_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46449,6 +46660,7 @@ mod catalog_alias_governance_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46576,6 +46788,7 @@ mod consent_plan_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -46856,6 +47069,7 @@ mod work_author_tests {
             repo_ref: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -47278,6 +47492,7 @@ mod council_ballot_tests {
             repo_ref: Some("proof-repo".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             project_id: None,
             archived_at: None,
@@ -47295,6 +47510,92 @@ mod council_ballot_tests {
             assurance: Default::default(),
             power: None,
             run_context: None,
+        }
+    }
+
+    /// (core#1905) A model call's seats are the run's own: its launch roster as the launch persists
+    /// it (`team_plan.roster`, the instances and the launcher's health), less its own benches and
+    /// its launch benches the ballot way (a governed-only bench does not bind it; the codex
+    /// worktree bench of a bound run on the host floor does). A run with no launch roster has none.
+    #[test]
+    fn a_model_call_reads_the_runs_launch_roster_and_its_benches() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        let mut claude2 = seat("claude");
+        claude2.key = "claude#2".into();
+        let mut sick = seat("codex");
+        sick.health = Some(wicked_council::types::SeatHealth {
+            usable: false,
+            reason: Some("signed out".into()),
+        });
+        // the shape the launch writes (`launch_run`'s `TeamPlanState { roster, .. }`)
+        let with_roster = |clis: &[crate::AgenticCli]| AgentSession {
+            team_plan: Some(crate::plan_gate::TeamPlanState {
+                roster: clis
+                    .iter()
+                    .filter_map(|c| serde_json::to_value(c).ok())
+                    .collect(),
+                ..Default::default()
+            }),
+            ..bound_run()
+        };
+        let verdict = |s: &AgentSession, contained: bool| {
+            model_call_admission(s, contained)
+                .into_iter()
+                .map(|(f, v)| (f, v.map(|c| c.key)))
+                .collect::<Vec<_>>()
+        };
+        // the instance answers for its family; an unusable codex is refused with its reason
+        let v = verdict(&with_roster(&[claude2.clone(), sick]), true);
+        assert_eq!(v[0], ("claude".to_string(), Ok("claude#2".to_string())));
+        assert!(v[1]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("not usable: signed out"));
+        // the run's own bench (not governed-only) binds; a governed-only one does not
+        let mut s = with_roster(&[claude2.clone(), seat("codex")]);
+        let bench = |cli: &str, reason: &str, governed_only: bool| crate::domain::BenchedSeat {
+            cli: cli.into(),
+            reason: reason.into(),
+            source: "launcher".into(),
+            governed_only,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
+        };
+        s.benched_seats = vec![bench("codex", "host floor", true)];
+        assert_eq!(verdict(&s, true)[1].1, Ok("codex".to_string()));
+        s.benched_seats = vec![bench("claude", "quota", false)];
+        assert!(verdict(&s, true)[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("benched for this run: quota"));
+        // the launch bench: a bound run's codex on a store that cannot arm its units in seats
+        let s = with_roster(&[seat("claude"), seat("codex")]);
+        assert!(verdict(&s, false)[1].1.is_err());
+        assert_eq!(verdict(&s, true)[1].1, Ok("codex".to_string()));
+        // no launch roster: no seat, whatever the registry holds
+        let v = verdict(&bound_run(), true);
+        assert!(v
+            .iter()
+            .all(|(_, r)| r.as_ref().unwrap_err().contains("on this run's roster")));
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 

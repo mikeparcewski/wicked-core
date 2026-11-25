@@ -137,6 +137,17 @@ fn engine_on(db: &str, cfg: TeamConfig) -> Engine {
     }
 }
 
+/// (core#1916) A launch reads the seat floor from the process environment
+/// (`container_floor::host_floor_chosen`, via `distribute::launch_benched`), once in `launch_run`
+/// and again when the actor plans the run after `launch_run` has returned. Tests that set
+/// `WICKED_SEAT_FLOOR` hold `ENV_LOCK` for writing, so a launch here holds it for reading until a
+/// `ping` (queued behind the planning) comes back: it never sees another test's floor.
+fn floor_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Launch a two-unit TEAM run: its def is the engine's composed per-run def (D1's marker).
 fn launch_team(e: &Engine, run: &str) {
     launch_team_with(e, run, HumanConfirm::None);
@@ -154,6 +165,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
     e.core
         .register_composed(def)
         .expect("composed def registers");
+    let _floor = floor_read_lock();
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -168,6 +180,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             workflow: Some(format!("{run}:plan-1")),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -182,6 +195,8 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 /// Poll until `cond` holds, generously (slow Windows runners), returning early.
@@ -1700,6 +1715,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
     }))
     .unwrap();
     e.core.register_composed(def).unwrap();
+    let _floor = floor_read_lock();
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -1714,6 +1730,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             workflow: Some("t616k:plan-1".into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -1728,6 +1745,9 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             qe_acceptance: Default::default(),
         })
         .unwrap();
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
+    drop(_floor);
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
     collect(&e, &mut evs);
     e.core
@@ -1882,6 +1902,7 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
     e.core
         .register_composed(def)
         .expect("composed def registers");
+    let _floor = floor_read_lock();
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -1896,6 +1917,7 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
             workflow: Some(format!("{run}:plan-1")),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: None,
             deliver_step: None,
@@ -1910,6 +1932,8 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 fn member_engine(
@@ -2591,6 +2615,16 @@ impl StepRunner for MemberTimesOutTwice {
     }
 }
 
+/// How many `awaitingHuman` events `run` emitted at `ord`.
+fn awaiting_at(evs: &[CoreEvent], run: &str, ord: u32) -> usize {
+    evs.iter()
+        .filter(|ev| {
+            matches!(ev, CoreEvent::AwaitingHuman { session, ord: o, .. }
+                if session == run && *o == ord)
+        })
+        .count()
+}
+
 /// The `gateSeq` of the newest `awaitingHuman` for `run` at `ord`.
 fn last_gate_seq(evs: &[CoreEvent], run: &str, ord: u32) -> u32 {
     evs.iter()
@@ -2643,8 +2677,13 @@ fn an_answer_for_an_earlier_opening_at_the_same_ord_is_refused_gate_changed() {
     e.core
         .confirm_gate_expecting("t6gs", approve(None), None, Some(expect(first)))
         .expect("the answer for the open gate is taken");
+    // Wait for the second opening's own awaitingHuman, not only for the status: right after the
+    // answer the status can still read the first opening's AwaitingHuman (Windows CI, core#1918).
+    wait_for("the write gate to open a second time", || {
+        collect(&e, &mut evs);
+        awaiting_at(&evs, "t6gs", WRITE) >= 2
+    });
     wait_status(&e, "t6gs", SessionStatus::AwaitingHuman);
-    collect(&e, &mut evs);
     let second = last_gate_seq(&evs, "t6gs", WRITE);
     assert!(
         second > first,
@@ -3110,6 +3149,7 @@ fn steps(v: serde_json::Value) -> crate::PlanSteps {
 /// scores 100, is high risk, and pauses `plan_approval` before its first unit (T2 (g)). It
 /// declares `touch`, so the launch decides it (X1: a plan with none is scoped by its PA first).
 fn launch_plan_run(e: &Engine, run: &str) {
+    let _floor = floor_read_lock();
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -3124,6 +3164,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             workflow: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: Some(steps(serde_json::json!({
                 "steps": [{"catalog": "build", "id": "build"}],
@@ -3141,6 +3182,8 @@ fn launch_plan_run(e: &Engine, run: &str) {
             qe_acceptance: Default::default(),
         })
         .expect("launch");
+    // (core#1916) Planning (and its seat-floor read) runs after launch_run returns.
+    e.core.ping();
 }
 
 fn open_gate_kinds(db: &str, run: &str) -> Vec<String> {
@@ -3351,6 +3394,38 @@ fn an_accepted_edit_applies_only_after_its_gate_decided_lands() {
     assert_eq!(count(&types, tev::PLAN_ACCEPTED), 1);
     assert_eq!(plan_revs(&e, "r9h"), (2, 2));
     assert_eq!(unit_ids(&e, "r9h"), EDITED_UNITS);
+}
+
+/// (core#1925) Each unit records the plan revision it was dispatched under: after an edit
+/// accepted at the plan gate (rev 2), the units the run released ran from rev 2, and the run view
+/// says so; a unit not yet dispatched has none.
+#[test]
+fn units_record_the_plan_rev_they_ran_under() {
+    let rig = rig("prrev");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "prr");
+    let s = e.core.confirm_gate("prr", the_edit()).unwrap();
+    assert_ne!(s, SessionStatus::AwaitingHuman);
+    let revs = || -> Vec<(String, Option<u32>)> {
+        e.core
+            .sessions_detail()
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.session.id == "prr")
+            .flat_map(|v| v.units)
+            .map(|u| (u.id.clone(), u.plan_rev))
+            .collect()
+    };
+    wait_for("a unit dispatched under the edit's rev", || {
+        revs().iter().any(|(_, r)| r.is_some())
+    });
+    assert_eq!(plan_revs(&e, "prr"), (2, 2));
+    let revs = revs();
+    assert_eq!(revs.len(), EDITED_UNITS.len(), "{revs:?}");
+    assert!(
+        revs.iter().all(|(_, r)| r.is_none() || *r == Some(2)),
+        "{revs:?}"
+    );
 }
 
 /// Round 9 (2): the edit's `gate.decided` fails past the bound → the run pauses
@@ -3709,7 +3784,8 @@ fn try_launch_plan(
     human_confirm: HumanConfirm,
     deliver_step: Option<crate::PlanStep>,
 ) -> anyhow::Result<String> {
-    e.core.launch_run(LaunchSpec {
+    let _floor = floor_read_lock();
+    let launched = e.core.launch_run(LaunchSpec {
         base_ref: None,
         project_id: None,
         problem: "add SSO login".into(),
@@ -3722,6 +3798,7 @@ fn try_launch_plan(
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: Some(steps(body)),
         deliver_step,
@@ -3734,7 +3811,12 @@ fn try_launch_plan(
         voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
-    })
+    });
+    // (core#1916) Planning runs after launch_run returns; the ping waits for it under the lock.
+    if launched.is_ok() {
+        e.core.ping();
+    }
+    launched
 }
 
 fn runs(e: &Engine) -> usize {
@@ -3884,6 +3966,7 @@ fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         workflow: None,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,

@@ -345,6 +345,7 @@ fn launch_with(rig: &mut Rig, run: &str, declared: bool) {
             project_id: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            optional_read_roots: Vec::new(),
             project_graph: None,
             plan: Some(plan),
             deliver_step: None,

@@ -86,6 +86,14 @@ export interface LaunchOptions {
    */
   extraReadRoots?: Array<string>
   /**
+   * The entries of `extraReadRoots` the run can do without (core#1463). On the container floor, one that
+   * does not fit the unit's copy-in caps is left out of the unit's copy (its directory holds only a
+   * note saying so) instead of refusing the unit. It grants no read: each entry must equal an entry of
+   * `extraReadRoots`, or the launch is REJECTED. A root another source also requires is never left
+   * out. Omit to keep every read root required.
+   */
+  optionalReadRoots?: Array<string>
+  /**
    * The PROJECT code graph this run's governed workers should query, instead of the run repo's
    * own graph — one database holding every member repo of the project, so a worker's
    * SearchEntity / BlastRadius / TraverseGraph can see the whole project rather than one repo.
@@ -629,6 +637,13 @@ export declare class Core {
   gateActions(runId: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
+  /**
+   * (core#1043 part 2) Turn seat layers off for a repo: `offJson` is a JSON array of layer ids
+   * (`[]` turns every layer back on). Resolves to the updated `RepoEntry` JSON object, whose
+   * `seat_layers` rows (`{id, enabled, off_by}`) show the result. Rejects naming an unknown
+   * layer id or repo.
+   */
+  setRepoSeatLayersOff(repoId: string, offJson: string): Promise<string>
   /**
    * Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
    * plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's

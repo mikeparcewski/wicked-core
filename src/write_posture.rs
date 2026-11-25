@@ -521,8 +521,10 @@ mod tests {
                 second.to_string_lossy().into_owned(),
             ],
             extra_read_roots: vec!["/somewhere/readonly".into()],
+            optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
+            seat_layers_off: Vec::new(),
             apps: None,
         };
         let in_process = deliverable_roots_from(&g.extra_write_roots);
