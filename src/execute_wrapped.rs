@@ -3362,6 +3362,24 @@ impl WrappedCliStepRunner {
         // the CLI that will run it — and so admission knows WHICH CLI it is admitting for.
         let binary = template_binary(&invocation);
         let is_claude = binary_is_claude(&binary);
+        // (DES-STANDIN-001 §3.4, core#1881) A host-floor stand-in this template cannot keep out of
+        // its base's sessions is refused HERE, before any seat dir, skills copy or scratch exists.
+        if wicked_apps_core::spawn::seat_id::is_stand_in(&cli_key)
+            && !uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            )
+        {
+            if let Err(why) = host_stand_in_admits(
+                &invocation,
+                wicked_apps_core::spawn::SeatCli::from_binary(&binary),
+            ) {
+                return StepOutput {
+                    output: format!("(the stand-in's launch was refused: {why})"),
+                    ..posture_refusal(input, &why)
+                };
+            }
+        }
         // On the wrapped path the CLI IS the carrier, so its lever (v3.2) is the CLI's own.
         let worker_cli =
             crate::skills_snapshot::WorkerCli::for_binaries(&binary, &binary, &cli_key);
@@ -7621,37 +7639,28 @@ fn stand_in_resume_selectors(cli: wicked_apps_core::spawn::SeatCli) -> &'static 
     }
 }
 
-/// (DES-STANDIN-001 §3.4, core#1881) A HOST-floor stand-in shares its base's CLI home: the
-/// credential lives there (claude's keychain entry is even keyed by its config dir), so the home
-/// cannot move. What must not be shared is what the base's builder turns left there: the session
-/// store and the auto-memory. Each CLI's own switch keeps the stand-in from saving a session or
-/// loading the memory, and the credential is untouched, so the base stays signed in:
-/// - claude: `--no-session-persistence` (nothing saved, nothing to resume) and auto-memory off
-///   ([`CLAUDE_DISABLE_AUTO_MEMORY_ENV`]); it never resumes (core#1863);
-/// - codex: `--ephemeral` right after the template's `exec` (no session files);
-/// - pi: `--no-session`.
-///
-/// A template that selects a session of its own (`--resume`, `--continue`, `exec resume`, …) is
-/// refused. Only the TRUSTED template's tokens count (`invocation`, before the first `{PROMPT}` /
-/// `{SKILLS}` placeholder): the argv also holds the untrusted prompt, which may spell any option
-/// (as [`inject_codex_write_roots`] reads it). Returns the environment to set. Any other CLI, or a
-/// codex template with no `exec`, is refused: no switch is known to keep it out of its base's
-/// session store. The switches stop the stand-in INHERITING its base's sessions and memory; the
-/// host floor is no read jail for any seat (the container floor gives a stand-in a home of its own).
-pub(crate) fn host_stand_in_fresh(
-    argv: &mut Vec<String>,
+/// (core#1881) The trusted template's own tokens: every token of `invocation` but the placeholders
+/// (`{PROMPT}`, `{SKILLS}`), which the argv fills with text no option check may read.
+fn template_literals(invocation: &str) -> Vec<String> {
+    tokenize(invocation)
+        .into_iter()
+        .filter(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .collect()
+}
+
+/// (DES-STANDIN-001 §3.4, core#1881) Whether a HOST-floor stand-in may launch on this template at
+/// all, decided before anything is written for it (no seat dirs, no skills, no scratch): its CLI
+/// must have a no-store switch (claude, codex as `exec`, pi), and no literal token of the TRUSTED
+/// template may select a session (`--resume`, `--continue`, `exec resume`, … — before or after a
+/// placeholder). See [`host_stand_in_fresh`].
+pub(crate) fn host_stand_in_admits(
     invocation: &str,
     cli: wicked_apps_core::spawn::SeatCli,
-) -> Result<Vec<(&'static str, &'static str)>, String> {
+) -> Result<(), String> {
     use wicked_apps_core::spawn::SeatCli;
-    let template = tokenize(invocation);
-    let trusted: Vec<&str> = template
-        .iter()
-        .take_while(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
-        .map(String::as_str)
-        .collect();
+    let literals = template_literals(invocation);
     let selectors = stand_in_resume_selectors(cli);
-    if let Some(sel) = trusted.iter().skip(1).find(|t| {
+    if let Some(sel) = literals.iter().skip(1).find(|t| {
         selectors
             .iter()
             .any(|s| *t == s || (s.starts_with("--") && t.starts_with(&format!("{s}="))))
@@ -7662,42 +7671,93 @@ pub(crate) fn host_stand_in_fresh(
         ));
     }
     match cli {
+        SeatCli::Claude | SeatCli::Pi => Ok(()),
+        SeatCli::Codex if codex_template_exec(invocation).is_some() => Ok(()),
+        SeatCli::Codex => Err(
+            "a codex stand-in runs only as `codex exec` on the host floor (`--ephemeral` keeps it \
+             out of its base's session store); this template has no `exec`, so it runs only in a \
+             seat container (the container floor)"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "a stand-in on {other:?} would run in its base's home on the host floor and could \
+             read the session store its base's builder left there; it runs only in a seat \
+             container (the container floor)"
+        )),
+    }
+}
+
+/// The trusted codex template's `exec`: its index among the tokens before the first placeholder,
+/// and which `exec` token it is there (the first, unless an option's value also spells `exec`).
+fn codex_template_exec(invocation: &str) -> Option<(usize, usize)> {
+    let template = tokenize(invocation);
+    let prefix: Vec<&String> = template
+        .iter()
+        .take_while(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .collect();
+    let at = prefix
+        .iter()
+        .position(|t| *t == "exec")
+        .filter(|&i| i > 0)?;
+    Some((at, prefix[..=at].iter().filter(|t| **t == "exec").count()))
+}
+
+/// (DES-STANDIN-001 §3.4, core#1881) A HOST-floor stand-in shares its base's CLI home: the
+/// credential lives there (claude's keychain entry is even keyed by its config dir), so the home
+/// cannot move. What must not be shared is what the base's builder turns left there: the session
+/// store and the auto-memory. Each CLI's own switch keeps the stand-in from saving a session or
+/// loading the memory, and the credential is untouched, so the base stays signed in:
+/// - claude: `--no-session-persistence` (nothing saved, nothing to resume) and auto-memory off
+///   ([`CLAUDE_DISABLE_AUTO_MEMORY_ENV`]); it never resumes (core#1863);
+/// - codex: `--ephemeral` right after the template's `exec` (no session files);
+/// - pi: `--no-session`.
+///
+/// [`host_stand_in_admits`] first (the launch checks it before anything is written; this repeats
+/// it). Only the TRUSTED template's tokens count: the argv also holds the untrusted prompt, which
+/// may spell any option (as [`inject_codex_write_roots`] reads it). Codex's `exec` is found in the
+/// argv as the same `exec` token the template names, at or before its template index (the posture
+/// may have dropped a global option before it, `-C <dir>`). Returns the environment to set. The
+/// switches stop the stand-in INHERITING its base's sessions and memory; the host floor is no read
+/// jail for any seat (the container floor gives a stand-in a home of its own).
+pub(crate) fn host_stand_in_fresh(
+    argv: &mut Vec<String>,
+    invocation: &str,
+    cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    host_stand_in_admits(invocation, cli)?;
+    let literals = template_literals(invocation);
+    match cli {
         SeatCli::Claude | SeatCli::Pi => {
             let flag = if cli == SeatCli::Claude {
                 "--no-session-persistence"
             } else {
                 "--no-session"
             };
-            if !trusted.contains(&flag) {
+            if !literals.iter().any(|t| t == flag) {
                 apply_seat_posture(argv, &[flag.to_string()]);
             }
         }
         SeatCli::Codex => {
-            // `exec` as the trusted template places it, after any global options (`-c k=v`), and
-            // the argv token at that index must be `exec` too.
-            let Some(exec) = trusted
+            let (at, nth) = codex_template_exec(invocation).ok_or("no `exec` in the template")?;
+            let exec = argv
                 .iter()
-                .position(|t| *t == "exec")
-                .filter(|&i| i > 0 && argv.get(i).map(String::as_str) == Some("exec"))
-            else {
-                return Err(
-                    "a codex stand-in runs only as `codex exec` on the host floor (`--ephemeral` \
-                     keeps it out of its base's session store); this template has no `exec`, so \
-                     it runs only in a seat container (the container floor)"
-                        .to_string(),
-                );
-            };
-            if !trusted.contains(&"--ephemeral") {
+                .enumerate()
+                .take(at + 1)
+                .skip(1)
+                .filter(|(_, a)| *a == "exec")
+                .nth(nth - 1)
+                .map(|(i, _)| i)
+                .ok_or_else(|| {
+                    "the codex stand-in's argv lost the template's `exec`; refused, never run \
+                     sharing its base's session store"
+                        .to_string()
+                })?;
+            if !literals.iter().any(|t| t == "--ephemeral") {
                 argv.insert(exec + 1, "--ephemeral".to_string());
             }
         }
-        other => {
-            return Err(format!(
-                "a stand-in on {other:?} would run in its base's home on the host floor and \
-                 could read the session store its base's builder left there; it runs only in a \
-                 seat container (the container floor)"
-            ));
-        }
+        _ => unreachable!("host_stand_in_admits refused every other CLI"),
     }
     Ok(match cli {
         SeatCli::Claude => vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")],
@@ -15507,6 +15567,19 @@ mod tests {
                 "the prompt"
             ])
         );
+        // codex delta: the posture dropped a global option before `exec` (`-C <dir>`): the
+        // template's `exec` is still found, at an earlier index.
+        let mut stripped = s(&["/opt/bin/codex", "exec", "the prompt"]);
+        host_stand_in_fresh(
+            &mut stripped,
+            "/opt/bin/codex -C /repo exec {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            stripped,
+            s(&["/opt/bin/codex", "exec", "--ephemeral", "the prompt"])
+        );
         let mut pi = s(&["/opt/bin/pi", "-p", "the prompt"]);
         host_stand_in_fresh(&mut pi, "/opt/bin/pi -p {PROMPT}", SeatCli::Pi).unwrap();
         assert_eq!(pi, s(&["/opt/bin/pi", "-p", "the prompt", "--no-session"]));
@@ -15540,6 +15613,13 @@ mod tests {
             (SeatCli::Pi, "/opt/bin/pi -p -r {PROMPT}"),
             (SeatCli::Pi, "/opt/bin/pi -p --session /x.jsonl {PROMPT}"),
             (SeatCli::Pi, "/opt/bin/pi -p --session=/x.jsonl {PROMPT}"),
+            // codex delta: a selector AFTER a placeholder is a template token too.
+            (SeatCli::Claude, "/opt/bin/claude -p {PROMPT} --resume abc"),
+            (
+                SeatCli::Claude,
+                "/opt/bin/claude -p {SKILLS} --continue {PROMPT}",
+            ),
+            (SeatCli::Pi, "/opt/bin/pi -p {PROMPT} --session /x.jsonl"),
         ] {
             let mut argv = tokenize(&tpl.replace("{PROMPT}", "the prompt"));
             let why = host_stand_in_fresh(&mut argv, tpl, cli).unwrap_err();
@@ -15619,8 +15699,36 @@ mod tests {
             };
             WrappedCliStepRunner::default().run_unit(&input)
         };
+        // codex delta: a refused stand-in writes nothing first (no seat dir, no skills, no
+        // scratch): on a fresh home the worker home is still absent after both refusals.
+        let worker = home.join(".wicked-worker");
+        let resumed = run("codex~1", format!("{codex} exec resume --last {{PROMPT}}"));
+        assert_eq!(resumed.status, StepStatus::Failed, "{}", resumed.output);
+        assert!(
+            resumed.output.contains("selects a session"),
+            "{}",
+            resumed.output
+        );
+        let refused = run("copilot~1", format!("{copilot} -p {{PROMPT}}"));
+        assert_eq!(refused.status, StepStatus::Failed, "{}", refused.output);
+        assert!(
+            refused.output.contains("container floor") && !refused.output.contains("ARGV="),
+            "{}",
+            refused.output
+        );
+        assert!(
+            !worker.exists(),
+            "a refused stand-in wrote its seat home first"
+        );
         let stand_in = run("codex~1", format!("{codex} exec {{PROMPT}}"));
         assert_eq!(stand_in.status, StepStatus::Ok, "{}", stand_in.output);
+        // codex delta: a global option the read-only posture drops before `exec` (`-C <dir>`).
+        let rooted = run(
+            "codex~1",
+            format!("{codex} -C {} exec {{PROMPT}}", dir.display()),
+        );
+        assert_eq!(rooted.status, StepStatus::Ok, "{}", rooted.output);
+        assert!(rooted.output.contains("--ephemeral"), "{}", rooted.output);
         assert!(
             stand_in.output.contains("--ephemeral"),
             "{}",
@@ -15665,20 +15773,7 @@ mod tests {
             "{}",
             resumed.output
         );
-        let refused = run("copilot~1", format!("{copilot} -p {{PROMPT}}"));
-        assert_eq!(refused.status, StepStatus::Failed, "{}", refused.output);
-        assert!(
-            refused.output.contains("container floor"),
-            "{}",
-            refused.output
-        );
-        assert!(
-            !refused.output.contains("ARGV="),
-            "never spawned: {}",
-            refused.output
-        );
         // The worker home holds the base's home only: no `~`-named directory.
-        let worker = home.join(".wicked-worker");
         let mut tilde = Vec::new();
         let mut stack = vec![worker.clone()];
         while let Some(d) = stack.pop() {

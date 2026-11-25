@@ -8712,10 +8712,7 @@ mod denials_behind_tests {
 
 #[cfg(test)]
 mod denials_behind_unknown_tests {
-    use super::{
-        denials_behind_after_fold, standing_denials, FoldRefresh, PriorFold,
-        QE_STAND_IN_HOLD_PREFIX,
-    };
+    use super::{denials_behind_after_fold, FoldRefresh, PriorFold};
     use crate::domain::UnitDenial;
 
     /// xreview r3: a gate from before the record existed (the floor won, nothing recorded behind
