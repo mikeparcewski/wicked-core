@@ -1470,9 +1470,13 @@ pub(crate) fn ensure_seat_image_noting(
     rt: &Runtime,
     cli: &str,
     layers: &[&crate::seat_layers::Layer],
-) -> Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)> {
+) -> LayeredSeatImage {
     ensure_layered_seat_image(rt, cli, image_override(cli), &SeatBase::from_env(), layers)
 }
+
+/// A unit's seat image: its tag, how long the unit waited for a build, and its note when its
+/// toolchain layers did not build; or the arm's typed reason.
+type LayeredSeatImage = Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)>;
 
 /// (coord R2 F1 on core#1043) The layered seat images that failed to build in this process, by
 /// tag, with the build's error: a later unit runs on the plain image without building the set
@@ -1490,7 +1494,7 @@ fn ensure_layered_seat_image(
     over: Option<String>,
     base: &SeatBase,
     layers: &[&crate::seat_layers::Layer],
-) -> Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)> {
+) -> LayeredSeatImage {
     let built = crate::seat_layers::built(layers);
     if over.is_some() || built.is_empty() {
         return ensure_seat_image_with(rt, cli, over, base, layers).map(|(t, w)| (t, w, None));
