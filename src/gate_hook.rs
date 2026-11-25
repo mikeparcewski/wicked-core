@@ -6407,11 +6407,6 @@ fn is_sqlite_capable_program(base: &str) -> bool {
 /// an inline `-c` program text — but every occurrence must sit on a NAME BOUNDARY, or the
 /// sibling graph key `…/graphs/abc1234` would be refused because it starts with `…/graphs/abc123`
 /// (codex review). Refusing a unit's own fixture db is a false refusal, not a safe default.
-///
-/// (crew#1935) A location that HOLDS the unit's own tree (`own_tree`: an app's worktree lives
-/// under `WICKED_HOME/apps`) is a home, not a store file, and the unit's tree is never the store:
-/// such a location is named only by a path that resolves inside it AND outside the tree
-/// ([`enclosing_store_named_outside_tree`]). Every other location is judged as before.
 fn token_names_graph_store(
     tok: &str,
     graph_store: &[std::path::PathBuf],
@@ -6423,78 +6418,22 @@ fn token_names_graph_store(
         return true;
     }
     let normalised = script_path(tok);
-    let (enclosing, stores): (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) = graph_store
-        .iter()
-        .cloned()
-        .partition(|g| own_tree.is_some_and(|tree| holds_tree(g, tree, home)));
-    if stores
+    if graph_store
         .iter()
         .any(|g| names_path(&normalised, &g.to_string_lossy()))
     {
         return true;
     }
-    relative_token_names_graph_store(&normalised, &stores, cwd_bases, home)
-        || own_tree.is_some_and(|tree| {
-            enclosing_store_named_outside_tree(&normalised, &enclosing, tree, cwd_bases, home)
-        })
+    relative_token_names_graph_store(&normalised, graph_store, cwd_bases, home, own_tree)
 }
 
 /// Does store location `g` strictly contain the unit's own tree (same normalize → symlink chain
-/// as the boundary)? A location equal to the tree, or inside it, is a store the tree holds, and is
-/// judged by the ordinary arms.
+/// as the boundary)? A location equal to the tree, or inside it, is a store the tree holds.
 fn holds_tree(g: &std::path::Path, tree: &std::path::Path, home: Option<&std::path::Path>) -> bool {
     let within = |a: &std::path::Path, b: &std::path::Path| {
         crate::path_policy::raw_resolves_within(&a.to_string_lossy(), a, home, b)
     };
     within(tree, g) && !within(g, tree)
-}
-
-/// The words of a token that could be a path: split on the characters no path continues
-/// through (a token may be a bare argument, a `--db=<path>` flag or an interpreter's whole `-c`
-/// program text), `./` off, flags and bare words (`select`, `nodes`) dropped — a path carries a
-/// `/` or a `.`.
-fn path_fragments(normalised: &str) -> impl Iterator<Item = &str> {
-    normalised
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ',' | ';' | '=' | '`')
-        })
-        .filter_map(|frag| {
-            let f = frag.trim_start_matches("./");
-            (!f.is_empty() && !f.starts_with('-') && (f.contains('/') || f.contains('.')))
-                .then_some(f)
-        })
-}
-
-/// (crew#1935) Does a token name a store location that HOLDS the unit's own tree, through a path
-/// that lands outside that tree? Every path-shaped word, absolute or relative, is resolved from
-/// where the shell may stand (and from the tree itself, so an absolute word always has a base)
-/// through the boundary's normalize → symlink-resolve chain: `$HOME_DIR/memory.db`,
-/// `../../memory.db`, `cd <home> && sqlite3 memory.db` and a link in the tree that already points
-/// at a store are all outside the tree, while the app's own `.`, `f.name` or `queries/x.db` are
-/// inside it. A link created by the same command is the documented literal-scan limit (an
-/// ordinary worktree has the same one); the OS sandbox is the hermetic layer.
-fn enclosing_store_named_outside_tree(
-    normalised: &str,
-    enclosing: &[std::path::PathBuf],
-    tree: &std::path::Path,
-    cwd_bases: &[std::path::PathBuf],
-    home: Option<&std::path::Path>,
-) -> bool {
-    if enclosing.is_empty() {
-        return false;
-    }
-    path_fragments(normalised).any(|f| {
-        cwd_bases
-            .iter()
-            .map(std::path::PathBuf::as_path)
-            .chain(std::iter::once(tree))
-            .any(|base| {
-                !crate::path_policy::raw_resolves_within(f, base, home, tree)
-                    && enclosing
-                        .iter()
-                        .any(|g| crate::path_policy::raw_resolves_within(f, base, home, g))
-            })
-    })
 }
 
 /// Does a RELATIVE token name the graph store from where the shell STANDS (issue #645, second
@@ -6513,23 +6452,53 @@ fn enclosing_store_named_outside_tree(
 /// word would refuse a whole segment the moment the shell stood in the store dir (`select` would
 /// "resolve into" it), which is a false refusal — and a control that fires on legitimate work is
 /// how a control gets switched off ([`crate::path_policy`]'s module doc).
+///
+/// (crew#1935) The unit's own tree (`own_tree`) is never the store. crew keeps an app's worktree
+/// under `WICKED_HOME/apps`, and `WICKED_HOME` is a store location, so every relative word of an
+/// interpreter's program text (`.`, `f.name`) resolved "into the store" and crew's own apps
+/// self-check was refused. A location that strictly HOLDS the tree is named by a relative word
+/// only when it resolves inside the location AND outside the tree: `../../memory.db`,
+/// `cd <home> && sqlite3 memory.db` and an existing link in the tree to a store still are. The
+/// absolute arm above is unchanged for every location.
 fn relative_token_names_graph_store(
     normalised: &str,
     graph_store: &[std::path::PathBuf],
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
+    own_tree: Option<&std::path::Path>,
 ) -> bool {
     if cwd_bases.is_empty() || graph_store.is_empty() {
         return false;
     }
-    // Absolute fragments were already judged by the literal arm.
-    path_fragments(normalised)
-        .filter(|f| !f.starts_with('/'))
+    // Each location, with the tree it holds (if any): a word inside that tree is not the store.
+    let stores: Vec<(&std::path::PathBuf, Option<&std::path::Path>)> = graph_store
+        .iter()
+        .map(|g| (g, own_tree.filter(|tree| holds_tree(g, tree, home))))
+        .collect();
+    // A token may be a bare argument, a `--db=<path>` flag or an interpreter's whole `-c` program
+    // text, so split on the characters no path continues through and judge each fragment.
+    normalised
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ',' | ';' | '=' | '`')
+        })
+        .filter_map(|frag| {
+            let f = frag.trim_start_matches("./");
+            // Absolute fragments were already judged by the literal arm; a flag is not a path; a
+            // bare word (`select`, `nodes`) is not one either.
+            (!f.is_empty()
+                && !f.starts_with('/')
+                && !f.starts_with('-')
+                && (f.contains('/') || f.contains('.')))
+            .then_some(f)
+        })
         .any(|f| {
             cwd_bases.iter().any(|base| {
-                graph_store
-                    .iter()
-                    .any(|g| crate::path_policy::raw_resolves_within(f, base, home, g))
+                stores.iter().any(|(g, held)| {
+                    crate::path_policy::raw_resolves_within(f, base, home, g)
+                        && !held.is_some_and(|tree| {
+                            crate::path_policy::raw_resolves_within(f, base, home, tree)
+                        })
+                })
             })
         })
 }
@@ -6848,7 +6817,7 @@ fn classify_estate_command(
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
     // The unit's own tree (the hook's cwd): never the store, even under a store location
-    // (crew#1935, [`token_names_graph_store`]).
+    // (crew#1935, [`relative_token_names_graph_store`]).
     own_tree: Option<&std::path::Path>,
 ) -> Option<EstateDeny> {
     let _scan = ShellScanGuard::session();
@@ -19409,6 +19378,7 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
             let home = wicked_home.display();
             std::os::unix::fs::symlink(wicked_home.join("memory.db"), wt.join("m.db")).unwrap();
             for command in [
+                // The pin-variable arm (unchanged; kept so a refactor cannot drop it for a home).
                 "sqlite3 \"$WICKED_HOME/memory.db\" 'DELETE FROM memories'".to_string(),
                 format!("sqlite3 {home}/memory.db 'DELETE FROM memories'"),
                 format!("sqlite3 --db={home}/memory.db 'DELETE FROM memories'"),
@@ -19417,6 +19387,8 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
                 format!("cd {home} && sqlite3 memory.db 'DELETE FROM memories'"),
                 // A link in the tree that already points at the store resolves to the store.
                 "sqlite3 m.db 'DELETE FROM memories'".to_string(),
+                // The absolute arm is unchanged for a home (round 1, codex): a SQLite URI.
+                format!("python3 -c 'import sqlite3; sqlite3.connect(\"file:{home}/memory.db\", uri=True)'"),
             ] {
                 let bases = super::graph_store_cwd_bases(&command, &wt, None);
                 let hit = super::classify_estate_command(
@@ -19430,6 +19402,25 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
                 .unwrap_or_else(|| panic!("the home's store stays fenced: {command}"));
                 assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
             }
+            // A home whose path holds a space is still named whole by the absolute arm.
+            let spaced = wicked_home.join("a home");
+            let spaced_tree = spaced.join("apps/x.wicked/wicked-worktrees/apps-x-1");
+            std::fs::create_dir_all(&spaced_tree).unwrap();
+            let command = format!(
+                "python3 -c 'import sqlite3; sqlite3.connect(\"{}/memory.db\")'",
+                spaced.display()
+            );
+            let bases = super::graph_store_cwd_bases(&command, &spaced_tree, None);
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                &[spaced.clone()],
+                &bases,
+                None,
+                Some(spaced_tree.as_path()),
+            )
+            .unwrap_or_else(|| panic!("a spaced home stays fenced: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
             // … and a sqlite call on the app's own files is the app's business.
             for benign in [
                 "sqlite3 queries/local.db 'select 1'",
