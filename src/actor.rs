@@ -13562,7 +13562,7 @@ fn dispatch_unit_with(
     is_acp: bool,
     probe: Option<Box<DispatchProbe>>,
 ) -> anyhow::Result<bool> {
-    let session = crate::domain::get_session(store, run_id)?
+    let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     // (DES-TEAMING-002 T3, round 10) THE dispatch guard: no unit runs past a held plan, or ahead
     // of the accepted rev's `plan.accepted` on a teamed run — whichever path asked.
@@ -14001,6 +14001,9 @@ fn dispatch_unit_with(
                         fresh.assurance.stand_ins.push(binding.clone());
                         crate::standin::note_label(&mut fresh.assurance, &binding, &display);
                         put_node(store, fresh.to_node())?;
+                        // (codex r1 on b7-standin) The rest of this dispatch (the judge's
+                        // stand-in offer) mints its slot from the binding just taken.
+                        session.assurance = fresh.assurance.clone();
                         emit(
                             subscribers,
                             CoreEvent::StandInSeated {

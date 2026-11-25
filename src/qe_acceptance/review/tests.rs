@@ -2243,6 +2243,17 @@ fn t_r11_a_one_seat_consented_run_reviews_qe_on_a_stand_in() {
     );
     let (next, _) = stand_in_reviewer(&held, &units, &u, 5, &reg, &reg).unwrap();
     assert_eq!(next.seat, "claude~2");
+    // (codex r1 on b7-standin) The base runs as this run seated it (a launch override included),
+    // not as the registry's record says: what admission judged is what the stand-in runs.
+    let mut seated = units.clone();
+    seated[0].assigned_invocation = Some("claude -p --model opus-x {PROMPT}".into());
+    let mut u_seated = u.clone();
+    u_seated.assigned_invocation = seated[0].assigned_invocation.clone();
+    let (own, _) = stand_in_reviewer(&s, &seated, &u_seated, 4, &reg, &reg).unwrap();
+    assert_eq!(
+        own.invocation.as_deref(),
+        Some("claude -p --model opus-x {PROMPT}")
+    );
     // Real seats win: a second CLI reviews, and the caller never asks for a stand-in.
     let two = aware(session(&["claude", "codex"], false), true);
     assert_eq!(

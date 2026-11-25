@@ -3970,7 +3970,7 @@ impl WrappedCliStepRunner {
         let host_stand_in_env = if wicked_apps_core::spawn::seat_id::is_stand_in(&cli_key)
             && !uses_container_seat(runs_in_seat(input), container)
         {
-            match host_stand_in_fresh(&mut argv, seat_cli) {
+            match host_stand_in_fresh(&mut argv, &invocation, seat_cli) {
                 Ok(env) => env,
                 Err(why) => {
                     return StepOutput {
@@ -7592,44 +7592,100 @@ pub(crate) fn apply_no_code_posture(
     Ok(p.lever)
 }
 
-/// The `-c` pin that keeps a codex seat's command shell from being a login shell
-/// (`allow_login_shell=false`; codex then also drops `login` from its `exec_command` schema, so
-/// the model is never offered one). A login shell sources the image's `/etc/profile`, which on
-/// the Debian seat image sets PATH for a non-root user to a fixed list, dropping every entry the
-/// carrier handed (measured on @openai/codex 0.162.1 in the seat image: a bare `wicked-garden`
-/// was "command not found" with the pin off and resolved from `<snapshot>/scripts` with it on).
 /// (core#1881) Claude Code's switch that turns its auto-memory off, reads and writes alike.
 pub(crate) const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
+/// (core#1881) The template options that would put a stand-in back into a session its base's
+/// builder left: each CLI's resume / continue / named-session selectors (bare or `--opt=value`).
+/// Codex's selector is its `resume` subcommand (`codex exec resume …`), matched as a token.
+fn stand_in_resume_selectors(cli: wicked_apps_core::spawn::SeatCli) -> &'static [&'static str] {
+    use wicked_apps_core::spawn::SeatCli;
+    match cli {
+        SeatCli::Claude => &[
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--session-id",
+            "--fork-session",
+            "--from-pr",
+        ],
+        SeatCli::Codex => &["resume", "--last"],
+        SeatCli::Pi => &["--resume", "-r", "--continue", "-c", "--session"],
+        _ => &[],
+    }
+}
 
 /// (DES-STANDIN-001 §3.4, core#1881) A HOST-floor stand-in shares its base's CLI home: the
 /// credential lives there (claude's keychain entry is even keyed by its config dir), so the home
 /// cannot move. What must not be shared is what the base's builder turns left there: the session
-/// store and the auto-memory. Each CLI's own switch keeps the stand-in out of both, and the
-/// credential is untouched, so the base stays signed in:
+/// store and the auto-memory. Each CLI's own switch keeps the stand-in from saving a session or
+/// loading the memory, and the credential is untouched, so the base stays signed in:
 /// - claude: `--no-session-persistence` (nothing saved, nothing to resume) and auto-memory off
 ///   ([`CLAUDE_DISABLE_AUTO_MEMORY_ENV`]); it never resumes (core#1863);
-/// - codex: `exec --ephemeral` (no session files);
+/// - codex: `--ephemeral` right after the template's `exec` (no session files);
 /// - pi: `--no-session`.
 ///
-/// Returns the environment to set. Any other CLI, or a codex template that is not `exec`, is
-/// refused: no switch is known to keep it out of its base's stores.
+/// A template that selects a session of its own (`--resume`, `--continue`, `exec resume`, …) is
+/// refused. Only the TRUSTED template's tokens count (`invocation`, before the first `{PROMPT}` /
+/// `{SKILLS}` placeholder): the argv also holds the untrusted prompt, which may spell any option
+/// (as [`inject_codex_write_roots`] reads it). Returns the environment to set. Any other CLI, or a
+/// codex template with no `exec`, is refused: no switch is known to keep it out of its base's
+/// session store. The switches stop the stand-in INHERITING its base's sessions and memory; the
+/// host floor is no read jail for any seat (the container floor gives a stand-in a home of its own).
 pub(crate) fn host_stand_in_fresh(
     argv: &mut Vec<String>,
+    invocation: &str,
     cli: wicked_apps_core::spawn::SeatCli,
 ) -> Result<Vec<(&'static str, &'static str)>, String> {
     use wicked_apps_core::spawn::SeatCli;
-    let flags: &[&str] = match cli {
-        SeatCli::Claude => &["--no-session-persistence"],
-        SeatCli::Codex
-            if argv
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with('-'))
-                .is_some_and(|a| a == "exec") =>
-        {
-            &["--ephemeral"]
+    let template = tokenize(invocation);
+    let trusted: Vec<&str> = template
+        .iter()
+        .take_while(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .map(String::as_str)
+        .collect();
+    let selectors = stand_in_resume_selectors(cli);
+    if let Some(sel) = trusted.iter().skip(1).find(|t| {
+        selectors
+            .iter()
+            .any(|s| *t == s || (s.starts_with("--") && t.starts_with(&format!("{s}="))))
+    }) {
+        return Err(format!(
+            "the stand-in's {cli:?} template selects a session of its own (`{sel}`); a stand-in \
+             starts fresh, so it never resumes one its base's builder left"
+        ));
+    }
+    match cli {
+        SeatCli::Claude | SeatCli::Pi => {
+            let flag = if cli == SeatCli::Claude {
+                "--no-session-persistence"
+            } else {
+                "--no-session"
+            };
+            if !trusted.contains(&flag) {
+                apply_seat_posture(argv, &[flag.to_string()]);
+            }
         }
-        SeatCli::Pi => &["--no-session"],
+        SeatCli::Codex => {
+            // `exec` as the trusted template places it, after any global options (`-c k=v`), and
+            // the argv token at that index must be `exec` too.
+            let Some(exec) = trusted
+                .iter()
+                .position(|t| *t == "exec")
+                .filter(|&i| i > 0 && argv.get(i).map(String::as_str) == Some("exec"))
+            else {
+                return Err(
+                    "a codex stand-in runs only as `codex exec` on the host floor (`--ephemeral` \
+                     keeps it out of its base's session store); this template has no `exec`, so \
+                     it runs only in a seat container (the container floor)"
+                        .to_string(),
+                );
+            };
+            if !trusted.contains(&"--ephemeral") {
+                argv.insert(exec + 1, "--ephemeral".to_string());
+            }
+        }
         other => {
             return Err(format!(
                 "a stand-in on {other:?} would run in its base's home on the host floor and \
@@ -7637,19 +7693,19 @@ pub(crate) fn host_stand_in_fresh(
                  seat container (the container floor)"
             ));
         }
-    };
-    let flags: Vec<String> = flags
-        .iter()
-        .filter(|f| !argv.iter().any(|a| a == *f))
-        .map(|f| f.to_string())
-        .collect();
-    apply_seat_posture(argv, &flags);
+    }
     Ok(match cli {
         SeatCli::Claude => vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")],
         _ => Vec::new(),
     })
 }
 
+/// The `-c` pin that keeps a codex seat's command shell from being a login shell
+/// (`allow_login_shell=false`; codex then also drops `login` from its `exec_command` schema, so
+/// the model is never offered one). A login shell sources the image's `/etc/profile`, which on
+/// the Debian seat image sets PATH for a non-root user to a fixed list, dropping every entry the
+/// carrier handed (measured on @openai/codex 0.162.1 in the seat image: a bare `wicked-garden`
+/// was "command not found" with the pin off and resolved from `<snapshot>/scripts` with it on).
 fn codex_shell_pins() -> Vec<String> {
     vec!["-c".to_string(), "allow_login_shell=false".to_string()]
 }
@@ -15331,13 +15387,19 @@ mod tests {
     }
 
     /// (core#1881) A host-floor stand-in keeps no session in its base's home and reads no
-    /// auto-memory there: each CLI's own switch, before the prompt guard; any other CLI refused.
+    /// auto-memory there: each CLI's own switch, read off the TRUSTED template; a template that
+    /// selects a session is refused; any other CLI refused.
     #[test]
     fn a_host_stand_in_runs_with_its_clis_no_session_switches() {
         use wicked_apps_core::spawn::SeatCli;
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let mut claude = s(&["/opt/bin/claude", "-p", "--", "the prompt"]);
-        let env = host_stand_in_fresh(&mut claude, SeatCli::Claude).unwrap();
+        let env = host_stand_in_fresh(
+            &mut claude,
+            "/opt/bin/claude -p -- {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
         assert_eq!(
             claude,
             s(&[
@@ -15349,29 +15411,125 @@ mod tests {
             ])
         );
         assert_eq!(env, vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]);
-        // Applied twice (a template that states it): one flag, never two.
-        host_stand_in_fresh(&mut claude, SeatCli::Claude).unwrap();
+        // A template that states it: one flag, never two.
+        let mut stated = s(&["/opt/bin/claude", "-p", "--no-session-persistence", "x"]);
+        host_stand_in_fresh(
+            &mut stated,
+            "/opt/bin/claude -p --no-session-persistence {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
         assert_eq!(
-            claude
+            stated,
+            s(&["/opt/bin/claude", "-p", "--no-session-persistence", "x"])
+        );
+        // A PROMPT that spells the switch is no switch: it is still added.
+        let mut spelled = s(&["/opt/bin/claude", "-p", "--no-session-persistence"]);
+        host_stand_in_fresh(&mut spelled, "/opt/bin/claude -p {PROMPT}", SeatCli::Claude).unwrap();
+        assert_eq!(
+            spelled
                 .iter()
                 .filter(|a| *a == "--no-session-persistence")
                 .count(),
-            1
+            2
         );
         let mut codex = s(&["/opt/bin/codex", "exec", "--", "the prompt"]);
-        assert!(host_stand_in_fresh(&mut codex, SeatCli::Codex)
-            .unwrap()
-            .is_empty());
+        assert!(host_stand_in_fresh(
+            &mut codex,
+            "/opt/bin/codex exec -- {PROMPT}",
+            SeatCli::Codex
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(
             codex,
             s(&["/opt/bin/codex", "exec", "--ephemeral", "--", "the prompt"])
         );
+        // codex r1: global options with values before `exec` (`-c k=v`, `-m model`).
+        let mut global = s(&[
+            "/opt/bin/codex",
+            "-c",
+            "model=m",
+            "-m",
+            "o3",
+            "exec",
+            "--skip-git-repo-check",
+            "the prompt",
+        ]);
+        host_stand_in_fresh(
+            &mut global,
+            "/opt/bin/codex -c model=m -m o3 exec --skip-git-repo-check {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            global,
+            s(&[
+                "/opt/bin/codex",
+                "-c",
+                "model=m",
+                "-m",
+                "o3",
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "the prompt"
+            ])
+        );
         let mut pi = s(&["/opt/bin/pi", "-p", "the prompt"]);
-        host_stand_in_fresh(&mut pi, SeatCli::Pi).unwrap();
+        host_stand_in_fresh(&mut pi, "/opt/bin/pi -p {PROMPT}", SeatCli::Pi).unwrap();
         assert_eq!(pi, s(&["/opt/bin/pi", "-p", "the prompt", "--no-session"]));
-        // codex outside `exec` has no `--ephemeral`: refused, never run sharing its stores.
-        let mut interactive = s(&["/opt/bin/codex", "the prompt"]);
-        assert!(host_stand_in_fresh(&mut interactive, SeatCli::Codex).is_err());
+        // codex outside `exec` has no `--ephemeral`: refused, even when the PROMPT says `exec`.
+        for (argv, tpl) in [
+            (
+                s(&["/opt/bin/codex", "the prompt"]),
+                "/opt/bin/codex {PROMPT}",
+            ),
+            (s(&["/opt/bin/codex", "exec"]), "/opt/bin/codex {PROMPT}"),
+        ] {
+            let mut argv = argv;
+            let before = argv.clone();
+            assert!(host_stand_in_fresh(&mut argv, tpl, SeatCli::Codex).is_err());
+            assert_eq!(argv, before, "nothing added");
+        }
+        // codex r1: a template that selects a session of its own is refused, every spelling.
+        for (cli, tpl) in [
+            (SeatCli::Claude, "/opt/bin/claude -p --resume abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p --resume=abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p -r abc {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p --continue {PROMPT}"),
+            (SeatCli::Claude, "/opt/bin/claude -p -c {PROMPT}"),
+            (
+                SeatCli::Claude,
+                "/opt/bin/claude -p --session-id u {PROMPT}",
+            ),
+            (SeatCli::Codex, "/opt/bin/codex exec resume --last {PROMPT}"),
+            (SeatCli::Codex, "/opt/bin/codex exec resume abc {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --continue {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p -r {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --session /x.jsonl {PROMPT}"),
+            (SeatCli::Pi, "/opt/bin/pi -p --session=/x.jsonl {PROMPT}"),
+        ] {
+            let mut argv = tokenize(&tpl.replace("{PROMPT}", "the prompt"));
+            let why = host_stand_in_fresh(&mut argv, tpl, cli).unwrap_err();
+            assert!(why.contains("selects a session"), "{tpl}: {why}");
+        }
+        // The same words in the PROMPT select nothing: the stand-in runs.
+        let mut prompt_says = s(&["/opt/bin/claude", "-p", "--resume"]);
+        host_stand_in_fresh(
+            &mut prompt_says,
+            "/opt/bin/claude -p {PROMPT}",
+            SeatCli::Claude,
+        )
+        .unwrap();
+        // codex's `-c` is a config override, not a selector.
+        let mut config = s(&["/opt/bin/codex", "-c", "k=v", "exec", "p"]);
+        host_stand_in_fresh(
+            &mut config,
+            "/opt/bin/codex -c k=v exec {PROMPT}",
+            SeatCli::Codex,
+        )
+        .unwrap();
         for cli in [
             SeatCli::Copilot,
             SeatCli::Opencode,
@@ -15379,7 +15537,7 @@ mod tests {
             SeatCli::Other,
         ] {
             let mut argv = s(&["/opt/bin/x", "the prompt"]);
-            let why = host_stand_in_fresh(&mut argv, cli).unwrap_err();
+            let why = host_stand_in_fresh(&mut argv, "/opt/bin/x {PROMPT}", cli).unwrap_err();
             assert!(why.contains("container floor"), "{why}");
             assert_eq!(argv, s(&["/opt/bin/x", "the prompt"]), "nothing added");
         }
@@ -15440,6 +15598,42 @@ mod tests {
         let base = run("codex", format!("{codex} exec {{PROMPT}}"));
         assert_eq!(base.status, StepStatus::Ok, "{}", base.output);
         assert!(!base.output.contains("--ephemeral"), "{}", base.output);
+        // claude: the switch on the argv and auto-memory off in the CHILD's environment.
+        let _no_mem = VarGuard::unset(CLAUDE_DISABLE_AUTO_MEMORY_ENV);
+        let claude = dir.join("claude");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &claude,
+                "#!/bin/sh\necho \"ARGV=[$*] MEM=[$CLAUDE_CODE_DISABLE_AUTO_MEMORY]\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let claude = claude.to_string_lossy().into_owned();
+        let stand_in = run("claude~1", format!("{claude} -p {{PROMPT}}"));
+        assert_eq!(stand_in.status, StepStatus::Ok, "{}", stand_in.output);
+        assert!(
+            stand_in.output.contains("--no-session-persistence")
+                && stand_in.output.contains("MEM=[1]"),
+            "{}",
+            stand_in.output
+        );
+        let base = run("claude", format!("{claude} -p {{PROMPT}}"));
+        assert_eq!(base.status, StepStatus::Ok, "{}", base.output);
+        assert!(
+            !base.output.contains("--no-session-persistence") && base.output.contains("MEM=[]"),
+            "{}",
+            base.output
+        );
+        // A stand-in whose template resumes a session is refused before it spawns.
+        let resumed = run("claude~1", format!("{claude} -p --resume abc {{PROMPT}}"));
+        assert_eq!(resumed.status, StepStatus::Failed, "{}", resumed.output);
+        assert!(
+            resumed.output.contains("selects a session") && !resumed.output.contains("ARGV="),
+            "{}",
+            resumed.output
+        );
         let refused = run("copilot~1", format!("{copilot} -p {{PROMPT}}"));
         assert_eq!(refused.status, StepStatus::Failed, "{}", refused.output);
         assert!(

@@ -533,8 +533,8 @@ pub(crate) fn stand_in_bases(
 }
 
 /// (DES-STANDIN-001 §3.2, T-R11) The stand-in QE reviewer for a unit no real seat can review: a
-/// binding on [`stand_in_bases`]' first credential, with its base's exact invocation
-/// ([`crate::standin::resolve`]). `None` without consent, with no base, or when no record resolves
+/// binding on [`stand_in_bases`]' first credential, with its base's exact invocation (as the run
+/// seated it, else [`crate::standin::resolve`]). `None` without consent, with no base, or when no record resolves
 /// the base (fail closed). The caller persists the binding before the reviewer runs. A binding
 /// this unit's attempt already holds is reused, so stamping the same attempt twice never mints a
 /// second one.
@@ -582,7 +582,10 @@ pub(crate) fn stand_in_reviewer(
             }
         }
     };
-    let invocation = si::resolve(roster, registry, &binding.key)?;
+    // (codex r1 on b7-standin) The base's invocation as this run seated it (what admission judged,
+    // a launch override included), else its record on the roster or registry.
+    let invocation = seat_invocation(units, unit, &binding.base)
+        .or_else(|| si::resolve(roster, registry, &binding.key))?;
     Some((
         QeReviewerSeat {
             seat: binding.key.clone(),

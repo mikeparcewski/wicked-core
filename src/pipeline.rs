@@ -2069,8 +2069,8 @@ pub(crate) fn apply_and_finish_unit(
                 Some(crate::domain::UnitDenial::new(
                     crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
                     format!(
-                        "the run requires QE acceptance ({}) and no helper that did not build the \
-                         work can review its evidence: {}",
+                        "{QE_STAND_IN_HOLD_PREFIX}{}) and no helper that did not build the work \
+                         can review its evidence: {}",
                         crate::assurance::QE_ACCEPTANCE,
                         d.reason
                     ),
@@ -3154,6 +3154,17 @@ fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String 
     )
 }
 
+/// (DES-STANDIN-001 §3.10, T-R11) How the QE reviewer's `stand_in_needed` hold begins: the same
+/// source as the judge's, so this prefix (written only by the QE arm of the fold) tells the two
+/// layers apart when an earlier hold is weighed against the layers this attempt asked again.
+const QE_STAND_IN_HOLD_PREFIX: &str = "the run requires QE acceptance (";
+
+/// The QE reviewer's `stand_in_needed` hold, not the judge's (see [`QE_STAND_IN_HOLD_PREFIX`]).
+fn is_qe_stand_in_hold(d: &crate::domain::UnitDenial) -> bool {
+    d.source == crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED
+        && d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX)
+}
+
 /// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
 /// supplies no invented denials; the fold record separately preserves its unknown state.
 fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::UnitDenial> {
@@ -3178,8 +3189,13 @@ fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::
     // A layer gave a FRESH word this fold only when it was asked again: the judge, the QE
     // reviewer, or — for every other layer, all read off the seat's work — the seat. Anything
     // else that denied before over the same tree still stands (deny-dominates, fail-closed).
-    let refreshed = |s: &str| {
-        if judge_layer(s) {
+    let refreshed = |d: &crate::domain::UnitDenial| {
+        let s = d.source.as_str();
+        // (codex r1 on b7-standin) The QE reviewer's hold is the QE layer's, refreshed by a QE
+        // review: a grant that re-runs the QE review with no judge due must clear it.
+        if is_qe_stand_in_hold(d) {
+            now.qe
+        } else if judge_layer(s) {
             now.judge
         } else if qe_layer(s) {
             now.qe
@@ -3195,7 +3211,7 @@ fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::
         .behind
         .iter()
         .flatten()
-        .filter(|d| !floor(&d.source) && !refreshed(&d.source))
+        .filter(|d| !floor(&d.source) && !refreshed(d))
         .cloned()
         .collect()
 }
@@ -4315,7 +4331,8 @@ fn gate_receipt(
         r.skip(a::EVALUATOR_PASS, a::SKIP_ERROR, Some(e.to_string()));
     }
     // (DES-STANDIN-001 §5.1, T-R11) The isolated QE reviewer: the seat whose turn bound the verdict,
-    // real or a stand-in this run recorded; nobody when no turn reached a verdict. A `~` key the
+    // real or a stand-in this run recorded; a recorded stand-in that bound none is `failed`;
+    // nobody when no turn reached a verdict. A `~` key the
     // run never recorded is no reviewer (fail closed), as for the judge.
     if let (Some(roles), Some(q)) = (roles.as_mut(), f.qe) {
         let seat = q
@@ -4336,7 +4353,21 @@ fn gate_receipt(
                 }
                 None => a::RoleRecord::real(crate::standin::Role::QeReviewer, k, unit.ord, attempt),
             },
-            None => a::RoleRecord::none(crate::standin::Role::QeReviewer, unit.ord, attempt),
+            // (codex r1 on b7-standin) A stand-in this run recorded that ran and bound no verdict
+            // still took part: `failed`, never dropped (a receipt must not read independent).
+            None => match q
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|t| crate::standin::binding_for(run, Some(t.seat.as_str())))
+            {
+                Some(b) => {
+                    let mut failed = b.clone();
+                    failed.state = crate::standin::STATE_FAILED.to_string();
+                    a::RoleRecord::stand_in(&failed, failed.display())
+                }
+                None => a::RoleRecord::none(crate::standin::Role::QeReviewer, unit.ord, attempt),
+            },
         });
     }
     if let Some(roles) = roles {
@@ -7308,7 +7339,7 @@ mod judge_bench_tests {
             true,
             "pass",
             vec![qe_attempt("b", "verdict")],
-            vec![binding],
+            vec![binding.clone()],
         );
         let role = qe_role(&u).expect("a real reviewer's role");
         assert_eq!(
@@ -7324,6 +7355,29 @@ mod judge_bench_tests {
             Vec::new(),
         );
         assert_eq!(qe_role(&u).map(|r| r.filled), Some("none".to_string()));
+        // (codex r1 on b7-standin) A recorded stand-in that ran and bound no verdict took part:
+        // `failed`, and the receipt does not read independent.
+        let (_, u) = fold_qe_review_aware(
+            &format!("tr11-rec-failed-{pid}"),
+            true,
+            true,
+            crate::qe_acceptance::review::OUTCOME_UNAVAILABLE,
+            vec![qe_attempt("a~1", "seat_failure:timeout")],
+            vec![binding.clone()],
+        );
+        let role = qe_role(&u).expect("the failed stand-in's role");
+        assert_eq!(
+            (
+                role.filled.as_str(),
+                role.state.as_str(),
+                role.seat.as_deref()
+            ),
+            ("stand_in", "failed", Some("a~1"))
+        );
+        assert_eq!(
+            u.assurance.as_ref().unwrap().independence.as_deref(),
+            Some("stand_in")
+        );
         // An unaware run's receipt stays on the legacy path: no roles at all.
         let (_, u) = fold_qe_review_aware(
             &format!("tr11-rec-unaware-{pid}"),
@@ -8432,7 +8486,10 @@ mod guarded_read_step_tests {
 
 #[cfg(test)]
 mod denials_behind_tests {
-    use super::{denials_behind_after_fold, FoldRefresh, PriorFold};
+    use super::{
+        denials_behind_after_fold, standing_denials, FoldRefresh, PriorFold,
+        QE_STAND_IN_HOLD_PREFIX,
+    };
     use crate::domain::UnitDenial;
 
     fn d(source: &str) -> UnitDenial {
@@ -8497,6 +8554,41 @@ mod denials_behind_tests {
         );
         assert_eq!(sources(&out), Some(vec![]));
     }
+    /// (codex r1 on b7-standin) The QE reviewer's `stand_in_needed` hold is the QE layer's: a
+    /// same-tree attempt that re-ran only the QE review (the grant's re-dispatch, no judge due)
+    /// clears it, and one that re-ran only the judge does not. The judge's own hold (same source)
+    /// stays the judge layer's.
+    #[test]
+    fn a_qe_stand_in_hold_is_refreshed_by_the_qe_review_not_the_judge() {
+        let qe_hold = UnitDenial::new(
+            crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
+            format!("{QE_STAND_IN_HOLD_PREFIX}qe_acceptance) and no helper that did not build"),
+        );
+        let judge_hold = d(crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED);
+        let prior_with = |hold: &UnitDenial| PriorFold {
+            behind: Some(vec![hold.clone()]),
+            tree: Some("t1".into()),
+        };
+        let qe_only = FoldRefresh {
+            qe: true,
+            ..floor_only("t1")
+        };
+        let judge_only = FoldRefresh {
+            judge: true,
+            ..floor_only("t1")
+        };
+        assert!(standing_denials(&prior_with(&qe_hold), &qe_only).is_empty());
+        assert_eq!(
+            standing_denials(&prior_with(&qe_hold), &judge_only),
+            vec![qe_hold.clone()]
+        );
+        assert_eq!(
+            standing_denials(&prior_with(&judge_hold), &qe_only),
+            vec![judge_hold.clone()]
+        );
+        assert!(standing_denials(&prior_with(&judge_hold), &judge_only).is_empty());
+    }
+
     /// The record a previous fold left: what denied behind its winner, and the winner itself
     /// unless it was the floor (as the fold records it).
     fn prior(behind: Option<Vec<UnitDenial>>, winner: &str, tree: &str) -> PriorFold {
@@ -8620,7 +8712,10 @@ mod denials_behind_tests {
 
 #[cfg(test)]
 mod denials_behind_unknown_tests {
-    use super::{denials_behind_after_fold, FoldRefresh, PriorFold};
+    use super::{
+        denials_behind_after_fold, standing_denials, FoldRefresh, PriorFold,
+        QE_STAND_IN_HOLD_PREFIX,
+    };
     use crate::domain::UnitDenial;
 
     /// xreview r3: a gate from before the record existed (the floor won, nothing recorded behind
