@@ -3211,7 +3211,10 @@ impl Core {
     /// a build reached the minimum), `coverage` the store now, `build` the label that build persisted,
     /// `rows` the engine's verdict on each listed row that recorded its unit (same pass as `coverage`),
     /// and `satisfied_by` each listed requirement's live code links, sorted by symbol, with an empty
-    /// list when no target remains and null until built. An unknown `repo_ref` REJECTS.
+    /// list when no target remains and null until built. An unknown `repo_ref` REJECTS. A J6 v3
+    /// model (`graph.metadata.schema_version` "1.2.0") is returned as its build wrote it: `coverage`
+    /// is its `metadata.accounting`, `rows` and `target` are null, and each `satisfied_by` link
+    /// carries the `lines` (`[from, to]`) of its located statements, absent when none is located.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn get_requirements_graph_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
@@ -3221,6 +3224,25 @@ impl Core {
             let doc = wicked_core::requirements_graph_for_repo(&daemon, &db_path, &repo_ref)
                 .map_err(err)?;
             serde_json::to_string(&doc).map_err(err)
+        })
+    }
+
+    /// (J6 v3) A person's ruling on the domain model of ONE registered repo: Confirm or Reject on an
+    /// open statement or an unaccounted target, then the model is rebuilt (0 model calls).
+    /// `request` is JSON `{ statement?: string, target?: string, expect_key?: string,
+    /// expect_target_hash: string, action: "confirm" | "reject", note?: string, by: string }`
+    /// (exactly one of `statement` / `target`; `expect_key` with a statement). Resolves to a JSON
+    /// string: `{ ok: true, ruling, build: { ok: true, generation, accounting } }`, `{ ok: true,
+    /// ruling, build: { ok: false, error } }` (the ruling stands, the rebuild failed), or `{ ok:
+    /// false, code: "not_found" | "not_open" | "changed" | "stale_code" | "note_required" |
+    /// "bad_request" | "store", message }` (nothing written). An unknown `repo_ref` REJECTS.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn domain_ruling(&self, repo_ref: String, request: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            wicked_core::domain_ruling_for_repo(&daemon, &db_path, &repo_ref, &request).map_err(err)
         })
     }
 

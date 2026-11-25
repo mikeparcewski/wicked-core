@@ -16,11 +16,12 @@
 //!   the worktree, named by `WICKED_DOMAIN_SCOPE`, byte-equal to what the launch carried, and gone
 //!   with the channel when the step ends;
 //! - a launch with no human confirm ends Done with no gate;
-//! - a `domain-extraction` launch with no scope, or a scope on another launch, is refused by name.
-//!
-//! The rules the step writes and the graph built from them are C2's (the builder reads garden's
-//! new annotation shape): this test seeds the store the old way so the current `domain-graph`
-//! builds, and the C2 suite asserts the built rule.
+//! - a `domain-extraction` launch with no scope, or a scope on another launch, is refused by name;
+//! - (J6 C2, F28) the graph step builds 1.2.0 from the rows the run step wrote: the store starts
+//!   with garden's indexed nodes and no rows; while `domain-run` holds, the test writes the rows
+//!   garden's real route wrote over the same tree (`tests/fixtures/domain_v3/mini-cobol.sql`), and
+//!   the built graph holds their Checked statement. A second run whose step retires every row (a
+//!   run that found no rules) leaves an empty model, not the first one.
 //!
 //! Unix-gated: the channel is a unix socket.
 #![cfg(unix)]
@@ -29,17 +30,14 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wicked_apps_core::{
-    open_store, synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span,
-    SYMBOL_SCHEME,
-};
+use wicked_apps_core::{open_store, GraphRead, GraphWrite};
 use wicked_core::{
     Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, PresetSpec, RepoEntry, RepoSpec,
     StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
-use wicked_estate_core::{Annotation, ValidationClaim};
+use wicked_estate_core::Annotation;
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
@@ -85,6 +83,12 @@ for call in "claude a" "claude b" "codex c"; do
     --timeout-s 30 2>"$d/$2.err"
   echo $? > "$d/$2.rc"
 done
+# A checkout carrying the marker holds here while the test writes this run's rows into the store.
+if [ -f e2e-handshake ]; then
+  : > "$d/ready"
+  i=0
+  while [ ! -f "$d/written" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+fi
 exit 0
 "#;
 
@@ -162,34 +166,70 @@ impl StepRunner for Seats {
     }
 }
 
-/// A store with one behaviour already resolved to a rule, so today's `domain-graph` builds (C2
-/// replaces the builder and asserts the rule the step writes).
-fn seed(db: &str) {
+/// The real-shape fixture (J6 C2): garden's indexed store of `mini-cobol` and the rows its
+/// `domain-run` wrote over that tree.
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/domain_v3")
+}
+
+/// Load the fixture store into `db` (a new file), keeping `rows` of its annotations or none.
+fn load_fixture_store(db: &std::path::Path, rows: bool) {
+    for ext in ["", "-wal", "-shm"] {
+        let mut p = db.as_os_str().to_owned();
+        p.push(ext);
+        let _ = std::fs::remove_file(p);
+    }
+    let sql = std::fs::read_to_string(fixture_dir().join("mini-cobol.sql")).unwrap();
+    let con = rusqlite::Connection::open(db).unwrap();
+    con.execute_batch(&sql).unwrap();
+    if !rows {
+        con.execute("DELETE FROM annotations", []).unwrap();
+    }
+}
+
+/// What the run step writes, applied while it holds: the fixture's rows (`fixture` is the full
+/// fixture store), or a tombstone on every live key (a run that found nothing retires them).
+fn write_run_rows(db: &str, fixture: &std::path::Path, retire: bool) {
+    if !retire {
+        let con = rusqlite::Connection::open(db).unwrap();
+        con.execute("ATTACH DATABASE ?1 AS f", [fixture.to_str().unwrap()])
+            .unwrap();
+        con.execute("INSERT INTO annotations SELECT * FROM f.annotations", [])
+            .unwrap();
+        return;
+    }
     let mut store = open_store(Some(db)).unwrap();
-    let n = Node::new(
-        synthetic_symbol("code", "charge"),
-        NodeKind::Function,
-        "charge".to_string(),
-        Language::new(SYMBOL_SCHEME),
-        Location::new("billing/charge.rs".to_string(), Span::ZERO),
-    );
-    store.begin_batch().unwrap();
-    store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
-    store.commit_batch().unwrap();
-    store
-        .set_node_semantics(
-            &n.symbol,
-            None,
-            Some("REQ-1"),
-            Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
-        )
-        .unwrap();
-    store
-        .annotate(
-            &n.symbol,
-            Annotation::new("business_rule", "r", "amount > 0").with_confidence(0.9),
-        )
-        .unwrap();
+    let mut keys = std::collections::BTreeSet::new();
+    for ty in [
+        "business_rule",
+        "domain_target",
+        "rule_group",
+        "domain_followup",
+    ] {
+        for (sym, a) in store.annotations_by_type(ty).unwrap() {
+            keys.insert((sym, ty, a.key));
+        }
+    }
+    assert!(!keys.is_empty(), "the first run's rows are there to retire");
+    for (sym, ty, key) in keys {
+        store
+            .annotate(&sym, Annotation::new(ty, key, r#"{"status": "retired"}"#))
+            .unwrap();
+    }
+}
+
+/// Hold until the run step reaches its handshake, apply `rows`, and let it go on.
+fn while_the_step_holds(tree: &std::path::Path, rows: impl FnOnce()) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !tree.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the run step never reached its handshake"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    rows();
+    std::fs::write(tree.join("written"), b"").unwrap();
 }
 
 /// The folder beside the checkout `repo` that holds its run trees (core#1109).
@@ -209,7 +249,9 @@ fn rm_repo(repo: &std::path::Path) {
     let _ = std::fs::remove_dir_all(repo);
 }
 
-fn make_git_repo(name: &str) -> std::path::PathBuf {
+/// A git checkout; with `fixture_tree`, it holds the fixture's tree (the files the rows were
+/// written over) and the launcher's handshake marker.
+fn make_git_repo(name: &str, fixture_tree: bool) -> std::path::PathBuf {
     let repo = std::env::temp_dir().join(format!("wicked-core-de-{name}-{}", std::process::id()));
     rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
@@ -226,9 +268,26 @@ fn make_git_repo(name: &str) -> std::path::PathBuf {
     git(&["config", "user.name", "t"]);
     git(&["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("README.md"), "hello").unwrap();
+    if fixture_tree {
+        copy_dir(&fixture_dir().join("mini-cobol"), &repo);
+        std::fs::write(repo.join("e2e-handshake"), "").unwrap();
+    }
     git(&["add", "."]);
     git(&["commit", "-qm", "init"]);
     repo
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let p = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &p);
+        } else {
+            std::fs::copy(e.path(), p).unwrap();
+        }
+    }
 }
 
 /// The process-wide environment, set once: the engine's own binary, the repository graph root,
@@ -268,7 +327,7 @@ fn setup_env() {
         // ambient one here must never reach a step.
         std::env::set_var("WICKED_DOMAIN_SCOPE", "/nonexistent/ambient-scope.json");
         // garden#1370: a domain-extraction launch re-indexes the repo graph at its base; a hermetic
-        // runner has no wicked-estate, and the seeded graph is what the run reads.
+        // runner has no wicked-estate, and the fixture graph is what the run reads.
         let indexer = base.join("wicked-estate-stub");
         std::fs::write(&indexer, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&indexer, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -341,7 +400,7 @@ fn wait_terminal(
 }
 
 /// A core on a scratch store with the recording seats, and a registered repository whose store
-/// holds the seeded rule.
+/// holds the fixture's indexed nodes and no rows yet.
 struct Rig {
     core: Core,
     seats: Arc<Seats>,
@@ -357,7 +416,7 @@ impl Drop for Rig {
     }
 }
 
-fn rig(name: &str) -> Rig {
+fn rig(name: &str, fixture_tree: bool) -> Rig {
     setup_env();
     let dir = std::env::temp_dir().join(format!("wicked-core-de-db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -368,7 +427,7 @@ fn rig(name: &str) -> Rig {
         Arc::new(StubDispatcher),
         seats.clone(),
     );
-    let repo = make_git_repo(name);
+    let repo = make_git_repo(name, fixture_tree);
     let entry = core
         .register_repo(RepoSpec {
             name: name.into(),
@@ -377,7 +436,7 @@ fn rig(name: &str) -> Rig {
         })
         .expect("register repo");
     std::fs::create_dir_all(std::path::Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
-    seed(&entry.code_graph_db);
+    load_fixture_store(std::path::Path::new(&entry.code_graph_db), false);
     Rig {
         core,
         seats,
@@ -408,7 +467,7 @@ fn shipped_steps() -> Vec<wicked_core::PlanStep> {
 
 #[test]
 fn the_shipped_preset_runs_armed_with_its_scope_and_ends_with_no_gate() {
-    let rig = rig("armed");
+    let rig = rig("armed", true);
     let (core, seats, repo, entry) = (&rig.core, &rig.seats, &rig.repo, &rig.entry);
     let scope = a_scope();
     let run_id = format!("de-armed-{}", std::process::id());
@@ -420,8 +479,13 @@ fn the_shipped_preset_runs_armed_with_its_scope_and_ends_with_no_gate() {
         Some(scope.clone()),
     ))
     .expect("launch domain-extraction with a scope");
-    let (end, gated) = wait_terminal(&ev, &run_id);
     let tree = run_tree(repo, &run_id).join(".wicked/domain/e2e");
+    let fixture = rig.dir.join("fixture.db");
+    load_fixture_store(&fixture, true);
+    while_the_step_holds(&tree, || {
+        write_run_rows(&entry.code_graph_db, &fixture, false)
+    });
+    let (end, gated) = wait_terminal(&ev, &run_id);
     let read = |f: &str| std::fs::read_to_string(tree.join(f)).unwrap_or_default();
     assert!(
         matches!(end, CoreEvent::SessionCompleted { .. }) && !gated,
@@ -511,13 +575,61 @@ fn the_shipped_preset_runs_armed_with_its_scope_and_ends_with_no_gate() {
             .any(|(_, seat, _)| seat.as_deref() == Some("codex")),
         "{seen:?}"
     );
+
+    // (C2, F28) The graph step built 1.2.0 from the rows the run step wrote: the Checked statement
+    // is in the model, on its code, and the run's open work is counted.
+    let graph = |db: &str| {
+        wicked_governance::load_domain_graph(&open_store(Some(db)).unwrap(), None)
+            .unwrap()
+            .expect("the graph step built a model")
+    };
+    let doc = graph(&entry.code_graph_db);
+    assert_eq!(doc["metadata"]["schema_version"], "1.2.0", "{doc:#}");
+    let prog = &doc["domains"]["app/cbl/PAYCALC1.cbl"]["requirements"];
+    let rules: Vec<&serde_json::Value> = prog
+        .as_object()
+        .unwrap_or_else(|| panic!("no PAYCALC1 domain: {doc:#}"))
+        .values()
+        .flat_map(|r| r["business_rules"].as_array().unwrap())
+        .collect();
+    let checked = rules
+        .iter()
+        .find(|r| r["status"] == "Checked")
+        .unwrap_or_else(|| panic!("no Checked statement: {doc:#}"));
+    assert_eq!(
+        checked["id"],
+        "ts-cobol . . . app/cbl/PAYCALC1/PAYCALC1#READ-PARA().#0"
+    );
+    assert_eq!(checked["source_ref"], "app/cbl/PAYCALC1.cbl#L20-L29");
+    assert_eq!(
+        doc["metadata"]["accounting"],
+        serde_json::json!({"targets": 4, "accounted": 2, "open": 3, "stale": 0})
+    );
+
+    // A second run that finds nothing retires every row: the model empties, nothing is carried.
+    let again = format!("{run_id}-2");
+    let ev = core.subscribe();
+    core.launch_run(spec(&again, &entry.id, "domain-extraction", Some(scope)))
+        .expect("launch the second run");
+    let tree2 = run_tree(repo, &again).join(".wicked/domain/e2e");
+    while_the_step_holds(&tree2, || {
+        write_run_rows(&entry.code_graph_db, &fixture, true)
+    });
+    let (end, gated) = wait_terminal(&ev, &again);
+    assert!(
+        matches!(end, CoreEvent::SessionCompleted { .. }) && !gated,
+        "{end:?}"
+    );
+    let doc = graph(&entry.code_graph_db);
+    assert_eq!(doc["domains"], serde_json::json!({}), "{doc:#}");
+    assert_eq!(doc["metadata"]["accounting"]["targets"], 0, "{doc:#}");
 }
 
 /// (coord ruling B') A `domain-extraction` launch with no scope is refused by name, and so is a
 /// scope on another launch or a malformed one; nothing is persisted.
 #[test]
 fn a_launch_without_its_scope_or_with_a_stray_one_is_refused_by_name() {
-    let rig = rig("refused");
+    let rig = rig("refused", false);
     let (core, entry) = (&rig.core, &rig.entry);
     let pid = std::process::id();
     let none = core
@@ -577,7 +689,7 @@ fn a_launch_without_its_scope_or_with_a_stray_one_is_refused_by_name() {
 /// their step refuses by name before the launcher runs, and no seat answers anything.
 #[test]
 fn only_the_shipped_name_arms_its_step_and_a_copy_under_another_name_runs_no_seat() {
-    let rig = rig("ident");
+    let rig = rig("ident", false);
     let (core, seats, repo, entry) = (&rig.core, &rig.seats, &rig.repo, &rig.entry);
     let pid = std::process::id();
     let project = core.project_create("j6-ident", None).unwrap();

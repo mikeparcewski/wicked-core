@@ -163,16 +163,28 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "domain-graph",
-        "wicked-core domain-graph [--db <path>] [--repo-root <dir>] [--min-coverage-pct <N>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
-         Build the requirements graph from the ANNOTATED estate graph and save it INTO the estate \
-         store (domain, requirement and business-rule nodes, SatisfiedBy edges to code; what crew \
-         reads). --out also writes it as a JSON export file. Fails closed below the configured \
-         minimum coverage (--min-coverage-pct, else the repository's own target \
-         (requirements-target), else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).\n\
+        "wicked-core domain-graph [--db <path>] --repo-root <dir> [--out <F>]\n  \
+         Build the domain model (schema 1.2.0) from the statements, rule groups, targets and \
+         follow-ups garden's domain-run wrote, and save it INTO the estate store (what crew \
+         reads). A statement whose code changed since it was checked is shown stale, judged \
+         against the checkout at --repo-root. No minimum: an empty run builds an empty model. \
+         --out also writes it as a JSON export file.\n\
+         wicked-core domain-graph [--db <path>] [--repo-root <dir>] --schema-version 1.1.0 [--min-coverage-pct <N>] [--coverage <F>] [--out <F>]\n  \
+         The pre-J6-v3 build from confidence annotations, failing closed below a minimum \
+         coverage (deleted with core#1924).\n\
          wicked-core domain-graph [--db <path>] --retire <domain>::<REQ-NNN>\n  \
          Retire one requirement whose code was deleted: it leaves the stored graph now, no later \
          build carries it, and its id is never given to other code. Refused while its code is \
          still in the index.",
+    ),
+    (
+        "domain-ruling",
+        "wicked-core domain-ruling [--db <path>] --repo-root <dir> (--statement <id> --expect <statement_key> | --target <id>) --expect-target <target_hash> --action confirm|reject [--note <text>] --by <who>\n  \
+         Record a person's ruling on an open statement or an unaccounted target of the domain \
+         model, then rebuild the model (0 model calls). Refused, with nothing written, when the \
+         subject is gone, is not open, changed since it was read, or its code changed; a reject \
+         needs a note. Prints one JSON line. Exit 0 = written and rebuilt, 2 = refused, 3 = \
+         written but the rebuild failed (the ruling stands).",
     ),
     (
         "coverage",
@@ -485,6 +497,7 @@ fn main() {
         Some("gate-phase") => return gate_phase_cmd(&args),
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
+        Some("domain-ruling") => return domain_ruling_cmd(&args),
         Some("model-call") => return model_call_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
         Some("requirements-target") => return requirements_target_cmd(&args),
@@ -1223,9 +1236,24 @@ fn domain_graph_cmd(args: &[String]) {
     // file — for garden's hermetic emit lane and ad-hoc inspection; nothing in the run reads it.
     let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
     let out_path = flag(args, "--out");
-    // The domain-model schema accepts 1.0.0 and 1.1.0; 1.1.0 is the contract that carries the
-    // optional `metadata.coverage` + `requirement.corroboration` this build emits.
-    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
+    // 1.2.0 (J6 v3, the default) builds from the rows garden's domain-run writes; 1.1.0 / 1.0.0 is
+    // the legacy confidence build with its minimum, kept until C3 deletes it.
+    let schema_version =
+        flag(args, "--schema-version").unwrap_or_else(|| wicked_governance::SCHEMA_V3.to_string());
+    if schema_version == wicked_governance::SCHEMA_V3 {
+        // The 1.2.0 build has no minimum: a caller asking for one would otherwise get no check.
+        if let Some(f) = ["--coverage", "--min-coverage-pct"]
+            .into_iter()
+            .find(|f| args.iter().any(|a| a == f))
+        {
+            fail(&format!(
+                "domain-graph: {f} is a 1.1.0 option (pass --schema-version 1.1.0); the 1.2.0 \
+                 model has no minimum, it counts accounted targets and open statements"
+            ));
+            return;
+        }
+        return domain_graph_v3(args, repo_root, out_path);
+    }
 
     // Declared before the store so it drops after it: the graph goes back to DELETE mode (core#1602).
     let _settle = wicked_core::RepoGraphWrite::begin(std::path::Path::new(&store_path(args)));
@@ -1390,6 +1418,84 @@ fn domain_graph_cmd(args: &[String]) {
         ),
         Err(e) => fail(&format!("domain-graph: cannot write {out_path}: {e}")),
     }
+}
+
+/// `wicked-core domain-graph` at 1.2.0 (J6 v3, DES-C2-v2): the model garden's domain-run wrote,
+/// built and saved with no minimum. `--repo-root` is required: a statement is shown checked only
+/// while its code is the code it was checked against.
+fn domain_graph_v3(
+    args: &[String],
+    repo_root: Option<std::path::PathBuf>,
+    out_path: Option<String>,
+) {
+    let Some(root) = repo_root else {
+        fail("domain-graph: --repo-root is required: the model is judged against the checkout");
+        return;
+    };
+    let _settle = wicked_core::RepoGraphWrite::begin(std::path::Path::new(&store_path(args)));
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("domain-graph: open store failed: {e}"));
+            return;
+        }
+    };
+    let (model, outcome) = match wicked_governance::build_and_persist(
+        &mut store,
+        &root,
+        wicked_governance::now_unix(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("domain-graph: {e}"));
+            return;
+        }
+    };
+    let a = outcome.accounting;
+    let said = format!(
+        "{} requirement(s); {} of {} target(s) accounted, {} open statement(s), {} stale target(s)",
+        outcome.requirements, a.accounted, a.targets, a.open, a.stale
+    );
+    println!("domain-graph: built the domain model into the estate store: {said}");
+    if let Some(out_path) = out_path {
+        let json = serde_json::to_string_pretty(&model).expect("DomainModel serializes to JSON");
+        let written = std::path::Path::new(&out_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&out_path, json));
+        if let Err(e) = written {
+            fail(&format!(
+                "domain-graph: the model is built into the store, but the export {out_path} \
+                 could not be written: {e}"
+            ));
+        }
+    }
+}
+
+/// `wicked-core domain-ruling` (DES-C2-v2 §4): a person's ruling on one open statement or one
+/// unaccounted target, then the rebuild. One JSON line on stdout either way.
+fn domain_ruling_cmd(args: &[String]) {
+    // Every refusal is the same one JSON line (exit 2), argument errors included.
+    let Some(root) = flag(args, "--repo-root").map(std::path::PathBuf::from) else {
+        let v = serde_json::json!({"ok": false, "code": "bad_request",
+            "message": "--repo-root is required: a ruling is checked against the checkout"});
+        println!("{v}");
+        std::process::exit(2);
+    };
+    let req = wicked_governance::RulingRequest {
+        statement: flag(args, "--statement"),
+        target: flag(args, "--target"),
+        expect_key: flag(args, "--expect"),
+        expect_target_hash: flag(args, "--expect-target").unwrap_or_default(),
+        action: flag(args, "--action").unwrap_or_default(),
+        note: flag(args, "--note"),
+        by: flag(args, "--by").unwrap_or_default(),
+    };
+    let db = store_path(args);
+    let (line, code) = wicked_core::domain_ruling(std::path::Path::new(&db), &root, &req);
+    println!("{line}");
+    std::process::exit(code);
 }
 
 /// `wicked-core domain-graph --retire <domain>::<REQ-NNN>` (core#1698): retire one requirement whose

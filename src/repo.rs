@@ -455,7 +455,13 @@ pub fn coverage_report_for_repo(
     let repo = get_repo(daemon, repo_ref)?
         .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
-    wicked_governance::recompute_front_half_coverage(&repo_store)
+    // (J6 v3, R22) A v3 statement counts as resolved only while its code is the code it was
+    // checked against: judged against the registered checkout.
+    let cfg = wicked_governance::CoverageConfig {
+        repo_root: Some(std::path::PathBuf::from(&repo.root_path)),
+        ..Default::default()
+    };
+    wicked_governance::recompute_front_half_coverage_with(&repo_store, &cfg)
 }
 
 /// Re-index ONE registered repo's checkout into its existing code graph, under the launch indexer's
@@ -566,6 +572,21 @@ pub fn requirements_graph_for_repo(
         }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
+    // (J6 v3, DES-C2-v2 §5) A 1.2.0 model is read as its build wrote it: no recompute, no relabel,
+    // no minimum. `coverage` is its own accounting; `rows` and `target` are pre-v3 only.
+    let loaded = wicked_governance::load_domain_graph_with_units(&repo_store)?;
+    if let Some((graph, build, _, links)) = loaded.as_ref().filter(|(g, ..)| {
+        g["metadata"]["schema_version"].as_str() == Some(wicked_governance::SCHEMA_V3)
+    }) {
+        let code = build
+            .code_commit
+            .clone()
+            .map(|c| code_drift(&repo.root_path, &c, "build"));
+        return Ok(serde_json::json!({
+            "graph": graph, "coverage": graph["metadata"]["accounting"].clone(), "build": build,
+            "rows": null, "satisfied_by": links, "code": code, "target": null,
+        }));
+    }
     // (domain-graph-3) The repository's own target first (lowered at a budget ask), else the
     // daemon-wide minimum.
     // Read ONCE: the minimum applied and the `target` the read reports come from the same values
@@ -581,13 +602,17 @@ pub fn requirements_graph_for_repo(
     // not hold (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is
     // built. The rows are read FIRST and the store counted after (xreview on #1237): a build or a
     // mapping that commits in between shows as a difference, never as a stale build matching.
-    let loaded = wicked_governance::load_domain_graph_with_units(&repo_store)?;
     let units = loaded
         .as_ref()
         .map(|(_, _, u, _)| u.clone())
         .unwrap_or_default();
+    // Judged against the checkout: a v3 row whose code changed never counts as resolved (R22).
     let (report, rows, weighted_milli) =
-        wicked_governance::recompute_front_half_coverage_for_rows(&repo_store, &units)?;
+        wicked_governance::recompute_front_half_coverage_for_rows_at(
+            &repo_store,
+            &units,
+            Some(Path::new(&repo.root_path)).filter(|p| !p.as_os_str().is_empty()),
+        )?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
     // The confidence-weighted headline rides on the READ only (optional on the wire, never in the
     // persisted label, which keeps `coverage` typed): older readers ignore the extra key.
@@ -629,6 +654,92 @@ pub fn requirements_graph_for_repo(
         "satisfied_by": links, "code": code,
         "target": target,
     }))
+}
+
+/// (J6 v3, DES-C2-v2 §4) Record a ruling on the domain model in the estate store at `db` and
+/// rebuild the model against the checkout `root`. Returns one JSON line and the exit code:
+/// 0 `{ok: true, ruling, build: {ok: true, generation, accounting}}`; 2 `{ok: false, code,
+/// message}` (refused, nothing written); 3 `{ok: true, ruling, build: {ok: false, error}}` (the
+/// ruling stands; the rebuild failed and the next build picks it up). An error opening the store
+/// is code `store`, exit 1.
+pub fn domain_ruling(
+    db: &Path,
+    root: &Path,
+    req: &wicked_governance::RulingRequest,
+) -> (String, i32) {
+    // A store that does not exist has no model to rule on: refused before anything is opened, so a
+    // refusal never creates or migrates a store.
+    if !db.is_file() {
+        let v = serde_json::json!({"ok": false, "code": "not_found",
+            "message": "this repository has no domain model yet"});
+        return (v.to_string(), 2);
+    }
+    let _settle = crate::RepoGraphWrite::begin(db);
+    let mut store = match wicked_apps_core::open_store(db.to_str()) {
+        Ok(s) => s,
+        Err(e) => {
+            let v = serde_json::json!({"ok": false, "code": "store", "message": e.to_string()});
+            return (v.to_string(), 1);
+        }
+    };
+    let ruling = match wicked_governance::write_ruling(
+        &mut store,
+        root,
+        req,
+        wicked_governance::now_unix(),
+    ) {
+        Ok(Ok(r)) => r,
+        Ok(Err(refusal)) => {
+            let v =
+                serde_json::json!({"ok": false, "code": refusal.code, "message": refusal.message});
+            return (v.to_string(), 2);
+        }
+        Err(e) => {
+            let v = serde_json::json!({"ok": false, "code": "store", "message": e.to_string()});
+            return (v.to_string(), 1);
+        }
+    };
+    match wicked_governance::build_and_persist(&mut store, root, wicked_governance::now_unix()) {
+        Ok((_, outcome)) => {
+            let v = serde_json::json!({"ok": true, "ruling": ruling, "build": {
+                "ok": true, "generation": outcome.generation, "accounting": outcome.accounting}});
+            (v.to_string(), 0)
+        }
+        Err(e) => {
+            let v = serde_json::json!({"ok": true, "ruling": ruling, "build": {
+                "ok": false, "error": format!("the ruling is saved; the model was not rebuilt: {e}")}});
+            (v.to_string(), 3)
+        }
+    }
+}
+
+/// [`domain_ruling`] on a registered repo: its store and its checkout resolve from the registry on
+/// `daemon` (the same resolution as [`requirements_graph_for_repo`]). `request` is the JSON of a
+/// [`wicked_governance::RulingRequest`]; a request that does not parse answers `bad_request`.
+pub fn domain_ruling_for_repo(
+    daemon: &dyn GraphRead,
+    daemon_db: &str,
+    repo_ref: &str,
+    request: &str,
+) -> anyhow::Result<String> {
+    let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
+    let repo = get_repo(daemon, repo_ref)?
+        .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
+    let (db, root) = (repo.code_graph_db, repo.root_path);
+    let req: wicked_governance::RulingRequest = match serde_json::from_str(request) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(serde_json::json!({"ok": false, "code": "bad_request",
+                "message": format!("the ruling request does not parse: {e}")})
+            .to_string())
+        }
+    };
+    if db.is_empty() || !Path::new(&db).exists() {
+        return Ok(serde_json::json!({"ok": false, "code": "not_found",
+            "message": "this repository has no domain model yet"})
+        .to_string());
+    }
+    Ok(domain_ruling(Path::new(&db), Path::new(&root), &req).0)
 }
 
 /// `{ built_from: { commit, at, basis }, head, commits_behind }` for a build made from `commit`, read
@@ -3485,6 +3596,7 @@ mod tests {
                 coverage: None,
                 product_only: None,
                 business_domains: Vec::new(),
+                extract: None,
             },
             domains: Default::default(),
         }
@@ -3549,6 +3661,7 @@ mod tests {
                     source_kinds: vec!["code-body".into()],
                 },
                 source_ref: None,
+                extract: None,
             });
             let mut model = empty_model();
             let mut d = wicked_governance::Domain::default();
@@ -3823,6 +3936,7 @@ mod tests {
                     coverage: None,
                     product_only: None,
                     business_domains: Vec::new(),
+                    extract: None,
                 },
                 domains: Default::default(),
             };
@@ -3873,6 +3987,7 @@ mod tests {
                     coverage: Some(built_at),
                     product_only: None,
                     business_domains: Vec::new(),
+                    extract: None,
                 },
                 domains: Default::default(),
             };
@@ -6974,6 +7089,81 @@ mod tests {
             wt.file_name().unwrap().to_str().unwrap(),
             "web-refresh-lint-a0"
         );
+        rm_repo(&root);
+    }
+
+    /// (J6 C2) The registered-repo wire: a ruling over the repo's store and checkout, then the
+    /// graph read returns the 1.2.0 model as built, with its accounting as `coverage` and the
+    /// statements' ranges on each link. A request that does not parse is a named refusal.
+    #[test]
+    fn a_ruling_and_the_graph_read_over_a_registered_repo_carry_the_1_2_0_model() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("dm3-wire");
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/domain_v3");
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap().map(Result::unwrap) {
+                let p = to.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    copy(&e.path(), &p);
+                } else {
+                    std::fs::copy(e.path(), p).unwrap();
+                }
+            }
+        }
+        copy(&fx.join("mini-cobol"), &root);
+        let state_home = scratch_state_home("dm3-wire");
+        let daemon_path = state_home.join("daemon-store.db");
+        let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "dm3".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let db = daemon_path.to_str().unwrap();
+        std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
+        let sql = std::fs::read_to_string(fx.join("mini-cobol.sql")).unwrap();
+        rusqlite::Connection::open(&entry.code_graph_db)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+
+        let bad = domain_ruling_for_repo(&daemon, db, &entry.id, "{\"action\": 1}").unwrap();
+        let bad: serde_json::Value = serde_json::from_str(&bad).unwrap();
+        assert_eq!(bad["code"], "bad_request", "{bad}");
+        assert!(domain_ruling_for_repo(&daemon, db, "no-such-repo", "{}").is_err());
+
+        let repo_store = wicked_apps_core::open_store_ro(Some(&entry.code_graph_db)).unwrap();
+        let idx = wicked_governance::ExtractIndex::load(&repo_store, Some(root.as_path())).unwrap();
+        drop(repo_store);
+        let id = "ts-cobol . . . app/cbl/PAYCALC1/PAYCALC1#READ-PARA().#1";
+        let st = &idx.statements[id];
+        let req = serde_json::json!({
+            "statement": id, "expect_key": st.key,
+            "expect_target_hash": st.row.value["target_hash"], "action": "confirm", "by": "ana",
+        });
+        let out = domain_ruling_for_repo(&daemon, db, &entry.id, &req.to_string()).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["build"]["ok"], true, "{out}");
+
+        let read = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(read["graph"]["metadata"]["schema_version"], "1.2.0");
+        assert_eq!(
+            read["coverage"],
+            serde_json::json!({"targets": 4, "accounted": 2, "open": 2, "stale": 0})
+        );
+        assert!(read["rows"].is_null() && read["target"].is_null(), "{read}");
+        let links = &read["satisfied_by"]["app/cbl/PAYCALC1.cbl"];
+        let link = &links.as_object().unwrap().values().next().unwrap()[0];
+        assert_eq!(link["lines"], serde_json::json!([[20, 29]]), "{read}");
         rm_repo(&root);
     }
 }

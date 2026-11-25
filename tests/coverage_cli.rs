@@ -107,6 +107,9 @@ fn domain_graph_recompute_beats_a_lying_coverage_file() {
     let out = Command::new(BIN)
         .args([
             "domain-graph",
+            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
+            "--schema-version",
+            "1.1.0",
             "--db",
             db.to_str().unwrap(),
             "--coverage",
@@ -139,6 +142,9 @@ fn domain_graph_translates_a_fully_accounted_store_with_no_coverage_file() {
     let out = Command::new(BIN)
         .args([
             "domain-graph",
+            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
+            "--schema-version",
+            "1.1.0",
             "--db",
             db.to_str().unwrap(),
             "--out",
@@ -284,6 +290,9 @@ fn domain_graph_builds_at_the_minimum_into_estate_and_writes_no_file() {
         .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
         .args([
             "domain-graph",
+            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
+            "--schema-version",
+            "1.1.0",
             "--db",
             db.to_str().unwrap(),
             "--repo-root",
@@ -350,6 +359,9 @@ fn domain_graph_refuses_below_the_configured_minimum_and_says_how_far_it_got() {
         }
         cmd.args([
             "domain-graph",
+            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
+            "--schema-version",
+            "1.1.0",
             "--db",
             db.to_str().unwrap(),
             "--out",
@@ -496,6 +508,7 @@ fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
         } else {
             let rg = dir.join("rg.json");
             c.args(["--db", db.to_str().unwrap(), "--out", rg.to_str().unwrap()]);
+            c.args(["--schema-version", "1.1.0"]);
         }
         let o = c.output().unwrap();
         let err = String::from_utf8_lossy(&o.stderr);

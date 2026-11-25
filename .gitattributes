@@ -12,3 +12,5 @@ tests/fixtures/** text eol=lf
 # The pinned agent-sandbox release manifest is checked by its sha256 (src/k8s/cluster.rs): never
 # convert its line endings (a Windows checkout would change the bytes and fail the pin).
 containers/k8s/*.yaml -text
+# J6 C2 fixtures: the stored hashes are of these exact bytes (garden batch_hash); never convert line endings.
+tests/fixtures/domain_v3/** -text

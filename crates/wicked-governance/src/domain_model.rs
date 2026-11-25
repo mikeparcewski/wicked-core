@@ -54,6 +54,10 @@ pub struct Metadata {
     /// (`<dir>::REQ-NNN`, unchanged) to the business area. Empty when nothing was assigned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub business_domains: Vec<BusinessDomain>,
+    /// (1.2.0, J6 v3) The rule groups, follow-ups, targets and accounting of a model built from
+    /// garden's `domain-run` rows ([`crate::domain_extract`]). Absent on 1.0.0 / 1.1.0.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<crate::domain_extract::ExtractMeta>,
 }
 
 /// One business domain of the repository (`metadata.business_domains[]`).
@@ -176,6 +180,9 @@ pub struct Rule {
     pub provenance: Provenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ref: Option<String>,
+    /// (1.2.0, J6 v3) The statement's key, effective status, claims and ruling.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<crate::domain_extract::StatementView>,
 }
 
 /// A field-level validation (`id` + `statement` required).
@@ -358,6 +365,9 @@ pub struct CoverageConfig {
     /// `Other(tag)` tags that ARE behavior-bearing (coverage.py `DEFAULT_ESTATE_BEHAVIOR_KINDS`).
     pub behavior_other_tags: std::collections::BTreeSet<String>,
     pub resolve_threshold: f64,
+    /// (J6 v3) The checkout a v3 statement's freshness is judged against; `None` treats every
+    /// target as fresh (a store with no repository, such as the daemon's).
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 impl Default for CoverageConfig {
@@ -368,6 +378,7 @@ impl Default for CoverageConfig {
                 .map(|s| s.to_string())
                 .collect(),
             resolve_threshold: DEFAULT_RESOLVE_THRESHOLD,
+            repo_root: None,
         }
     }
 }
@@ -770,6 +781,9 @@ fn classify_node(
     // DB-backed store a second `node_semantics` per node is a second round trip across the whole
     // graph — 34,897 of them on the run that motivated the tally.
     semantics: Option<&wicked_estate_core::NodeSemantics>,
+    // (J6 v3, R22) The store's v3 rows, read once per pass: a v3 statement counts by its effective
+    // status, never by its annotation's confidence column.
+    extract: &crate::domain_extract::ExtractIndex,
 ) -> anyhow::Result<Bucket> {
     // A requirement counts as present ONLY when non-blank — an empty/whitespace `requirement` is NOT
     // real accounting (coverage.py truthy-checks `req`); counting it would be a vacuous-gate fail-open.
@@ -783,6 +797,20 @@ fn classify_node(
     let mut best_rule_conf: Option<f64> = None;
     let mut has_business_rule = false;
     for a in annotations.iter().filter(|a| a.r#type == BUSINESS_RULE_ANN) {
+        use crate::domain_extract::RuleCount;
+        match extract.rule_counts(&a.key, &a.value) {
+            RuleCount::Ignored => continue,
+            RuleCount::Unresolved => {
+                has_business_rule = true;
+                continue;
+            }
+            RuleCount::Resolved(c) => {
+                has_business_rule = true;
+                best_rule_conf = Some(best_rule_conf.map_or(c, |b: f64| b.max(c)));
+                continue;
+            }
+            RuleCount::Legacy => {}
+        }
         if !(0.0..=1.0).contains(&a.confidence) {
             anyhow::bail!(
                 "node {}: business_rule confidence {} out of [0,1] — never fabricated or clamped",
@@ -905,6 +933,7 @@ fn recompute_observing(
     let mut nodes = store.all_nodes()?;
     nodes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     let total = nodes.len() as u64;
+    let extract = crate::domain_extract::ExtractIndex::load(store, cfg.repo_root.as_deref())?;
 
     // Precompute ONCE: behaviour-out edges (Module dead shells, interfaces that act), bodiless
     // callables and the interfaces/traits that carry a body.
@@ -959,7 +988,13 @@ fn recompute_observing(
         let app = package_dir(&node.location.file);
         let acc = apps.entry(app.clone()).or_default();
         acc.behavior_bearing += 1;
-        let bucket = classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())?;
+        let bucket = classify_node(
+            store,
+            node,
+            cfg.resolve_threshold,
+            semantics.as_ref(),
+            &extract,
+        )?;
         observe(
             node,
             UnitClass::Counted {
@@ -1550,6 +1585,7 @@ pub fn build_domain_model_with(
     // `domain::REQ-NNN`) would land on the wrong item. Gaps in the numbering are unmapped nodes.
     let cfg = CoverageConfig::default();
     let idx = BehaviorIndex::build(store, &nodes)?;
+    let extract = crate::domain_extract::ExtractIndex::load(store, None)?;
     let mut unknown_other = std::collections::BTreeSet::new();
     let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     // The business domains the requirements were assigned to (reqgraph Fix B), by id: each one's
@@ -1571,7 +1607,9 @@ pub fn build_domain_model_with(
 
         // Real business rules — the annotation's own confidence rides through (fail-closed if out of range).
         let mut business_rules: Vec<Rule> = Vec::new();
-        for a in annotations.iter().filter(|a| a.r#type == BUSINESS_RULE_ANN) {
+        for a in annotations.iter().filter(|a| {
+            a.r#type == BUSINESS_RULE_ANN && !crate::domain_extract::is_v3_value(&a.value)
+        }) {
             if !(0.0..=1.0).contains(&a.confidence) {
                 anyhow::bail!(
                     "node {}: business_rule confidence {} out of [0,1] — never fabricated or clamped",
@@ -1585,6 +1623,7 @@ pub fn build_domain_model_with(
                 confidence: a.confidence,
                 provenance: node_provenance(node),
                 source_ref: Some(node_ref(node)),
+                extract: None,
             });
         }
 
@@ -1615,7 +1654,13 @@ pub fn build_domain_model_with(
         if !behavior
             && accounted
             && !matches!(
-                classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())?,
+                classify_node(
+                    store,
+                    node,
+                    cfg.resolve_threshold,
+                    semantics.as_ref(),
+                    &extract
+                )?,
                 Bucket::Resolved { .. }
             )
         {
@@ -1662,6 +1707,7 @@ pub fn build_domain_model_with(
                 confidence,
                 provenance: node_provenance(node),
                 source_ref: Some(node_ref(node)),
+                extract: None,
             });
         }
 
@@ -1744,6 +1790,7 @@ pub fn build_domain_model_with(
             coverage: rich.then(|| model_coverage(&recomputed, min_pct)),
             product_only: rich.then_some(true),
             business_domains: business.into_values().collect(),
+            extract: None,
         },
         domains,
     })
@@ -1882,9 +1929,12 @@ pub fn persist_domain_model_expecting(
             o.remove("requirements");
         }
         dnode.metadata.insert(DOMAIN_DOC_KEY.to_string(), ddoc);
+        // The v3 lists ride on the build record only (one copy, read back by the load).
+        let mut domain_meta = model.metadata.clone();
+        domain_meta.extract = None;
         dnode.metadata.insert(
             MODEL_METADATA_KEY.to_string(),
-            serde_json::to_value(&model.metadata)?,
+            serde_json::to_value(&domain_meta)?,
         );
         nodes.push(dnode);
 
@@ -2187,6 +2237,12 @@ struct BuildRecord {
     retired: Vec<serde_json::Value>,
 }
 
+/// The generation of the last committed build (0 when none): what a build that reads before it
+/// assembles its model expects to find still in place when it persists.
+pub fn build_generation(store: &dyn GraphRead) -> anyhow::Result<u64> {
+    Ok(read_build_record(store)?.generation)
+}
+
 fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
     let sym = wicked_apps_core::synthetic_symbol(BUILD_SCHEME, BUILD_ID);
     let Some(node) = store.get_node(&sym)? else {
@@ -2367,6 +2423,18 @@ pub fn stabilize_requirement_ids(
     store: &dyn GraphRead,
     model: &mut DomainModel,
 ) -> anyhow::Result<u64> {
+    stabilize_requirement_ids_with(store, model, true)
+}
+
+/// [`stabilize_requirement_ids`], choosing whether a previous requirement whose code left the index
+/// is carried into `model`. A 1.2.0 build (J6 v3, DES-C2-v2 F13) emits only its live set: it keeps
+/// the ids of requirements still present and never reuses an id (the high-water marks), but does
+/// not carry an absent one back.
+pub fn stabilize_requirement_ids_with(
+    store: &dyn GraphRead,
+    model: &mut DomainModel,
+    carry_absent: bool,
+) -> anyhow::Result<u64> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     let generation = read_build_record(store)?.generation;
     let high = previous_req_high(store)?;
@@ -2465,6 +2533,9 @@ pub fn stabilize_requirement_ids(
             }
         }
         domain.requirements = renamed;
+    }
+    if !carry_absent {
+        return Ok(generation);
     }
     for (dname, rkey, node) in requirement_ids(&nodes) {
         if model
@@ -2750,6 +2821,10 @@ pub struct SatisfiedByLink {
     pub file: String,
     pub kind: String,
     pub confidence: f64,
+    /// (1.2.0) The anchor ranges `[from, to]` (inclusive, 1-based) of the requirement's statements
+    /// on this code, from the persisted document; empty before 1.2.0.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<[u64; 2]>,
 }
 
 /// Live satisfaction links by domain then requirement id, sorted by target symbol. Every listed
@@ -2821,38 +2896,53 @@ pub fn recompute_front_half_coverage_for_rows(
     store: &dyn GraphRead,
     units: &RequirementUnits,
 ) -> anyhow::Result<(CoverageReport, ListedRows, u128)> {
+    recompute_front_half_coverage_for_rows_at(store, units, None)
+}
+
+/// [`recompute_front_half_coverage_for_rows`] judged against the checkout `repo_root` (J6 v3, R22):
+/// a v3 statement whose code changed there is stale, so it never counts as resolved. `None` treats
+/// every v3 target as fresh (a store with no checkout to judge against).
+pub fn recompute_front_half_coverage_for_rows_at(
+    store: &dyn GraphRead,
+    units: &RequirementUnits,
+    repo_root: Option<&std::path::Path>,
+) -> anyhow::Result<(CoverageReport, ListedRows, u128)> {
     let wanted: std::collections::HashSet<&str> = units
         .values()
         .flat_map(|reqs| reqs.values().map(String::as_str))
         .collect();
-    let threshold = CoverageConfig::default().resolve_threshold;
+    let cfg = CoverageConfig {
+        repo_root: repo_root.map(std::path::Path::to_path_buf),
+        ..CoverageConfig::default()
+    };
+    let threshold = cfg.resolve_threshold;
+    let extract = crate::domain_extract::ExtractIndex::load(store, repo_root)?;
     let mut seen: std::collections::HashMap<String, ListedRow> = std::collections::HashMap::new();
-    let (report, weighted_milli) =
-        recompute_observing(store, &CoverageConfig::default(), &mut |node, class| {
-            let sym = node.symbol.as_str();
-            if !wanted.contains(sym) {
-                return Ok(());
-            }
-            let row = match class {
-                UnitClass::Counted { real } => ListedRow {
-                    real,
-                    uncounted: None,
+    let (report, weighted_milli) = recompute_observing(store, &cfg, &mut |node, class| {
+        let sym = node.symbol.as_str();
+        if !wanted.contains(sym) {
+            return Ok(());
+        }
+        let row = match class {
+            UnitClass::Counted { real } => ListedRow {
+                real,
+                uncounted: None,
+                code_mismatch: code_mismatch_of(store, &node.symbol)?,
+            },
+            // Not counted: still say whether a rule was stated there, by the same classifier.
+            UnitClass::Uncounted(why) => {
+                let semantics = store.node_semantics(&node.symbol)?;
+                let bucket = classify_node(store, node, threshold, semantics.as_ref(), &extract)?;
+                ListedRow {
+                    real: matches!(bucket, Bucket::Resolved { .. }),
+                    uncounted: Some(why),
                     code_mismatch: code_mismatch_of(store, &node.symbol)?,
-                },
-                // Not counted: still say whether a rule was stated there, by the same classifier.
-                UnitClass::Uncounted(why) => {
-                    let semantics = store.node_semantics(&node.symbol)?;
-                    let bucket = classify_node(store, node, threshold, semantics.as_ref())?;
-                    ListedRow {
-                        real: matches!(bucket, Bucket::Resolved { .. }),
-                        uncounted: Some(why),
-                        code_mismatch: code_mismatch_of(store, &node.symbol)?,
-                    }
                 }
-            };
-            seen.insert(sym.to_string(), row);
-            Ok(())
-        })?;
+            }
+        };
+        seen.insert(sym.to_string(), row);
+        Ok(())
+    })?;
     let mut out = ListedRows::new();
     for (domain, reqs) in units {
         for (req, sym) in reqs {
@@ -2946,14 +3036,11 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
                         file: node.location.file,
                         kind: kind_label(&node.kind),
                         confidence: round4(edge.confidence.get() as f64),
+                        lines: Vec::new(),
                     });
                 }
             }
             satisfied_by.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-            links
-                .entry(dname.clone())
-                .or_default()
-                .insert(key.clone(), satisfied_by);
             if let Some(sym) = r.metadata.get("code_symbol").and_then(Value::as_str) {
                 units
                     .entry(dname.clone())
@@ -2966,6 +3053,17 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
                 // and edges say.
                 None => legacy_requirement(r, &edges, &by_symbol, &dname, &key)?,
             };
+            // (1.2.0) Each statement's anchor range, on the link to the code it sits on.
+            if let Some(code) = r.metadata.get("code_symbol").and_then(Value::as_str) {
+                let ranges = anchor_ranges(&doc);
+                for link in satisfied_by.iter_mut().filter(|l| l.symbol == code) {
+                    link.lines = ranges.clone();
+                }
+            }
+            links
+                .entry(dname.clone())
+                .or_default()
+                .insert(key.clone(), satisfied_by);
             out_reqs.insert(key, doc);
         }
         let mut dom = match d.metadata.get(DOMAIN_DOC_KEY) {
@@ -2999,6 +3097,26 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
         units,
         links,
     ))))
+}
+
+/// The `[from, to]` of each `source_ref` (`file#La-Lb`) of a requirement document's rules.
+fn anchor_ranges(doc: &serde_json::Value) -> Vec<[u64; 2]> {
+    let mut out: Vec<[u64; 2]> = doc
+        .get("business_rules")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("source_ref")?.as_str())
+        .filter_map(|s| {
+            let (a, b) = s.rsplit_once('#')?.1.split_once('-')?;
+            let a = a.strip_prefix('L')?.parse().ok()?;
+            let b = b.strip_prefix('L')?.parse().ok()?;
+            Some([a, b])
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// A requirement of a graph persisted without its document, rebuilt from its node, its rule nodes
@@ -3137,6 +3255,7 @@ mod tests {
                 source_kinds: vec!["code-body".to_string()],
             },
             source_ref: None,
+            extract: None,
         };
         let mut reqs = std::collections::BTreeMap::new();
         reqs.insert(
@@ -3176,6 +3295,7 @@ mod tests {
                 coverage: None,
                 product_only: None,
                 business_domains: Vec::new(),
+                extract: None,
             },
             domains,
         };
@@ -3312,6 +3432,7 @@ mod tests {
                 coverage: None,
                 product_only: None,
                 business_domains: Vec::new(),
+                extract: None,
             },
             domains,
         };
@@ -4672,6 +4793,7 @@ mod tests {
                     coverage: None,
                     product_only: None,
                     business_domains: Vec::new(),
+                    extract: None,
                 },
                 domains: Default::default(),
             };
@@ -6099,6 +6221,7 @@ mod tests {
                         source_kinds: vec!["code-body".into()],
                     },
                     source_ref: None,
+                    extract: None,
                 }],
                 code_symbol: code.map(str::to_string),
                 ..Default::default()

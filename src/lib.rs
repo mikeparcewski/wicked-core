@@ -435,9 +435,9 @@ pub use project::{
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
 pub use repo::{
-    coverage_report_for_repo, get_repo, graph_kinds_for_repo, index_repo_checkout,
-    requirements_graph_for_repo, RepoEntry, RepoFinding, RepoSpec,
-    FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
+    coverage_report_for_repo, domain_ruling, domain_ruling_for_repo, get_repo,
+    graph_kinds_for_repo, index_repo_checkout, requirements_graph_for_repo, RepoEntry, RepoFinding,
+    RepoSpec, FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
 };
 pub use repo_checks::{
     is_environment_refusal, BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv,

@@ -247,14 +247,16 @@ mod tests {
     }
 
     /// The domain-model builder emits `schema_version` documents the schema accepts — assert the
-    /// owner copy accepts both the version `wicked-core domain-graph` now emits by default ("1.1.0",
-    /// the optional coverage + corroboration fields) and the 1.0.0 every older document carries.
+    /// owner copy accepts the version `wicked-core domain-graph` now emits by default ("1.2.0", the
+    /// J6 v3 model, `crate::SCHEMA_V3`), the legacy build's "1.1.0" and the 1.0.0 every older
+    /// document carries.
     #[test]
-    fn domain_model_contract_version_is_1_1_0_and_still_accepts_1_0_0() {
+    fn domain_model_contract_version_is_1_2_0_and_still_accepts_1_1_0_and_1_0_0() {
         let schema = parsed("domain-model.schema.json", DOMAIN_MODEL_SCHEMA);
+        assert_eq!(crate::SCHEMA_V3, "1.2.0");
         assert_eq!(
             schema["properties"]["metadata"]["properties"]["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", "1.1.0"]),
+            serde_json::json!(["1.0.0", "1.1.0", "1.2.0"]),
             "domain-model contract version moved — update domain_model.rs callers + this pin together"
         );
     }
