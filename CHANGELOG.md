@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The stand-in gate's hold reads as a person's sentence** (core#1930 F7). On a stand-in-aware run with no
+  consent, a judge or a QE reviewer that no helper could be holds the run at `stand_in_needed`, and the gate
+  prompt shows the hold's reason as written. That reason began "the run requires QE acceptance (qe_acceptance)
+  and no helper …" (and "the run requires a judge (judge) …"): a lowercase sentence start and an engine token.
+  It now reads "The job needs a QE review of its evidence, and no helper that did not build the work can do it:
+  …" and "The job needs a judge, and no helper that did not build the work can be it: …". A QE hold an engine
+  already wrote in the old words stays the QE layer's (a run waiting at its gate across an upgrade).
+
 - **Reading a repo no longer rescans its checkout** (core#1933, the core#1932 follow-up). Since core#1932
   every `get_repo` and `list_repos` detected the repo's seat layers on the checkout inside the actor, listing
   up to 257 directories: several times per dispatched unit, and once per repo on each studio poll. Now only

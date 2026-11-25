@@ -3155,29 +3155,28 @@ fn seat_refused_reason(refused: &[crate::tool_activity::SeatRefusal]) -> String 
 /// (DES-STANDIN-001 §3.10, T-R11) How the QE reviewer's `stand_in_needed` hold begins: the same
 /// source as the judge's, so this prefix (written only by the QE arm of the fold) tells the two
 /// layers apart when an earlier hold is weighed against the layers this attempt asked again.
-const QE_STAND_IN_HOLD_PREFIX: &str = "the run requires QE acceptance (";
+const QE_STAND_IN_HOLD_PREFIX: &str = "The job needs a QE review of its evidence, and no helper ";
 
-/// The judge's `stand_in_needed` hold: the stand-in gate prompt shows it as written.
+/// How the QE hold began before core#1930: a hold an engine persisted in those words (a run that
+/// waits at its gate across an upgrade) is still the QE layer's.
+const QE_STAND_IN_HOLD_PREFIX_BEFORE_1930: &str = "the run requires QE acceptance (";
+
+/// The judge's `stand_in_needed` hold. (core#1930 F7) The stand-in gate prompt shows it as
+/// written, so it is a person's sentence: a capital first word, and no engine token.
 fn judge_stand_in_hold_reason(why: &str) -> String {
-    format!(
-        "the run requires a judge ({}) and no helper that did not build the work can be it: {why}",
-        crate::assurance::JUDGE
-    )
+    format!("The job needs a judge, and no helper that did not build the work can be it: {why}")
 }
 
-/// The QE reviewer's `stand_in_needed` hold: the stand-in gate prompt shows it as written.
+/// The QE reviewer's `stand_in_needed` hold, in a person's words like the judge's.
 fn qe_stand_in_hold_reason(why: &str) -> String {
-    format!(
-        "{QE_STAND_IN_HOLD_PREFIX}{}) and no helper that did not build the work can review its \
-         evidence: {why}",
-        crate::assurance::QE_ACCEPTANCE
-    )
+    format!("{QE_STAND_IN_HOLD_PREFIX}that did not build the work can do it: {why}")
 }
 
 /// The QE reviewer's `stand_in_needed` hold, not the judge's (see [`QE_STAND_IN_HOLD_PREFIX`]).
 fn is_qe_stand_in_hold(d: &crate::domain::UnitDenial) -> bool {
     d.source == crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED
-        && d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX)
+        && (d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX)
+            || d.reason.starts_with(QE_STAND_IN_HOLD_PREFIX_BEFORE_1930))
 }
 
 /// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
