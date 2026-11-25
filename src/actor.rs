@@ -43,7 +43,7 @@ pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
-mod stand_in_gate;
+pub(crate) mod stand_in_gate;
 #[cfg(test)]
 mod stand_in_packet_tests;
 mod team_gate;
