@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The requirements minimum is gone from the engine** (core#1924, J6 C3; phase 2 after crew#1930 and studio#1434).
+  A 1.2.0 domain model has no minimum, and the last configured minimum went with the 1.1.0 build. Removed, each
+  refused by name where a caller could still send it:
+  - `wicked-core domain-graph --schema-version 1.1.0` (the 1.1.0 build from confidence annotations), with its
+    `--coverage <F>` and `--min-coverage-pct <N>`; `domain-graph` builds 1.2.0 only. Stored 1.1.0 graphs are
+    still read.
+  - `wicked-core coverage --min-coverage-pct [N]` (its exit 3); `coverage` only reports.
+  - `wicked-core requirements-target` (the repository's own target; a stored target node stays inert) and
+    `wicked-core seed-domain-validators` (the coverage validator, its script, its criterion and its pin
+    `COVERAGE_VALIDATOR_PIN`, and the preset's plan-time seed).
+  - `WICKED_REQUIREMENTS_MIN_COVERAGE_PCT` and, in `wicked-governance`, `MIN_COVERAGE_ENV`,
+    `DEFAULT_MIN_COVERAGE_PCT`, `parse_min_coverage_pct`, `min_coverage_pct_from_env`, `repo_min_coverage_pct`,
+    `set_repo_min_coverage_pct` and `effective_min_coverage_pct`.
+  - `scripts/install-local.py` checks the installed binary's version only (it asked the binary for that pin).
+  The requirements read of a stored 1.1.0 graph labels it with the minimum its own build recorded, or none
+  (`ModelCoverage.min_pct` is optional in Rust; a label written into a graph always carries it, as the schema
+  requires), and its `target` is always null.
+
 - **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
   unset, `on` or `1` now enables pre-existing-failure exclusion: a head red only on tests its red base also
   fails passes with "N pre-existing excluded: …", when the base's build guide is usable and verified by every

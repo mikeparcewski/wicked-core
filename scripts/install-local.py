@@ -20,6 +20,8 @@ closed on an unresolvable pin, because crew writes a drop-in carrying the NEW pi
 CLI's vault only holds the OLD one. That is FINDING-080's failure mode, reached by doing nothing
 wrong except forgetting to reinstall.
 
+(core#1924 removed that coverage validator and its pin; the version check below is what is left.)
+
 So copying is not the job. **Verifying is the job.** This script fails loudly when the binary it
 just installed does not agree with the source it was built from, which turns that whole family from
 a thing you have to remember into a checked property.
@@ -44,7 +46,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -95,69 +96,11 @@ def installed_version(binary: Path) -> str:
     return m.group(1)
 
 
-def source_pin() -> str:
-    """The coverage validator pin the SOURCE declares.
-
-    Read out of the source rather than restated here: a second copy of a constant that must agree is
-    the defect this script exists to catch, and writing one into the checker would be absurd.
-    """
-    path = REPO / "src" / "domain_extraction.rs"
-    try:
-        src = path.read_text(encoding="utf-8")
-    except OSError as e:
-        # A traceback is not a diagnosis. This script's entire job is to fail in a way the reader
-        # can act on, so it must not make an exception of its own failures (review).
-        sys.exit(f"could not read {path}: {e}")
-    m = re.search(r'COVERAGE_VALIDATOR_PIN:\s*&str\s*=\s*"([0-9a-f]+)"', src)
-    if not m:
-        sys.exit(
-            "could not find COVERAGE_VALIDATOR_PIN in src/domain_extraction.rs — the constant "
-            "moved or was renamed; update this check rather than deleting it."
-        )
-    return m.group(1)
-
-
-def installed_pin(binary: Path) -> str:
-    """What the BINARY seeds, asked of the binary itself.
-
-    Seeded into a throwaway database: this must never touch operator state to answer a question
-    about a build.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        db = Path(tmp) / "verify.db"
-        try:
-            out = subprocess.run(
-                [str(binary), "seed-domain-validators", "--db", str(db)],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            sys.exit(f"could not run `{binary} seed-domain-validators`: {e}")
-        blob = f"{out.stdout}\n{out.stderr}"
-        # EXIT CODE FIRST. Parsing output from a command that failed is a presence-shaped check —
-        # a `pin:` line in a failure message would "verify" a broken install, which is the exact
-        # class of defect this script exists to catch. Flagged in review.
-        if out.returncode != 0:
-            sys.exit(
-                f"`{binary} seed-domain-validators` exited {out.returncode}, so its output cannot "
-                f"be trusted to describe this binary. Output:\n{blob[:400]}"
-            )
-        m = re.search(r"pin:\s*([0-9a-f]{16})", blob)
-        if not m:
-            sys.exit(
-                f"`{binary} seed-domain-validators` printed no pin. Output:\n"
-                f"{blob[:400]}\n"
-                "A binary that cannot report its pin cannot be verified, so this is a failure, "
-                "not a skip."
-            )
-        return m.group(1)
-
-
 def verify(binary: Path) -> int:
     """Does the installed binary agree with the source it should have been built from?"""
-    # VERSION first: a version mismatch explains a pin mismatch, and reporting them in the other
-    # order makes the operator debug the symptom.
+    # The version is the check. (Until core#1924 it was followed by the domain-extraction coverage
+    # validator's pin, asked of the binary through its validator-seeding command; the validator, its pin
+    # and the command were removed.)
     vwant, vgot = source_version(), installed_version(binary)
     print(f"  source version  : {vwant}")
     print(f"  installed       : {vgot}")
@@ -170,21 +113,6 @@ def verify(binary: Path) -> int:
         )
         return 1
 
-    want, got = source_pin(), installed_pin(binary)
-    print(f"  source declares : {want}")
-    print(f"  {binary.name} seeds : {got}")
-    if want != got:
-        # Flush first: stderr is unbuffered, so without this the diagnosis prints BEFORE the two
-        # values it is about, and the reader sees the conclusion with no evidence under it.
-        sys.stdout.flush()
-        print(
-            f"\nSKEW: {binary} was built from a different revision than this checkout.\n"
-            f"  Every domain-extraction run on this host will fail closed on an unresolvable pin:\n"
-            f"  the workflow drop-in carries {want}, this binary's vault only holds {got}.\n"
-            f"  Fix: re-run this script without --check.",
-            file=sys.stderr,
-        )
-        return 1
     print("  OK — the installed binary agrees with this checkout.")
     return 0
 

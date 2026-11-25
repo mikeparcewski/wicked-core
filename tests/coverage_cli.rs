@@ -1,7 +1,7 @@
-//! core#25 end-to-end: the `coverage` emitter + store-bound `domain-graph` through the REAL binary.
-//! Proves (a) `wicked-core coverage` emits a schema-shaped report recomputed FROM the store, and (b)
-//! `domain-graph` recomputes coverage from the store as PRIMARY — a lying external `--coverage 1.0` file
-//! cannot green-light a graph that actually has an unaccounted behavior node (the trust-boundary fix).
+//! core#25 end-to-end: the `coverage` emitter through the REAL binary: `wicked-core coverage` emits a
+//! schema-shaped report recomputed FROM the store. core#1924 removed the 1.1.0 `domain-graph` build
+//! and every configured minimum (`--min-coverage-pct`, `requirements-target`, the daemon variable);
+//! the last test here pins that each is refused by name.
 
 use std::process::Command;
 use wicked_apps_core::{
@@ -85,82 +85,6 @@ fn coverage_emitter_writes_a_store_recomputed_report() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn domain_graph_recompute_beats_a_lying_coverage_file() {
-    let dir = scratch("lie");
-    let db = dir.join("estate.db");
-    seed(db.to_str().unwrap(), false); // a hole → real coverage < 1.0
-
-    // A LYING external report claiming full coverage.
-    let lie = dir.join("lie.json");
-    std::fs::write(
-        &lie,
-        serde_json::json!({
-            "total": 1, "behavior_bearing": 1, "resolved": 1, "risk_flagged": 0,
-            "unaccounted": 0, "coverage": 1.0, "resolved_rate": 1.0, "mean_confidence": 1.0,
-            "resolve_threshold": 0.75, "per_app": [], "unaccounted_nodes": []
-        })
-        .to_string(),
-    )
-    .unwrap();
-
-    let out = Command::new(BIN)
-        .args([
-            "domain-graph",
-            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
-            "--schema-version",
-            "1.1.0",
-            "--db",
-            db.to_str().unwrap(),
-            "--coverage",
-            lie.to_str().unwrap(),
-            "--out",
-            dir.join("rg.json").to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "a lying --coverage 1.0 must NOT green-light a graph with a store hole"
-    );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("DISAGREES") || err.contains("< 1.0"),
-        "fails closed on the store recompute, not the file: {err}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn domain_graph_translates_a_fully_accounted_store_with_no_coverage_file() {
-    let dir = scratch("ok");
-    let db = dir.join("estate.db");
-    let rg = dir.join("rg.json");
-    seed(db.to_str().unwrap(), true); // coverage 1.0
-
-    // No --coverage supplied: recompute-from-store stands (not a hard error).
-    let out = Command::new(BIN)
-        .args([
-            "domain-graph",
-            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
-            "--schema-version",
-            "1.1.0",
-            "--db",
-            db.to_str().unwrap(),
-            "--out",
-            rg.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "a fully-accounted store translates with NO --coverage file: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(rg.exists(), "requirements_graph.json was written");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Seed `n` behavior nodes, the first `accounted` of them mapped (validated requirement + rule).
 fn seed_many(db: &str, n: usize, accounted: usize) {
     let mut store = open_store(Some(db)).unwrap();
@@ -197,12 +121,12 @@ fn seed_many(db: &str, n: usize, accounted: usize) {
     }
 }
 
-/// Operator decision 2026-11-01 (core#1233): the minimum counts REAL requirements only. One stated
-/// rule and four risk-flagged placeholders used to read "100% mapped" and pass an 80% minimum; now
-/// the check reads 20% and exits 3. Two JSON keys (indexed as `Struct`) and a test function are not
-/// behaviour-bearing at all, and the placeholders are listed for the next page.
+/// Operator decision 2026-11-01 (core#1233): the report counts REAL requirements only. One stated
+/// rule and four risk-flagged placeholders read 20% real, never "100% mapped". Two JSON keys
+/// (indexed as `Struct`) and a test function are not behaviour-bearing at all, and the placeholders
+/// are listed.
 #[test]
-fn placeholders_never_reach_the_minimum_and_non_product_files_are_not_counted() {
+fn placeholders_are_not_real_and_non_product_files_are_not_counted() {
     let dir = scratch("real");
     let db = dir.join("estate.db");
     let dbs = db.to_str().unwrap();
@@ -246,22 +170,20 @@ fn placeholders_never_reach_the_minimum_and_non_product_files_are_not_counted() 
     drop(store);
     let out_file = dir.join("coverage-report.json");
     let out = Command::new(BIN)
-        .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
         .args(["coverage", "--db", dbs, "--out", out_file.to_str().unwrap()])
-        .args(["--min-coverage-pct", "80"])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "placeholders do not count: {err}"
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        err.contains(
-            "20% real requirements, minimum 80% (1 of 5 behaviours; 4 placeholders, 0 unmapped)"
+        String::from_utf8_lossy(&out.stdout).contains(
+            "20% real requirements (1 of 5 behaviours; 4 placeholders, 0 unmapped; 3 not product code)"
         ),
-        "{err}"
+        "placeholders do not count: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
@@ -275,245 +197,75 @@ fn placeholders_never_reach_the_minimum_and_non_product_files_are_not_counted() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Operator ruling 2026-10-31: the graph is built once coverage reaches the configured minimum
-/// (default 80%), labelled with its share, and saved INTO the estate store — no JSON file in the
-/// checkout (operator ruling 2026-10-31); `--out` is the explicit export.
+/// core#1924: the configured minimum is gone, and every way to ask for it is refused by name before
+/// anything is opened: the 1.1.0 `domain-graph` build, its `--coverage` and `--min-coverage-pct`,
+/// `coverage --min-coverage-pct` (never an exit 0 a caller would read as "met"), and the
+/// `requirements-target` and `seed-domain-validators` commands (unknown now: usage, exit 2).
 #[test]
-fn domain_graph_builds_at_the_minimum_into_estate_and_writes_no_file() {
-    let dir = scratch("min80");
-    let db = dir.join("estate.db");
-    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
-    let root = dir.join("repo");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let out = Command::new(BIN)
-        .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
-        .args([
-            "domain-graph",
-            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
-            "--schema-version",
-            "1.1.0",
-            "--db",
-            db.to_str().unwrap(),
-            "--repo-root",
-            root.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "80% mapped meets the default minimum: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !root.join(".wicked-estate").exists(),
-        "no requirements JSON in the checkout"
-    );
-    let store = wicked_apps_core::open_store_ro(Some(db.to_str().unwrap())).unwrap();
-    let report = wicked_governance::recompute_front_half_coverage(&store).unwrap();
-    let label = wicked_governance::model_coverage(&report, 80);
-    let graph = wicked_governance::load_domain_graph(&store, Some(&label))
-        .unwrap()
-        .expect("the graph is in estate");
-    let cov = &graph["metadata"]["coverage"];
-    assert_eq!(cov["real_pct"], 80, "{cov}");
-    assert_eq!(cov["min_pct"], 80);
-    assert_eq!(cov["behavior_bearing"], 5);
-    assert_eq!(cov["real"], 4);
-    assert_eq!(cov["placeholders"], 0);
-    assert_eq!(cov["unmapped"], 1);
-    assert_eq!(cov["not_product"], 0);
-    assert!(
-        cov.get("mapped_pct").is_none(),
-        "no field keeps an old name: {cov}"
-    );
-    let reqs = graph["domains"]["billing"]["requirements"]
-        .as_object()
-        .unwrap();
-    assert_eq!(
-        reqs.len(),
-        4,
-        "only the mapped behaviours become requirements"
-    );
-    assert!(
-        reqs.values()
-            .all(|r| r["corroboration"]["status"] == "unconfirmed"
-                && r["corroboration"]["why"]["code"] == "dead_code"),
-        "nothing calls these: unconfirmed, and why: {reqs:?}"
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("80% real requirements, minimum 80%"));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn domain_graph_refuses_below_the_configured_minimum_and_says_how_far_it_got() {
-    let dir = scratch("min90");
-    let db = dir.join("estate.db");
-    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
-    let rg = dir.join("rg.json");
-    for (flag, env) in [(Some("90"), None), (None, Some("90"))] {
-        let mut cmd = Command::new(BIN);
-        cmd.env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT");
-        if let Some(e) = env {
-            cmd.env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", e);
-        }
-        cmd.args([
-            "domain-graph",
-            // the 1.1.0 build (the minimum it tests; 1.2.0 has none, J6 C2)
-            "--schema-version",
-            "1.1.0",
-            "--db",
-            db.to_str().unwrap(),
-            "--out",
-            rg.to_str().unwrap(),
-        ]);
-        if let Some(f) = flag {
-            cmd.args(["--min-coverage-pct", f]);
-        }
-        let out = cmd.output().unwrap();
-        assert!(!out.status.success(), "80% is below a 90% minimum");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains(
-                "80% real requirements, minimum 90% (4 of 5 behaviours; 0 placeholders, 1 unmapped)"
-            ),
-            "names how far it got: {err}"
-        );
-        assert!(err.contains("kept in the estate store"), "{err}");
-        assert!(!rg.exists(), "no graph below the minimum");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// domain-graph-3: a repository's own target (`requirements-target`) lives in its store and holds
-/// the graph before the daemon-wide minimum: lowered to 80 there, the bare `--min-coverage-pct`
-/// check passes at 80% even with the daemon at 90; `--set` with no value, or beside `--clear`, is
-/// refused and changes nothing (codex/agy r1 on #1226); a read never creates a store.
-#[test]
-fn a_repositorys_own_target_holds_the_check_before_the_daemon_minimum() {
-    let dir = scratch("target");
-    let db = dir.join("estate.db");
-    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
-    let dbs = db.to_str().unwrap();
-    let cli = |args: &[&str]| {
-        Command::new(BIN)
-            .env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", "90")
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let check = || {
-        cli(&[
-            "coverage",
-            "--db",
-            dbs,
-            "--out",
-            dir.join("c.json").to_str().unwrap(),
-            "--min-coverage-pct",
-        ])
-    };
-    assert_eq!(
-        check().status.code(),
-        Some(3),
-        "the daemon's 90 holds first"
-    );
-    let read = cli(&["requirements-target", "--db", dbs, "--json"]);
-    assert!(read.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&read.stdout).unwrap(),
-        serde_json::json!({"min_coverage_pct": 90, "source": "daemon"})
-    );
-    for bad in [
-        vec!["requirements-target", "--db", dbs, "--set"],
-        vec!["requirements-target", "--db", dbs, "--clear", "--set", "70"],
-        vec!["requirements-target", "--db", dbs, "--set", "--json"],
-        vec!["requirements-target", "--db", dbs, "--set", "0"],
-    ] {
-        assert_eq!(cli(&bad).status.code(), Some(1), "{bad:?} is refused");
-    }
-    let set = cli(&["requirements-target", "--db", dbs, "--set", "80", "--json"]);
-    assert!(set.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&set.stdout).unwrap()["source"],
-        "repository"
-    );
-    assert!(
-        check().status.success(),
-        "the repository's own 80 holds now"
-    );
-    assert!(cli(&["requirements-target", "--db", dbs, "--clear"])
-        .status
-        .success());
-    assert_eq!(
-        check().status.code(),
-        Some(3),
-        "cleared: the daemon's 90 again"
-    );
-    let missing = dir.join("never.db");
-    assert!(
-        !cli(&["requirements-target", "--db", missing.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(!missing.exists(), "a read creates no store");
-}
-
-#[test]
-fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
-    let dir = scratch("check");
+fn the_removed_minimum_is_refused_by_name() {
+    let dir = scratch("removed");
     let db = dir.join("estate.db");
     seed_many(db.to_str().unwrap(), 5, 4);
-    let out_file = dir.join("coverage-report.json");
-    let run = |min: &str| {
-        Command::new(BIN)
-            .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
-            .args([
+    let dbs = db.to_str().unwrap();
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let roots = root.to_str().unwrap();
+    let run = |args: &[&str]| Command::new(BIN).args(args).output().unwrap();
+    for (args, says) in [
+        (
+            vec!["domain-graph", "--db", dbs, "--schema-version", "1.1.0"],
+            "--schema-version 1.1.0 is not built any more",
+        ),
+        (
+            vec![
+                "domain-graph",
+                "--db",
+                dbs,
+                "--repo-root",
+                roots,
+                "--min-coverage-pct",
+                "80",
+            ],
+            "--min-coverage-pct was a 1.1.0 option and was removed",
+        ),
+        (
+            vec![
+                "domain-graph",
+                "--db",
+                dbs,
+                "--repo-root",
+                roots,
+                "--coverage",
+                "c.json",
+            ],
+            "--coverage was a 1.1.0 option and was removed",
+        ),
+        (
+            vec![
                 "coverage",
                 "--db",
-                db.to_str().unwrap(),
-                "--out",
-                out_file.to_str().unwrap(),
+                dbs,
+                "--json",
                 "--min-coverage-pct",
-                min,
-            ])
-            .output()
-            .unwrap()
-    };
-    let below = run("85");
-    assert_eq!(below.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&below.stderr).contains("80% real requirements, minimum 85%"));
-    assert!(out_file.is_file(), "the report is written either way");
-    assert!(run("80").status.success());
-    let junk = run("eighty");
-    assert_eq!(
-        junk.status.code(),
-        Some(1),
-        "a junk minimum is an error, never a default"
-    );
-    assert_eq!(run("").status.code(), Some(1), "an empty value is junk too");
-    // xreview on core#1215: a SET-but-invalid variable fails closed (exit 1), never becomes 80 —
-    // for the bare flag (the validator's call) and for domain-graph alike.
-    for cmd in ["coverage", "domain-graph"] {
-        let mut c = Command::new(BIN);
-        c.env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", "95.5")
-            .arg(cmd);
-        if cmd == "coverage" {
-            c.args([
-                "--db",
-                db.to_str().unwrap(),
-                "--out",
-                out_file.to_str().unwrap(),
-            ]);
-            c.arg("--min-coverage-pct");
-        } else {
-            let rg = dir.join("rg.json");
-            c.args(["--db", db.to_str().unwrap(), "--out", rg.to_str().unwrap()]);
-            c.args(["--schema-version", "1.1.0"]);
-        }
-        let o = c.output().unwrap();
+                "80",
+            ],
+            "--min-coverage-pct was removed",
+        ),
+    ] {
+        let o = run(&args);
         let err = String::from_utf8_lossy(&o.stderr);
-        assert_eq!(o.status.code(), Some(1), "{cmd}: {err}");
-        assert!(err.contains("not a whole percentage"), "{cmd}: {err}");
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains(says), "{args:?}: {err}");
+        assert!(o.stdout.is_empty(), "{args:?} printed nothing to stdout");
+    }
+    for cmd in ["requirements-target", "seed-domain-validators"] {
+        let o = run(&[cmd, "--db", dbs]);
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{cmd} is not a command any more: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

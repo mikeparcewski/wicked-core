@@ -1626,7 +1626,8 @@ impl std::fmt::Display for SkillsError {
                 write!(
                     f,
                     "the skills snapshot at {} does not hold the skills this run requires: {}; \
-                     enable and republish them (or fix the workflow's skill_ref)",
+                     upgrade {PLUGIN_NAME} to a version that has them and publish the snapshot \
+                     again (or fix the workflow's skill_ref)",
                     root.display(),
                     missing.join(", ")
                 )?;
@@ -6342,6 +6343,8 @@ mod tests {
                 crate::workflow::BASE_SKILL_REF_ENV,
                 "refused at intake, before any unit was planned",
                 "does not hold the skills this run requires: wicked-garden-governed-worker",
+                // (J6 C3, F3) The person's fix is an upgrade, not a republish of what they have.
+                "upgrade wicked-garden to a version that has them",
             ] {
                 assert!(text.contains(needle), "missing {needle:?} in: {text}");
             }

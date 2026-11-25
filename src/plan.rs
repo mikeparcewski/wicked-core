@@ -4509,7 +4509,7 @@ mod tests {
                 (
                     json!({"steps": [
                         {"catalog": "understand", "id": "u", "answer_only": true,
-                         "validator_pin": crate::domain_extraction::COVERAGE_VALIDATOR_PIN}
+                         "validator_pin": "9a2c71609c3e3ced"}
                     ]}),
                     "validator pin",
                 ),

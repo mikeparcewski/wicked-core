@@ -6438,10 +6438,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             };
             // (core#799) The judge is told the pinned floor decides the criterion's
             // deterministic half — it runs after the judge, so the judge never sees its result.
-            // (e2e F29) The coverage judge is also told the minimum the engine applies to THIS
-            // run (the repository's own target when the person set or lowered it).
-            let judge_criterion =
-                crate::domain_extraction::pinned_judge_criterion_for(v, input.governance.as_ref());
+            let judge_criterion = crate::validator::pinned_judge_criterion(v);
             let work_author = input
                 .unit
                 .assigned_cli
