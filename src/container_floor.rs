@@ -7282,6 +7282,31 @@ esac
         assert!(!has(&["--bind-tcp", "3000"]));
     }
 
+    /// (core#1463 R2 F3) A path named in several read lists is resolved once: even when the link
+    /// it is spelled through answers differently on every lookup (retargeted mid-arm), each list
+    /// gets the same answer, so the builds and the settle agree on it.
+    #[test]
+    fn core_1463_a_read_path_resolves_once_for_every_build() {
+        let (link, other) = (PathBuf::from("/h/link"), PathBuf::from("/h/other"));
+        let mut calls = 0;
+        let [all, required, optional] = resolve_once(
+            [
+                &[link.clone(), other.clone()][..],
+                &[link.clone()][..],
+                &[link.clone(), PathBuf::from("/h/gone")][..],
+            ],
+            |p| {
+                calls += 1;
+                (p != Path::new("/h/gone")).then(|| PathBuf::from(format!("/t{calls}")))
+            },
+        );
+        assert_eq!(calls, 3, "one lookup per distinct path");
+        assert_eq!(all, [PathBuf::from("/t1"), PathBuf::from("/t2")]);
+        assert_eq!(required, [PathBuf::from("/t1")]);
+        // An unresolvable path is dropped (never optional), the resolved one is the same.
+        assert_eq!(optional, [PathBuf::from("/t1")]);
+    }
+
     /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
     /// container launch, never over a mask.
     /// (core#1463) An optional read root stays optional only when nothing the unit requires lies in
