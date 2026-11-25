@@ -866,6 +866,11 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// [`CITED_MAX`] distinct cites, [`CITED_SPAN`] lines each, [`CITED_CAP`] bytes in all. `None`
 /// when the WORK cites nothing.
 fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<String> {
+    // Only a unix host opens beneath the root with no link followed; elsewhere a junction or a link
+    // under the checkout could lead the read out, so the judge gets no cited lines there.
+    if !cfg!(unix) {
+        return None;
+    }
     let root = std::fs::canonicalize(workdir).ok()?;
     let mut seen: Vec<(String, usize, usize)> = Vec::new();
     for cite in work
@@ -908,15 +913,8 @@ fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<Strin
             )),
             Some(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
-                // Redacted whole, so a secret continued onto the next line is still cut; shown
-                // only when redaction kept the line numbering.
-                let redacted = crate::tool_activity::redact_prose(&text);
-                let lines: Vec<&str> = redacted.lines().collect();
-                if lines.len() != text.lines().count() {
-                    block.push_str(&format!(
-                        "{path}:{first}: (not shown: redacting the file moved its lines)\n"
-                    ));
-                } else if first > lines.len() {
+                let lines: Vec<&str> = text.lines().collect();
+                if first > lines.len() {
                     block.push_str(&format!(
                         "{path}:{first}: (past the end: the file has {} lines)\n",
                         lines.len()
@@ -927,9 +925,17 @@ fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<Strin
                         .min(first.saturating_add(CITED_SPAN))
                         .saturating_add(2)
                         .min(lines.len());
+                    let shown = redacted_lines(&lines, from - 1, to - 1);
                     for n in from..=to {
-                        let line: String = lines[n - 1].chars().take(240).collect();
-                        block.push_str(&format!("{path}:{n}: {line}\n"));
+                        match &shown[n - from] {
+                            Some(line) => {
+                                let line: String = line.chars().take(240).collect();
+                                block.push_str(&format!("{path}:{n}: {line}\n"));
+                            }
+                            None => block.push_str(&format!(
+                                "{path}:{n}: (withheld: a continued line the redactor cuts)\n"
+                            )),
+                        }
                     }
                 }
             }
@@ -941,6 +947,52 @@ fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<Strin
         out.push_str(&block);
     }
     Some(out)
+}
+
+/// Lines `from..=to` (0-based) of a file, redacted for the judge: a line on its own is redacted as
+/// the activity feed's prose is; a shell continuation chain (lines ending in `\`) is redacted
+/// whole, as the shell joins it, and every line of a chain the redactor cuts is withheld (`None`),
+/// however many continuations it spans.
+fn redacted_lines(lines: &[&str], from: usize, to: usize) -> Vec<Option<String>> {
+    let continues = |l: &str| l.trim_end_matches([' ', '\t']).ends_with('\\');
+    let mut start = from;
+    while start > 0 && continues(lines[start - 1]) {
+        start -= 1;
+    }
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut i = start;
+    while i <= to {
+        let mut j = i;
+        while j + 1 < lines.len() && continues(lines[j]) {
+            j += 1;
+        }
+        let chain = &lines[i..=j];
+        let shown: Vec<Option<String>> = if chain.len() == 1 {
+            vec![Some(crate::tool_activity::redact_prose(chain[0]))]
+        } else {
+            let plain: String = chain
+                .iter()
+                .enumerate()
+                .map(|(k, l)| {
+                    if k + 1 < chain.len() {
+                        let t = l.trim_end_matches([' ', '\t']);
+                        &t[..t.len() - 1]
+                    } else {
+                        l
+                    }
+                })
+                .collect();
+            let clean = crate::tool_activity::redact(&chain.join("\n")) == plain;
+            chain.iter().map(|l| clean.then(|| l.to_string())).collect()
+        };
+        for (k, line) in shown.into_iter().enumerate() {
+            if (from..=to).contains(&(i + k)) {
+                out.push(line);
+            }
+        }
+        i = j + 1;
+    }
+    out
 }
 
 /// At most this many distinct cites are shown to the judge.
@@ -9019,12 +9071,33 @@ mod tests {
             "API_KEY=\\\nOpaqueValue0123456789\nNot logged in\n",
         )
         .unwrap();
+        std::fs::write(
+            dir.join("src/env3.sh"),
+            "API_KEY=\\\n\\\nOpaqueValue0123456789\nnext\n",
+        )
+        .unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join("src/pipe.txt").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: a plain libc call on a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(
+            dir.join("src/long.txt"),
+            format!("{}\n", "x".repeat(200)).repeat(400),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/max.txt"), "a".repeat(CITED_FILE_MAX as usize)).unwrap();
+        std::fs::write(
+            dir.join("src/over.txt"),
+            "a".repeat(CITED_FILE_MAX as usize + 1),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("src/link.txt")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
         let shown = cited_source_for_judge(
             &dir,
             &format!(
-                "src/a.js:{} src/a.js:2 src/link.txt:1 out/secret.txt:1 src/env.sh:2",
+                "src/a.js:{} src/a.js:2 src/link.txt:1 out/secret.txt:1 src/env.sh:2 \
+                 src/env3.sh:3 src/pipe.txt:1 src/max.txt:1 src/over.txt:1",
                 usize::MAX
             ),
         )
@@ -9035,7 +9108,22 @@ mod tests {
         assert!(shown.contains("src/link.txt:1: (not read"), "{shown}");
         assert!(shown.contains("out/secret.txt:1: (not read"), "{shown}");
         assert!(!shown.contains("OpaqueValue0123456789"), "{shown}");
-        // Many cites stay within the budget.
+        assert!(shown.contains("src/env3.sh:3: (withheld"), "{shown}");
+        assert!(shown.contains("src/env3.sh:4: next"), "{shown}");
+        // A FIFO is opened without blocking and refused; the size limit is inclusive.
+        assert!(shown.contains("src/pipe.txt:1: (not read"), "{shown}");
+        assert!(shown.contains("src/max.txt:1: aaa"), "{shown}");
+        assert!(shown.contains("src/over.txt:1: (not read"), "{shown}");
+        // The byte budget cuts a long section and says so.
+        let long: String = (0..12)
+            .map(|k| format!("src/long.txt:{}-{} ", k * 30 + 1, k * 30 + 20))
+            .collect();
+        let shown = cited_source_for_judge(&dir, &long).unwrap();
+        assert!(shown.contains("src/long.txt:1: xxx"), "{shown}");
+        assert!(shown.contains("[further cited lines elided by the harness]"));
+        assert!(!shown.contains("src/long.txt:331:"));
+        assert!(shown.len() <= CITED_CAP + 100, "{}", shown.len());
+        // Many cites stay within the count.
         let many: String = (1..=200).map(|n| format!("src/f{n}.js:{n} ")).collect();
         let shown = cited_source_for_judge(&dir, &many).unwrap();
         assert!(shown.len() <= CITED_CAP + 200, "{}", shown.len());
@@ -9105,11 +9193,16 @@ mod tests {
             .collect();
         // The judge has no tree of its own: the harness hands it the cited lines.
         let asked = &judge[0].unit.description;
-        assert!(asked.contains("CITED SOURCE"), "{asked}");
-        assert!(
-            asked.contains("src/math.js:2: ") && asked.contains("for (let i = 1; i < xs.length"),
-            "{asked}"
-        );
+        if cfg!(unix) {
+            assert!(asked.contains("CITED SOURCE"), "{asked}");
+            assert!(
+                asked.contains("src/math.js:2: ")
+                    && asked.contains("for (let i = 1; i < xs.length"),
+                "{asked}"
+            );
+        } else {
+            assert!(!asked.contains("CITED SOURCE"), "{asked}");
+        }
         // An opening PASS with no closing line is confirmed once by the same seat, not denied.
         assert_eq!(judge.len(), 2, "one confirm call");
         assert_eq!(judge[1].unit.assigned_cli, judge[0].unit.assigned_cli);
