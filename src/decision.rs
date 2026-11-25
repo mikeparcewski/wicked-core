@@ -62,9 +62,15 @@ pub(crate) struct SeatBallots {
     inflight: BallotReaper,
     /// How long a cancelled ballot is given to stop before its timeout is reported.
     drain: std::time::Duration,
+    /// (DES-j6-build C0) Each ballot is a Tool step's model call, run tool-free
+    /// ([`crate::model_call::tool_free`]).
+    model_calls: bool,
     /// (DES-j6-build C0a) Hand every ballot's prompt on stdin, whatever the seat's input mode
     /// ([`SeatBallots::prompt_on_stdin`]).
     stdin: bool,
+    /// (coord round 2 on garden#1557) A claude ballot's answer cap in output tokens
+    /// ([`crate::execute_wrapped::with_answer_cap`]); none = the seat's own default.
+    answer_cap: Option<u32>,
 }
 
 /// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
@@ -137,14 +143,29 @@ impl SeatBallots {
             parent_run_id: parent_run_id.map(str::to_string),
             inflight: BallotReaper::default(),
             drain: BALLOT_CANCEL_DRAIN,
+            model_calls: false,
             stdin: false,
+            answer_cap: None,
         }
+    }
+
+    /// (DES-j6-build C0) Run every ballot as a tool-free model call, its prompt on stdin
+    /// ([`SeatBallots::prompt_on_stdin`]): a model call's prompt reaches the seat byte-exact at
+    /// any size, on both floors.
+    pub(crate) fn model_calls(mut self) -> Self {
+        self.model_calls = true;
+        self.prompt_on_stdin()
+    }
+
+    /// (coord round 2 on garden#1557) Cap every claude ballot's answer at `cap` output tokens.
+    pub(crate) fn answer_cap(mut self, cap: Option<u32>) -> Self {
+        self.answer_cap = cap;
+        self
     }
 
     /// (DES-j6-build C0a) Hand every ballot its prompt on stdin
     /// ([`crate::execute_wrapped::with_prompt_on_stdin`]): byte-exact at any size, on the host
     /// floor and in a seat container alike, never as a file the seat is told to read.
-    #[allow(dead_code)] // the model-call channel's switch (DES-j6-build C0, core#1894)
     pub(crate) fn prompt_on_stdin(mut self) -> Self {
         self.stdin = true;
         self
@@ -212,6 +233,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
             ));
         }
         let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
+        let answer_cap = self.answer_cap;
         let run_id = ballot_run_id(task_id, &cli.key);
         let mut unit = crate::domain::WorkUnit::pending(
             crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
@@ -223,6 +245,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         unit.parent_run_id = self.parent_run_id.clone();
         unit.assigned_cli = Some(cli.key.clone());
         unit.assigned_invocation = Some(cli.headless_invocation.clone());
+        if self.model_calls {
+            crate::model_call::tool_free(&mut unit, &cli.key);
+        }
         let input = crate::workflow::StepInput {
             base_commit: None,
             run_id: run_id.clone(),
@@ -248,7 +273,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::execute_wrapped::with_stdout_cap(stdout_cap, || {
                     crate::execute_wrapped::with_prompt_on_stdin(on_stdin, || {
-                        runner.run_unit(&input)
+                        crate::execute_wrapped::with_answer_cap(answer_cap, || {
+                            runner.run_unit(&input)
+                        })
                     })
                 })
             }));

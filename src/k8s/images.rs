@@ -187,7 +187,7 @@ pub(crate) fn ensure_loaded(
         if loaded.contains(&key) {
             continue;
         }
-        let dir = archive_dir().map_err(&refuse)?;
+        let dir = archive_dir().map_err(refuse)?;
         let path = dir.0.join("image.tar");
         let path_arg = path.to_string_lossy().into_owned();
         let mut save = rt.cmd();

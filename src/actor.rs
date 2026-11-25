@@ -14888,6 +14888,21 @@ fn dispatch_unit_with(
             .flatten();
         // No token, no command: crew's route authenticates the unit by it.
         let apps_unarmed = apps_tool && apps_channel.is_none();
+        // (DES-j6-build D1, C0) A declared Tool step of a SHIPPED preset can ask the daemon's own
+        // seats for a model call (`wicked-core model-call`); a repo-defined Tool step cannot
+        // ([`crate::model_call::shipped_step`]). The step runner and the seat registry it is armed
+        // with are read here on the actor (the registry as the judges read it).
+        let model_calls = (run_env.is_some()
+            && crate::model_call::shipped_step(
+                session.team_plan.as_ref().and_then(|p| p.preset.as_deref()),
+                unit,
+                session
+                    .repo_ref
+                    .as_deref()
+                    .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                    .as_ref(),
+            ))
+        .then(|| (runner.clone(), judge_registries().1));
         std::thread::spawn(move || {
             let (_apps_token, _apps_binding, apps_env) = match apps_channel {
                 Some((t, b, env)) => (Some(t), Some(b), env),
@@ -15102,6 +15117,25 @@ fn dispatch_unit_with(
                         let mut run_vars =
                             run_env.as_ref().map(ToolRunEnv::vars).unwrap_or_default();
                         run_vars.extend(apps_env.iter().cloned());
+                        // (DES-j6-build D1, C0) The model-call channel lives until the command
+                        // exits (this scope); a channel that could not be armed leaves the
+                        // variables unset, and the client says so.
+                        let _model_call = model_calls.as_ref().and_then(|(r, reg)| {
+                            match crate::model_call::arm(r.clone(), reg.clone(), &input.run_id, ord)
+                            {
+                                Ok(ch) => Some(ch),
+                                Err(e) => {
+                                    eprintln!(
+                                        "wicked-core: run {} unit {ord}: no model-call channel: {e}",
+                                        input.run_id
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                        if let Some(ch) = &_model_call {
+                            run_vars.extend(ch.env());
+                        }
                         // (core#802) The garden root the run was admitted against rides every
                         // generic Tool unit as `WICKED_GARDEN_ROOT`, so a def runs
                         // `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from the

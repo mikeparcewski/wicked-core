@@ -430,6 +430,9 @@ fn a_150_kb_prompt_rides_a_seat_pods_exec_stdin_byte_exact() {
     // spawn-audit: test-only — a fake kubectl script; proves the pod seat's stdin wiring.
     let mut cmd = Command::new(&wrapper[0]);
     cmd.args(&wrapper[1..]).args(&cli).current_dir(&dir);
+    // (coord round 2 on garden#1557) A model call's answer cap, as the runner sets it on the
+    // seat's command: the pod's unit file exports it and hands it to the CLI through landrun.
+    cmd.env(CLAUDE_MAX_OUTPUT_ENV, "64000");
     let prompt = big_prompt();
     let emit = |_: &str| {};
     let (code, out, ..) = run_bounded_fed(
@@ -452,6 +455,11 @@ fn a_150_kb_prompt_rides_a_seat_pods_exec_stdin_byte_exact() {
     let env = std::fs::read_to_string(dir.join("env")).unwrap();
     assert!(
         env.contains("'claude' '-p'") && env.contains("'--tools' ''"),
+        "{env}"
+    );
+    assert!(
+        env.contains("export CLAUDE_CODE_MAX_OUTPUT_TOKENS='64000'")
+            && env.contains("'--env' 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'"),
         "{env}"
     );
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
@@ -490,4 +498,95 @@ fn a_dropped_feed_stops_on_a_pipe_held_unread() {
         took < FEED_GRACE,
         "the dropped feed was not stopped: {took:?}"
     );
+}
+
+/// (coord round 2 on garden#1557, W24) Host floor, through the real wrapped runner with stand-in
+/// seats: a claude launch on a thread capped by [`with_answer_cap`] runs with
+/// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` set to the cap (the J6 v3 proof's 64000), and one without a cap,
+/// or a codex launch under one, runs with no such variable.
+#[cfg(unix)]
+#[test]
+fn a_claude_answer_cap_reaches_the_claude_process_and_nothing_else() {
+    struct Var(&'static str, Option<std::ffi::OsString>);
+    impl Drop for Var {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let set = |k: &'static str, v: Option<&std::ffi::OsStr>| {
+        let prev = std::env::var_os(k);
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+        Var(k, prev)
+    };
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-answer-cap-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let _snapshot = set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, None);
+    let _floor = set(
+        crate::container_floor::SEAT_FLOOR_ENV,
+        Some(std::ffi::OsStr::new("host")),
+    );
+    let _config = set(
+        crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
+        Some(dir.join("config").as_os_str()),
+    );
+    // Not inherited from the test's own environment: only the launch may set it.
+    let _cap = set(CLAUDE_MAX_OUTPUT_ENV, None);
+    let run = |cli: &str, cap: Option<u32>| {
+        let bin = dir.join(cli);
+        if !bin.exists() {
+            crate::test_env::install_stub(
+                &bin,
+                "#!/bin/sh\ncat >/dev/null\nprintf 'CAP %s\\n' \"${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-none}\"\n",
+            );
+        }
+        let mut unit = WorkUnit::pending(COUNCIL_BALLOT_UNIT, "council", 1, "answer");
+        unit.assigned_cli = Some(cli.to_string());
+        let flags = if cli == "claude" {
+            "-p"
+        } else {
+            "exec --skip-git-repo-check"
+        };
+        unit.assigned_invocation = Some(format!("{} {flags} {{PROMPT}}", bin.display()));
+        crate::model_call::tool_free(&mut unit, cli);
+        let input = StepInput {
+            base_commit: None,
+            run_id: format!("cap-{cli}-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-council".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let out = with_prompt_on_stdin(true, || with_answer_cap(cap, || runner.run_unit(&input)));
+        let _ = std::fs::remove_dir_all(sandbox_for(&input));
+        assert_eq!(out.status, StepStatus::Ok, "{cli}: {}", out.output);
+        line(&out.output, "CAP ").to_string()
+    };
+    assert_eq!(run("claude", Some(64000)), "64000");
+    assert_eq!(run("claude", None), "none");
+    assert_eq!(run("codex", Some(64000)), "none");
+    assert_eq!(answer_cap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
 }

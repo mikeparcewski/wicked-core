@@ -17,6 +17,8 @@
 //!   wicked-core gate-phase --workflow <preset> --phase <step-id> --criterion "..."
 //!       # author+approve a validator for the criterion, PIN it onto that step, and save a gated
 //!       # preset (`<step>-gated-<preset>`) so the rev0.4 dual-validator gate engages on it
+//!   wicked-core model-call --family claude|codex --in <F> --out <F>   # one model call from a
+//!       # Tool step, through the daemon's own seat (DES-j6-build D1)
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
 //!       # domain-extraction preset pins, so it runs instead of failing closed
 //!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
@@ -148,6 +150,17 @@ const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --p
 /// them unguarded, and a new subcommand added tomorrow inherits this by default instead of having to
 /// remember. Same reason every spawn goes through one hardened helper.
 const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
+    (
+        "model-call",
+        "wicked-core model-call --family claude|codex --in <prompt file> --out <answer file> [--timeout-s <N>] [--max-output-tokens <N>]\n  \
+         One model call from inside a Tool step of a run: the prompt goes, byte-exact, to the \
+         daemon's own `claude` or `codex` seat (the seat container under the container floor) \
+         through the channel the step was armed with ($WICKED_MODEL_CALL_SOCK), and the seat's \
+         text is written to --out. Exit 0 = answered, 2 = refused or the seat failed (the reason \
+         on stderr), 1 = bad arguments or files. Budget: --timeout-s, default 1500, at most 3600. \
+         --max-output-tokens caps a claude call's answer (1..=128000; the seat's \
+         CLAUDE_CODE_MAX_OUTPUT_TOKENS); a codex call that names it is refused.",
+    ),
     (
         "domain-graph",
         "wicked-core domain-graph [--db <path>] [--repo-root <dir>] [--min-coverage-pct <N>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
@@ -472,6 +485,7 @@ fn main() {
         Some("gate-phase") => return gate_phase_cmd(&args),
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
+        Some("model-call") => return model_call_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
         Some("requirements-target") => return requirements_target_cmd(&args),
         // `floor probe --repo <dir> --guide <file> [--check <name>]` (DES-BUILD-GUIDE): every piece
@@ -1501,6 +1515,78 @@ fn min_coverage_pct_arg(
 /// repository's OWN coverage target (domain-graph-3), kept in its estate store: `--set` lowers
 /// (or raises) the bar this repository's requirements graph is held to, `--clear` returns it to the
 /// daemon-wide minimum. Prints the target in force and where it comes from.
+/// `model-call` (DES-j6-build D1): one prompt to the run's `claude` or `codex` seat through the Tool
+/// step's channel. Opens no store and spawns no actor: the daemon that armed the step runs the seat.
+fn model_call_cmd(args: &[String]) {
+    // A flag named with no value after it is bad input, never the default (codex r1 on #1894).
+    for name in [
+        "--family",
+        "--in",
+        "--out",
+        "--timeout-s",
+        "--max-output-tokens",
+    ] {
+        if let Some(i) = args.iter().position(|a| a == name) {
+            if args.get(i + 1).is_none_or(|v| v.starts_with("--")) {
+                return fail(&format!("model-call: {name} needs a value"));
+            }
+        }
+    }
+    let family = match flag(args, "--family") {
+        Some(f) if wicked_core::model_call::FAMILIES.contains(&f.as_str()) => f,
+        Some(f) => {
+            return fail(&format!(
+                "model-call: --family {f:?} is not claude or codex"
+            ))
+        }
+        None => return fail("model-call: --family claude|codex is required"),
+    };
+    let (Some(input), Some(output)) = (flag(args, "--in"), flag(args, "--out")) else {
+        return fail("model-call: --in <prompt file> and --out <answer file> are required");
+    };
+    let timeout_s = match flag(args, "--timeout-s") {
+        None => None,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if (1..=wicked_core::model_call::MAX_TIMEOUT_S).contains(&n) => Some(n),
+            _ => {
+                return fail(&format!(
+                    "model-call: --timeout-s {v:?} is not 1..{}",
+                    wicked_core::model_call::MAX_TIMEOUT_S
+                ))
+            }
+        },
+    };
+    // A claude call's answer cap (the seat's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`); the channel refuses
+    // it on a codex call.
+    let max_output_tokens = match flag(args, "--max-output-tokens") {
+        None => None,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if (1..=wicked_core::model_call::MAX_OUTPUT_TOKENS).contains(&n) => Some(n),
+            _ => {
+                return fail(&format!(
+                    "model-call: --max-output-tokens {v:?} is not 1..={}",
+                    wicked_core::model_call::MAX_OUTPUT_TOKENS
+                ))
+            }
+        },
+    };
+    let prompt = match std::fs::read_to_string(&input) {
+        Ok(p) => p,
+        Err(e) => return fail(&format!("model-call: cannot read {input}: {e}")),
+    };
+    match wicked_core::model_call::call_from_env(&family, &prompt, timeout_s, max_output_tokens) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&output, text) {
+                fail(&format!("model-call: cannot write {output}: {e}"));
+            }
+        }
+        Err(why) => {
+            eprintln!("model-call: {why}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn requirements_target_cmd(args: &[String]) {
     // Flag PRESENCE is read on its own (codex/agy r1 on #1226): `--set` with no value, or beside
     // `--clear`, is refused before the store is opened — never a read, never a silent clear.

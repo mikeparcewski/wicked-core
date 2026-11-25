@@ -4818,6 +4818,11 @@ impl WrappedCliStepRunner {
             for (k, v) in &floor_build_env {
                 cmd.env(k, v);
             }
+            // (coord round 2 on garden#1557) A model call's claude answer cap: set on the seat's own
+            // command, so it reaches the host process and a seat pod's exec alike.
+            if let Some(n) = answer_cap().filter(|_| is_claude) {
+                cmd.env(CLAUDE_MAX_OUTPUT_ENV, n.to_string());
+            }
             // (core#928) The QE unit's temp is its notes root, a root its fence admits (on every
             // floor): `<cwd>/tmp` and the floor's own scratch are outside its admitted roots, so
             // the reviewer's staged verdict script was refused and the verdict lost.
@@ -8461,6 +8466,32 @@ thread_local! {
     /// (DES-j6-build C0a) Whether this thread's caller asked for the prompt on stdin
     /// ([`with_prompt_on_stdin`]).
     static PROMPT_ON_STDIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (coord round 2 on garden#1557) The claude answer cap this thread's caller set
+    /// ([`with_answer_cap`]).
+    static ANSWER_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The variable a claude seat reads for the most output tokens one answer may take.
+pub(crate) const CLAUDE_MAX_OUTPUT_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+
+/// (coord round 2 on garden#1557) Run `f` with every claude unit the wrapped runner launches on
+/// THIS thread capped at `cap` output tokens per answer: the seat's process gets
+/// [`CLAUDE_MAX_OUTPUT_ENV`] set to it (an explicit launch variable, so a tool-less scrub keeps it
+/// and a seat pod's exec carries it). `None` leaves the seat's own default. A model call's carrier
+/// sets it for a claude call that asks ([`crate::model_call::Request::max_output_tokens`]).
+pub(crate) fn with_answer_cap<T>(cap: Option<u32>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ANSWER_CAP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(ANSWER_CAP.with(|c| c.replace(cap)));
+    f()
+}
+
+pub(crate) fn answer_cap() -> Option<u32> {
+    ANSWER_CAP.with(|c| c.get())
 }
 
 /// (DES-j6-build C0a) Run `f` with every unit the wrapped runner launches on THIS thread handed
