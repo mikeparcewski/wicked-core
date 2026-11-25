@@ -300,11 +300,12 @@ const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// (core#1933) The most checkout roots [`detect_cached`] remembers.
 const DETECT_CACHE_MAX: usize = 256;
 
-/// (core#1933) Each checkout root's last detection: when it ran, and its layer ids.
+/// (core#1933) A checkout root's last detection: when it ran, and its layer ids.
+type Detected = (std::time::Instant, Vec<&'static str>);
+
+/// (core#1933) Each checkout root's last detection.
 static DETECTED: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<std::path::PathBuf, (std::time::Instant, Vec<&'static str>)>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Detected>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// (core#1933) [`detect`] for the repo list a person sees, reused for [`DETECT_TTL`]: a marker
