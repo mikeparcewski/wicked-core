@@ -113,7 +113,8 @@ fn fold_on(
         false,
         Vec::new(),
         None,
-        true,
+        // A stand-in-aware launch is never reduced (`LaunchStandIn::validate`).
+        !stand_ins,
         &crate::assurance::QeOverride::Auto,
     )
     .expect("plan");
@@ -531,6 +532,7 @@ fn a_rule_check_on_the_run_judge_stand_in_is_recorded_and_its_verdicts_stand() {
     let rc = RuleCheckReport {
         rows: vec![kept],
         seats: vec!["a~1".into()],
+        calls: 1,
         ..Default::default()
     };
     let (approved, denial, unit, session) = fold_on("rc-standin", Some(rc), None, true);
@@ -578,6 +580,7 @@ fn a_rule_check_on_a_stand_in_the_run_did_not_offer_keeps_no_verdict() {
     let rc = RuleCheckReport {
         rows: vec![kept],
         seats: vec!["a~7".into()],
+        calls: 1,
         ..Default::default()
     };
     let (approved, denial, unit, session) = fold_on("rc-standin-forged", Some(rc), None, true);
@@ -609,6 +612,7 @@ fn a_rule_check_stand_in_that_ruled_nothing_is_recorded_failed() {
             "the judge did not answer",
         )],
         seats: vec!["a~1".into()],
+        calls: 1,
         ..Default::default()
     };
     let (approved, _, unit, session) = fold_on("rc-standin-failed", Some(rc), None, true);
@@ -628,4 +632,55 @@ fn a_rule_check_stand_in_that_ruled_nothing_is_recorded_failed() {
         .expect("the role took part")
         .clone();
     assert_eq!(rj.state, crate::standin::STATE_FAILED);
+}
+
+/// (core#1944) A verdict carried from an earlier check (a cached row) that names a stand-in the
+/// run's record does not hold counts for nothing either, whatever seats this check drew.
+#[test]
+fn a_carried_verdict_naming_an_unrecorded_stand_in_keeps_nothing() {
+    let mut cached = row("K", RuleStatus::Kept, RuleHow::Cache, "src/a.rs:1");
+    cached.judge = Some("a~5".into());
+    let rc = RuleCheckReport {
+        rows: vec![
+            cached,
+            row("R", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:2"),
+        ],
+        seats: vec!["codex".into()],
+        calls: 1,
+        ..Default::default()
+    };
+    let (approved, denial, unit, _) = fold_on("rc-standin-carried", Some(rc), None, true);
+    assert!(!approved);
+    assert_eq!(denial.expect("held").rule_ids, ["K"]);
+    let rules = &unit.assurance.as_ref().expect("a receipt").rules;
+    assert_eq!(rules[0].status, RuleStatus::Unchecked);
+    assert_eq!(
+        rules[1].status,
+        RuleStatus::Kept,
+        "a real seat's verdict stands"
+    );
+}
+
+/// (core#1944) Offered and never asked: every rule settled without a judge call, so the stand-in
+/// took no part. Nothing is recorded or announced, and its slot stays free.
+#[test]
+fn an_offered_stand_in_the_rule_check_never_asked_is_not_recorded() {
+    let rc = RuleCheckReport {
+        rows: vec![row(
+            "N",
+            RuleStatus::NotApplicable,
+            RuleHow::Fact,
+            "selected for install",
+        )],
+        seats: vec!["a~1".into()],
+        ..Default::default()
+    };
+    let (approved, denial, unit, session) = fold_on("rc-standin-unasked", Some(rc), None, true);
+    assert!(approved, "{denial:?}");
+    assert!(session.assurance.stand_ins.is_empty());
+    assert!(!unit
+        .assurance
+        .as_ref()
+        .and_then(|r| r.roles.as_ref())
+        .is_some_and(|roles| roles.iter().any(|r| r.role == "rule_judge")));
 }

@@ -3167,13 +3167,30 @@ fn the_unit_runner_hands_its_judge_stand_in_to_the_rule_check() {
         aware: true,
         offer: Some(offer),
     };
-    let (_, _, evidence) = run_unit_and_judge_standing_in(
+    // The work's author as the actor hands it (`pipeline::fallback_work_authors`,
+    // `work_author_binaries`): the builder `claude`, which ran `claude`.
+    let authors = ["claude".to_string()];
+    let (_, _, evidence) = run_unit_and_judge_on(
         &dynr,
         &input,
+        None,
+        &|_| {},
         &roster,
         &["claude".to_string()],
         &[],
-        &stand_in,
+        JudgeFallbackCtx {
+            pool: &[],
+            registry: &roster,
+            bench: &[],
+            work_authors: &authors,
+            author_binaries: Some(&authors),
+            reprobe: false,
+            rule_council: None,
+            stand_in_judge: Some(&stand_in),
+        },
+        None,
+        None,
+        None,
     );
     crate::observed_provider::take_receipts();
     let rc = evidence.rule_check.expect("the review's rule check ran");
