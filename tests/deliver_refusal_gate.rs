@@ -130,6 +130,7 @@ fn spec(
     base_ref: Option<&str>,
 ) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: base_ref.map(str::to_string),
         project_id: None,
         problem: format!("Revise the pull request: {session_id}"),

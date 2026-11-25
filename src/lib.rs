@@ -282,10 +282,11 @@ pub use domain::{
     RejudgeReadiness, RoutingInfo, SeatFailureMark, SessionStatus, SessionView, StageKind,
     UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
+/// (J6 C1b) The launch's scope: the strict parse core-ts uses for `scopeJson`, and its check.
+pub use domain_extraction::{check_launch_scope, parse_scope_json};
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
-    COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID, EXTRACT_APPLY_STEP,
-    EXTRACT_PREPARE_STEP, RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
+    COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID,
 };
 pub use event::{ArmPhase, BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;
@@ -437,9 +438,9 @@ pub use project::{
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
 pub use repo::{
-    coverage_report_for_repo, get_repo, graph_kinds_for_repo, index_repo_checkout,
-    requirements_graph_for_repo, RepoEntry, RepoFinding, RepoSpec,
-    FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
+    coverage_report_for_repo, domain_ruling, domain_ruling_for_repo, get_repo,
+    graph_kinds_for_repo, index_repo_checkout, requirements_graph_for_repo, RepoEntry, RepoFinding,
+    RepoSpec, FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
 };
 pub use repo_checks::{
     is_environment_refusal, BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv,
@@ -626,6 +627,13 @@ pub struct LaunchSpec {
     /// `false`, the default, keeps today's behaviour), the parties and any human consent.
     /// Persisted on the run's contract, never re-read from here.
     pub stand_in: crate::standin::LaunchStandIn,
+    /// (J6 C1b) The domain-extraction run's SCOPE, as studio's Start carries it from the preview:
+    /// `{intent, phrases?, scope_hash?, description?}`. Checked at launch
+    /// ([`crate::domain_extraction::check_launch_scope`]): a `domain-extraction` launch without
+    /// one is refused by name, and a scope on any other launch is refused, never dropped. It is
+    /// persisted on the session, and each arm of the `domain-run` step writes it into the step's
+    /// private channel directory and names the file in `WICKED_DOMAIN_SCOPE`.
+    pub scope: Option<serde_json::Value>,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):

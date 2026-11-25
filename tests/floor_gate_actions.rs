@@ -261,6 +261,7 @@ fn launch(core: &Core, name: &str, repo: &Path, sid: &str) -> std::sync::mpsc::R
         .expect("register");
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Fix the bug in src/app.ts".into(),

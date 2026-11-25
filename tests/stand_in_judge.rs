@@ -169,6 +169,7 @@ fn consent() -> StandInConsent {
 
 fn spec(sid: &str, repo_ref: &str, def: &str, consent: Option<StandInConsent>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "perPerson(120, 20, 3) returns 840 instead of 48: fix it".into(),

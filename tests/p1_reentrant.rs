@@ -126,6 +126,7 @@ fn launch(core: &Core, session_id: &str) -> anyhow::Result<String> {
 
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two".into(),

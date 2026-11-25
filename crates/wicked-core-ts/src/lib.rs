@@ -870,6 +870,12 @@ pub struct LaunchOptions {
     /// (QE acceptance) REQUIRE QE acceptance whatever the run's impact score says (no waiver).
     /// Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
     pub force_qe_acceptance: Option<bool>,
+    /// (J6 C1b) A `domain-extraction` run's scope, as JSON: `{"intent": "...", "phrases"?: [...],
+    /// "scope_hash"?: "...", "description"?: "..."}` (Start carries it from the preview). A
+    /// `domain-extraction` launch without it is REJECTED by name, as is a scope on any other launch
+    /// or one that is malformed or over 64 KiB. Check `supportsDomainScope` first: an older addon
+    /// drops this field.
+    pub scope_json: Option<String>,
 }
 
 /// (DES-RULE-CHECK-001 S2) The `skip_rules` answer's skips: `amend` holds JSON
@@ -951,6 +957,13 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         .map(parse_deliver_step)
         .transpose()?;
     Ok(LaunchSpec {
+        // (J6 C1b) A key twice is refused, never dropped (the engine checks the shape at launch).
+        scope: o
+            .scope_json
+            .as_deref()
+            .map(wicked_core::parse_scope_json)
+            .transpose()
+            .map_err(|e| err(format!("scopeJson: {e}")))?,
         problem: o.problem,
         clis,
         entity_mode: o
@@ -1178,6 +1191,14 @@ impl Core {
     /// ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
     #[napi]
     pub fn supports_power_mode() -> bool {
+        true
+    }
+
+    /// (J6 C1b) Whether this addon carries a domain-extraction run's scope (`LaunchOptions.scopeJson`).
+    /// An older addon drops the field (napi ignores an undeclared one), and its engine runs the old
+    /// loop, so the launcher keys on this first.
+    #[napi]
+    pub fn supports_domain_scope() -> bool {
         true
     }
 
@@ -3208,7 +3229,10 @@ impl Core {
     /// a build reached the minimum), `coverage` the store now, `build` the label that build persisted,
     /// `rows` the engine's verdict on each listed row that recorded its unit (same pass as `coverage`),
     /// and `satisfied_by` each listed requirement's live code links, sorted by symbol, with an empty
-    /// list when no target remains and null until built. An unknown `repo_ref` REJECTS.
+    /// list when no target remains and null until built. An unknown `repo_ref` REJECTS. A J6 v3
+    /// model (`graph.metadata.schema_version` "1.2.0") is returned as its build wrote it: `coverage`
+    /// is its `metadata.accounting`, `rows` and `target` are null, and each `satisfied_by` link
+    /// carries the `lines` (`[from, to]`) of its located statements, absent when none is located.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn get_requirements_graph_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
@@ -3218,6 +3242,25 @@ impl Core {
             let doc = wicked_core::requirements_graph_for_repo(&daemon, &db_path, &repo_ref)
                 .map_err(err)?;
             serde_json::to_string(&doc).map_err(err)
+        })
+    }
+
+    /// (J6 v3) A person's ruling on the domain model of ONE registered repo: Confirm or Reject on an
+    /// open statement or an unaccounted target, then the model is rebuilt (0 model calls).
+    /// `request` is JSON `{ statement?: string, target?: string, expect_key?: string,
+    /// expect_target_hash: string, action: "confirm" | "reject", note?: string, by: string }`
+    /// (exactly one of `statement` / `target`; `expect_key` with a statement). Resolves to a JSON
+    /// string: `{ ok: true, ruling, build: { ok: true, generation, accounting } }`, `{ ok: true,
+    /// ruling, build: { ok: false, error } }` (the ruling stands, the rebuild failed), or `{ ok:
+    /// false, code: "not_found" | "not_open" | "changed" | "stale_code" | "note_required" |
+    /// "bad_request" | "store", message }` (nothing written). An unknown `repo_ref` REJECTS.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn domain_ruling(&self, repo_ref: String, request: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            wicked_core::domain_ruling_for_repo(&daemon, &db_path, &repo_ref, &request).map_err(err)
         })
     }
 
@@ -3642,7 +3685,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (DES-TEAMING-002 T8) `Core.catalog()`: the nineteen entries, in catalog order, each with
+    /// (DES-TEAMING-002 T8) `Core.catalog()`: the eighteen entries, in catalog order, each with
     /// the picker's keys.
     #[test]
     fn catalog_json_is_the_catalog_in_order() {
@@ -3662,7 +3705,7 @@ mod tests {
             .filter(|e| e["verified_evidence"] == true)
             .map(|e| e["id"].as_str().unwrap())
             .collect();
-        assert_eq!(verified, ["test", "walkthrough_review", "domain_coverage"]);
+        assert_eq!(verified, ["test", "walkthrough_review"]);
     }
 
     /// (wicked-core#631) `Core.busEmit()` / `Core.busRead()`: an emit resolves to the row's id (a

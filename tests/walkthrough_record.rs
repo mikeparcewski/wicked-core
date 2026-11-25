@@ -161,6 +161,7 @@ fn run(name: &str, mode: Option<&str>) -> Run {
     }))
     .unwrap();
     core.launch_run(LaunchSpec {
+        scope: None,
         problem: "show the checkout working".into(),
         clis: Vec::new(),
         entity_mode: EntityMode::Shared,

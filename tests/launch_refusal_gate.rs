@@ -103,6 +103,7 @@ const ONE_BUILD: &str = r#"{"id":"refusal-one-build","phases":[
 
 fn spec(sid: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),

@@ -89,6 +89,7 @@ fn def(id: &str, pin: &str) -> String {
 
 fn launch(core: &Core, id: &str, sid: &str) -> anyhow::Result<String> {
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "draft the doc".into(),

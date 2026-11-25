@@ -261,6 +261,12 @@ pub struct AgentSession {
     /// without it serializes byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_root: Option<String>,
+    /// (J6 C1b) The domain-extraction run's scope (`LaunchSpec::scope`), checked at launch and
+    /// persisted so every arm of `domain-run` (a restart's included) writes the same scope into
+    /// the step's channel directory. `#[serde(default)]` + skip-if-none: older sessions read
+    /// `None` and a run without it serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<serde_json::Value>,
     /// (core#850) The run's assurance contract — what it requires and whether the launch opted
     /// into `reduced` assurance ([`crate::assurance::RunAssurance`]). `#[serde(default)]`: a session
     /// persisted before this field reads back `full` with the default requirements (fail-closed).
@@ -2954,6 +2960,7 @@ mod tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,

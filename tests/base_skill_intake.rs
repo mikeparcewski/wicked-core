@@ -141,6 +141,7 @@ mod skills_fixture;
 
 fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Triage, then review.".into(),

@@ -174,6 +174,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
     let ev = core.subscribe();
     let run = "rcj-run";
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "fix the reported bug".into(),
@@ -421,6 +422,7 @@ fn launch_tool_check(
     .expect("register the def");
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "write tests for clamp".into(),

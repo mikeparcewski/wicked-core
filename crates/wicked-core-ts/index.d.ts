@@ -206,6 +206,14 @@ export interface LaunchOptions {
    * Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
    */
   forceQeAcceptance?: boolean
+  /**
+   * (J6 C1b) A `domain-extraction` run's scope, as JSON: `{"intent": "...", "phrases"?: [...],
+   * "scope_hash"?: "...", "description"?: "..."}` (Start carries it from the preview). A
+   * `domain-extraction` launch without it is REJECTED by name, as is a scope on any other launch
+   * or one that is malformed or over 64 KiB. Check `supportsDomainScope` first: an older addon
+   * drops this field.
+   */
+  scopeJson?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -304,6 +312,12 @@ export declare class Core {
    * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
    */
   static supportsPowerMode(): boolean
+  /**
+   * (J6 C1b) Whether this addon carries a domain-extraction run's scope (`LaunchOptions.scopeJson`).
+   * An older addon drops the field (napi ignores an undeclared one), and its engine runs the old
+   * loop, so the launcher keys on this first.
+   */
+  static supportsDomainScope(): boolean
   /**
    * What this process's engine knows about its connection to the bus file at `path`
    * (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus
@@ -1264,9 +1278,24 @@ export declare class Core {
    * a build reached the minimum), `coverage` the store now, `build` the label that build persisted,
    * `rows` the engine's verdict on each listed row that recorded its unit (same pass as `coverage`),
    * and `satisfied_by` each listed requirement's live code links, sorted by symbol, with an empty
-   * list when no target remains and null until built. An unknown `repo_ref` REJECTS.
+   * list when no target remains and null until built. An unknown `repo_ref` REJECTS. A J6 v3
+   * model (`graph.metadata.schema_version` "1.2.0") is returned as its build wrote it: `coverage`
+   * is its `metadata.accounting`, `rows` and `target` are null, and each `satisfied_by` link
+   * carries the `lines` (`[from, to]`) of its located statements, absent when none is located.
    */
   getRequirementsGraphForRepo(repoRef: string): Promise<string>
+  /**
+   * (J6 v3) A person's ruling on the domain model of ONE registered repo: Confirm or Reject on an
+   * open statement or an unaccounted target, then the model is rebuilt (0 model calls).
+   * `request` is JSON `{ statement?: string, target?: string, expect_key?: string,
+   * expect_target_hash: string, action: "confirm" | "reject", note?: string, by: string }`
+   * (exactly one of `statement` / `target`; `expect_key` with a statement). Resolves to a JSON
+   * string: `{ ok: true, ruling, build: { ok: true, generation, accounting } }`, `{ ok: true,
+   * ruling, build: { ok: false, error } }` (the ruling stands, the rebuild failed), or `{ ok:
+   * false, code: "not_found" | "not_open" | "changed" | "stale_code" | "note_required" |
+   * "bad_request" | "store", message }` (nothing written). An unknown `repo_ref` REJECTS.
+   */
+  domainRuling(repoRef: string, request: string): Promise<string>
   /**
    * Node-count-by-kind summary of ONE registered repo's code graph, over that repo's OWN store
    * (#122). Resolves to a JSON string: an array of `{ "kind": string, "count": number }`,

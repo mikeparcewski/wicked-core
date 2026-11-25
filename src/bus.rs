@@ -1567,6 +1567,7 @@ fn launch_from_event(
         .map_err(|e| BridgeError::Permanent(anyhow::anyhow!(e)))?,
     );
     let spec = LaunchSpec {
+        scope: None,
         base_ref: None,
         problem: req.problem.clone(),
         clis: roster.to_vec(),

@@ -112,6 +112,7 @@ else echo 'wicked-repeat {{"next":"done","line":"target reached"}}'; fi"#,
 
 fn spec(session_id: &str, workflow: &str, repo_ref: String) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: format!("loop {session_id}"),

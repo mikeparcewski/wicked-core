@@ -95,6 +95,7 @@ fn run_with(name: &str, exclude_seats: Vec<String>) -> Vec<Vec<String>> {
     core.register_workflow(DEF).unwrap();
     let run = core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "Do step one. Do step two".into(),
@@ -170,6 +171,7 @@ fn the_straight_through_path_refuses_an_exclusion_instead_of_dropping_it() {
     );
     let events = core.subscribe();
     let id = core.launch(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do one thing".into(),

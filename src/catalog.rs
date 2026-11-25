@@ -13,10 +13,6 @@
 //! `review` and `security_review` entries carry [`EVIDENCE_FLOOR_PIN`] as data, so a composed
 //! plan's code-writing and code-judging steps are floored by the catalog, not by each def.
 //!
-//! `domain_coverage` carries [`COVERAGE_VALIDATOR_PIN`] as data (the shipped domain-extraction
-//! `coverage` phase's pin). A step may not swap a pin its entry carries, so the coverage judge is
-//! its own entry rather than a pin swap on `test`.
-//!
 //! Deviations from the §8.3 table, each forced by "compose of today's def equals today's def"
 //! (seam C1 acceptance (a)) and recorded in the C1 PR:
 //! - `run` has no single kind in the table ("per step"); the entry's default is `recon`, the kind
@@ -31,7 +27,6 @@ use std::sync::OnceLock;
 
 use crate::builtin_floors::{EVIDENCE_FLOOR_PIN, WALKTHROUGH_LINT_PIN, WALKTHROUGH_RESULT_PIN};
 use crate::domain::StageKind;
-use crate::domain_extraction::COVERAGE_VALIDATOR_PIN;
 use crate::plan::PlanStep;
 use crate::workflow::{
     GateCond, GateSpec, GateType, PhaseDef, PhaseExecutor, PhaseRole, StepOwner,
@@ -46,17 +41,12 @@ pub const SECURITY_REVIEW_SKILLS: &[&str] = &[
     SECURITY_REVIEW_SKILL,
     "wicked-garden-platform-security-engineer",
 ];
-/// The skill domain-extraction's coverage judge runs (`domain_coverage`, X-MIG M6): the one skill
-/// under which a self-verifying evaluator's code run is report-writing, not code work
-/// ([`crate::plan`]'s `code_work_step`).
-pub const DOMAIN_COVERAGE_SKILL: &str = "wicked-garden-domain-coverage";
-
-/// The nineteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
+/// The eighteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
 /// after `test`; the two demo Tools, DES-DEMO-RECORD-001, then the editor conformance Tool,
 /// DES-EDITOR-CONFORMANCE-HOST, close the table). The draft render Tool (PLAN G12) sits right after
 /// `produce`, its pipeline slot: the plan floor inserts a floor type at its catalog-order position
 /// (`plan::floor_fill`), so a floor-ADDED `critique` lands after the render, never before it.
-pub const CATALOG_IDS: [&str; 19] = [
+pub const CATALOG_IDS: [&str; 18] = [
     "understand",
     "test_plan",
     "design",
@@ -70,7 +60,6 @@ pub const CATALOG_IDS: [&str; 19] = [
     "review",
     "critique",
     "security_review",
-    "domain_coverage",
     "run",
     "deliver",
     crate::demo_record::PROBE_CATALOG_ID,
@@ -94,7 +83,7 @@ pub const WALKTHROUGH_RECORD_CMD: [&str; 4] = [
     "record",
 ];
 
-/// The phase catalog: nineteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The phase catalog: eighteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -122,7 +111,7 @@ pub struct CatalogEntry {
     /// That pin is the evidence floor ([`EVIDENCE_FLOOR_PIN`]).
     pub evidence_floor: bool,
     /// The entry declares re-verified evidence (`PhaseDef::verified_evidence`): a step of it is
-    /// an acceptance requirement of the run that contains it (`test`, `domain_coverage`).
+    /// an acceptance requirement of the run that contains it (`test`, `walkthrough_review`).
     pub verified_evidence: bool,
     pub skill_ref: Option<String>,
     /// The entry's one-line description, when it has one (`null` for every entry today).
@@ -810,8 +799,7 @@ fn chat_preset() -> Vec<PlanStep> {
 /// with a requirement. On AutoGPT, after exactly these two steps, 28,885 of 28,885
 /// behavior-bearing nodes were unaccounted, so every registration ended `sessionFailed` after the
 /// work that mattered had succeeded (FINDING-068). `domain-graph` belongs to `domain-extraction`,
-/// downstream of the `extract` + `coverage` phases that produce its precondition. Do not relax
-/// that gate to make it pass here (DES-OUTGOV-001/005).
+/// after the `domain-run` step that writes the rules it builds from.
 fn onboarding_preset() -> Vec<PlanStep> {
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
     let tool = |id: &str, cmd: &[&str], after: Option<&str>| PlanStep {
@@ -1290,99 +1278,37 @@ fn steering_author_preset() -> Vec<PlanStep> {
     ]
 }
 
-/// `domain-extraction` (M6): §11.2's row. survey, analyze → `understand` (no gate type);
-/// extract-prepare → `run` (the host's Tool step: the hub-first worklist, wicked-garden#1362);
-/// extract → `produce` (the bold cell: kind recon → build; the seat states rules into a file);
-/// critique → `critique` (the page's review: the stated rules, not the repository's completeness);
-/// extract-apply → `run` (the host's Tool step: checks the rules file and writes the store);
-/// extract-next → `run` (the host's Tool step that loops back to extract-prepare for the next page
-/// until the target or the budget's ask, `repeat_from`);
-/// coverage → `domain_coverage`, which
-/// carries `COVERAGE_VALIDATOR_PIN` as data (the step restates it, a no-op), with `executes_code`
-/// raised and its report as the deliverable; domain-graph → `run`, the Tool step that builds the
-/// requirements graph, behind a `human_confirm` gate. The skills are the domain family's.
+/// `domain-extraction` (J6 v3, DES-j6-build §2): two host steps and no seat unit.
+/// - `domain-run` (`run`, Tool): garden's `scripts/domain/run.py` reads the run's scope
+///   (`--scope "$WICKED_DOMAIN_SCOPE"`, the file core writes into the step's channel directory),
+///   finds the targets, and asks the run's own seats for each extraction and check through
+///   `wicked-core model-call` (a declared step, [`crate::model_call::MODEL_CALL_STEPS`]). It
+///   writes the rules into the repository's store. No gate type: the step's own exit decides.
+/// - `domain-graph` (`run`, Tool): builds the requirements graph from the store into the same
+///   store, where crew reads it (`requirements_graph_for_repo`). No human gate: a launch with
+///   `HumanConfirm::None` ends with no gate.
 fn domain_extraction_preset() -> Vec<PlanStep> {
-    use crate::domain_extraction::{
-        garden_domain_step_cmd, COVERAGE_REPORT_FILE, EXTRACT_APPLY_STEP, EXTRACT_NEXT_STEP,
-        EXTRACT_PREPARE_STEP, RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
-    };
+    use crate::domain_extraction::garden_domain_step_cmd;
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
-    let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
-        catalog: catalog.to_string(),
-        id: id.to_string(),
-        depends_on: after.map(|a| vec![a.to_string()]),
-        ..PlanStep::default()
-    };
     vec![
         PlanStep {
-            gate_type: Some(None),
-            skill_ref: Some("wicked-garden-domain".to_string()),
-            ..step("understand", "survey", None)
-        },
-        PlanStep {
-            gate_type: Some(None),
-            skill_ref: Some("wicked-garden-domain".to_string()),
-            ..step("understand", "analyze", Some("survey"))
-        },
-        // wicked-garden#1362: the seat cannot reach a store or the engine's binaries, so the host
-        // prepares its work list and applies what it states — files in the worktree between them.
-        PlanStep {
+            catalog: "run".to_string(),
+            id: DOMAIN_RUN_STEP.to_string(),
             gate_type: Some(None),
             executor: Some(PhaseExecutor::Tool {
                 cmd: garden_domain_step_cmd(
-                    EXTRACT_PREPARE_STEP,
-                    "scripts/domain/prepare_worklist.py",
-                    &format!("--out {WORKLIST_REL}"),
+                    DOMAIN_RUN_STEP,
+                    "scripts/domain/run.py",
+                    "--scope \"${WICKED_DOMAIN_SCOPE:?the engine handed this step no scope; launch domain-extraction with one}\"",
                 ),
             }),
-            ..step("run", EXTRACT_PREPARE_STEP, Some("analyze"))
+            ..PlanStep::default()
         },
         PlanStep {
-            skill_ref: Some(crate::domain_extraction::EXTRACTOR_SKILL.to_string()),
-            required_deliverables: Some(vec![RULES_REL.to_string()]),
-            ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
-        },
-        // The page's own review (a `critique`, so the floor adds no generic one that judges a page
-        // as an incomplete model): before the host writes anything.
-        PlanStep {
-            instructions: Some(RULES_REVIEW_INSTRUCTIONS.to_string()),
-            ..step("critique", "critique", Some("extract"))
-        },
-        PlanStep {
-            gate_type: Some(None),
-            executor: Some(PhaseExecutor::Tool {
-                cmd: garden_domain_step_cmd(
-                    EXTRACT_APPLY_STEP,
-                    "scripts/domain/apply_rules.py",
-                    &format!("--rules {RULES_REL} --coverage-out {COVERAGE_REPORT_FILE}"),
-                ),
-            }),
-            ..step("run", EXTRACT_APPLY_STEP, Some("critique"))
-        },
-        // domain-graph-3: the generation keeps going until the repository's target or the
-        // operator stops it — this host step decides each page's next (another page from the
-        // frontier, the budget's ask, or done), a bounded loop back to `extract-prepare`.
-        PlanStep {
-            gate_type: Some(None),
-            executor: Some(PhaseExecutor::Tool {
-                cmd: garden_domain_step_cmd(EXTRACT_NEXT_STEP, "scripts/domain/next_page.py", ""),
-            }),
-            repeat_from: Some(EXTRACT_PREPARE_STEP.to_string()),
-            ..step("run", EXTRACT_NEXT_STEP, Some(EXTRACT_APPLY_STEP))
-        },
-        PlanStep {
-            executes_code: Some(true),
-            required_deliverables: Some(vec!["coverage-report.json".to_string()]),
-            skill_ref: Some(DOMAIN_COVERAGE_SKILL.to_string()),
-            validator_pin: Some(Some(COVERAGE_VALIDATOR_PIN.to_string())),
-            ..step("domain_coverage", "coverage", Some(EXTRACT_NEXT_STEP))
-        },
-        PlanStep {
+            catalog: "run".to_string(),
+            id: "domain-graph".to_string(),
             kind: Some(StageKind::Build),
-            gate_type: Some(Some(GateType::Strategy)),
-            gate: Some(GateSpec::HumanConfirm {
-                unconditional: false,
-            }),
+            gate_type: Some(None),
             executor: Some(PhaseExecutor::Tool {
                 cmd: [
                     "wicked-core",
@@ -1392,19 +1318,21 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
                     // The graph is saved into the repo's estate store (`--db`), where crew reads
                     // it (`requirements_graph_for_repo`); no file is written into the checkout
                     // (operator ruling 2026-10-31). `--repo-root` names the checkout whose
-                    // tracked files the corroboration reads. The coverage minimum reaches the
-                    // step through the daemon's environment
-                    // (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, crew's setting).
+                    // tracked files the corroboration reads.
                     "--repo-root",
                     REPO_ROOT_TOKEN,
                 ]
                 .map(str::to_string)
                 .to_vec(),
             }),
-            ..step("run", "domain-graph", Some("coverage"))
+            depends_on: Some(vec![DOMAIN_RUN_STEP.to_string()]),
+            ..PlanStep::default()
         },
     ]
 }
+
+/// The `domain-extraction` step whose command makes model calls (J6 v3).
+pub const DOMAIN_RUN_STEP: &str = "domain-run";
 
 fn build_catalog() -> Vec<PhaseDef> {
     use GateType::{Execution, Strategy, Value};
@@ -1496,20 +1424,6 @@ fn build_catalog() -> Vec<PhaseDef> {
                 auto,
                 Execution,
                 floor(),
-                false,
-            )
-        },
-        PhaseDef {
-            // domain-extraction's coverage judge: the `test` shape with the coverage pin as data,
-            // and re-verified evidence like `test` (its pin is what re-verifies it).
-            verified_evidence: true,
-            ..entry(
-                "domain_coverage",
-                Test,
-                Evaluator,
-                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
-                Execution,
-                Some(COVERAGE_VALIDATOR_PIN.to_string()),
                 false,
             )
         },
@@ -1696,7 +1610,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_nineteen_entries_of_the_table() {
+    fn the_catalog_is_the_eighteen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -1741,7 +1655,6 @@ mod tests {
                 j("agent"),
                 Some("wicked-garden-qe-security-test-engineer"),
             ),
-            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("9a2c71609c3e3ced"), false, j("agent"), None),
             ("run", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
             ("demo_probe", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
@@ -1803,15 +1716,6 @@ mod tests {
         // (core#810, studio#617) Every shipped entry is a pool of 1 today: the key is pinned so a
         // plan editor can offer a lower pool the day an entry declares one.
         assert!(entries.iter().all(|e| e["pool"] == 1));
-        let cov = by("domain_coverage");
-        assert_eq!(
-            (cov["pinned"].clone(), cov["evidence_floor"].clone()),
-            (true.into(), false.into())
-        );
-        assert_eq!(
-            cov["gate"],
-            serde_json::json!({"human_confirm_if": "verdict_not_pass"})
-        );
         let run = by("run");
         assert_eq!(run["executor"], "tool");
         assert_eq!(
@@ -1825,7 +1729,7 @@ mod tests {
             .filter(|e| e["verified_evidence"] == true)
             .map(|e| e["id"].as_str().unwrap())
             .collect();
-        assert_eq!(verified, ["test", WALKTHROUGH_REVIEW, "domain_coverage"]);
+        assert_eq!(verified, ["test", WALKTHROUGH_REVIEW]);
     }
 
     fn composed(name: &str) -> crate::workflow::WorkflowDef {
@@ -1999,16 +1903,6 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         }
     }
 
-    #[test]
-    fn domain_extract_declares_its_rules_deliverable() {
-        let def = composed("domain-extraction");
-        let extract = def.phases.iter().find(|p| p.id == "extract").unwrap();
-        assert_eq!(
-            extract.required_deliverables,
-            [crate::domain_extraction::RULES_REL]
-        );
-    }
-
     /// #1320: fixing one old failure cannot pay for a new failure in the same file.
     #[cfg(unix)]
     #[test]
@@ -2152,127 +2046,44 @@ chmod +x node_modules/.bin/vitest
         text
     }
 
-    /// M6: the built-in `domain-extraction` composes to the def the shipped JSON describes (the C1
-    /// mapping pins every field; this names the ones the run depends on). coverage carries the
-    /// coverage validator's pin from its catalog entry, so no installed copy can drift
-    /// (FINDING-080); extract is a `produce` creator; domain-graph is the Tool step behind a human
-    /// gate, with the code graph placeholder the planner binds per run.
+    /// (J6 v3) The built-in `domain-extraction` composes to its two host steps and nothing more:
+    /// both `run` Tools on the host with no seat, no gate and no pin, so the plan floor adds no
+    /// creator, critique or deliver step (`run` steps are not creator work), and `domain-run`
+    /// runs garden's `run.py` through the admitted generation's launcher with the store and
+    /// repository bound by placeholder. Fails on the old 9-step preset.
     #[test]
-    fn domain_extraction_composes_with_its_coverage_pin_and_graph_tool() {
-        let def = composed("domain-extraction");
-        let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
-        let coverage = by("coverage");
-        assert_eq!(
-            coverage.validator_pin.as_deref(),
-            Some(COVERAGE_VALIDATOR_PIN)
-        );
-        assert!(coverage.executes_code && coverage.verified_evidence);
-        assert_eq!(coverage.required_deliverables, ["coverage-report.json"]);
-        let extract = by("extract");
-        assert_eq!(
-            (extract.kind, extract.role),
-            (StageKind::Build, PhaseRole::Creator)
-        );
-        let graph = by("domain-graph");
-        match &graph.executor {
-            PhaseExecutor::Tool { cmd } => {
-                assert!(cmd
-                    .iter()
-                    .any(|a| a == crate::workflow::CODE_GRAPH_DB_TOKEN))
-            }
-            other => panic!("domain-graph is a Tool step, got {other:?}"),
-        }
-        assert_eq!(
-            graph.gate,
-            GateSpec::HumanConfirm {
-                unconditional: false
-            }
-        );
-    }
-
-    /// wicked-garden#1362: a seat container has no `wicked-core`, `wicked-estate` or writable
-    /// store, so the host brackets the seat's `extract`: `extract-prepare` writes the worklist
-    /// before it, `extract-apply` checks and writes its rules after it, and coverage waits for the
-    /// apply. Both are Tool steps (the engine's own command on the host, no seat) that run garden's
-    /// scripts through the admitted generation's launcher — never a PATH `wicked-garden` — with the
-    /// store and repository bound by placeholder, whole arguments only.
-    #[test]
-    fn domain_extraction_brackets_the_seat_with_host_steps() {
-        use crate::domain_extraction::{
-            EXTRACT_APPLY_STEP, EXTRACT_NEXT_STEP, EXTRACT_PREPARE_STEP,
-        };
+    fn domain_extraction_composes_to_its_two_host_steps() {
         let def = composed("domain-extraction");
         assert_eq!(
             def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            [
-                "survey",
-                "analyze",
-                EXTRACT_PREPARE_STEP,
-                "extract",
-                "critique",
-                EXTRACT_APPLY_STEP,
-                EXTRACT_NEXT_STEP,
-                "coverage",
-                "domain-graph"
-            ]
+            [DOMAIN_RUN_STEP, "domain-graph"]
         );
-        let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
-        assert_eq!(by("extract").depends_on, [EXTRACT_PREPARE_STEP]);
-        // The page's review sits between the seat and the host's write, judging stated rules
-        // (rig run 7588cff1: a generic critique failed a page of wicked-crew as incomplete).
-        let review = by("critique");
-        assert_eq!(review.role, PhaseRole::Evaluator);
-        assert_eq!(review.depends_on, ["extract"]);
-        assert!(review
-            .instructions
-            .as_deref()
-            .is_some_and(|i| i.contains("one page at a time")
-                && i.contains("Completeness is not your question")));
-        assert_eq!(by(EXTRACT_APPLY_STEP).depends_on, ["critique"]);
-        // domain-graph-3: after each page the host decides the next — the loop back to
-        // extract-prepare (the generation keeps going until the target or the operator's word).
-        assert_eq!(by(EXTRACT_NEXT_STEP).depends_on, [EXTRACT_APPLY_STEP]);
-        assert_eq!(
-            by(EXTRACT_NEXT_STEP).repeat_from.as_deref(),
-            Some(EXTRACT_PREPARE_STEP)
-        );
-        assert!(
-            def.phases
-                .iter()
-                .filter(|p| p.repeat_from.is_some())
-                .count()
-                == 1
-        );
-        assert_eq!(by("coverage").depends_on, [EXTRACT_NEXT_STEP]);
-        for (id, script) in [
-            (EXTRACT_PREPARE_STEP, "scripts/domain/prepare_worklist.py"),
-            (EXTRACT_APPLY_STEP, "scripts/domain/apply_rules.py"),
-            (EXTRACT_NEXT_STEP, "scripts/domain/next_page.py"),
-        ] {
-            let phase = by(id);
-            assert_eq!(phase.role, PhaseRole::Neutral, "{id}");
-            assert_eq!(phase.gate, GateSpec::Auto, "{id}");
-            let PhaseExecutor::Tool { cmd } = &phase.executor else {
-                panic!("{id} is not a Tool step");
-            };
-            assert_eq!(&cmd[..2], ["bash", "-c"], "{id}");
+        for phase in &def.phases {
+            assert_eq!(phase.role, PhaseRole::Neutral, "{}", phase.id);
+            assert_eq!(phase.gate, GateSpec::Auto, "{}", phase.id);
+            assert!(phase.validator_pin.is_none(), "{}", phase.id);
+            assert!(phase.repeat_from.is_none(), "{}", phase.id);
             assert!(
-                cmd[2].starts_with("exec \"${WICKED_GARDEN_ROOT:?")
-                    && cmd[2].contains(&format!("/scripts/wicked-garden\" run {script} "))
-                    && cmd[2].contains("--db \"$1\" --repo-root \"$2\""),
-                "{id}: {}",
-                cmd[2]
-            );
-            assert_eq!(
-                &cmd[3..],
-                [
-                    id,
-                    crate::workflow::CODE_GRAPH_DB_TOKEN,
-                    crate::workflow::REPO_ROOT_TOKEN
-                ],
-                "{id}"
+                matches!(phase.executor, PhaseExecutor::Tool { .. }),
+                "{}",
+                phase.id
             );
         }
+        let PhaseExecutor::Tool { cmd } = &def.phases[0].executor else {
+            unreachable!()
+        };
+        assert!(
+            cmd[2].starts_with("exec \"${WICKED_GARDEN_ROOT:?")
+                && cmd[2].contains("/scripts/wicked-garden\" run scripts/domain/run.py ")
+                && cmd[2].contains("--db \"$1\" --repo-root \"$2\""),
+            "{}",
+            cmd[2]
+        );
+        let plan = crate::plan::PlanSteps {
+            steps: builtin_preset("domain-extraction").unwrap(),
+            ..Default::default()
+        };
+        assert!(!plan.has_creator(), "no creator step");
     }
 
     /// M3/M4: `chat` (read-only) and `onboarding` (tool-only) have no creator step, so the PA does
@@ -2351,7 +2162,6 @@ chmod +x node_modules/.bin/vitest
             .map(|e| e.id.as_str())
             .collect();
         assert_eq!(floored, ["build", "test", "review", "security_review"]);
-        // The only other pin is domain_coverage's coverage pin.
         let other: Vec<_> = catalog()
             .iter()
             .filter_map(|e| match e.validator_pin.as_deref() {
@@ -2359,13 +2169,12 @@ chmod +x node_modules/.bin/vitest
                 Some(pin) => Some((e.id.as_str(), pin)),
             })
             .collect();
-        // The other pins: the two walkthrough pins (WT-C1) and domain_coverage's coverage pin.
+        // The other pins: the two walkthrough pins (WT-C1).
         assert_eq!(
             other,
             [
                 (WALKTHROUGH_PLAN, WALKTHROUGH_LINT_PIN),
                 (WALKTHROUGH_REVIEW, WALKTHROUGH_RESULT_PIN),
-                ("domain_coverage", COVERAGE_VALIDATOR_PIN)
             ]
         );
     }
@@ -2737,9 +2546,8 @@ chmod +x node_modules/.bin/vitest
     /// deliver step and no step that may write: no creator, no Tool, nothing that executes code —
     /// and, with no creator, floor fill adds nothing (no deliver either) even at the top band on a
     /// delivering run. Each ends in a cited-findings critique held for a person when it fails. The
-    /// one exception is Domain (`domain-extraction`), whose writes are bounded to `.wicked/domain/`
-    /// and the project graph and which never delivers (Q17; `tests/domain_extraction_e2e.rs`
-    /// asserts the run's diff).
+    /// one exception is Domain (`domain-extraction`): two host Tools, no seat, no creator, and it
+    /// never delivers (J6 v3).
     #[test]
     fn every_investigate_analyze_and_judge_preset_is_read_only_and_never_delivers() {
         use crate::workflow::{GateCond, GateSpec};
@@ -2808,14 +2616,12 @@ chmod +x node_modules/.bin/vitest
             // Never QE acceptance: a read-only run changes no application.
             assert_eq!(builtin_preset_instruments(name), None, "{name}");
         }
-        // The bounded exception: Domain's one creator is its `produce` extract step.
+        // The bounded exception: Domain has no creator, only its two host Tools.
         let domain = builtin_preset("domain-extraction").unwrap();
-        let creators: Vec<&str> = domain
+        assert!(domain
             .iter()
-            .filter(|s| catalog_entry(&s.catalog).is_some_and(|e| e.role == PhaseRole::Creator))
-            .map(|s| s.catalog.as_str())
-            .collect();
-        assert_eq!(creators, ["produce"]);
+            .all(|s| catalog_entry(&s.catalog).is_some_and(|e| e.role != PhaseRole::Creator)));
+        assert!(domain.iter().all(|s| s.catalog == "run"));
         assert!(!domain
             .iter()
             .any(|s| s.catalog == "deliver" || s.catalog == "build"));

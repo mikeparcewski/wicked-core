@@ -146,6 +146,7 @@ fn make_repo(name: &str) -> PathBuf {
 /// (there, claude created the fix and pi checked it — every seat but codex was a party).
 fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "perPerson(120, 20, 3) returns 840 instead of 48: fix it".into(),

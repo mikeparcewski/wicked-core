@@ -333,6 +333,7 @@ fn launch_with(rig: &mut Rig, run: &str, declared: bool) {
     let plan: PlanSteps = serde_json::from_value(plan).unwrap();
     rig.core()
         .launch_run(LaunchSpec {
+            scope: None,
             problem: "add SSO login".into(),
             clis: vec![cli("a"), cli("b"), cli("c")],
             entity_mode: EntityMode::Shared,

@@ -49,170 +49,132 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 pub const COVERAGE_CRITERION: &str =
     "at least one behavior-bearing node in product code; real requirements (resolved behaviours; risk-flagged placeholders never count, and placeholders may remain) at or above the repository's minimum, which the engine recomputes from the run's store: the repository's own target when one is set (the person may lower it during the run), else the daemon's setting. The engine's recompute decides the share and the minimum; a share, minimum or met/not-met flag written in the work does not. Only when the engine has no store to recompute from must every behaviour be a real requirement, and the engine decides which applies; and at least one requirement genuinely resolved (resolved > 0)";
 
-/// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
-/// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
-/// design), so the HOST prepares the work. It runs garden's `prepare_worklist.py`: `wicked-core
-/// coverage`'s unmapped behaviours in files the repository tracks, hub-first, framed into
-/// [`WORKLIST_REL`] in the run's worktree.
-pub const EXTRACT_PREPARE_STEP: &str = "extract-prepare";
-/// The host step AFTER the seat's `extract`: garden's `apply_rules.py` checks the seat's
-/// [`RULES_REL`] against its closed schema and the store (an unmapped behaviour, in a file git
-/// tracks), refuses the rest, writes what passes with the harness's own validation and authorship,
-/// and writes [`COVERAGE_REPORT_FILE`] for the `coverage` step. Seats never gain write access.
-pub const EXTRACT_APPLY_STEP: &str = "extract-apply";
-/// The host step AFTER `extract-apply` that decides whether the run maps another page
-/// (domain-graph-3): garden's `next_page.py` measures the mapped share against the repository's
-/// target and the generation's budget, prints the one progress line ("Mapping wicked-crew · 3% →
-/// 12% · target 80% · page 2 · about 2 h left"), and ends with the loop's decision line
-/// ([`crate::repeat`]): another page from [`EXTRACT_PREPARE_STEP`] while the share is below the
-/// target and the budget holds, the operator's ask (map more, lower the target for this
-/// repository, or stop) when the budget is spent, and done once the target is reached.
-pub const EXTRACT_NEXT_STEP: &str = "extract-next";
-/// The worklist the host prepares, relative to the run's worktree (garden's `rules_file.WORKLIST_REL`).
-pub const WORKLIST_REL: &str = ".wicked/domain/worklist.json";
-/// The rules the seat states, relative to the run's worktree (garden's `rules_file.RULES_REL`).
-pub const RULES_REL: &str = ".wicked/domain/rules.json";
-/// Q17 paths a mapping run's agents may change.
-pub const MAPPING_WRITE_SET: &[&str] = &[".wicked/domain/", COVERAGE_REPORT_FILE];
+/// The keys a domain-extraction scope may carry (garden `scripts/domain/run.py` `SCOPE_KEYS`, which
+/// re-checks the same shape when the step reads it).
+pub const SCOPE_KEYS: [&str; 4] = ["intent", "phrases", "scope_hash", "description"];
 
-/// The run's own review of what the seat stated, between `extract` and `extract-apply` (a `critique`
-/// step, so the floor adds no generic one). A run maps ONE page of a repository (the worklist,
-/// hub-first, up to garden's default of 300 behaviours): a generic critique judged that page as an
-/// incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
-/// wicked-crew, 8,109 behaviours). Completeness is the coverage step's question, against the
-/// configured minimum; this review judges the rules that were stated.
-/// The skill the mapping preset's one creator step (`extract`, a `produce`) runs: it states rules
-/// into the run's own `.wicked/domain/` files, never a change to the repository (wicked-core#1338,
-/// [`crate::plan::PlanSteps::maps_only`]).
-pub const EXTRACTOR_SKILL: &str = "wicked-garden-domain-extractor";
+/// The largest scope a launch may carry, as compact JSON (garden's `SCOPE_MAX_BYTES`).
+pub const SCOPE_MAX_BYTES: usize = 64 * 1024;
 
-pub const RULES_REVIEW_INSTRUCTIONS: &str =
-    "Review the rules the extract step stated in `.wicked/domain/rules.json` against the units of \
-`.wicked/domain/worklist.json`. This run maps the repository one page at a time: the worklist is \
-the current page, hub-first, of product-code units not yet resolved to a requirement (unmapped \
-first, then placeholders an earlier page left empty or under the confidence threshold). \
-Completeness is not your question. The host measures the share of real requirements after each \
-page and maps the next page until the target is reached; the requirements graph is built in the \
-domain-graph step. When the rules file carries `business_domains` (the repository's business \
-domains, proposed on its first page), judge each domain too: it names an area by what the code \
-does for its users, never a directory, package or module name; its purpose is one line; and its \
-evidence cites real code (entry points, routes, CLI verbs, public-API nouns) that shows that \
-area. Judge each rule's `domain` pick, and each of the file's `assignments`, as part of the \
-work: the area the rule serves, not its file's directory. A domain the code does not show, a \
-catalog of directory names, or picks that mostly follow the directory instead of the rule are \
-problems you list as `ITEM n: FAIL — business_domains — <why>`. Judge each stated rule: it \
-names a unit of the worklist, it states what the \
-business requires rather than describing the code, it is grounded in that unit's source, and its \
-confidence is not inflated. An empty statement is right where the source supports no rule: pure \
-plumbing such as a re-export, a getter or a pass-through wrapper. Most product code does encode \
-a rule (a check, a refusal, a limit, a default, an ordering, a permission, a state change, a \
-field a caller must supply), so an empty statement on a unit whose source shows one is a MISSED \
-rule, and a problem you list. Units in test, data, manifest or document files are not product \
-requirements: the host records whatever is stated for them as unconfirmed, never as a validated \
-requirement, so they are not a reason to fail the page; judge the page on its product-code \
-units, and PASS a page that has none. An extracted rule (kind `Rule`: a Salesforce Flow, a cloud \
-policy) is product behaviour whatever its file's extension, outside test and fixture files: \
-judge it like code. A page's change should hold only this run's own files \
-(`.wicked/domain/worklist.json`, `.wicked/domain/rules.json`, `.wicked/domain/apply-report.json`, \
-`coverage-report.json`): when it does, a break that the repository's existing code already had is \
-not this page's to keep, so a rule it breaks is `RULE <id>: N/A — pre-existing: <file:line> is not \
-in this change`, never an ITEM or a FAIL (wicked-core#1339); a rule the page's own files break \
-(in the rules file, say) is judged as usual. When the change touches any other file, list that \
-file as a problem and judge the rules against it as usual. You judge work another seat did; \
-change no file. List each problem as `ITEM \
-n: FAIL — <symbol> — <why>` (for a missed rule, `missed: <the rule its source shows>`). Judge \
-the PAGE: a weak or code-describing statement is a problem you list, and the host records every \
-statement under its confidence threshold as a risk, never as a validated requirement. End with \
-`VERDICT: PASS` when the page is sound as a whole (most stated rules are grounded in their \
-unit's source and name worklist units, and the units whose source shows a rule got one), or \
-`VERDICT: FAIL` when it is not: rules are invented, name symbols outside the worklist, were \
-composed by a script from names rather than read from the source, most of them describe code \
-instead of requirements, or most sourced product-code units were left empty while their source \
-shows a rule (a page that states almost nothing is not sound, however correct its few rules \
-are), or its `business_domains` hold a domain the cited code does not show or one named after a \
-directory (a stored catalog is never replaced, so an unsound one must not pass).";
-
-/// (core#1724) How much of the page the extract seat's rules file states.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageStated {
-    /// Worklist units with an entry in the rules file: a rule, or an empty statement where the
-    /// unit's source shows none (the extractor skill's own "stated").
-    pub stated: usize,
-    /// Units on the page (the worklist's `units`).
-    pub units: usize,
-    /// The first few unstated units' `symbol_id`s, for the note that asks for them.
-    pub unstated: Vec<String>,
-}
-
-impl PageStated {
-    /// The units the file does not state yet.
-    pub fn left(&self) -> usize {
-        self.units.saturating_sub(self.stated)
-    }
-}
-
-/// How many unstated `symbol_id`s [`page_stated`] keeps for the note.
-const UNSTATED_SAMPLE: usize = 5;
-
-/// (core#1724, review) The largest page file [`page_stated`] reads: the fold runs on the actor, so
-/// it never materializes an outsized file a seat left. Garden's own worklist ceiling (64 MiB); a
-/// real page is about 1 MiB (500 framed units). A worklist past it is not measured; a rules file
-/// past it states nothing (garden's apply step refuses it).
-const PAGE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
-/// (core#1724) The page the extract seat was handed ([`WORKLIST_REL`]) against what its rules file
-/// ([`RULES_REL`]) states, read from the run's worktree. A seat that stated 79 of 500 units and
-/// left the rest "for subsequent pages" passed as a whole page: garden's `--check-rules` exits 0
-/// on a file whose entries conform however few they are, and the page's review judges the rules
-/// stated, not the page's coverage. `None` when there is no readable worklist (nothing to
-/// measure); a rules file that is absent or unreadable states nothing.
-pub fn page_stated(workdir: &std::path::Path) -> Option<PageStated> {
-    let read = |rel: &str| -> Option<serde_json::Value> {
-        let path = workdir.join(rel);
-        let meta = std::fs::symlink_metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() > PAGE_FILE_MAX_BYTES {
-            return None;
-        }
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+/// (J6 C1b) The launch's check of [`crate::LaunchSpec::scope`] against the workflow it names: a
+/// `domain-extraction` launch needs a scope, and no other launch takes one. A scope is a JSON object
+/// of [`SCOPE_KEYS`] only, with `intent` a non-empty string, `phrases` (when present, `null`
+/// included) a list of non-empty strings, `scope_hash` and `description` strings, and at most
+/// [`SCOPE_MAX_BYTES`]. Every refusal names what is wrong.
+pub fn check_launch_scope(
+    workflow: Option<&str>,
+    scope: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let domain = workflow == Some(DOMAIN_EXTRACTION_WORKFLOW_ID);
+    let Some(scope) = scope else {
+        return if domain {
+            Err("domain-extraction needs a scope (Start carries it from the preview)".to_string())
+        } else {
+            Ok(())
+        };
     };
-    let worklist = read(WORKLIST_REL)?;
-    let ids: Vec<&str> = worklist
-        .get("units")?
-        .as_array()?
-        .iter()
-        .filter_map(|u| u.get("symbol_id").and_then(|i| i.as_str()))
+    if !domain {
+        return Err(format!(
+            "a scope is only for a {DOMAIN_EXTRACTION_WORKFLOW_ID} launch; this launch runs {}",
+            workflow.unwrap_or("no preset")
+        ));
+    }
+    let size = serde_json::to_vec(scope).map_or(usize::MAX, |b| b.len());
+    if size > SCOPE_MAX_BYTES {
+        return Err(format!("the scope is over {SCOPE_MAX_BYTES} bytes"));
+    }
+    let Some(obj) = scope.as_object() else {
+        return Err("the scope is not a JSON object".to_string());
+    };
+    let extra: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !SCOPE_KEYS.contains(k))
         .collect();
-    let rules = read(RULES_REL);
-    let have: std::collections::HashSet<&str> = rules
-        .as_ref()
-        .and_then(|r| r.get("rules"))
-        .and_then(|r| r.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|e| e.get("statement").is_some_and(|st| st.is_string()))
-                .filter_map(|e| e.get("symbol_id").and_then(|i| i.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut unique = std::collections::HashSet::new();
-    let mut stated = 0;
-    let mut unstated = Vec::new();
-    for id in ids {
-        if !unique.insert(id) {
-            continue;
-        }
-        if have.contains(id) {
-            stated += 1;
-        } else if unstated.len() < UNSTATED_SAMPLE {
-            unstated.push(id.to_string());
+    if !extra.is_empty() {
+        return Err(format!("the scope has unknown keys: {}", extra.join(", ")));
+    }
+    let filled = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+    if !obj.get("intent").is_some_and(filled) {
+        return Err("the scope has no intent (a non-empty string)".to_string());
+    }
+    if let Some(ph) = obj.get("phrases") {
+        if !ph.as_array().is_some_and(|a| a.iter().all(filled)) {
+            return Err("the scope's phrases are not a list of non-empty strings".to_string());
         }
     }
-    Some(PageStated {
-        stated,
-        units: unique.len(),
-        unstated,
-    })
+    for k in ["scope_hash", "description"] {
+        if obj.get(k).is_some_and(|v| !v.is_string()) {
+            return Err(format!("the scope's {k} is not a string"));
+        }
+    }
+    Ok(())
+}
+
+/// (J6 C1b) Parse a launcher's scope JSON (core-ts `scopeJson`) without losing a field: an object
+/// key that appears twice is refused, as garden's own reader refuses it, where a plain parse would
+/// keep the last one and drop the first silently. Lone surrogate escapes and non-JSON text are
+/// refused by the parser itself. The shape is then [`check_launch_scope`]'s.
+pub fn parse_scope_json(text: &str) -> Result<serde_json::Value, String> {
+    use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
+    use serde_json::Value;
+    struct Strict(Value);
+    struct Strictly;
+    impl<'de> serde::Deserialize<'de> for Strict {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(Strictly).map(Strict)
+        }
+    }
+    impl<'de> Visitor<'de> for Strictly {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+            Ok(Value::Bool(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+            Ok(Value::from(v))
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+            Ok(Value::from(v))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
+            serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .ok_or_else(|| E::custom("a number that is not finite"))
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+            Ok(Value::String(v.to_owned()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Value, E> {
+            Ok(Value::String(v))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Strict(v)) = a.next_element()? {
+                out.push(v);
+            }
+            Ok(Value::Array(out))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+            let mut out = serde_json::Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if out.contains_key(&k) {
+                    return Err(A::Error::custom(format!("a key appears twice: {k}")));
+                }
+                let Strict(v) = a.next_value()?;
+                out.insert(k, v);
+            }
+            Ok(Value::Object(out))
+        }
+    }
+    serde_json::from_str::<Strict>(text)
+        .map(|s| s.0)
+        .map_err(|e| format!("the scope is not JSON: {e}"))
 }
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
@@ -466,7 +428,7 @@ mod tests {
     use super::*;
     use crate::validator::run_validator;
     use crate::validator_vault::{load_validator, pin};
-    use crate::workflow::{GateCond, GateSpec, GateType, PhaseRole};
+    use crate::workflow::GateSpec;
     use crate::{domain::StageKind, plan::plan_from_def};
 
     /// The shipped def: the built-in preset as the engine composes it (X-MIG M6/M11).
@@ -474,202 +436,211 @@ mod tests {
         crate::preset::builtin_preset_def(DOMAIN_EXTRACTION_WORKFLOW_ID)
     }
 
+    /// (J6 v3) The shipped preset is two host steps, `domain-run` then `domain-graph`, with no
+    /// seat unit, no skill, no gate type, no human gate and no validator pin: a run launched with
+    /// no human confirm ends with no gate. Fails on the old 9-step preset.
     #[test]
-    fn shipped_workflow_loads_and_validates() {
+    fn the_shipped_preset_is_two_host_steps_with_no_gate() {
         let def = load_shipped_def();
         assert_eq!(def.id, DOMAIN_EXTRACTION_WORKFLOW_ID);
         let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "survey",
-                "analyze",
-                EXTRACT_PREPARE_STEP,
-                "extract",
-                "critique",
-                EXTRACT_APPLY_STEP,
-                EXTRACT_NEXT_STEP,
-                "coverage",
-                "domain-graph"
-            ],
-            "phases map anti-legacy's front half in order, the seat's extract bracketed by the \
-             host's prepare and apply (wicked-garden#1362)"
-        );
-        // The whole thing must satisfy the DAG/uniqueness invariants (backward-only depends_on).
+        assert_eq!(ids, [crate::catalog::DOMAIN_RUN_STEP, "domain-graph"]);
         def.validate().expect("shipped def is a valid WorkflowDef");
-    }
-
-    #[test]
-    fn coverage_phase_is_the_gated_evaluator_over_the_extract_creator() {
-        // The evaluator≠creator attestation (CONTRACT-3 §2): extract CREATES the rule IP, coverage
-        // EVALUATES it cold under a seat-distinct judge, gated on the approved coverage validator.
-        let def = load_shipped_def();
-        let creator = def
-            .phases
-            .iter()
-            .find(|p| p.role == PhaseRole::Creator)
-            .unwrap();
-        // Two evaluators: the page's review of the stated rules, then the coverage judge.
-        let evaluators: Vec<&str> = def
-            .phases
-            .iter()
-            .filter(|p| p.role == PhaseRole::Evaluator)
-            .map(|p| p.id.as_str())
-            .collect();
-        assert_eq!(evaluators, ["critique", "coverage"]);
-        let evaluator = def.phases.iter().find(|p| p.id == "coverage").unwrap();
-        assert_eq!(creator.id, "extract");
-        // coverage runs after extract (structural ordering — the DAG makes it non-negotiable):
-        // through the host's apply step, which writes what extract stated (wicked-garden#1362).
-        // …and the next-page decision that loops back until the target (domain-graph-3).
-        assert_eq!(evaluator.depends_on, [EXTRACT_NEXT_STEP]);
-        let apply = def
-            .phases
-            .iter()
-            .find(|p| p.id == EXTRACT_APPLY_STEP)
-            .unwrap();
-        assert_eq!(apply.depends_on, ["critique"]);
-
-        let coverage = def.phases.iter().find(|p| p.id == "coverage").unwrap();
-        assert_eq!(coverage.kind, StageKind::Test);
-        assert_eq!(coverage.gate_type, Some(GateType::Execution));
-        assert_eq!(
-            coverage.gate,
-            GateSpec::HumanConfirmIf(GateCond::VerdictNotPass)
-        );
-        assert!(
-            coverage.verified_evidence,
-            "coverage re-verifies evidence at the gate"
-        );
-        assert_eq!(
-            coverage.validator_pin.as_deref(),
-            Some(COVERAGE_VALIDATOR_PIN),
-            "the coverage phase carries the approved configured-minimum coverage pin"
-        );
-    }
-
-    #[test]
-    fn domain_graph_is_gated_human_confirm_after_coverage() {
-        // CONTRACT-3 §2: the target requirements-graph is not built until coverage is a proven terminal;
-        // its design gate is a human confirm.
-        let def = load_shipped_def();
-        let dg = def.phases.iter().find(|p| p.id == "domain-graph").unwrap();
+        for p in &def.phases {
+            assert!(
+                matches!(p.executor, crate::workflow::PhaseExecutor::Tool { .. }),
+                "{} is a host step",
+                p.id
+            );
+            assert!(p.skill_ref.is_none(), "{} runs no skill", p.id);
+            assert_eq!(p.gate_type, None, "{} has no gate type", p.id);
+            assert!(
+                !matches!(
+                    p.gate,
+                    GateSpec::HumanConfirm { .. } | GateSpec::HumanConfirmIf(_)
+                ),
+                "{} has no human gate: {:?}",
+                p.id,
+                p.gate
+            );
+            assert!(p.validator_pin.is_none(), "{} carries no pin", p.id);
+        }
+        let dg = &def.phases[1];
+        assert_eq!(dg.depends_on, [crate::catalog::DOMAIN_RUN_STEP]);
         assert_eq!(dg.kind, StageKind::Build);
-        assert_eq!(dg.gate_type, Some(GateType::Strategy));
-        assert!(matches!(dg.gate, GateSpec::HumanConfirm { .. }));
-        assert!(dg.depends_on.contains(&"coverage".to_string()));
-        // PERSIST FIX (core#237): domain-graph is a DETERMINISTIC Tool that runs `wicked-core
-        // domain-graph --db {code_graph_db}`, which builds AND PERSISTS the domain/requirement/rule
-        // graph into the repo store — not an LLM skill that could hit a non-persisting hermetic
-        // fallback (which left the store empty and the milestone unverifiable). Mutation: revert it
-        // to the `wicked-garden-domain-modeler` skill phase (executor → Agent) and this fails.
-        match &dg.executor {
-            crate::workflow::PhaseExecutor::Tool { cmd } => {
-                assert_eq!(cmd.first().map(String::as_str), Some("wicked-core"));
-                assert!(
-                    cmd.iter().any(|a| a == "domain-graph"),
-                    "runs the domain-graph subcommand"
-                );
-                assert!(
-                    cmd.iter().any(|a| a == crate::workflow::CODE_GRAPH_DB_TOKEN),
-                    "targets the repo's own code graph via {} so the persist lands in the repo store",
-                    crate::workflow::CODE_GRAPH_DB_TOKEN
-                );
-                // The graph is saved into the estate store and nowhere else (operator ruling
-                // 2026-10-31): no `--out` export file in the run. `--repo-root` names the checkout
-                // whose tracked files the corroboration reads.
-                let root = cmd.iter().position(|a| a == "--repo-root").expect("names --repo-root");
-                assert_eq!(cmd[root + 1], crate::workflow::REPO_ROOT_TOKEN);
-                assert!(
-                    !cmd.iter().any(|a| a == "--out"),
-                    "no --out: the run writes no JSON file: {cmd:?}"
-                );
-            }
-            other => panic!(
-                "domain-graph must persist via a `wicked-core domain-graph` Tool executor, not {other:?}"
+        let units = plan_from_def(&def, "map the payments service", "s1");
+        assert_eq!(units.len(), 2);
+        assert!(units
+            .iter()
+            .all(|u| u.tool_cmd.is_some() && u.skill_ref.is_none()));
+    }
+
+    /// (J6 C1b) `domain-run` runs garden's `run.py` from the admitted garden root and reads the
+    /// scope file core wrote into the step's channel directory, refusing by name when there is
+    /// none. `domain-graph` builds into the repository's store (`--db`) for the checkout
+    /// (`--repo-root`) and writes no file into the run.
+    #[test]
+    fn domain_run_reads_the_scope_core_hands_it_and_domain_graph_builds_into_the_store() {
+        let def = load_shipped_def();
+        let cmd = |i: usize| match &def.phases[i].executor {
+            crate::workflow::PhaseExecutor::Tool { cmd } => cmd.clone(),
+            other => panic!("not a Tool: {other:?}"),
+        };
+        let run = cmd(0);
+        assert_eq!(run[..2], ["bash", "-c"]);
+        assert!(
+            run[2].contains("run scripts/domain/run.py --db \"$1\" --repo-root \"$2\" --scope \"${WICKED_DOMAIN_SCOPE:?"),
+            "{run:?}"
+        );
+        assert!(run[2].contains("${WICKED_GARDEN_ROOT:?"), "{run:?}");
+        assert_eq!(
+            run[3..],
+            [
+                crate::catalog::DOMAIN_RUN_STEP,
+                crate::workflow::CODE_GRAPH_DB_TOKEN,
+                crate::workflow::REPO_ROOT_TOKEN
+            ]
+        );
+        assert_eq!(crate::model_call::SCOPE_ENV, "WICKED_DOMAIN_SCOPE");
+        let graph = cmd(1);
+        assert_eq!(
+            graph,
+            [
+                "wicked-core",
+                "domain-graph",
+                "--db",
+                crate::workflow::CODE_GRAPH_DB_TOKEN,
+                "--repo-root",
+                crate::workflow::REPO_ROOT_TOKEN
+            ]
+        );
+    }
+
+    /// (J6 C1b, codex r1) A launcher's scope text parses without losing a field: a key twice, at
+    /// the top or nested, is refused by name, as garden refuses it; a lone surrogate and non-JSON
+    /// are refused; a well-formed scope parses to the same value a plain parse gives.
+    #[test]
+    fn a_scope_with_a_key_twice_or_bad_text_is_refused_at_parse() {
+        for (text, why) in [
+            (
+                r#"{"intent":"a","scope_hash":"h","scope_hash":""}"#,
+                "a key appears twice: scope_hash",
             ),
+            (
+                r#"{"intent":"a","intent":"b"}"#,
+                "a key appears twice: intent",
+            ),
+            (
+                r#"{"intent":"a","phrases":["x"],"phrases":[]}"#,
+                "a key appears twice: phrases",
+            ),
+            (
+                r#"{"intent":"a","x":{"k":1,"k":2}}"#,
+                "a key appears twice: k",
+            ),
+            (r#"{"intent":"\ud800"}"#, "the scope is not JSON"),
+            ("not json", "the scope is not JSON"),
+        ] {
+            let err = parse_scope_json(text).unwrap_err();
+            assert!(err.contains(why), "{text}: {err}");
         }
-        assert!(
-            dg.skill_ref.is_none(),
-            "domain-graph is a deterministic Tool, not a skill (no LLM hermetic-fallback lane)"
+        let text = r#"{"intent":"refunds","phrases":["remboursé"],"n":[1,-2,2.5,null,true]}"#;
+        assert_eq!(
+            parse_scope_json(text).unwrap(),
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
         );
     }
 
+    /// (J6 C1b, coord ruling B') The launch's scope check, refusal by refusal. Each case fails
+    /// without its clause.
     #[test]
-    fn skill_phases_carry_a_garden_skill_ref_in_dash_form() {
-        // CONTRACT-4 §3 SKILL NAMING: dash-form `wicked-<product>-<skill>`, never a colon namespace.
-        // The four AGENTIC front phases are garden skills; `domain-graph` is NOT — it is a
-        // deterministic `wicked-core domain-graph` Tool executor (core#237 persist fix) and carries
-        // no skill_ref (asserted in `domain_graph_is_gated_human_confirm_after_coverage`).
-        let def = load_shipped_def();
-        // Retargeted to the REAL garden `domain` surface (core#43) — renamed from `modernize`.
-        let expected = [
-            ("survey", "wicked-garden-domain"),
-            ("analyze", "wicked-garden-domain"),
-            ("extract", "wicked-garden-domain-extractor"),
-            ("coverage", "wicked-garden-domain-coverage"),
-        ];
-        for (phase_id, skill) in expected {
-            let phase = def.phases.iter().find(|p| p.id == phase_id).unwrap();
+    fn a_launch_scope_is_checked_and_each_refusal_names_why() {
+        use serde_json::json;
+        let de = Some(DOMAIN_EXTRACTION_WORKFLOW_ID);
+        let ok = json!({"intent": "payments", "phrases": ["refund"], "scope_hash": "ab", "description": "d"});
+        assert_eq!(check_launch_scope(de, Some(&ok)), Ok(()));
+        assert_eq!(
+            check_launch_scope(de, Some(&json!({"intent": "x"}))),
+            Ok(())
+        );
+        // No scope: refused on domain-extraction, fine elsewhere.
+        assert_eq!(
+            check_launch_scope(de, None).unwrap_err(),
+            "domain-extraction needs a scope (Start carries it from the preview)"
+        );
+        assert_eq!(check_launch_scope(Some("feature"), None), Ok(()));
+        assert_eq!(check_launch_scope(None, None), Ok(()));
+        // A scope on another launch is refused, never dropped.
+        let other = check_launch_scope(Some("feature"), Some(&ok)).unwrap_err();
+        assert!(
+            other.contains("only for a domain-extraction launch") && other.contains("feature"),
+            "{other}"
+        );
+        assert!(check_launch_scope(None, Some(&ok))
+            .unwrap_err()
+            .contains("no preset"));
+        for (bad, why) in [
+            (json!("payments"), "the scope is not a JSON object"),
+            (json!(["payments"]), "the scope is not a JSON object"),
+            (
+                json!({"intent": "x", "extra": 1, "more": 2}),
+                "the scope has unknown keys: extra, more",
+            ),
+            (json!({}), "the scope has no intent (a non-empty string)"),
+            (
+                json!({"intent": "  "}),
+                "the scope has no intent (a non-empty string)",
+            ),
+            (
+                json!({"intent": 3}),
+                "the scope has no intent (a non-empty string)",
+            ),
+            (
+                json!({"intent": null}),
+                "the scope has no intent (a non-empty string)",
+            ),
+            (
+                json!({"intent": "x", "phrases": null}),
+                "the scope's phrases are not a list of non-empty strings",
+            ),
+            (
+                json!({"intent": "x", "phrases": "refund"}),
+                "the scope's phrases are not a list of non-empty strings",
+            ),
+            (
+                json!({"intent": "x", "phrases": ["refund", " "]}),
+                "the scope's phrases are not a list of non-empty strings",
+            ),
+            (
+                json!({"intent": "x", "phrases": [1]}),
+                "the scope's phrases are not a list of non-empty strings",
+            ),
+            (
+                json!({"intent": "x", "scope_hash": 1}),
+                "the scope's scope_hash is not a string",
+            ),
+            (
+                json!({"intent": "x", "description": null}),
+                "the scope's description is not a string",
+            ),
+        ] {
             assert_eq!(
-                phase.skill_ref.as_deref(),
-                Some(skill),
-                "{phase_id} skill_ref"
-            );
-            assert!(
-                !skill.contains(':'),
-                "{skill} must be dash-form, not a colon namespace"
-            );
-            assert!(
-                skill.starts_with("wicked-garden-"),
-                "{skill} is a garden skill"
+                check_launch_scope(de, Some(&bad)).unwrap_err(),
+                why,
+                "{bad}"
             );
         }
-        // The `wicked-brain-*` allowed_skills are RETIRED — every phase's allowlist is now empty, so a
-        // leftover on ANY phase (not just the two pinned below) fails CI (reviewed correction).
-        for phase in &def.phases {
-            assert!(
-                phase.allowed_skills.is_empty(),
-                "phase {} still carries a dead allowed_skills entry: {:?}",
-                phase.id,
-                phase.allowed_skills
-            );
-        }
-    }
-
-    #[test]
-    fn plan_from_def_carries_skill_refs_and_roles_onto_units() {
-        // SkillRef wiring (deliverable 3): the phase skill_ref + least-privilege allowed_skills ride onto
-        // the WorkUnit so the cli-runner invokes the right garden skill under the right brain-engine scope.
-        let def = load_shipped_def();
-        let units = plan_from_def(&def, "mine the legacy payments service", "s1");
-        assert_eq!(units.len(), 9);
-        let (extract, coverage) = (&units[3], &units[7]);
+        // The size bound is on the compact JSON: one byte over refuses, the bound itself passes.
+        let pad = |n: usize| json!({"intent": "x", "description": "d".repeat(n)});
+        let base = serde_json::to_vec(&pad(0)).unwrap().len();
         assert_eq!(
-            extract.skill_ref.as_deref(),
-            Some("wicked-garden-domain-extractor")
-        );
-        assert!(
-            extract.allowed_skills.is_empty(),
-            "the retired brain allowlist is gone"
+            check_launch_scope(de, Some(&pad(SCOPE_MAX_BYTES - base))),
+            Ok(())
         );
         assert_eq!(
-            coverage.skill_ref.as_deref(),
-            Some("wicked-garden-domain-coverage")
+            check_launch_scope(de, Some(&pad(SCOPE_MAX_BYTES - base + 1))).unwrap_err(),
+            "the scope is over 65536 bytes"
         );
-        assert!(coverage.allowed_skills.is_empty());
-        // The evaluator≠creator role survives onto the units.
-        assert_eq!(extract.role, PhaseRole::Creator);
-        assert_eq!(coverage.role, PhaseRole::Evaluator);
-        // The host steps are Tool units: no seat, no skill (wicked-garden#1362).
-        assert_eq!(units[4].role, PhaseRole::Evaluator, "the page's own review");
-        for host in [&units[2], &units[5]] {
-            assert!(
-                host.tool_cmd.is_some() && host.skill_ref.is_none(),
-                "{}",
-                host.id
-            );
-        }
     }
 
     #[test]
@@ -691,53 +662,6 @@ mod tests {
     /// That is FINDING-050's shape: a denial whose stated reason does not match its cause. Both
     /// strings are inputs to the content-address, so they cannot drift silently in the pin — but
     /// they can drift in MEANING, which is what this asserts.
-    /// The page review agrees with the denominator (core#1233, codex r3 on #1234): tests and
-    /// data files are not product requirements, an extracted rule in a data-extension file is,
-    /// and a page that leaves most sourced product units empty is not passed.
-    /// wicked-core#1339 (run 92749083): a page whose change holds only its own files leaves a break
-    /// that existing code already had as N/A pre-existing, never an ITEM or a FAIL; its own files
-    /// and any other file are judged as usual. Falsifier: drop the sentence and the page reviewer
-    /// fails a mapping page on the repository's existing JSDoc.
-    #[test]
-    fn the_page_review_judges_the_page_not_the_code_it_did_not_touch() {
-        let r = RULES_REVIEW_INSTRUCTIONS
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        for f in [
-            WORKLIST_REL,
-            RULES_REL,
-            ".wicked/domain/apply-report.json",
-            COVERAGE_REPORT_FILE,
-        ] {
-            assert!(r.contains(&format!("`{f}`")), "{f}");
-        }
-        assert!(r.contains("`RULE <id>: N/A — pre-existing: <file:line> is not in this change`, never an ITEM or a FAIL"), "{r}");
-        assert!(
-            r.contains(
-                "a rule the page's own files break (in the rules file, say) is judged as usual"
-            ),
-            "{r}"
-        );
-        assert!(
-            r.contains("When the change touches any other file, list that file as a problem"),
-            "{r}"
-        );
-    }
-
-    #[test]
-    fn the_page_review_matches_what_the_minimum_counts() {
-        let r = RULES_REVIEW_INSTRUCTIONS;
-        assert!(r.contains("not product requirements"), "{r}");
-        assert!(r.contains("An extracted rule (kind `Rule`"), "{r}");
-        assert!(r.contains("judge it like code"), "{r}");
-        assert!(r.contains("MISSED rule"), "{r}");
-        assert!(
-            r.contains("most sourced product-code units were left empty"),
-            "{r}"
-        );
-    }
-
     #[test]
     fn the_criterion_describes_the_requirement_the_script_enforces() {
         let script_checks_non_vacuity =
@@ -919,7 +843,7 @@ mod tests {
 
     #[test]
     fn embedded_pin_matches_the_approved_vaulted_validator() {
-        // The load-bearing tie: the pin the built-in preset's coverage step carries == the pin of the
+        // The load-bearing tie: the embedded COVERAGE_VALIDATOR_PIN == the pin of the
         // APPROVED coverage validator, minted through the real vault provision/approve path. A drifted
         // script would change the pin and fail here (tamper-evidence at author time).
         use wicked_apps_core::open_store;
@@ -941,14 +865,7 @@ mod tests {
             .expect("present");
         assert!(loaded.approved, "the vaulted copy is approved");
         assert_eq!(pin(&loaded), COVERAGE_VALIDATOR_PIN);
-
-        // And the JSON's coverage phase carries exactly this pin.
-        let def = load_shipped_def();
-        let coverage = def.phases.iter().find(|p| p.id == "coverage").unwrap();
-        assert_eq!(
-            coverage.validator_pin.as_deref(),
-            Some(approved_pin.as_str())
-        );
+        // (J6 C1b) The shipped preset no longer pins it; C2 retires this closure.
 
         let _ = std::fs::remove_dir_all(&dir);
     }

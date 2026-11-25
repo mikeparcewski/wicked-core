@@ -132,6 +132,7 @@ const BUILD_TWO_REVIEWS: &str = r#"{"id":"benched-seat-two-reviews","phases":[
 /// no gate ord that matches, so nothing pauses before the work.
 fn launch(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Fix the thing, then check it twice.".into(),

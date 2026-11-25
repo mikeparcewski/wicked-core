@@ -83,6 +83,7 @@ fn seat(key: &str, script: &std::path::Path) -> AgenticCli {
 
 fn spec(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing, then review it.".into(),

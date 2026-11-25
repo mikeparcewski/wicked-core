@@ -181,6 +181,7 @@ fn spec(session_id: &str, problem: &str) -> LaunchSpec {
 
 fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: problem.into(),

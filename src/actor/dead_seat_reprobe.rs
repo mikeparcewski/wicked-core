@@ -270,6 +270,7 @@ mod tests {
             }),
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,

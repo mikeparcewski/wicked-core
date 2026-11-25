@@ -251,6 +251,7 @@ fn two_answers() -> PlanSteps {
 
 fn spec(run: &str, clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         problem: "what does the retire flow do".into(),
         clis,
         entity_mode: EntityMode::Shared,

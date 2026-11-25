@@ -117,6 +117,7 @@ fn boot(db: String) -> Core {
 
 fn spec(session: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two. Do step three".into(),

@@ -41,6 +41,7 @@ macro_rules! eprintln {
 mod conformance;
 pub mod corroboration;
 mod domain;
+pub mod domain_extract;
 mod domain_model;
 mod drift;
 
@@ -109,15 +110,22 @@ pub use domain_model::{
     load_domain_graph_with_build, load_domain_graph_with_units, meets_minimum,
     min_coverage_pct_from_env, model_coverage, parse_min_coverage_pct, persist_domain_model,
     persist_domain_model_expecting, real_pct, recompute_front_half_coverage,
-    recompute_front_half_coverage_for_rows, recompute_front_half_coverage_with,
-    repo_min_coverage_pct, retire_requirement, set_repo_min_coverage_pct,
-    stabilize_requirement_ids, touched_requirements, weighted_pct, BusinessDomain,
-    BusinessDomainRef, CoverageConfig, CoverageReport, Domain, DomainBuildOptions,
-    DomainGraphBuild, DomainModel, Entity, EntityField, ErrorPath, ListedRow, ListedRows,
-    Metadata as DomainMetadata, ModelCoverage, PerApp, Provenance as DomainProvenance, Requirement,
-    RequirementLinks, RequirementUnits, RetiredRequirement, Rule as DomainRule, SatisfiedByLink,
-    TouchedRequirement, UnaccountedNode, Uncounted, Validation, BUSINESS_DOMAIN_ANN,
-    DEFAULT_MIN_COVERAGE_PCT, DEFAULT_RESOLVE_THRESHOLD, MIN_COVERAGE_ENV,
+    recompute_front_half_coverage_for_rows, recompute_front_half_coverage_for_rows_at,
+    recompute_front_half_coverage_with, repo_min_coverage_pct, retire_requirement,
+    set_repo_min_coverage_pct, stabilize_requirement_ids, stabilize_requirement_ids_with,
+    touched_requirements, weighted_pct, BusinessDomain, BusinessDomainRef, CoverageConfig,
+    CoverageReport, Domain, DomainBuildOptions, DomainGraphBuild, DomainModel, Entity, EntityField,
+    ErrorPath, ListedRow, ListedRows, Metadata as DomainMetadata, ModelCoverage, PerApp,
+    Provenance as DomainProvenance, Requirement, RequirementLinks, RequirementUnits,
+    RetiredRequirement, Rule as DomainRule, SatisfiedByLink, TouchedRequirement, UnaccountedNode,
+    Uncounted, Validation, BUSINESS_DOMAIN_ANN, DEFAULT_MIN_COVERAGE_PCT,
+    DEFAULT_RESOLVE_THRESHOLD, MIN_COVERAGE_ENV,
+};
+// J6 v3: the model garden's domain-run writes, read into domain-model 1.2.0, and the rulings on it.
+pub use domain_extract::{
+    build_and_persist, build_extract_model, now_unix, statement_key, write_ruling, Accounting,
+    BuildOutcome, ExtractIndex, ExtractMeta, RulingRefusal, RulingRequest, StatementView,
+    SCHEMA_V3,
 };
 // Corroboration of each requirement (operator ruling 2026-10-31, "validation by duplication").
 pub use corroboration::{Corroboration, CorroborationIndex, Unconfirmed, VALIDATED_MIN_SOURCES};

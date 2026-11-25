@@ -473,42 +473,6 @@ impl PlanSteps {
         self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
 
-    /// (wicked-core#1338; DES-CATALOG-002 Q17) A MAPPING plan: it has the mapping step (a `produce`
-    /// that runs the domain extractor, [`crate::domain_extraction::EXTRACTOR_SKILL`], with no
-    /// authored instructions: it states rules into the run's own `.wicked/domain/` files and the
-    /// repository's store), every other creator is the `domain_coverage` judge as shipped (it runs
-    /// code only to write its own report), and no step does code work ([`code_work_step`]). Such a
-    /// plan has nothing to deliver, so it takes no `deliver` step, from the launch or the floor,
-    /// unless the floor adds a creator to it ([`floor_fill`]). A plan with any other creator
-    /// delivers as before.
-    pub fn maps_only(&self) -> bool {
-        self.maps_only_in(crate::catalog::catalog())
-    }
-
-    /// [`Self::maps_only`] against `catalog`.
-    pub fn maps_only_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
-        let mapping = |s: &PlanStep| {
-            s.catalog == "produce"
-                && s.skill_ref.as_deref() == Some(crate::domain_extraction::EXTRACTOR_SKILL)
-                && s.instructions.is_none()
-        };
-        // The coverage judge as shipped (codex r2): any other skill or authored instructions make
-        // it code work, which delivers.
-        let judge = |s: &PlanStep| {
-            s.catalog == "domain_coverage"
-                && s.skill_ref.as_deref() == Some(crate::catalog::DOMAIN_COVERAGE_SKILL)
-                && s.instructions.is_none()
-                && !code_work_step(catalog, s)
-        };
-        self.steps.iter().any(mapping)
-            && !self.steps.iter().any(|s| code_work_step(catalog, s))
-            && self
-                .steps
-                .iter()
-                .filter(|s| is_creator_step(catalog, s))
-                .all(|s| mapping(s) || judge(s))
-    }
-
     /// (core#649 option A) The plan has a creator step, EVERY creator step declares
     /// `writes_nothing: true`, and it has no `run` step: no step of it changes the run's tree, so
     /// an empty scope is an honest answer. A `run` step is an arbitrary Tool command that the diff
@@ -530,35 +494,13 @@ impl PlanSteps {
 }
 
 /// A step that does CODE WORK, judged on the phase it composes to: its entry executes code or the
-/// step raises `executes_code` — except an evaluator whose evidence its OWN validator re-derives: a
-/// `verified_evidence` entry pinned to something other than the diff floor (domain-extraction's
-/// `domain_coverage`, which runs code only to write the report its coverage validator reads).
-/// Counting it inserted a `build` creator into every domain-extraction plan (DES-TEAMING-002 M6).
-/// Any other evaluator raised to `executes_code` (a `test` that writes) still counts: its write
-/// posture is not narrowed. The exemption holds only for the judge as shipped (codex on the M6
-/// rebase, P1): a step that authors its own `instructions`, or runs any skill but the coverage
-/// skill, could write source under the evaluator's write posture, so it counts as code work. The
-/// ONE predicate [`floor_types`] and [`floor_fill`]'s security-review refusal (core#846) share: a
-/// plan with no such step is a NON-CODE plan.
+/// step raises `executes_code`. The ONE predicate [`floor_types`] and [`floor_fill`]'s
+/// security-review refusal (core#846) share: a plan with no such step is a NON-CODE plan.
 fn code_work_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
-    let self_verifying = |e: &crate::workflow::PhaseDef| {
-        e.role == crate::workflow::PhaseRole::Evaluator
-            && e.verified_evidence
-            && e.validator_pin
-                .as_deref()
-                .is_some_and(|p| p != crate::builtin_floors::EVIDENCE_FLOOR_PIN)
-            && step.instructions.is_none()
-            && step
-                .skill_ref
-                .as_deref()
-                .is_none_or(|s| s == crate::catalog::DOMAIN_COVERAGE_SKILL)
-    };
     catalog
         .iter()
         .find(|e| e.id == step.catalog)
-        .is_some_and(|e| {
-            !self_verifying(e) && (step.executes_code == Some(true) || e.executes_code)
-        })
+        .is_some_and(|e| step.executes_code == Some(true) || e.executes_code)
 }
 
 /// (§8.5, T3 round 10) A step that CHANGES something, judged on the phase it COMPOSES to — never
@@ -1197,7 +1139,6 @@ pub fn compose(
             catalog: s.catalog.clone(),
         });
     }
-    let maps_only = plan.maps_only_in(catalog);
     let mut phases = Vec::with_capacity(plan.steps.len());
     for (i, step) in plan.steps.iter().enumerate() {
         let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
@@ -1208,16 +1149,7 @@ pub fn compose(
         };
         let mut phase = apply_step(entry, step)?;
         phase.catalog = Some(entry.id.clone());
-        phase.write_set = if maps_only
-            && !matches!(&phase.executor, crate::workflow::PhaseExecutor::Tool { .. })
-        {
-            crate::domain_extraction::MAPPING_WRITE_SET
-                .iter()
-                .map(|p| p.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        phase.write_set = Vec::new();
         let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
         if step.depends_on.is_none()
             && entry.role == crate::workflow::PhaseRole::Evaluator
@@ -1575,8 +1507,7 @@ pub struct FloorFilled {
 }
 
 /// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
-/// step; on a non-code run (no step does code work, see [`code_work_step`]: a self-verifying
-/// evaluator that runs code does not count) `produce` fills the build slot and `critique` the review
+/// step; on a non-code run (no step does code work, see [`code_work_step`]) `produce` fills the build slot and `critique` the review
 /// slot, and the band's `security_review` is left out — that entry carries the DIFF evidence floor,
 /// which a run that writes no code can never satisfy, so its denial gate's approve-means-retry
 /// loops forever (core#649, X-MIG M6); nor may a rule or an author add it there (core#846,
@@ -1808,22 +1739,6 @@ pub fn floor_fill(
                 floor.push(ty.clone());
                 qe_floor.push(ty.clone());
             }
-        }
-    }
-    // wicked-core#1338: a mapping plan delivers nothing, decided on the plan the floor leaves: the
-    // floor's `deliver` goes only while the floor adds no creator to it (codex r2: a floor-added
-    // `build` or `produce` is work to hand over).
-    if plan.maps_only_in(catalog) {
-        // The planner's one creator predicate (codex r3): a role, or a non-Tool entry that runs code.
-        let adds_creator = floor.iter().any(|t| {
-            let added = PlanStep {
-                catalog: t.clone(),
-                ..PlanStep::default()
-            };
-            is_creator_step(catalog, &added) && !plan.steps.iter().any(|s| &s.catalog == t)
-        });
-        if !adds_creator {
-            floor.retain(|t| t != "deliver");
         }
     }
     // Both halves are in catalog order; the union is too (a stable sort keeps the band's own
@@ -2201,9 +2116,11 @@ mod tests {
         assert_eq!(plan_units("Upgrade to version 3.5 now", "s").len(), 1);
     }
 
+    /// (J6 v3) The domain-extraction preset is two host Tools: the floor adds nothing to it at a
+    /// mid band (no creator, critique or deliver step), and its units carry no write set.
     #[test]
-    fn mapping_agent_units_carry_the_q17_write_set() {
-        let mut plan = PlanSteps {
+    fn the_domain_extraction_preset_floor_fills_to_its_two_host_steps() {
+        let plan = PlanSteps {
             steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
             ..PlanSteps::default()
         };
@@ -2225,24 +2142,15 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(filled.floor.is_empty(), "{:?}", filled.floor);
         let units = plan_from_def(&filled.def, "map", "mapping");
-        for unit in &units {
-            if unit.tool_cmd.is_none() {
-                assert_eq!(unit.write_set, [".wicked/domain/", "coverage-report.json"]);
-            } else {
-                assert!(unit.write_set.is_empty());
-            }
-        }
-        plan.steps.push(PlanStep {
-            catalog: "build".into(),
-            id: "fix".into(),
-            depends_on: Some(vec!["domain-graph".into()]),
-            ..PlanStep::default()
-        });
-        let def = compose(catalog, &plan).unwrap();
-        assert!(plan_from_def(&def, "build", "ordinary")
+        assert_eq!(
+            units.iter().map(|u| u.phase_id()).collect::<Vec<_>>(),
+            [Some(crate::catalog::DOMAIN_RUN_STEP), Some("domain-graph")]
+        );
+        assert!(units
             .iter()
-            .all(|u| u.write_set.is_empty()));
+            .all(|u| u.tool_cmd.is_some() && u.write_set.is_empty()));
     }
 
     // ---- plan_from_def: the data-driven planner (Law 2) ----
@@ -3374,7 +3282,7 @@ mod tests {
     }
 
     /// compose's implicit inputs (coordinator decision on #619): a step with no `depends_on`
-    /// gets one rule, authored or floor-inserted. An evaluator (incl. `domain_coverage`) depends on
+    /// gets one rule, authored or floor-inserted. An evaluator (incl. `critique`) depends on
     /// every build/produce step before it, `deliver` on the step just before it, anything else on
     /// nothing; an explicit `depends_on` (even `[]`) always wins.
     #[test]
@@ -3407,13 +3315,13 @@ mod tests {
                 ("deliver".to_string(), s(&["sec"])),
             ]
         );
-        // domain_coverage is an evaluator: it depends on the produce step before it.
+        // critique is an evaluator: it depends on the produce step before it.
         assert_eq!(
             deps(serde_json::json!({"steps": [
-                {"catalog": "produce", "id": "extract"},
-                {"catalog": "domain_coverage", "id": "coverage"}
+                {"catalog": "produce", "id": "draft"},
+                {"catalog": "critique", "id": "critique"}
             ]}))[1],
-            ("coverage".to_string(), s(&["extract"]))
+            ("critique".to_string(), s(&["draft"]))
         );
         // An explicit depends_on wins, including an explicit empty one.
         assert_eq!(
@@ -4867,30 +4775,10 @@ mod tests {
             assert!(f.floor.iter().any(|t| t == "security_review"));
         }
 
-        /// (M6) A self-verifying evaluator that executes code does not make the run code work:
-        /// domain-extraction's coverage judge runs code to write the report its own validator reads,
-        /// and its plan already has its creator (`produce`). No `build` creator is inserted. A `test`
-        /// evaluator raised to `executes_code` still does (codex review on M6: its writes are not
-        /// narrowed).
+        /// An evaluator raised to `executes_code` makes the run code work: its writes are not
+        /// narrowed, so the floor adds the build creator and the review (codex review on M6).
         #[test]
-        fn t2_a_code_running_evaluator_does_not_make_a_code_run() {
-            let p = plan(json!({"steps": [
-                {"catalog": "produce", "id": "extract"},
-                {"catalog": "domain_coverage", "id": "coverage", "executes_code": true}
-            ]}));
-            for score in [0, 30, 100] {
-                let f = fill(&p, score, &AUTO, None).unwrap();
-                assert!(
-                    !f.floor.iter().any(|t| t == "build"),
-                    "{score}: {:?}",
-                    f.floor
-                );
-                assert!(
-                    f.floor.iter().any(|t| t == "produce"),
-                    "{score}: {:?}",
-                    f.floor
-                );
-            }
+        fn t2_an_evaluator_raised_to_executes_code_makes_a_code_run() {
             let code = plan(json!({"steps": [{"catalog": "build", "id": "b"}]}));
             assert!(fill(&code, 0, &AUTO, None)
                 .unwrap()
@@ -4904,35 +4792,6 @@ mod tests {
             let f = fill(&writing_test, 30, &AUTO, None).unwrap();
             assert!(f.floor.iter().any(|t| t == "build"), "{:?}", f.floor);
             assert!(f.floor.iter().any(|t| t == "review"), "{:?}", f.floor);
-            // (codex, M6 rebase) The exemption is the judge as shipped: authored instructions or
-            // another skill make the same step code work.
-            for extra in [
-                json!({"instructions": "edit src/lib.rs, then write the report"}),
-                json!({"skill_ref": "wicked-garden-engineering"}),
-            ] {
-                let mut coverage = json!({"catalog": "domain_coverage", "id": "coverage",
-                                          "executes_code": true});
-                for (k, v) in extra.as_object().unwrap() {
-                    coverage[k] = v.clone();
-                }
-                let p = plan(json!({"steps": [{"catalog": "produce", "id": "extract"}, coverage]}));
-                let f = fill(&p, 30, &AUTO, None).unwrap();
-                assert!(
-                    f.floor.iter().any(|t| t == "build"),
-                    "{extra}: {:?}",
-                    f.floor
-                );
-            }
-            let shipped = plan(json!({"steps": [
-                {"catalog": "produce", "id": "extract"},
-                {"catalog": "domain_coverage", "id": "coverage", "executes_code": true,
-                 "skill_ref": crate::catalog::DOMAIN_COVERAGE_SKILL}
-            ]}));
-            assert!(!fill(&shipped, 30, &AUTO, None)
-                .unwrap()
-                .floor
-                .iter()
-                .any(|t| t == "build"));
         }
 
         /// A floor-added step whose natural id is taken gets a distinct one.

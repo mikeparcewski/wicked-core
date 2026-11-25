@@ -2886,7 +2886,7 @@ mod workflow_def_tests {
                 }
             }
         }
-        // Vacuity guard: feature/test, bug/verify, migration/verify, domain-extraction/coverage.
+        // Vacuity guard: feature/test, bug/verify, migration/verify, and the walkthrough review.
         assert!(
             declared >= 4,
             "expected the shipped defs to declare verified_evidence somewhere; found {declared}"

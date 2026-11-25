@@ -426,6 +426,7 @@ fn assert_every_input_carries_the_ban(inputs: &Inputs, preset: &str) {
 
 fn spec(run_id: &str, workflow: &str, repo: &str, clis: &[&str]) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Open escalations as a KPI".into(),

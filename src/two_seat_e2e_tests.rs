@@ -135,6 +135,7 @@ fn make_repo(name: &str) -> PathBuf {
 
 fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "perPerson(120, 20, 3) returns 840 instead of 48: fix it".into(),

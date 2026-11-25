@@ -10,16 +10,16 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
 | File | Role | Own contract version (`$id` / `metadata.schema_version`) |
 |---|---|---|
 | `conformance-rules.schema.json` | PRESCRIPTIVE rules applied TO code — the wire format `ConformanceRule` mirrors | 1.2.0 |
-| `domain-model.schema.json` | DESCRIPTIVE domain model mined FROM code — garden STEERS on it | 1.1.0 |
+| `domain-model.schema.json` | DESCRIPTIVE domain model mined FROM code — garden STEERS on it | 1.2.0 |
 | `coverage.schema.json` | Front-half coverage report wire shape | 1.0.0 |
 | `vocabulary.schema.json` | Domain vocabulary spine | 1.0.0 |
-| `VERSION` | Semver of the whole **bundle** (currently `1.3.2`) | — |
+| `VERSION` | Semver of the whole **bundle** (currently `1.4.0`) | — |
 
 ## Version semantics (two versions, deliberately)
 
 - **Bundle version** (`VERSION` file): bumps when ANY file in the bundle changes
   (additive optional field = patch; new required field = minor; invariant change
-  = major). Currently `1.3.2` (1.0.0→1.1.0 added `conformance-rules.schema.json`
+  = major). Currently `1.4.0` (1.0.0→1.1.0 added `conformance-rules.schema.json`
   to the bundle — archive commit 75735b9; 1.2.0→1.2.1 is the additive, optional
   DC-S1 project-rule fields of conformance-rules 1.2.0; 1.2.1→1.2.2 is the additive
   `operator-words` rule source kind of conformance-rules 1.3.0, core#827; 1.2.2→1.2.3 is
@@ -35,7 +35,7 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
   `metadata.product_only`: the build left tests, data, manifests and documents out (an extracted
   rule counts whatever its file). Set by the build, never by a read's coverage relabel; absent means
   a build from before the field (no claim). A row carried from an earlier build because its unit
-  left the index is flagged `unindexed` on the read's rows and keeps that build's verdict (core#1236).
+  left the index is flagged `unindexed` on the read's rows and keeps that build's verdict (core#1236); 1.3.2→1.4.0 adds domain-model 1.2.0, the J6 v3 model `wicked-core domain-graph` builds from garden's domain-run rows: statements with their key, claims, effective status and ruling, and `metadata.accounting`, `rule_groups`, `followups`, `targets`, `built_at` and `skipped`; every 1.0.0 and 1.1.0 document stays valid).
 - **Per-schema contract version** (the `$id` version segment and each schema's
   `metadata.schema_version` const): the version a *document* carries and a
   consumer validates against. Independent of the bundle semver — the schemas say

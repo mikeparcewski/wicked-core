@@ -120,6 +120,7 @@ fn a_feature_launch_on_one_seat_fails_at_the_scope_boundary_naming_the_cause() {
     let rx = core.subscribe();
     let run = "one-seat".to_string();
     core.launch_run(LaunchSpec {
+        scope: None,
         problem: "stage a stalled run for a demo chapter".into(),
         clis: vec![cli("solo")],
         entity_mode: EntityMode::Shared,

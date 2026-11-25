@@ -320,6 +320,7 @@ fn a_denied_tool_call_gates_the_session() {
     );
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing".into(),
@@ -419,6 +420,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
         "a|b",
     ] {
         let res = core.launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "Build the thing".into(),

@@ -126,6 +126,7 @@ const JUDGE_ONLY: &str = r#"{"id":"assurance-judge-only","required_instruments":
 
 fn spec(sid: &str, workflow: &str, reduced: bool) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),

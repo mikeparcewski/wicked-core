@@ -16,6 +16,7 @@ fn an_in_memory_core_creates_no_event_log_directory() {
     let core = Core::spawn(":memory:");
     let events = core.subscribe();
     let _ = core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do one thing.".into(),

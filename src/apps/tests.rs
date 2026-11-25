@@ -101,6 +101,7 @@ fn session(id: &str, assurance: RunAssurance) -> AgentSession {
         team_plan: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        scope: None,
         assurance,
         power: None,
         run_context: None,

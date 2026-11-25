@@ -198,6 +198,7 @@ fn workflow(units: u64) -> String {
 fn spec(run: &str, repo_ref: &str) -> LaunchSpec {
     let gated = knob("WICKED_LOAD_GATES", 0) == 1;
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Load harness run: do each step".into(),

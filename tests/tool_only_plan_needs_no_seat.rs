@@ -154,6 +154,7 @@ fn make_git_repo(name: &str) -> PathBuf {
 
 fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: format!("Onboard repository: {session_id}"),

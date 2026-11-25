@@ -514,6 +514,9 @@ pub(crate) fn pre_distribute(
         power: None,
         exclude_seats,
         evidence_root,
+        // (J6 C1b) The launch stub carries the checked scope; it is copied from the stored
+        // session below (a path with no stub records it after planning).
+        scope: None,
         assurance: crate::assurance::RunAssurance::new(
             selected_def
                 .as_ref()
@@ -548,6 +551,9 @@ pub(crate) fn pre_distribute(
             session.exclude_seats = existing.exclude_seats;
             // (WT-C2) …and so is its evidence root.
             session.evidence_root = existing.evidence_root;
+            // (J6 C1b) …and so is the run's domain-extraction scope, which every arm of its
+            // `domain-run` step hands the command.
+            session.scope = existing.scope;
             // (core#850) …and its assurance contract.
             session.assurance = existing.assurance;
             // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
@@ -5096,141 +5102,6 @@ mod resolve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FINDING-066. The sibling of the test above, for the shipped DROP-IN rather than the built-ins —
-    /// and it was the missing half. `domain-extraction.json` pins the coverage validator, but nothing on
-    /// the plan path vaulted it; the operator had to run `wicked-core seed-domain-validators` out of
-    /// band. That is not a "one extra step", because the vault is rows in a database and the CLI's
-    /// default database is not a daemon's: measured against the crew daemon, the command succeeded,
-    /// printed the exact pin the run had asked for, and the relaunch failed identically — the seed had
-    /// landed in `$CWD/wicked-estate.db` while the engine read `~/.wicked-crew/core.db`.
-    ///
-    /// A fresh store here stands in for "whichever database the engine happened to open". Delete the
-    /// coverage seed from `pre_distribute` and this fails with the pin-not-in-vault bail.
-    #[test]
-    fn the_shipped_drop_in_plans_against_a_store_nobody_seeded() {
-        use wicked_apps_core::open_store;
-        let dir =
-            std::env::temp_dir().join(format!("wicked-dropin-unseeded-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
-
-        // The real shipped JSON, loaded exactly as an operator's overlay dir would load it — not a
-        // hand-built def. The pin under test is the one that actually ships.
-        // (X-MIG M11) The shipped def is the built-in preset as the engine composes it.
-        let def = crate::preset::builtin_preset_def("domain-extraction");
-        let coverage_pin = def
-            .phases
-            .iter()
-            .find(|p| p.id == "coverage")
-            .and_then(|p| p.validator_pin.clone())
-            .expect("this test is only meaningful while the coverage phase carries a pin");
-        assert_eq!(
-            coverage_pin,
-            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
-            "the shipped preset pins the const the plan path seeds"
-        );
-        let id = def.id.clone();
-        let mut registry = crate::workflow::WorkflowRegistry::default();
-        registry
-            .register_composed(def)
-            .expect("the composed preset registers");
-
-        // domain-graph is now a deterministic `wicked-core domain-graph --db {code_graph_db}` Tool
-        // (core#237 persist fix), so the workflow legitimately requires a bound repo to fill that
-        // placeholder — a domain graph cannot persist without a repo store. Register one at the
-        // scratch dir; `pre_distribute` only `get_repo`+`bind_repo_paths` at plan time (no worktree/
-        // git). The PIN-resolution assertion below — the seed-in-the-wrong-db regression this test
-        // actually guards — is unchanged.
-        // register_repo validates the root is a git repo WITH ≥1 commit (a worktree needs a base).
-        // Two direct `git` spawns (cross-platform; `sh -c` would not run on Windows CI): init, then
-        // an empty base commit with a LOCAL identity so no global config or signing is required.
-        assert!(
-            // spawn-audit: test-only — fixture setup, never spawned in production.
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&dir)
-                .status()
-                .expect("spawn git init")
-                .success(),
-            "git init the scratch repo must succeed"
-        );
-        assert!(
-            // spawn-audit: test-only — fixture setup, never spawned in production.
-            std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.email=t@wicked.test",
-                    "-c",
-                    "user.name=wicked",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "--allow-empty",
-                    "-qm",
-                    "base",
-                ])
-                .current_dir(&dir)
-                .status()
-                .expect("spawn git commit")
-                .success(),
-            "git base commit must succeed"
-        );
-        let repo = crate::repo::register_repo(
-            &mut store,
-            crate::repo::RepoSpec {
-                name: "dropin-unseeded-repo".to_string(),
-                root_path: dir.to_string_lossy().into_owned(),
-                registered_at: 0,
-            },
-        )
-        .expect("register a scratch repo so {code_graph_db} binds");
-
-        let pre = pre_distribute(
-            &mut store,
-            &[],
-            "extract the domain",
-            EntityMode::Isolated,
-            "s-dropin-unseeded",
-            crate::domain::HumanConfirm::None,
-            false,
-            Some(repo.id.clone()),
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            Some(&id),
-            &mut |_| {},
-            Some(&registry),
-            false,
-            false,
-            Vec::new(),
-            None,
-            false,
-            &crate::assurance::QeOverride::Auto,
-        )
-        .expect("a shipped drop-in must never require an out-of-band seed to plan");
-
-        // Attached AND approved — a pin that resolved to an unapproved validator would plan fine here
-        // and then deny every run at gate time, which is the failure this must not silently become.
-        let gated = pre
-            .units
-            .iter()
-            .filter(|u| {
-                u.validator
-                    .as_ref()
-                    .is_some_and(|v| v.approved && crate::validator_vault::pin(v) == coverage_pin)
-            })
-            .count();
-        assert_eq!(
-            gated, 1,
-            "the coverage phase came back carrying the APPROVED shipped pin"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// FINDING-066. Naming a command is only half a remedy when the vault is per-database, so every
     /// arm of the refusal must say which database to seed. Pinned as a property of the function rather
     /// than of one message, because the generic arm is the live one and it was the arm with no hint at
@@ -5254,8 +5125,8 @@ mod resolve_tests {
     }
 
     /// Seam C1 acceptance (e): a def composed from EVERY catalog entry plans with each entry's pin
-    /// attached (the evidence floor on `build`/`test`/`review`/`security_review`, the coverage pin
-    /// on `domain_coverage`, nothing on the rest), and a step that ADDS an UNAPPROVED pin to an
+    /// attached (the evidence floor on `build`/`test`/`review`/`security_review`, the walkthrough
+    /// pins on their two entries, nothing on the rest), and a step that ADDS an UNAPPROVED pin to an
     /// unpinned entry is refused at attach (a swap is refused earlier, by `compose`: `pin_changed`).
     #[test]
     fn attach_pinned_validators_attaches_every_catalog_pin() {
@@ -5268,7 +5139,6 @@ mod resolve_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
         crate::builtin_floors::seed_builtin_floors(&mut store).unwrap();
-        crate::domain_extraction::provision_and_approve_coverage_validator(&mut store).unwrap();
 
         let steps = |add: Option<&str>| -> crate::plan::PlanSteps {
             let mut steps = Vec::new();
@@ -5298,12 +5168,6 @@ mod resolve_tests {
         )
         .unwrap()
         .unwrap();
-        let coverage = crate::validator_vault::load_validator(
-            &store,
-            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
-        )
-        .unwrap()
-        .unwrap();
         let pinned: Vec<&str> = units
             .iter()
             .zip(def.phases.iter())
@@ -5311,7 +5175,6 @@ mod resolve_tests {
             .map(|(u, p)| {
                 let walkthrough;
                 let want = match p.id.as_str() {
-                    "domain_coverage" => &coverage,
                     "walkthrough_plan" | "walkthrough_review" => {
                         walkthrough = crate::validator_vault::load_validator(
                             &store,
@@ -5336,7 +5199,6 @@ mod resolve_tests {
                 "walkthrough_review",
                 "review",
                 "security_review",
-                "domain_coverage"
             ]
         );
 

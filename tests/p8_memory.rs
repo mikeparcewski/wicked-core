@@ -70,6 +70,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str, problem: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: problem.into(),

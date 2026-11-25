@@ -621,6 +621,7 @@ fn the_straight_through_path_refuses_every_qe_word() {
     {
         let sid = format!("straight-{i}");
         core.launch(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "Fix the thing.".into(),

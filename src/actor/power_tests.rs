@@ -13,6 +13,7 @@ fn launch_power(e: &Engine, run: &str, repo_ref: &str) {
 fn launch_power_voiced(e: &Engine, run: &str, repo_ref: &str, voice: Option<String>) {
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "power mode launch".into(),
@@ -178,6 +179,7 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
         .unwrap();
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "phased".into(),
@@ -441,6 +443,7 @@ fn an_oversized_voice_refuses_the_launch() {
     let err = e
         .core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "too much voice".into(),

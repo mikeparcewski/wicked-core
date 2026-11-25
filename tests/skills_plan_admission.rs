@@ -146,6 +146,7 @@ fn marker_cmd(marker: &std::path::Path) -> Vec<String> {
 
 fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Index, then extract.".into(),

@@ -492,9 +492,64 @@ pub fn list_all_presets(store: &dyn GraphRead) -> anyhow::Result<Vec<Preset>> {
 }
 
 #[cfg(test)]
+#[path = "preset_old_domain_row.rs"]
+mod old_domain_row;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use wicked_apps_core::open_store;
+
+    /// (J6 C1b) A store seeded before J6 v3 holds the old 9-step `domain-extraction` built-in row
+    /// (main's own preset, through the store's own writer: [`old_domain_row`]). The row still
+    /// decodes (its `repeat_from` and `domain_coverage` step included), and the next boot's seed
+    /// replaces it in place with the two-step preset. Fails if seeding skipped a built-in row whose
+    /// steps changed, or if the old row stopped decoding.
+    #[test]
+    fn an_old_nine_step_domain_row_is_replaced_in_place_by_the_seed() {
+        let mut store = mem_store();
+        let old = Preset {
+            name: "domain-extraction".into(),
+            scope: GLOBAL_SCOPE.into(),
+            steps: old_domain_row::domain_extraction_preset(),
+            created_by: BUILTIN_CREATED_BY.into(),
+            updated_at: 1,
+            deleted_at: None,
+            required_instruments: None,
+            title: None,
+            summary: None,
+            use_when: Vec::new(),
+        };
+        assert_eq!(old.steps.len(), 9);
+        crate::domain::put_nodes(&mut store, &[old.to_node()]).unwrap();
+        let before = get_row(&store, GLOBAL_SCOPE, "domain-extraction")
+            .unwrap()
+            .expect("the old row decodes");
+        assert_eq!(before.steps, old.steps);
+        let seeded = seed_builtins(&mut store, 2).unwrap();
+        assert!(
+            seeded.iter().any(|n| n == "domain-extraction"),
+            "{seeded:?}"
+        );
+        let after = get_row(&store, GLOBAL_SCOPE, "domain-extraction")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after
+                .steps
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            [crate::catalog::DOMAIN_RUN_STEP, "domain-graph"]
+        );
+        assert_eq!(after.created_by, BUILTIN_CREATED_BY);
+        assert_eq!(after.updated_at, 2);
+        // a second boot leaves it be
+        assert!(!seed_builtins(&mut store, 3)
+            .unwrap()
+            .iter()
+            .any(|n| n == "domain-extraction"));
+    }
 
     fn mem_store() -> wicked_apps_core::SqliteStore {
         open_store(Some(":memory:")).unwrap()
