@@ -3411,7 +3411,7 @@ mod tests {
         wt
     }
 
-    fn git_repo(name: &str) -> std::path::PathBuf {
+    pub(super) fn git_repo(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "wicked-wt-{name}-{}-{:?}",
             std::process::id(),
@@ -7087,7 +7087,7 @@ mod tests {
 /// minted, so a same-id relaunch mints both from the base again instead of adopting the branch.
 #[cfg(test)]
 mod discard_minted_tests {
-    use super::tests::rm_repo;
+    use super::tests::{git_repo, rm_repo};
     use super::*;
 
     fn run(cwd: &Path, args: &[&str]) {
