@@ -7422,6 +7422,11 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
         std::fs::read_to_string(replica.join(rep("repos/gamma")).join("lib.rs")).unwrap(),
         "x".repeat(900)
     );
+    // (codex r1 #3) Turn 1 left gamma a stamp in the replica.
+    assert!(
+        read_repo_stamps(&replica, &rep("repos/gamma")).contains_key(&rep("repos/gamma")),
+        "turn 1 stamps gamma"
+    );
 
     // Turn 2: gamma grew past what is left of the cap (two optional roots reserve 2 KiB).
     std::thread::sleep(Duration::from_millis(20));
@@ -7429,9 +7434,15 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
     let cap = 2 * seat::NOTE_RESERVE + 2500;
     let (body, second) = with_cap(cap, || chat_turn(&replica, &tree, &roots));
     assert!(second.contains("left-out 1;"), "{second}");
+    // (codex r1 #2) Gamma's one file passed the cap and was never read: none of it counts as fit.
     assert!(
-        second.contains(&format!("{}:left-out:", rep("repos/gamma"))),
+        second.contains(&format!("{}:left-out:0/", rep("repos/gamma"))),
         "{second}"
+    );
+    // (codex r1 #3) Leaving gamma out removed turn 1's stamp from the replica.
+    assert!(
+        read_repo_stamps(&replica, &rep("repos/gamma")).is_empty(),
+        "a left-out root keeps no stamp"
     );
     assert!(
         !body.windows(3000).any(|w| w == "y".repeat(3000).as_bytes()),
@@ -7446,6 +7457,10 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
     assert_eq!(names, vec![seat::LEFT_OUT_NOTE.to_string()], "{gamma:?}");
     let note = std::fs::read_to_string(gamma.join(seat::LEFT_OUT_NOTE)).unwrap();
     assert!(note.contains("left out") && note.contains("chat scoped to this repository"));
+    assert!(
+        note.contains("capped at 1 MiB") && note.contains("about 0 MiB of it fit"),
+        "{note}"
+    );
     assert!(
         note.len() < 600,
         "the note must fit its reserve: {}",
@@ -7468,6 +7483,80 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
         !third.contains(&format!("{}:kept", rep("repos/gamma"))),
         "{third}"
     );
+}
+
+/// (core#1463, codex r1 #3) A plain optional root that is not a repository is left out through
+/// the read cache too: turn 1 reads it (and caches what it read), turn 2 at the same host state
+/// serves it from the cache, finds it over a smaller cap, and leaves it out without reading it.
+#[cfg(unix)]
+#[test]
+fn k8s_core_1463_an_optional_root_is_left_out_from_the_read_cache() {
+    let host = tmp("optional-cached");
+    let tree = host.join("chats/c1");
+    let (docs, notes) = (host.join("docs"), host.join("notes"));
+    for d in [&tree, &docs, &notes] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(tree.join("AGENTS.md"), "scope").unwrap();
+    std::fs::write(docs.join("guide.md"), "d".repeat(100)).unwrap();
+    std::fs::write(notes.join("big.md"), "n".repeat(3000)).unwrap();
+    let mounts = vec![
+        PlanMount::Bind {
+            path: tree.clone(),
+            rw: false,
+        },
+        PlanMount::Bind {
+            path: docs.clone(),
+            rw: false,
+        },
+        PlanMount::Bind {
+            path: notes.clone(),
+            rw: false,
+        },
+    ];
+    let (mut roots, _) = seat::plan(&tree, true, &mounts, &[], &[], None);
+    seat::mark_optional(&mut roots, std::slice::from_ref(&notes));
+    let r = roots.iter().find(|r| r.host == notes).unwrap();
+    assert!(r.optional && !r.repo, "{roots:?}");
+    let turn = |cap: u64| {
+        super::clock::begin();
+        let out = with_cap(cap, || {
+            seat::copy_in_stream(None, &tree, &roots, false, &Default::default())
+        });
+        let (phases, _) = super::clock::take().unwrap();
+        out.expect("the unit arms");
+        phases
+            .into_iter()
+            .find(|p| p.name == "copy_in_read")
+            .and_then(|p| p.detail)
+            .unwrap()
+    };
+    let rep = seat::replica_of(None, &notes).unwrap();
+    let first = turn(64 * 1024);
+    assert!(!first.contains("left-out"), "{first}");
+    let reads = seat::HOST_READS.with(|n| n.get());
+    let second = turn(seat::NOTE_RESERVE + 1000);
+    assert_eq!(
+        seat::HOST_READS.with(|n| n.get()),
+        reads,
+        "turn 2 is served from the read cache"
+    );
+    assert!(second.contains("left-out 1;"), "{second}");
+    assert!(second.contains(&format!("{rep}:left-out:0/")), "{second}");
+    let _ = std::fs::remove_dir_all(host);
+}
+
+/// (core#1463, codex r1 #2) A root left out by the entry cap says so, not the byte cap.
+#[test]
+fn k8s_core_1463_the_note_names_the_cap_that_was_passed() {
+    let files = seat::left_out_note(5 << 20, seat::OverCap::Files(399_998));
+    assert!(files.contains("capped at 399998 files"), "{files}");
+    assert!(files.contains("about 5 MiB of it fit"), "{files}");
+    let bytes = seat::left_out_note(0, seat::OverCap::Bytes(512 << 20));
+    assert!(bytes.contains("capped at 512 MiB"), "{bytes}");
+    for n in [&files, &bytes] {
+        assert!(n.len() < 600, "the note must fit its reserve: {}", n.len());
+    }
 }
 
 /// (core#1463) A required root never gives way: over the cap it refuses the unit as before, even

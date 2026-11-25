@@ -3378,8 +3378,10 @@ fn unit_mounts(
 /// canonical paths the copy-in plan holds. `mounts` is the unit's real mount set; `required` is
 /// the same set built from the required read roots only, where no optional root can absorb a
 /// required path (a read root, an argv file, a view) into its bind. An optional root stays
-/// optional only when it is a read-only bind of `mounts` and no destination of `required` is it
-/// or lies under it; otherwise it is required (fail-closed).
+/// optional only when it is a read-only bind of `mounts`, no destination of `required` is it or
+/// lies under it, and no bind of `required` holds it (codex 1463 r1 #1: a required parent's copy
+/// skips a nested root, so the optional child's files are part of what the parent requires);
+/// otherwise it is required (fail-closed).
 pub(crate) fn settle_optional(
     mounts: &[Mount],
     required: &[Mount],
@@ -3396,7 +3398,7 @@ pub(crate) fn settle_optional(
         let needed = required.iter().any(|m| {
             let d = crate::worker_sandbox::canon_lenient(m.dst())
                 .unwrap_or_else(|| m.dst().to_path_buf());
-            d.starts_with(&o)
+            d.starts_with(&o) || (matches!(m, Mount::Bind { .. }) && o.starts_with(&d))
         });
         if bound && !needed && !out.contains(&o) {
             out.push(o);
@@ -7344,6 +7346,63 @@ esac
         );
         // With nothing declared optional there is nothing to settle.
         assert!(settle_optional(&mounts, &required, &[]).is_empty());
+    }
+
+    /// (core#1463, codex r1 #1) An optional root declared BEFORE a required root that holds it
+    /// stays required: `add_read_roots` keeps both binds (the child came first), the copy-in plan
+    /// skips the child inside the parent's copy, so leaving the child out would cut a hole in the
+    /// required parent. An argv file inside the child (coalesced into the parent in the
+    /// required-only build) is covered the same way.
+    #[cfg(unix)]
+    #[test]
+    fn core_1463_an_optional_root_under_a_required_parent_stays_required() {
+        let base = tmp("opt-parent");
+        let tree = base.join("wt");
+        let (parent, child, other, free) = (
+            base.join("srv/repos"),
+            base.join("srv/repos/a"),
+            base.join("srv/repos/b"),
+            base.join("elsewhere/free"),
+        );
+        for d in [&tree, &child, &other, &free] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(other.join("prompt.md"), "system").unwrap();
+        let argv = vec![
+            "claude".to_string(),
+            "--system-prompt-file".to_string(),
+            other.join("prompt.md").to_string_lossy().into_owned(),
+        ];
+        let build = |reads: &[PathBuf]| {
+            let mut mounts = vec![Mount::Bind {
+                path: tree.clone(),
+                rw: true,
+            }];
+            add_read_roots(&mut mounts, reads);
+            let mut argv = argv.clone();
+            mount_argv_paths(&mut mounts, &mut argv, None);
+            mounts
+        };
+        // The launch order: the optional children first, then their required parent.
+        let optional = vec![child.clone(), other.clone(), free.clone()];
+        let all = vec![child.clone(), other.clone(), parent.clone(), free.clone()];
+        let mounts = build(&all);
+        let canon = |p: &PathBuf| p.canonicalize().unwrap();
+        // Both the child and its parent are binds of the real mounts.
+        for p in [&child, &parent] {
+            assert!(
+                mounts
+                    .iter()
+                    .any(|m| matches!(m, Mount::Bind { path, rw: false } if *path == canon(p))),
+                "{mounts:?}"
+            );
+        }
+        let required = build(std::slice::from_ref(&parent));
+        assert_eq!(
+            settle_optional(&mounts, &required, &optional),
+            vec![canon(&free)],
+            "a root a required bind holds is required"
+        );
     }
 
     #[test]

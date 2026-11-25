@@ -1428,14 +1428,28 @@ pub(crate) const LEFT_OUT_NOTE: &str = "WICKED-LEFT-OUT.txt";
 /// What each optional root reserves of the copy-in's byte cap for its note.
 pub(crate) const NOTE_RESERVE: u64 = 1024;
 
-/// (core#1463) The note a left-out optional root carries: what happened and what to do.
-pub(crate) fn left_out_note(read: u64) -> String {
+/// Which of the copy-in's caps an optional root passed (core#1463).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverCap {
+    /// The byte cap, in bytes.
+    Bytes(u64),
+    /// The entry cap, in files.
+    Files(usize),
+}
+
+/// (core#1463) The note a left-out optional root carries: what happened and what to do. `fit` is
+/// how much of the root the copy-in had counted before the cap it passed (codex r1 #2: the entry
+/// that passed it was never read, so it is not counted).
+pub(crate) fn left_out_note(fit: u64, over: OverCap) -> String {
+    let cap = match over {
+        OverCap::Bytes(b) => format!("{} MiB", b.div_ceil(1 << 20)),
+        OverCap::Files(n) => format!("{n} files"),
+    };
     format!(
-        "This repository was left out of this turn's read-only copy: the copy is capped at {} MiB \
-         and this repository did not fit (about {} MiB were read before the cap). Its files are not \
-         in this container. Ask about it in a chat scoped to this repository.\n",
-        STREAM_LIMIT >> 20,
-        read.div_ceil(1 << 20)
+        "This repository was left out of this turn's read-only copy: the copy is capped at {cap} \
+         and this repository did not fit (about {} MiB of it fit before the cap). Its files are \
+         not in this container. Ask about it in a chat scoped to this repository.\n",
+        fit.div_ceil(1 << 20)
     )
 }
 
@@ -2168,7 +2182,7 @@ fn copy_in_stream_with(
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
         let (budget_before, count_before) = (budget, count);
-        let mut left_out = false;
+        let mut left_out: Option<OverCap> = None;
         if r.stamped() {
             match stamps.keep(&replica) {
                 Ok(()) => {
@@ -2238,7 +2252,7 @@ fn copy_in_stream_with(
                 count += 1;
                 if count > max_entries {
                     if r.optional {
-                        left_out = true;
+                        left_out = Some(OverCap::Files(max_entries));
                         break;
                     }
                     return Err(
@@ -2250,10 +2264,13 @@ fn copy_in_stream_with(
                 } else {
                     e.data.len() as u64
                 };
-                budget += size.max(e.path.len() as u64);
+                let size = size.max(e.path.len() as u64);
+                budget += size;
                 if budget > limit {
                     if r.optional {
-                        left_out = true;
+                        // The entry that passed the cap is not part of what fit.
+                        budget -= size;
+                        left_out = Some(OverCap::Bytes(limit));
                         break;
                     }
                     return Err(format!(
@@ -2271,7 +2288,7 @@ fn copy_in_stream_with(
         let read_now = !matches!(&cached, Some((_, Some(_))));
         for p in rels
             .iter()
-            .filter(|_| read_now && !left_out)
+            .filter(|_| read_now && left_out.is_none())
             .filter(|p| !r.skip.iter().any(|s| sync::under(p, s)))
             .filter(|p| !no_git || !p.split('/').any(sync::is_git_name))
         {
@@ -2280,15 +2297,18 @@ fn copy_in_stream_with(
             count += 1;
             if count > max_entries {
                 if r.optional {
-                    left_out = true;
+                    left_out = Some(OverCap::Files(max_entries));
                     break;
                 }
                 return Err(format!("the unit's copy-in has more than {max_entries} files").into());
             }
-            budget += sync::entry_size(&r.host, p).max(p.len() as u64);
+            let size = sync::entry_size(&r.host, p).max(p.len() as u64);
+            budget += size;
             if budget > limit {
                 if r.optional {
-                    left_out = true;
+                    // Never opened: the entry that passed the cap is not part of what fit.
+                    budget -= size;
+                    left_out = Some(OverCap::Bytes(limit));
                     break;
                 }
                 return Err(format!(
@@ -2309,17 +2329,17 @@ fn copy_in_stream_with(
         if read_now && r.mode == Mode::Plain {
             HOST_READS.with(|c| c.set(c.get() + 1));
         }
-        if left_out {
+        if let Some(over) = left_out {
             // (core#1463) Left out: what was read is dropped and the root is sent as one note. A
             // plain root mirrors the replica to what it is sent, so a copy an earlier turn kept is
             // removed with its stamp, and the root, sent with no key, is decided again next turn.
             let read = budget - budget_before;
-            let note = left_out_note(read).into_bytes();
+            let note = left_out_note(read, over).into_bytes();
             budget = budget_before + (note.len() as u64).max(LEFT_OUT_NOTE.len() as u64);
             count = count_before + 1;
             eprintln!(
                 "wicked-core: the optional read root {} is left out of this copy-in: it passed the \
-                 copy-in's caps ({read} bytes read)",
+                 copy-in's cap of {over:?} ({read} bytes counted before it)",
                 r.host.display()
             );
             left.insert(replica.clone(), read);

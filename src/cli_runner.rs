@@ -9202,8 +9202,9 @@ mod tests {
                         .into_owned(),
                 ),
                 extra_write_roots: Vec::new(),
-                extra_read_roots: Vec::new(),
-                optional_read_roots: Vec::new(),
+                extra_read_roots: vec!["/abs/repos/a".into()],
+                // (core#1463) The off-actor launcher arms the copy-in: the marking must survive.
+                optional_read_roots: vec!["/abs/repos/a".into()],
                 project_id: None,
                 repo_id: None,
                 apps: None,
@@ -9214,6 +9215,13 @@ mod tests {
             launch_seq: 0,
             required_skills: Vec::new(),
         };
+        // (core#1463) A context with none writes no field: older payloads are unchanged.
+        let mut none = input.governance.clone().unwrap();
+        none.optional_read_roots.clear();
+        assert!(serde_json::to_value(&none)
+            .unwrap()
+            .get("optional_read_roots")
+            .is_none());
 
         arm_exec_publisher(BusDb::shared(&bus_path).expect("arm publisher"));
         assert!(
@@ -9243,6 +9251,7 @@ mod tests {
                 .to_str(),
             "the repo-local code graph survives the bus"
         );
+        assert_eq!(gov.optional_read_roots, ["/abs/repos/a"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

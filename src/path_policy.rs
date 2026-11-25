@@ -325,18 +325,6 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
 ///   that gate its own work — a creator that can read its evaluator's rules can write to them;
 /// - a root CONTAINING it (`~`, `/`) is an over-broad grant by construction — "ground this run in
 ///   X" names X, never the operator's whole home.
-/// (core#1463) Every optional read root must be one of the launch's `extra_read_roots`, spelled
-/// the same: marking a root optional never grants a read. Empty is always valid.
-pub fn validate_optional_read_roots(optional: &[String], extra: &[String]) -> Result<(), String> {
-    match optional.iter().find(|o| !extra.contains(o)) {
-        None => Ok(()),
-        Some(o) => Err(format!(
-            "optional_read_roots: {o} is not one of the launch's extra_read_roots (an optional \
-             read root only marks a declared read root as one the run can do without)"
-        )),
-    }
-}
-
 pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
     validate_extra_roots(
         roots,
@@ -345,6 +333,20 @@ pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Resul
         "even read-only, the pin that gates a governed worker's own work must stay outside \
          every launch-declared root (core#294, mirroring FINDING-098)",
     )
+}
+
+/// (core#1463) Every optional read root must be one of the launch's `extra_read_roots`, spelled
+/// the same: marking a root optional never grants a read. Empty is always valid. A membership
+/// check only: it assumes `extra` already passed [`validate_extra_read_roots`], which judges the
+/// paths themselves.
+pub fn validate_optional_read_roots(optional: &[String], extra: &[String]) -> Result<(), String> {
+    match optional.iter().find(|o| !extra.contains(o)) {
+        None => Ok(()),
+        Some(o) => Err(format!(
+            "optional_read_roots: {o} is not one of the launch's extra_read_roots (an optional \
+             read root only marks a declared read root as one the run can do without)"
+        )),
+    }
 }
 
 /// The home directory the launch-time root validation judges against: `$HOME`, or `$USERPROFILE`
