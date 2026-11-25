@@ -919,6 +919,19 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     ) {
         env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
     }
+    // core#1823: a claude seat never fetches or applies its organization's server-managed settings
+    // (`remote-settings.json`), whose `allowManagedHooksOnly` would silence the `--settings` gate
+    // hook mid-unit. Claude Code (2.1.296) counts a session as eligible for that fetch only on a
+    // first-party base URL: the gateway's is not one, and this pin keeps both the variable and a
+    // server-delivered "assume first party" document from making it count as one.
+    if cli == "claude"
+        && matches!(
+            kind,
+            CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey
+        )
+    {
+        env.push((CLAUDE_ASSUME_FIRST_PARTY_ENV.into(), "0".into()));
+    }
     // core#1024: a claude OAuth seat sends the operator's own token as its Authorization (the
     // arming adds it as CLAUDE_CODE_OAUTH_TOKEN), so its unit rides a header of its own, which
     // claude sends on every API request and the gateway strips before the upstream.
@@ -939,6 +952,11 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     }
     env
 }
+
+/// Claude Code's switch that makes a custom base URL count as first party, which makes the session
+/// eligible for the organization's server-managed settings (core#1823). Pinned off on every claude
+/// seat routed to the gateway.
+pub(crate) const CLAUDE_ASSUME_FIRST_PARTY_ENV: &str = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL";
 
 /// codex's override of its token endpoint (codex 0.162.1 `login/src/auth/manager.rs`
 /// `REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR`).
@@ -2581,16 +2599,9 @@ mod tests {
     fn core_1823_a_claude_seat_never_counts_as_first_party_for_server_managed_settings() {
         use crate::seat_credentials::SeatSignIn;
         for kind in [CredentialKind::ClaudeOauth, CredentialKind::ClaudeApiKey] {
-            let env = seat_env_for_sign_in(
-                "claude",
-                &SeatSignIn::from(kind),
-                "wk-test-PLACEHOLDER",
-            );
-            let get = |name: &str| {
-                env.iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.as_str())
-            };
+            let env =
+                seat_env_for_sign_in("claude", &SeatSignIn::from(kind), "wk-test-PLACEHOLDER");
+            let get = |name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
             let base = get("ANTHROPIC_BASE_URL").expect("a claude seat is routed to the gateway");
             assert!(
                 !base.contains("api.anthropic.com"),
