@@ -862,3 +862,152 @@ fn a_repaired_statement_id_is_valid_and_a_keyless_statement_is_not() {
     let compiled = jsonschema::JSONSchema::compile(&schema).unwrap();
     assert!(compiled.validate(&doc).is_err());
 }
+
+/// Rewrite the live row of `key` in place (the store a later write, or a read between two writes,
+/// leaves behind), by the row's own value.
+fn rewrite(f: &Fixture, key: &str, edit: impl FnOnce(&mut Value)) {
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let (id, raw): (i64, String) = conn
+        .query_row(
+            "SELECT id, value FROM annotations WHERE key = ?1 ORDER BY id DESC LIMIT 1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or_else(|e| panic!("no row {key}: {e}"));
+    let mut v: Value = serde_json::from_str(&raw).unwrap();
+    edit(&mut v);
+    conn.execute(
+        "UPDATE annotations SET value = ?1 WHERE id = ?2",
+        rusqlite::params![v.to_string(), id],
+    )
+    .unwrap();
+}
+
+fn rule_key(n: u32) -> String {
+    format!("business_rule:{}", sid(n))
+}
+
+fn group_key(f: &Fixture) -> String {
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .query_row(
+            "SELECT key FROM annotations WHERE type = 'rule_group' ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// R2-1 (a), the C2 round-1 P1: a statement row and its target's row from two different runs (a
+/// read between two writes) never show the old statement as Checked: it reads stale.
+#[test]
+fn a_statement_and_its_target_from_two_runs_read_stale() {
+    let f = fixture("mini-cobol", "two-runs");
+    assert_eq!(rules(&build(&f))[&sid(0)]["status"], "Checked");
+    for field in ["batch_hash", "target_hash"] {
+        let g = fixture("mini-cobol", &format!("two-runs-{field}"));
+        rewrite(&g, &rule_key(0), |v| v[field] = json!("0".repeat(64)));
+        let doc = build(&g);
+        let rs = rules(&doc);
+        assert_eq!(rs[&sid(0)]["status"], "stale", "{field}");
+        assert!(rs[&sid(0)]["checked_by"].is_null(), "{field}");
+        assert_eq!(
+            rs[&sid(1)]["status"],
+            "open",
+            "{field}: the other statements are of one run"
+        );
+        assert!(
+            target_of(&doc, READ_PARA)["stale"] == json!(false),
+            "{field}: the target itself is fresh"
+        );
+        // A missing hash on the statement is not a match either.
+        let h = fixture("mini-cobol", &format!("two-runs-{field}-none"));
+        rewrite(&h, &rule_key(0), |v| {
+            v.as_object_mut().unwrap().remove(field);
+        });
+        assert_eq!(
+            rules(&build(&h))[&sid(0)]["status"],
+            "stale",
+            "{field} absent"
+        );
+    }
+}
+
+/// R2-1 (b): an anchor outside the repository, or with a line 0, leaves the statement unlocated.
+#[test]
+fn an_unusable_anchor_leaves_the_statement_unlocated() {
+    let f = fixture("mini-cobol", "anchor");
+    assert_eq!(rules(&build(&f))[&sid(1)]["located"], true);
+    for (tag, file, lines) in [
+        ("up", "../outside.cbl", json!([20, 29])),
+        ("abs", "/srv/app/PAYCALC1.cbl", json!([20, 29])),
+        ("zero", PROG, json!([0, 29])),
+        ("short", PROG, json!([20])),
+    ] {
+        let g = fixture("mini-cobol", &format!("anchor-{tag}"));
+        rewrite(&g, &rule_key(1), |v| {
+            v["contract"]["anchor"]["file"] = json!(file);
+            v["contract"]["anchor"]["lines"] = lines.clone();
+        });
+        let doc = build(&g);
+        assert_eq!(rules(&doc)[&sid(1)]["located"], false, "{tag}");
+        validates(&doc);
+    }
+}
+
+/// R2-1 (c): a group sentence rests on its statements as they read now. A stored input hash that
+/// differs from the Checked statement's text, or none at all, withholds the sentence.
+#[test]
+fn a_group_sentence_whose_input_changed_or_is_missing_is_withheld() {
+    let f = fixture("mini-cobol", "inputs");
+    assert!(!build(&f)["metadata"]["rule_groups"][0]["rule"].is_null());
+    let gk = group_key(&f);
+    for (tag, input) in [("changed", Some(json!("0".repeat(64)))), ("missing", None)] {
+        let g = fixture("mini-cobol", &format!("inputs-{tag}"));
+        rewrite(&g, &gk, |v| match &input {
+            Some(h) => v["inputs"][sid(0)] = h.clone(),
+            None => {
+                v["inputs"].as_object_mut().unwrap().remove(&sid(0));
+            }
+        });
+        let doc = build(&g);
+        assert_eq!(
+            rules(&doc)[&sid(0)]["status"],
+            "Checked",
+            "{tag}: the statement itself stands"
+        );
+        let group = &doc["metadata"]["rule_groups"][0];
+        assert!(group["rule"].is_null(), "{tag}: {group:#}");
+        assert!(
+            group["withheld"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["id"] == "g1.r"
+                    && w["reason"] == "its statements changed since it was written"),
+            "{tag}: {group:#}"
+        );
+        validates(&doc);
+    }
+}
+
+/// R2-1 (e): a group row with no `group` object and a statement row with no text are malformed:
+/// counted, and not read.
+#[test]
+fn a_group_without_its_group_and_a_statement_without_text_are_malformed() {
+    let f = fixture("mini-cobol", "malformed");
+    assert_eq!(build(&f)["metadata"]["skipped"]["malformed"], 0);
+    let gk = group_key(&f);
+    rewrite(&f, &gk, |v| {
+        v.as_object_mut().unwrap().remove("group");
+    });
+    rewrite(&f, &rule_key(3), |v| v["statement"] = json!("  "));
+    let doc = build(&f);
+    assert_eq!(doc["metadata"]["skipped"]["malformed"], 2);
+    assert!(doc["metadata"]["rule_groups"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!rules(&doc).contains_key(&sid(3)));
+    validates(&doc);
+}
