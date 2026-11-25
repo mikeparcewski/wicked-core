@@ -235,6 +235,7 @@ fn run_with(name: &str, mode: &str, plant: bool, gated: bool) -> Run {
     }))
     .unwrap();
     core.launch_run(LaunchSpec {
+        scope: None,
         problem: "make a demo".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

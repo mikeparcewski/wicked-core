@@ -283,6 +283,7 @@ fn run(name: &str, mode: &str) -> Run {
     }))
     .unwrap();
     core.launch_run(LaunchSpec {
+        scope: None,
         problem: "build an editor plugin".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

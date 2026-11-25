@@ -336,6 +336,7 @@ fn launch(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps) {
 fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&str]) {
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "t4 re-plan".into(),
@@ -1723,6 +1724,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
     );
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "r3 repo".into(),

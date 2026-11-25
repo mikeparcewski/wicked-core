@@ -228,6 +228,7 @@ fn plan(v: Value) -> PlanSteps {
 
 fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         problem: "add SSO login".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

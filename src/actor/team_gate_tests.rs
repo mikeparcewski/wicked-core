@@ -156,6 +156,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
         .expect("composed def registers");
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "p1 team run".into(),
@@ -1703,6 +1704,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
     e.core.register_composed(def).unwrap();
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "t6 amend".into(),
@@ -1886,6 +1888,7 @@ fn launch_member_run_confirm(e: &Engine, run: &str, human_confirm: HumanConfirm)
         .expect("composed def registers");
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "t6 member step".into(),
@@ -3115,6 +3118,7 @@ fn steps(v: serde_json::Value) -> crate::PlanSteps {
 fn launch_plan_run(e: &Engine, run: &str) {
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "add SSO login".into(),
@@ -3714,6 +3718,7 @@ fn try_launch_plan(
     deliver_step: Option<crate::PlanStep>,
 ) -> anyhow::Result<String> {
     e.core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "add SSO login".into(),
@@ -3877,6 +3882,7 @@ fn a_released_deliver_unit_still_stops_at_its_deliver_gate() {
 
 fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "pick".into(),

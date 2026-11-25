@@ -870,6 +870,12 @@ pub struct LaunchOptions {
     /// (QE acceptance) REQUIRE QE acceptance whatever the run's impact score says (no waiver).
     /// Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
     pub force_qe_acceptance: Option<bool>,
+    /// (J6 C1b) A `domain-extraction` run's scope, as JSON: `{"intent": "...", "phrases"?: [...],
+    /// "scope_hash"?: "...", "description"?: "..."}` (Start carries it from the preview). A
+    /// `domain-extraction` launch without it is REJECTED by name, as is a scope on any other launch
+    /// or one that is malformed or over 64 KiB. Check `supportsDomainScope` first: an older addon
+    /// drops this field.
+    pub scope_json: Option<String>,
 }
 
 /// (DES-RULE-CHECK-001 S2) The `skip_rules` answer's skips: `amend` holds JSON
@@ -951,6 +957,13 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         .map(parse_deliver_step)
         .transpose()?;
     Ok(LaunchSpec {
+        // (J6 C1b) A key twice is refused, never dropped (the engine checks the shape at launch).
+        scope: o
+            .scope_json
+            .as_deref()
+            .map(wicked_core::parse_scope_json)
+            .transpose()
+            .map_err(|e| err(format!("scopeJson: {e}")))?,
         problem: o.problem,
         clis,
         entity_mode: o
@@ -1178,6 +1191,14 @@ impl Core {
     /// ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
     #[napi]
     pub fn supports_power_mode() -> bool {
+        true
+    }
+
+    /// (J6 C1b) Whether this addon carries a domain-extraction run's scope (`LaunchOptions.scopeJson`).
+    /// An older addon drops the field (napi ignores an undeclared one), and its engine runs the old
+    /// loop, so the launcher keys on this first.
+    #[napi]
+    pub fn supports_domain_scope() -> bool {
         true
     }
 
@@ -3624,7 +3645,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (DES-TEAMING-002 T8) `Core.catalog()`: the nineteen entries, in catalog order, each with
+    /// (DES-TEAMING-002 T8) `Core.catalog()`: the eighteen entries, in catalog order, each with
     /// the picker's keys.
     #[test]
     fn catalog_json_is_the_catalog_in_order() {
@@ -3644,7 +3665,7 @@ mod tests {
             .filter(|e| e["verified_evidence"] == true)
             .map(|e| e["id"].as_str().unwrap())
             .collect();
-        assert_eq!(verified, ["test", "walkthrough_review", "domain_coverage"]);
+        assert_eq!(verified, ["test", "walkthrough_review"]);
     }
 
     /// (wicked-core#631) `Core.busEmit()` / `Core.busRead()`: an emit resolves to the row's id (a

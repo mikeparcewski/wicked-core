@@ -60,6 +60,7 @@ impl Dispatcher for NumericDispatcher {
 
 fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
@@ -163,6 +164,7 @@ fn drain(
 
 fn attended(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         human_confirm: HumanConfirm::Before(99),
         ..spec(session_id, clis)
     }

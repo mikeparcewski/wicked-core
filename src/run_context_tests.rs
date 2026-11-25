@@ -1392,6 +1392,7 @@ fn the_engine_keeps_the_block_on_the_session_stamps_each_unit_and_survives_a_res
     let events = core.subscribe();
     let cli = &judges()[0];
     core.launch_run(crate::LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two".into(),

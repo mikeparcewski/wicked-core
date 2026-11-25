@@ -230,6 +230,8 @@ mod tests {
             // The unit's phase scope (core#296). Inheriting it scopes an unrelated child away from
             // writing code; observing it tells a worker which gate it is under.
             crate::gate_hook::PRE_BUILD_SCOPE_ENV,
+            // (J6 C1b) A `domain-run` step's scope file: only the armed step is handed it.
+            crate::model_call::SCOPE_ENV,
         ] {
             assert!(
                 ENGINE_INTERNAL_ENV.contains(&name),

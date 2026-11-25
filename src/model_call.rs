@@ -105,7 +105,8 @@ pub(crate) type Admission = std::collections::BTreeMap<String, Result<crate::Age
 
 /// (core#1905) The seats a model call may use: the run's own LAUNCH roster (the instances the
 /// launcher configured, with their invocations and the launcher's health probe), never the
-/// daemon's whole registry. An instance is out when it, or its CLI, is benched for this run, or
+/// daemon's whole registry. An instance is out when it is benched for this run (by its exact key, as
+/// dispatch matches: a bench of `claude` does not bench `claude#2`), or
 /// when the launcher's probe found it unusable. The benches are the ballot rule's (a model call is
 /// an ungoverned engine call, like a council ballot): the run's own (`run_bench`, its
 /// `benched_seats`) and its launch benches (`launch_bench`), each less its governed-only entries
@@ -128,8 +129,9 @@ pub(crate) fn admission(
                 .iter()
                 .filter(|c| crate::distribute::model_of(&c.key) == *family)
             {
-                let model = crate::distribute::model_of(&c.key);
-                if let Some(b) = bench.iter().find(|b| b.cli == c.key || b.cli == model) {
+                // The exact instance, as dispatch matches it (`distribute.rs`, `council_roster`): a
+                // bench of `claude` benches the base instance, never `claude#2`.
+                if let Some(b) = bench.iter().find(|b| b.cli == c.key) {
                     why.push(format!(
                         "the `{}` seat is benched for this run: {} ({})",
                         c.key, b.reason, b.source
@@ -440,9 +442,48 @@ pub(crate) struct Channel {
     /// This engine's own binary ([`crate::execute_wrapped::resolve_wicked_core_exe_opt`]), so the
     /// command's `wicked-core model-call` reaches this daemon's build, not whichever one PATH finds.
     core_exe: Option<String>,
+    /// (J6 C1b) The run's scope, written into this channel's own directory ([`Channel::hand_scope`]).
+    scope: Option<PathBuf>,
 }
 
+/// The variable that names the scope file a `domain-run` step reads (`--scope`).
+pub const SCOPE_ENV: &str = "WICKED_DOMAIN_SCOPE";
+
 impl Channel {
+    /// (J6 C1b) Write the run's scope as `scope.json` into this channel's private directory (0700,
+    /// engine-owned, never the worktree), readable by this user only, and hand the command its path
+    /// as [`SCOPE_ENV`]. The file goes with the directory when the channel drops.
+    #[cfg(unix)]
+    pub(crate) fn hand_scope(&mut self, scope: &serde_json::Value) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.dir.join("scope.json");
+        // The command reads the path from the environment: one that is not UTF-8 would reach it
+        // altered, so it is refused here rather than handed on.
+        if path.to_str().is_none() {
+            return Err(std::io::Error::other(format!(
+                "the channel directory {} is not a UTF-8 path",
+                self.dir.display()
+            )));
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(&serde_json::to_vec(scope).map_err(std::io::Error::other)?)?;
+        self.scope = Some(path);
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn hand_scope(&mut self, _scope: &serde_json::Value) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a Tool step's model-call channel needs a unix socket",
+        ))
+    }
+
     /// The variables the Tool command is handed: the socket, its token, and (when this engine's
     /// binary is found) `WICKED_CORE_EXE`, the one name the command resolves `wicked-core` by.
     pub(crate) fn env(&self) -> Vec<(String, String)> {
@@ -458,6 +499,9 @@ impl Channel {
                 crate::gate_hook::WICKED_CORE_EXE_ENV.to_string(),
                 exe.clone(),
             ));
+        }
+        if let Some(scope) = &self.scope {
+            env.push((SCOPE_ENV.to_string(), scope.to_string_lossy().into_owned()));
         }
         env
     }
@@ -533,6 +577,7 @@ pub(crate) fn arm(
         calls: calls.clone(),
         runner: runner.clone(),
         core_exe: crate::execute_wrapped::resolve_wicked_core_exe_opt(),
+        scope: None,
     };
     let seats = Arc::new(Seats {
         runner,
@@ -1023,12 +1068,11 @@ mod tests {
 
     /// (coord fold 1) A declared step of a shipped preset with the shipped command, bound to the
     /// run's repo, is armed; the same step under a repo preset name, a changed command, a command
-    /// bound to another repo, an undeclared step, or a run with no preset is not. A real shipped
-    /// Tool step (`extract-prepare`, whose command carries both repo placeholders) stands in for the
-    /// declaration.
+    /// bound to another repo, an undeclared step, or a run with no preset is not. The shipped
+    /// `domain-run` step (whose command carries both repo placeholders) is the declaration.
     #[test]
     fn only_a_declared_step_of_a_shipped_preset_is_armed() {
-        let step = crate::domain_extraction::EXTRACT_PREPARE_STEP;
+        let step = crate::catalog::DOMAIN_RUN_STEP;
         let cmd = shipped_cmd("domain-extraction", step);
         assert!(cmd.iter().any(|a| a == crate::workflow::REPO_ROOT_TOKEN));
         let repo = repo_at("app", "/src/app");
@@ -1062,8 +1106,11 @@ mod tests {
             Some("domain-extraction"),
             &planned("domain-graph", &cmd, &repo)
         ));
-        // production: nothing in today's presets is declared yet (C1 adds `domain-run`)
-        assert!(!shipped_step(Some("domain-extraction"), &real, || Some(
+        // production: the shipped preset's `domain-run` is declared (J6 C1b)
+        assert!(shipped_step(Some("domain-extraction"), &real, || Some(
+            repo.clone()
+        )));
+        assert!(!shipped_step(Some("my-repo-flow"), &real, || Some(
             repo.clone()
         )));
     }
@@ -1226,8 +1273,9 @@ mod tests {
 
     /// (core#1905) A run configured with a seat INSTANCE (`claude#2`) gets its calls on that
     /// instance, with its own invocation: the family, the answer cap and the tool-free posture
-    /// read its CLI. A bench of the instance benches only it; a bench of the CLI benches every
-    /// instance; an unusable first instance gives way to the next.
+    /// read its CLI. A bench matches the exact instance, as dispatch does: a bench of `claude#2`
+    /// benches only it, a bench of `claude` only the base instance; an unusable first instance
+    /// gives way to the next.
     #[test]
     fn a_seat_instance_answers_for_its_family() {
         let mut two = seat("claude#2");
@@ -1257,12 +1305,18 @@ mod tests {
             e.contains("`claude` seat is not usable") && e.contains("`claude#2` seat is benched"),
             "{e}"
         );
+        // A bench of the base instance `claude` (what every engine bench writer records) leaves
+        // `claude#2` answering, as dispatch keeps routing work to it.
         let a = admission(
             &[seat("claude"), two],
             &[bench("claude", "quota", false)],
             &[],
         );
-        assert!(a["claude"].is_err(), "a CLI bench benches its instances");
+        assert_eq!(
+            a["claude"].as_ref().map(|c| c.key.as_str()),
+            Ok("claude#2"),
+            "a bench of the base instance leaves the other instance serving"
+        );
     }
 
     /// (C1) The run's repo is read only for a declared step of a shipped preset: never for a

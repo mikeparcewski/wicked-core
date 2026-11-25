@@ -84,6 +84,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two".into(),

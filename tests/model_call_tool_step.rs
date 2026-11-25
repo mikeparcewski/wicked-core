@@ -165,6 +165,7 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
         .expect("register workflow");
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Make two model calls.".into(),

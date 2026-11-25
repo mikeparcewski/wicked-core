@@ -128,6 +128,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
     )
     .expect("register the 2-phase def");
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the auth feature. Then review it for security".into(),
@@ -226,6 +227,7 @@ fn a_run_convenes_no_council_and_still_separates_evaluator_from_creator() {
     .expect("register the 2-phase def");
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the auth feature. Then review it for security".into(),

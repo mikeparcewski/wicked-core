@@ -6,7 +6,7 @@ Read by `tests/catalog_compose.rs`.
   from crew `main` at `4870c87` by evaluating crew's own exports, with no hand transcription:
   `deliverPrPhase([], ...)` for `deliver` (the phase `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
   engine sees a def.
-- `mappings.json`: for each of the 13 remaining §11.2 consumers plus `mcp-server` (M12, the row DES-W7-M12 adds), `steps` (the plan that maps today's phases
+- `mappings.json`: for each of the 12 remaining §11.2 consumers plus `mcp-server` (M12, the row DES-W7-M12 adds), `steps` (the plan that maps today's phases
   onto catalog entries) and `bold` (§11.2's bold cells as `"<phase>.<field>": <composed value>`).
   A step carries a field only where today's phase differs from its catalog entry and the cell is
   not bold. `compose` enforces the step rules, so a step that weakened an entry would be refused.
@@ -23,7 +23,8 @@ Read by `tests/catalog_compose.rs`.
   held the draft skill), and (X-MIG M11) `feature`, `bug`, `migration`, `mcp-server` and
   `domain-extraction`, copied verbatim from the retired `workflows/*.json` (which the compiled
   `feature_def`/`bug_def`/`migration_def` serialized to byte for byte). They keep pinning the built-in presets
-  that replaced them.
+  that replaced them, except `domain-extraction`: J6 v3 replaced its preset with two host steps that map
+  none of its phases, so its mapping row is gone and its today-def here is the historical record only.
   `survey-repo`, `memories`, `domain-graph-slice` and `collab` were deleted outright with no preset
   (operator decision, 2026-09-26), so they have no fixture and no mapping.
 

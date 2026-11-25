@@ -201,6 +201,7 @@ fn answer(id: &str) -> Value {
 
 fn spec(run: &str, steps: Vec<Value>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         problem: "what does the retire flow do".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

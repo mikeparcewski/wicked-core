@@ -124,6 +124,7 @@ fn consent() -> StandInConsent {
 
 fn spec(sid: &str, stand_in: LaunchStandIn) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),

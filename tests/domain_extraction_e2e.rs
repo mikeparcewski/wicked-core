@@ -1,105 +1,104 @@
-//! core#28 — the whole thing runs end-to-end with governance ENFORCED (DES-OUTGOV-007).
+//! (J6 C1b, DES-C1 item 7) The shipped `domain-extraction` preset, armed, end to end.
 //!
-//! Drives the `domain-extraction` workflow through the real engine against a hand-seeded estate store
-//! at coverage 1.0, and proves the payoff:
-//!   TEST 1 — a governed run produces the gated artifacts: `coverage-report.json` (recomputed FROM the
-//!            store by the real `wicked-core coverage`) clears the pinned coverage validator, and
-//!            `wicked-core domain-graph` writes `requirements_graph.json`; the run completes.
-//!   TEST 2 — a POLICY violation in a phase's OUTPUT denies that phase (deny-dominates), the run fails,
-//!            and no downstream `requirements_graph.json` is produced.
-//!   TEST 3 — a registered CONFORMANCE RULE is RECALLED into the run: the per-unit output claim carries
-//!            the rule as an obligation (the M6/M7 recall→gate wiring firing IN the loop — inert before
-//!            this milestone).
+//! The preset is two host steps (J6 v3): `domain-run` runs garden's `scripts/domain/run.py` through
+//! the admitted garden generation, and `domain-graph` runs the real `wicked-core domain-graph` on the
+//! repository's store. Here the garden generation is a fixture whose `run.py` stand-in records how
+//! the engine ran it and makes three calls with the REAL `wicked-core model-call` client: two for
+//! claude and one for codex. The run's seats are a stub runner that records each call.
 //!
-//! Unix-gated: the pinned coverage validator is a POSIX grep script (`domain_extraction.rs`).
+//! What it proves, through the real actor and the real client:
+//! - the step is armed: the client reaches the channel, and each claude call reaches a seat as its
+//!   own ballot (distinct ballot ids) whose parent run is the run;
+//! - eligibility is the run's own (core#1905): a repository-bound run benches codex at launch
+//!   (the codex worktree bench, no `WICKED_CODEX_WORKTREE_OK`), so the codex call is refused by
+//!   name and no codex seat runs;
+//! - the run's scope (coord ruling B') is written into the step's own channel directory, outside
+//!   the worktree, named by `WICKED_DOMAIN_SCOPE`, byte-equal to what the launch carried, and gone
+//!   with the channel when the step ends;
+//! - a launch with no human confirm ends Done with no gate;
+//! - a `domain-extraction` launch with no scope, or a scope on another launch, is refused by name.
+//!
+//! The rules the step writes and the graph built from them are C2's (the builder reads garden's
+//! new annotation shape): this test seeds the store the old way so the current `domain-graph`
+//! builds, and the C2 suite asserts the built rule.
+//!
+//! Unix-gated: the channel is a unix socket.
 #![cfg(unix)]
 
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_apps_core::{
-    open_store, synthetic_symbol, GraphRead, GraphWrite, Language, Location, Node, NodeKind, Span,
-    CONFORMANCE_CLAIM, SYMBOL_SCHEME,
+    open_store, synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span,
+    SYMBOL_SCHEME,
+};
+use wicked_core::{
+    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, PresetSpec, RepoEntry, RepoSpec,
+    StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
-use wicked_estate_core::query::SymbolQuery;
-use wicked_estate_core::Annotation;
-use wicked_estate_core::ValidationClaim;
-use wicked_governance::{
-    register_policy, register_rule, ConfSeverity, ConformanceRule, Effect, Policy, RuleProvenance,
-    RuleType, Severity, Targets, Trigger,
-};
-
-use wicked_core::{
-    provision_and_approve_coverage_validator, Core, CoreEvent, EntityMode, HumanConfirm,
-    HumanDecision, LaunchSpec, RepoSpec, SessionStatus, SessionView, StepInput, StepOutput,
-    StepRunner, StepStatus, UnitStatus,
-};
-
-/// The crew-shaped skills snapshot fixture (shared with `skills_plan_admission.rs`): the
-/// domain-extraction workflow's units carry `skill_ref`s, and the plan-wide skills admission runs
-/// before the run's first unit — on a hermetic runner there is no snapshot and no live garden
-/// cache, so without this fixture the run is refused by name (core#396 review pass 7; the test
-/// used to pass locally only because the fallback found the developer's installed garden).
-#[path = "support/skills_snapshot_fixture.rs"]
-mod skills_fixture;
-
-/// The skills the `domain-extraction` preset's plan names: the three domain skills. The security
-/// reviewer's stays in the fixture although the plan no longer carries `security_review` (a
-/// non-code run owes none, core#649 / #847: the coverage judge is a self-verifying evaluator, so
-/// the run is not code work); an extra skill in the snapshot admits nothing the plan lacks.
-const DOMAIN_EXTRACTION_SKILLS: &[&str] = &[
-    "wicked-garden-domain",
-    "wicked-garden-domain-extractor",
-    "wicked-garden-domain-coverage",
-    "wicked-garden-qe-security-test-engineer",
-];
-
-/// The fixture generation `setup` published once for this process — the value
-/// `WICKED_SKILLS_SNAPSHOT` carries — for asserting the run was admitted against exactly it.
-fn skills_snapshot_root() -> std::path::PathBuf {
-    std::env::var_os("WICKED_SKILLS_SNAPSHOT")
-        .map(std::path::PathBuf::from)
-        .expect("setup() published the fixture snapshot once")
-}
-
-/// Every `SkillsSnapshotHanded` the run emitted so far, as `(path, gen, root)`.
-fn handed_generations(
-    events: &std::sync::mpsc::Receiver<CoreEvent>,
-    run_id: &str,
-) -> Vec<(String, Option<String>, String)> {
-    events
-        .try_iter()
-        .filter_map(|e| match e {
-            CoreEvent::SkillsSnapshotHanded {
-                session,
-                path,
-                gen,
-                root,
-                ..
-            } if session == run_id => Some((path, gen, root)),
-            _ => None,
-        })
-        .collect()
-}
+use wicked_estate_core::{Annotation, ValidationClaim};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
-// --- reused fixtures (mirrors seam_findings.rs / coverage_cli.rs / p3_repo.rs) ---
+#[path = "support/skills_snapshot_fixture.rs"]
+mod skills_fixture;
+
+/// Every emission this binary triggers spools into the per-process test outbox (core#311, core#749):
+/// never the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// The fixture generation's `scripts/wicked-garden` launcher. For `run scripts/domain/run.py` it
+/// records its arguments, working directory and `WICKED_DOMAIN_SCOPE`, copies the scope file, then
+/// asks for two claude calls and one codex call with the real client (`$WICKED_CORE_EXE`, which the
+/// channel hands the command), keeping each answer, stderr and exit code under
+/// `.wicked/domain/e2e/` in the run's tree. It exits 0 whatever the calls did, so the test reads
+/// every call's outcome.
+const FIXTURE_GARDEN_LAUNCHER: &str = r#"#!/bin/sh
+[ "$1" = run ] && [ "$2" = scripts/domain/run.py ] || exit 64
+shift 2
+d=.wicked/domain/e2e
+mkdir -p "$d"
+{
+  printf '%s\n' "$@"
+  printf 'cwd=%s\n' "$(pwd -P)"
+  printf 'scope_env=%s\n' "${WICKED_DOMAIN_SCOPE-}"
+} > "$d/args"
+scope=
+while [ $# -gt 0 ]; do
+  [ "$1" = --scope ] && scope=$2
+  shift
+done
+cp "$scope" "$d/scope.json" 2>"$d/scope.err"
+printf 'Name one rule.' > "$d/prompt"
+for call in "claude a" "claude b" "codex c"; do
+  set -- $call
+  "$WICKED_CORE_EXE" model-call --family "$1" --in "$d/prompt" --out "$d/$2.out" \
+    --timeout-s 30 2>"$d/$2.err"
+  echo $? > "$d/$2.rc"
+done
+exit 0
+"#;
 
 struct StubDispatcher;
 impl Dispatcher for StubDispatcher {
     fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
         Some(Vote {
             cli: cli.key.clone(),
-            recommendation: "x".into(),
+            recommendation: "1".into(),
             top_risk: "none".into(),
             change_my_mind: "no".into(),
             disqualifier: None,
             confidence: Confidence::default(),
-            provenance: "stub".into(),
+            provenance: "test".into(),
         })
     }
 }
@@ -129,91 +128,43 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// A deny policy scoped EXACTLY to one phase (`applies_to == [phase]`).
-fn deny_policy(phase: &str, pattern: &str) -> Policy {
-    Policy {
-        id: format!("deny-{phase}"),
-        kind: "guard".into(),
-        applies_to: vec![phase.into()],
-        effect: Effect::Deny,
-        trigger: Trigger {
-            contains: Some(pattern.into()),
-        },
-        obligations: vec![],
-        criteria: String::new(),
-        severity: Severity::High,
-        rule: "deny".into(),
-        retired: false,
-    }
+/// One model call a seat answered: (the ballot's run id, the seat, the asking run).
+type Answered = (String, Option<String>, Option<String>);
+
+/// The seats: each call answers `<seat>: <prompt>` and is recorded.
+#[derive(Default)]
+struct Seats {
+    seen: Mutex<Vec<Answered>>,
 }
 
-fn is_terminal(s: SessionStatus) -> bool {
-    matches!(
-        s,
-        SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
-    )
-}
-
-/// Upper bound on how long a governed run may take before the test gives up.
-///
-/// Deliberately far above the ~2s a run actually takes. Every wait below returns the instant its
-/// condition holds and fails fast on a terminal-but-wrong outcome, so a generous bound costs nothing
-/// on an idle host and only ever spends time on a run that is genuinely stuck. An 8s bound was
-/// reachable by scheduling noise alone — on a host under load these tests failed roughly one run in
-/// three, on unmodified `main`, which is a test reporting a defect that isn't there (FINDING-028).
-/// (M6) 180s: the preset's plan is PA-scoped and floor-filled, about eleven units where the drop-in
-/// def had five, and a loaded host was measured at ~10s per unit.
-const RUN_DEADLINE: Duration = Duration::from_secs(180);
-
-/// Waits for `run_id` to reach `want`. `Err` says which way it went wrong — a timeout and a run that
-/// terminated in the wrong status are different defects and must not read the same in the output.
-fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> Result<(), String> {
-    let deadline = Instant::now() + RUN_DEADLINE;
-    let mut last = None;
-    while Instant::now() < deadline {
-        if let Ok(views) = core.sessions_detail() {
-            if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
-                if v.session.status == want {
-                    return Ok(());
-                }
-                // Fail fast: a terminal status that isn't the one we want will never change.
-                if is_terminal(v.session.status) {
-                    return Err(format!(
-                        "run {run_id} terminated as {:?}, wanted {want:?}",
-                        v.session.status
-                    ));
-                }
-                let units: Vec<String> = v
-                    .units
-                    .iter()
-                    .map(|u| {
-                        format!(
-                            "{}={:?}",
-                            u.id.rsplit(':').next().unwrap_or_default(),
-                            u.status
-                        )
-                    })
-                    .collect();
-                last = Some((v.session.status, units));
-            }
+impl StepRunner for Seats {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        self.seen.lock().unwrap().push((
+            i.run_id.clone(),
+            i.unit.assigned_cli.clone(),
+            i.unit.parent_run_id.clone(),
+        ));
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: format!(
+                "{}: {}",
+                i.unit.assigned_cli.clone().unwrap_or_default(),
+                i.unit.description
+            ),
+            status: StepStatus::Ok,
+            usage: None,
+            files: vec![],
+            tools: Vec::new(),
+            governed: false,
         }
-        std::thread::sleep(Duration::from_millis(15));
     }
-    Err(format!(
-        "run {run_id} did not reach {want:?} within {}s — it was still {} when the wait gave up, so \
-         this is a timeout, not a wrong outcome",
-        RUN_DEADLINE.as_secs(),
-        last.map_or_else(
-            || "absent from sessions_detail".to_string(),
-            |(s, units)| format!("{s:?} (units: {})", units.join(", "))
-        )
-    ))
 }
 
-/// Seed ONE behavior node. `accounted` ⇒ a validated requirement + a business-rule annotation so the
-/// store recomputes to front-half coverage 1.0; `!accounted` ⇒ a BARE function → an unaccounted hole →
-/// coverage < 1.0 (so the pinned coverage validator denies).
-fn seed(db: &str, accounted: bool) {
+/// A store with one behaviour already resolved to a rule, so today's `domain-graph` builds (C2
+/// replaces the builder and asserts the rule the step writes).
+fn seed(db: &str) {
     let mut store = open_store(Some(db)).unwrap();
     let n = Node::new(
         synthetic_symbol("code", "charge"),
@@ -225,26 +176,41 @@ fn seed(db: &str, accounted: bool) {
     store.begin_batch().unwrap();
     store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
     store.commit_batch().unwrap();
-    if accounted {
-        store
-            .set_node_semantics(
-                &n.symbol,
-                None,
-                Some("REQ-1"),
-                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
-            )
-            .unwrap();
-        store
-            .annotate(
-                &n.symbol,
-                Annotation::new("business_rule", "r", "amount > 0").with_confidence(0.9),
-            )
-            .unwrap();
-    }
+    store
+        .set_node_semantics(
+            &n.symbol,
+            None,
+            Some("REQ-1"),
+            Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+        )
+        .unwrap();
+    store
+        .annotate(
+            &n.symbol,
+            Annotation::new("business_rule", "r", "amount > 0").with_confidence(0.9),
+        )
+        .unwrap();
+}
+
+/// The folder beside the checkout `repo` that holds its run trees (core#1109).
+fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
+    let mut name = repo.file_name().unwrap().to_os_string();
+    name.push(".wicked");
+    repo.with_file_name(name)
+}
+
+/// Where the engine mints run `id`'s tree for the checkout `repo` (core#1109).
+fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+    trees_beside(repo).join("wicked-worktrees").join(id)
+}
+
+fn rm_repo(repo: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(trees_beside(repo));
+    let _ = std::fs::remove_dir_all(repo);
 }
 
 fn make_git_repo(name: &str) -> std::path::PathBuf {
-    let repo = std::env::temp_dir().join(format!("wicked-core-e2e-{name}-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("wicked-core-de-{name}-{}", std::process::id()));
     rm_repo(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
@@ -265,230 +231,144 @@ fn make_git_repo(name: &str) -> std::path::PathBuf {
     repo
 }
 
-fn db_in(name: &str) -> String {
-    let dir =
-        std::env::temp_dir().join(format!("wicked-core-e2e-db-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("estate.db").to_str().unwrap().to_string()
-}
-
-/// The domain-extraction runner: keys on the unit's PHASE id (DES-TEAMING-002 M6: the preset's plan
-/// is PA-scoped and floor-filled, so ords move). Every other phase emits benign output; `coverage`
-/// shells the REAL `wicked-core coverage` (recompute FROM the seeded store → the pinned coverage
-/// validator greps `coverage-report.json` in the worktree); `domain-graph` shells the REAL
-/// `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a test inject a
-/// policy-tripping output for one phase.
-/// Per run: whether its `extract` unit reached the runner with a pinned git dir. Keyed by run id,
-/// so a parallel test's run never answers for this one's.
-static EXTRACT_PINNED: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
-/// Per run: whether its `extract` unit found the worklist the host's `extract-prepare` step wrote
-/// into the worktree (wicked-garden#1362: the seat reads only that file).
-static EXTRACT_SAW_WORKLIST: std::sync::Mutex<Vec<(String, bool)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// The fixture generation's `scripts/wicked-garden` launcher: it stands in for garden's domain
-/// scripts and records how the engine ran each host step — its arguments, its working directory,
-/// and whether the seat's rules file was there — into `.wicked/domain/<script>.args`. The real
-/// scripts are garden's (`tests/domain/test_extraction_files.py`); this proves the plumbing.
-const FIXTURE_GARDEN_LAUNCHER: &str = r#"#!/bin/sh
-[ "$1" = run ] || exit 64
-script=$(basename "$2")
-shift 2
-mkdir -p .wicked/domain
-{
-  printf '%s\n' "$@"
-  printf 'cwd=%s\n' "$(pwd -P)"
-  if [ -f .wicked/domain/rules.json ]; then echo rules=yes; else echo rules=no; fi
-} > ".wicked/domain/$script.args"
-if [ "$script" = prepare_worklist.py ]; then
-  printf '{"schema":"wicked-garden/domain-worklist@1","units":[]}' > .wicked/domain/worklist.json
-fi
-"#;
-
-struct DomainExtractionRunner {
-    db: String,
-    out_override: Option<(&'static str, String)>,
-}
-impl StepRunner for DomainExtractionRunner {
-    fn run_unit(&self, i: &StepInput) -> StepOutput {
-        // The engine's semantic agent-judge (validator-pinned phases) routes its PASS/REJECT review
-        // THROUGH this runner as a `validator-agent` unit. Emit a clean PASS so the agent gate clears —
-        // the DETERMINISTIC coverage script (grepping coverage-report.json) is the real coverage check.
-        if i.unit.id == "validator-agent" {
-            return StepOutput {
-                run_id: i.run_id.clone(),
-                unit_ix: i.unit_ix,
-                attempt: i.attempt,
-                // (DES-RULE-CHECK-001) …and the review's rule check, the same identity: N/A each.
-                output: wicked_core::stub_rule_verdicts(&i.unit.description)
-                    .unwrap_or_else(|| "PASS\nthe work meets the criterion\nPASS".into()),
-                status: StepStatus::Ok,
-                usage: None,
-                files: Vec::new(),
-                tools: Vec::new(),
-                governed: false,
-            };
-        }
-        let phase = i.unit.id.rsplit(':').next().unwrap_or_default();
-        // The seat container needs the worktree's git dir pinned from the registered repository
-        // (`verify_linked_worktree`); the actor hands it on the unit's baseline. `extract` is a
-        // creator with no code deliverable and a verifying phase after it, i.e. neither guarded
-        // nor floored — it used to dispatch with NO pin and fail `root_unresolvable` on every
-        // seat (rig run a4c6a389).
-        if phase == "extract" {
-            let pinned = i
-                .unit
-                .worktree_baseline
-                .as_ref()
-                .and_then(|b| b.git_dir.as_deref())
-                .is_some();
-            EXTRACT_PINNED
-                .lock()
-                .unwrap()
-                .push((i.run_id.clone(), pinned));
-            if let Some(wd) = i.workdir.as_ref() {
-                let domain = wd.join(".wicked").join("domain");
-                EXTRACT_SAW_WORKLIST
-                    .lock()
-                    .unwrap()
-                    .push((i.run_id.clone(), domain.join("worklist.json").is_file()));
-                // The seat's half: rules into the worktree, never into a store.
-                std::fs::create_dir_all(&domain).unwrap();
-                std::fs::write(
-                    domain.join("rules.json"),
-                    r#"{"schema":"wicked-garden/domain-rules@1","seat":"a","rules":[]}"#,
-                )
-                .unwrap();
-            }
-        }
-        let workdir = i.workdir.clone();
-        let mut output = format!("{phase} done");
-        if phase == "pa-scope" {
-            // The PA's answer. This rig has no bus (an UN-TEAMED run), so a declared scope is never
-            // diff-corrected and fails closed at 100: the plan pauses for approval (X1 r2 M1).
-            output.push_str(
-                "\nSCOPE {\"touch\":[\"coverage-report.json\",\"requirements_graph.json\",\".wicked/domain/rules.json\"]}",
-            );
-        }
-        if let Some((p, ref text)) = self.out_override {
-            if p == phase {
-                output = text.clone();
-            }
-        }
-        // DES-L1 PR-1A (D-9): the `coverage` phase is the def's Evaluator agent unit — its output
-        // must answer the verdict contract or the fold parks the run at the escalation gate before
-        // the domain-graph phase; the pinned coverage validator stays the real coverage check.
-        if i.unit.role == wicked_core::PhaseRole::Evaluator && i.unit.tool_cmd.is_none() {
-            output.push_str("\nVERDICT: PASS");
-        }
-        if let Some(wd) = workdir.as_ref() {
-            // Surface any subprocess failure LOUDLY (stderr + exit) so a lock / missing-binary / CLI
-            // error can't silently mask itself as a later "file missing" — never `let _ = …output()`.
-            let shell = |args: &[&str], label: &str| match Command::new(BIN).args(args).output() {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!(
-                    "e2e runner: `{label}` exited {}: {}",
-                    o.status,
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-                Err(e) => eprintln!("e2e runner: `{label}` failed to spawn: {e}"),
-            };
-            if phase == "coverage" {
-                let out = wd.join("coverage-report.json");
-                shell(
-                    &["coverage", "--db", &self.db, "--out", out.to_str().unwrap()],
-                    "coverage",
-                );
-            }
-            // `domain-graph` is a Tool unit: the engine runs the preset's REAL argv
-            // (`wicked-core domain-graph --db {code_graph_db} --repo-root {repo_root}`), never this
-            // runner — so the artifact the tests read is the one the shipped preset writes.
-        }
-        StepOutput {
-            run_id: i.run_id.clone(),
-            unit_ix: i.unit_ix,
-            attempt: i.attempt,
-            output,
-            status: StepStatus::Ok,
-            usage: None,
-            files: Vec::new(),
-            tools: Vec::new(),
-            governed: false,
-        }
-    }
-}
-
-/// Common setup: a store seeded to `accounted` coverage (1.0 when true, a hole when false) with the
-/// pinned coverage validator approved, a registered git repo, the drop-in workflow dir on the resolver
-/// path, and a spawned Core. Returns (core, repo_entry_id, db, repo_root).
-fn setup(
-    name: &str,
-    runner: DomainExtractionRunner,
-    accounted: bool,
-) -> (Core, String, String, std::path::PathBuf) {
-    let db = runner.db.clone();
-    seed(&db, accounted);
-    {
-        let mut store = open_store(Some(&db)).unwrap();
-        provision_and_approve_coverage_validator(&mut store).unwrap();
-    }
-    // domain-extraction is a built-in preset (X-MIG M6); no workflow overlay is read (M11).
-    // `set_var` is a data race under parallel test threads: set it EXACTLY ONCE (every caller sets the
-    // same value, so a single init is correct).
-    static WORKFLOWS_DIR_INIT: std::sync::Once = std::sync::Once::new();
-    WORKFLOWS_DIR_INIT.call_once(|| {
-        // core#237: the domain-graph Tool phase runs `wicked-core domain-graph`, which `run_tool_cmd`
-        // resolves via `resolve_wicked_core_exe` ($WICKED_CORE_EXE → current_exe → PATH → bare). Under
-        // `cargo test` current_exe is THIS test harness — spawning it as `wicked-core` would re-exec
-        // the suite (a fork bomb). Pin $WICKED_CORE_EXE to the real binary Cargo built so the Tool
-        // (and the coverage recompute, same resolver) invoke the actual engine.
+/// The process-wide environment, set once: the engine's own binary, the repository graph root,
+/// the fixture garden generation and a stub indexer.
+fn setup_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // `run_tool_cmd` resolves `wicked-core` through `WICKED_CORE_EXE`; under `cargo test` the
+        // current exe is this harness, so pin the binary Cargo built (and the channel hands the
+        // same value to the step's client).
         std::env::set_var("WICKED_CORE_EXE", BIN);
-        // Repo-graph root (code_graph.rs ADR, core#406): a fresh repo's code_graph_db resolves into
-        // `$WICKED_ESTATE_REPO_GRAPH_ROOT` when set (else `<state home>/repo-graphs` — the parent of
-        // the store the Core below is spawned on, itself a scratch dir). Pin the override too, so a
-        // concurrent env test cannot move the root mid-run — the same hermetic override crew's
-        // project graphs use.
         std::env::set_var(
             "WICKED_ESTATE_REPO_GRAPH_ROOT",
-            std::env::temp_dir().join(format!("wicked-core-e2e-estate-{}", std::process::id())),
+            std::env::temp_dir().join(format!("wicked-core-de-graphs-{}", std::process::id())),
         );
-        // core#396: the workflow's units name skills, and the plan-wide admission runs before the
-        // FIRST unit (the domain-graph Tool phase included). Publish a fixture generation exactly as
-        // crew lays one out and hand it to the engine — never the developer's live garden cache,
-        // which a hermetic CI runner does not have. Canonical base: the loader refuses an ancestor
-        // symlink, and the OS temp dir is one on macOS.
-        let skills_base = std::fs::canonicalize(std::env::temp_dir())
+        // The garden root rides every Tool step from the admitted generation (core#802): publish
+        // a fixture generation as crew lays one out, with the launcher above. Canonical base: the
+        // loader refuses an ancestor symlink, and the OS temp dir is one on macOS.
+        let base = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("wicked-core-e2e-skills-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&skills_base);
-        let snapshot = skills_fixture::publish_fixture_snapshot(
-            &skills_base,
-            "000001",
-            DOMAIN_EXTRACTION_SKILLS,
-        );
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let launcher = snapshot.join("scripts").join("wicked-garden");
-            std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
-            std::fs::write(&launcher, FIXTURE_GARDEN_LAUNCHER).unwrap();
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            .join(format!("wicked-core-de-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let snapshot =
+            skills_fixture::publish_fixture_snapshot(&base, "000001", &["wicked-garden-domain"]);
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = snapshot.join("scripts").join("wicked-garden");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, FIXTURE_GARDEN_LAUNCHER).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
         std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
-        // garden#1370: a domain-extraction launch re-indexes the repo graph at its base (D8) and
-        // is refused when that fails. A hermetic runner has no wicked-estate; the seeded graph is
-        // already what these runs map, so the indexer is a stub that succeeds.
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let indexer = skills_base.join("wicked-estate-stub");
-            std::fs::write(&indexer, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&indexer, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::env::set_var("WICKED_ESTATE_BIN", &indexer);
-        }
+        // codex is benched on a repository-bound run unless one of these says otherwise: pin both
+        // so the refusal below does not depend on the invoking shell.
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        std::env::remove_var("WICKED_SEAT_FLOOR");
+        // The engine strips an inherited scope path from every child (`ENGINE_INTERNAL_ENV`): an
+        // ambient one here must never reach a step.
+        std::env::set_var("WICKED_DOMAIN_SCOPE", "/nonexistent/ambient-scope.json");
+        // garden#1370: a domain-extraction launch re-indexes the repo graph at its base; a hermetic
+        // runner has no wicked-estate, and the seeded graph is what the run reads.
+        let indexer = base.join("wicked-estate-stub");
+        std::fs::write(&indexer, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&indexer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("WICKED_ESTATE_BIN", &indexer);
     });
+}
+
+fn spec(
+    run_id: &str,
+    repo_ref: &str,
+    workflow: &str,
+    scope: Option<serde_json::Value>,
+) -> LaunchSpec {
+    LaunchSpec {
+        scope,
+        base_ref: None,
+        project_id: None,
+        problem: "Map the refund rules.".into(),
+        clis: vec![cli("claude"), cli("codex")],
+        entity_mode: EntityMode::Shared,
+        session_id: run_id.into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: Some(repo_ref.into()),
+        workflow: Some(workflow.into()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
+        project_graph: None,
+        plan: None,
+        deliver_step: None,
+        exclude_seats: Vec::new(),
+        evidence_root: None,
+        primary: None,
+        reduced_assurance: true,
+        stand_in: Default::default(),
+        power: false,
+        voice: None,
+        deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
+    }
+}
+
+/// The run's terminal event, and whether it paused at any gate on the way.
+fn wait_terminal(
+    events: &std::sync::mpsc::Receiver<CoreEvent>,
+    session: &str,
+) -> (CoreEvent, bool) {
+    let deadline = Instant::now() + Duration::from_secs(80);
+    let mut gated = false;
+    while Instant::now() < deadline {
+        match events.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => {
+                if matches!(&ev, CoreEvent::AwaitingHuman { session: s, .. } if s == session) {
+                    gated = true;
+                    return (ev, gated);
+                }
+                let terminal = matches!(&ev, CoreEvent::SessionCompleted { session: s } if s == session)
+                    || matches!(&ev, CoreEvent::SessionFailed { session: s, .. } if s == session)
+                    || matches!(&ev, CoreEvent::RunCancelled { session: s, .. } if s == session);
+                if terminal {
+                    return (ev, gated);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    panic!("run {session} reached no terminal state in 80 s");
+}
+
+/// A core on a scratch store with the recording seats, and a registered repository whose store
+/// holds the seeded rule.
+struct Rig {
+    core: Core,
+    seats: Arc<Seats>,
+    repo: std::path::PathBuf,
+    entry: RepoEntry,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        rm_repo(&self.repo);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn rig(name: &str) -> Rig {
+    setup_env();
+    let dir = std::env::temp_dir().join(format!("wicked-core-de-db-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let seats = Arc::new(Seats::default());
+    let core = Core::spawn_with_engine(
+        dir.join("estate.db").to_str().unwrap().to_string(),
+        Arc::new(StubDispatcher),
+        seats.clone(),
+    );
     let repo = make_git_repo(name);
-    let core = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), Arc::new(runner));
     let entry = core
         .register_repo(RepoSpec {
             name: name.into(),
@@ -496,582 +376,277 @@ fn setup(
             registered_at: 0,
         })
         .expect("register repo");
-    // core#237: domain-graph is now a real `wicked-core domain-graph --db {code_graph_db}` Tool and
-    // the coverage gate recomputes from WICKED_COVERAGE_DB — BOTH read the REPO's OWN code graph, not
-    // the engine store. Seed the repo's code_graph_db (the exact path the run resolves) so the real
-    // executor path finds the fixture; the engine-store seed above still serves the mock's ord-4 shell.
     std::fs::create_dir_all(std::path::Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
-    seed(&entry.code_graph_db, accounted);
-    (core, entry.id, db, repo)
+    seed(&entry.code_graph_db);
+    Rig {
+        core,
+        seats,
+        repo,
+        entry,
+        dir,
+    }
 }
 
-fn launch(core: &Core, run_id: &str, repo_ref: &str) {
-    core.launch_run(LaunchSpec {
-        base_ref: None,
-        project_id: None,
-        problem: "extract the domain model".into(),
-        // Two seats: a team run never grades on its creator seat (§11.3 "Evaluator seat").
-        clis: vec![cli("a"), cli("b")],
-        entity_mode: EntityMode::Shared,
-        session_id: run_id.into(),
-        human_confirm: HumanConfirm::None,
-        auto_deliver: false,
-        repo_ref: Some(repo_ref.into()),
-        workflow: Some("domain-extraction".into()),
-        extra_write_roots: Vec::new(),
-        extra_read_roots: Vec::new(),
-        optional_read_roots: Vec::new(),
-        project_graph: None,
-        plan: None,
-        // wicked-core#1338: crew's repo-scoped launches (and studio's wizard) send a deliver step.
-        // A mapping run never delivers, so the engine drops it: were it kept, this step (a command
-        // that fails) would be the run's last unit and the run could not complete.
-        deliver_step: Some(
-            serde_json::from_value(serde_json::json!({
-                "catalog": "deliver",
-                "id": "deliver",
-                "executor": {"type": "tool", "cmd": ["false"]}
-            }))
-            .expect("a deliver step"),
-        ),
-        exclude_seats: Vec::new(),
-        evidence_root: None,
-        primary: None,
-        // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
-        reduced_assurance: true,
-        stand_in: Default::default(),
-        power: false,
-        voice: None,
-        deliverables: Vec::new(),
-        qe_acceptance: Default::default(),
+/// The scope as studio's Start carries it, with a non-ASCII phrase so "byte-equal" means it.
+fn a_scope() -> serde_json::Value {
+    serde_json::json!({
+        "intent": "refunds",
+        "phrases": ["refund", "remboursé"],
+        "scope_hash": "sha256:abc",
+        "description": "How refunds are approved."
     })
-    .expect("launch domain-extraction");
 }
 
-/// Derive the run's worktree from the repo root `setup` returns (not by re-deriving the temp-path
-/// scheme — so a change to the repo naming can't silently break this).
-/// (M6) Drive a preset run until `done` holds, approving every human gate it pauses at first. The
-/// first pause is the plan-approval gate (a creator plan the PA scopes, which on this un-teamed rig
-/// scores 100 and pauses even in auto mode); a floor-added phase may pause too. Returns the phases
-/// whose gates were approved (the unit before the cursor: `unit_ix` is the NEXT unit to execute),
-/// for the assertion messages.
-fn drive_until(
-    core: &Core,
-    run_id: &str,
-    what: &str,
-    done: impl Fn(&SessionView) -> bool,
-) -> Vec<String> {
-    let mut approved: Vec<String> = Vec::new();
-    let deadline = Instant::now() + RUN_DEADLINE;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        let Some(view) = core
-            .sessions_detail()
-            .ok()
-            .and_then(|vs| vs.into_iter().find(|v| v.session.id == run_id))
-        else {
-            std::thread::sleep(Duration::from_millis(15));
-            continue;
-        };
-        if done(&view) {
-            return approved;
-        }
-        assert!(
-            !is_terminal(view.session.status),
-            "run {run_id} ended {:?} before {what} (gates approved: {approved:?})",
-            view.session.status
-        );
-        let mut units = view.units.clone();
-        units.sort_by_key(|u| u.ord);
-        last = format!(
-            "{:?} at ix {} ({})",
-            view.session.status,
-            view.session.unit_ix,
-            units
-                .iter()
-                .map(|u| format!(
-                    "{}={:?}",
-                    u.id.rsplit(':').next().unwrap_or_default(),
-                    u.status
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        if view.session.status == SessionStatus::AwaitingHuman {
-            let gated = view
-                .session
-                .unit_ix
-                .checked_sub(1)
-                .and_then(|i| units.get(i))
-                .map(|u| u.id.rsplit(':').next().unwrap_or_default().to_string())
-                .unwrap_or_default();
-            assert!(
-                approved.len() < 8,
-                "run {run_id} kept pausing before {what}: {approved:?}, now at `{gated}`"
-            );
-            core.confirm_gate(
-                run_id,
-                HumanDecision::Approve {
-                    amend: None,
-                    amend_scope: Default::default(),
-                },
-            )
-            .unwrap_or_else(|e| panic!("approve the `{gated}` gate: {e}"));
-            approved.push(gated);
-            // Let the approve land before reading the run again.
-            let ix = view.session.unit_ix;
-            let settle = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < settle {
-                let moved = core
-                    .sessions_detail()
-                    .ok()
-                    .and_then(|vs| vs.into_iter().find(|v| v.session.id == run_id))
-                    .is_some_and(|v| {
-                        v.session.status != SessionStatus::AwaitingHuman || v.session.unit_ix != ix
-                    });
-                if moved {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            continue;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    panic!(
-        "run {run_id} never reached {what} within {}s; last: {last}; gates approved: {approved:?}",
-        RUN_DEADLINE.as_secs()
-    );
-}
-
-/// The run is paused at the human gate on `phase` (the unit before the cursor).
-fn paused_at(view: &SessionView, phase: &str) -> bool {
-    if view.session.status != SessionStatus::AwaitingHuman {
-        return false;
-    }
-    let mut units = view.units.clone();
-    units.sort_by_key(|u| u.ord);
-    view.session
-        .unit_ix
-        .checked_sub(1)
-        .and_then(|i| units.get(i))
-        .is_some_and(|u| u.id.rsplit(':').next() == Some(phase))
-}
-
-/// `phase`'s unit has been rejected (a denied gate on it).
-fn rejected(view: &SessionView, phase: &str) -> bool {
-    view.units
-        .iter()
-        .any(|u| u.id.rsplit(':').next() == Some(phase) && u.status == UnitStatus::Rejected)
-}
-
-fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
-    // crew#276: run worktrees live under the non-dotted root; core#1109: beside the checkout.
-    run_tree(repo_root, run_id)
-}
-
-// --- TEST 1: the governed run produces the gated artifacts ---
-
-#[test]
-fn a_governed_run_produces_coverage_and_requirements_graph() {
-    let db = db_in("happy");
-    let (core, repo_id, dbp, repo) = setup(
-        "happy",
-        DomainExtractionRunner {
-            db,
-            out_override: None,
-        },
-        true,
-    );
-    let events = core.subscribe();
-    launch(&core, "run-happy", &repo_id);
-    // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human there.
-    drive_until(&core, "run-happy", "the domain-graph gate", |v| {
-        paused_at(v, "domain-graph")
-    });
-    // core#396: the run was admitted against the fixture generation and against nothing else —
-    // the domain-graph Tool unit's plan-wide admission reports the verified generation it judged
-    // the plan by (`path: "tool_cmd"`), the way a worker handoff would.
-    let snapshot = skills_snapshot_root();
-    let handed = handed_generations(&events, "run-happy");
-    assert!(
-        !handed.is_empty()
-            && handed.iter().all(|(path, gen, root)| {
-                path == "tool_cmd"
-                    && gen.as_deref() == Some("000001")
-                    && skills_fixture::names_generation(root, &snapshot)
-            }),
-        "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
-        snapshot.display()
-    );
-    let seen: Vec<bool> = EXTRACT_PINNED
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(run, _)| run == "run-happy")
-        .map(|(_, pinned)| *pinned)
-        .collect();
-    assert_eq!(
-        seen,
-        vec![true],
-        "the `extract` unit reached its seat with the worktree's git dir pinned (a container \
-         seat refuses it otherwise)"
-    );
-    let wt = worktree(&repo, "run-happy");
-    // wicked-garden#1362: the host prepared the seat's work and applied what it stated, through
-    // the admitted garden generation, with the run's store and repository bound, in the worktree.
-    let saw: Vec<bool> = EXTRACT_SAW_WORKLIST
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(run, _)| run == "run-happy")
-        .map(|(_, saw)| *saw)
-        .collect();
-    assert_eq!(saw, vec![true], "extract found the host-prepared worklist");
-    let entry = core
-        .list_repos()
-        .unwrap()
+/// The shipped `domain-extraction` steps, as the built-in list holds them.
+fn shipped_steps() -> Vec<wicked_core::PlanStep> {
+    wicked_core::builtin_presets()
         .into_iter()
-        .find(|r| r.id == repo_id)
-        .unwrap();
-    let real_wt = std::fs::canonicalize(&wt).unwrap();
-    for (script, rest, rules) in [
-        (
-            "prepare_worklist.py",
-            vec!["--out", wicked_core::WORKLIST_REL],
-            "rules=no",
-        ),
-        (
-            "apply_rules.py",
-            vec![
-                "--rules",
-                wicked_core::RULES_REL,
-                "--coverage-out",
-                "coverage-report.json",
-            ],
-            "rules=yes",
-        ),
-        // domain-graph-3: after each page the host decides the next (this fixture prints no
-        // decision line, so the run moves on to coverage as before).
-        ("next_page.py", vec![], "rules=yes"),
-    ] {
-        let args =
-            std::fs::read_to_string(wt.join(".wicked/domain").join(format!("{script}.args")))
-                .unwrap_or_else(|e| panic!("{script} never ran on the host: {e}"));
-        let mut want: Vec<String> = vec![
-            "--db".into(),
-            entry.code_graph_db.clone(),
-            "--repo-root".into(),
-            entry.root_path.clone(),
-        ];
-        want.extend(rest.iter().map(|a| a.to_string()));
-        want.push(format!("cwd={}", real_wt.display()));
-        want.push(rules.into());
-        assert_eq!(args.lines().collect::<Vec<_>>(), want, "{script}");
-    }
+        .find(|(n, _)| *n == "domain-extraction")
+        .map(|(_, s)| s)
+        .expect("the built-in preset")
+}
+
+#[test]
+fn the_shipped_preset_runs_armed_with_its_scope_and_ends_with_no_gate() {
+    let rig = rig("armed");
+    let (core, seats, repo, entry) = (&rig.core, &rig.seats, &rig.repo, &rig.entry);
+    let scope = a_scope();
+    let run_id = format!("de-armed-{}", std::process::id());
+    let ev = core.subscribe();
+    core.launch_run(spec(
+        &run_id,
+        &entry.id,
+        "domain-extraction",
+        Some(scope.clone()),
+    ))
+    .expect("launch domain-extraction with a scope");
+    let (end, gated) = wait_terminal(&ev, &run_id);
+    let tree = run_tree(repo, &run_id).join(".wicked/domain/e2e");
+    let read = |f: &str| std::fs::read_to_string(tree.join(f)).unwrap_or_default();
     assert!(
-        wt.join("coverage-report.json").is_file(),
-        "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
+        matches!(end, CoreEvent::SessionCompleted { .. }) && !gated,
+        "the run ends Done with no gate: {end:?}; args: {}; a.err: {}; c.err: {}",
+        read("args"),
+        read("a.err"),
+        read("c.err")
     );
-    // (DES-CATALOG-002 §3.1, Q17) Analyze · Domain's one bounded exception to a read-only lens: its
-    // writes stay in `.wicked/domain/**` (the extract step's rules, the host steps' records) and the
-    // project graph. The only other path the run changes is its coverage judge's required
-    // deliverable, `coverage-report.json`, in the worktree, which the run never delivers.
-    let changed = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(&wt)
-        .output()
-        .expect("git status in the run worktree");
-    let changed = String::from_utf8_lossy(&changed.stdout).into_owned();
-    let stray: Vec<&str> = changed
-        .lines()
-        .map(|l| l.get(3..).unwrap_or(l).trim())
-        .filter(|p| !p.starts_with(".wicked/domain/") && *p != "coverage-report.json")
+
+    // The step ran garden's run.py with the store, the checkout and the scope file.
+    let args = read("args");
+    let lines: Vec<&str> = args.lines().collect();
+    assert_eq!(lines[0], "--db", "{args}");
+    assert_eq!(lines[1], entry.code_graph_db, "{args}");
+    assert_eq!(lines[2], "--repo-root", "{args}");
+    assert_eq!(lines[3], entry.root_path, "{args}");
+    assert_eq!(lines[4], "--scope", "{args}");
+    let scope_path = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("scope_env="))
+        .unwrap_or_default();
+    assert_eq!(
+        lines[5], scope_path,
+        "--scope is the WICKED_DOMAIN_SCOPE file: {args}"
+    );
+    // …in the step's own channel directory, outside the run's tree, gone when the step ended.
+    let scope_file = std::path::Path::new(scope_path);
+    assert_eq!(scope_file.file_name().unwrap(), "scope.json", "{args}");
+    let channel_dir = scope_file.parent().unwrap();
+    assert!(
+        channel_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("wmc-{}-", std::process::id())),
+        "{args}"
+    );
+    assert!(
+        !scope_path.contains(run_tree(repo, &run_id).to_str().unwrap()),
+        "{args}"
+    );
+    assert!(
+        !channel_dir.exists(),
+        "the channel directory went with the step"
+    );
+    assert_ne!(
+        scope_path, "/nonexistent/ambient-scope.json",
+        "the ambient value is stripped"
+    );
+    // …holding exactly the launch's scope.
+    let copied: serde_json::Value = serde_json::from_str(&read("scope.json"))
+        .unwrap_or_else(|e| panic!("{e}: {}", read("scope.err")));
+    assert_eq!(copied, scope);
+
+    // Both claude calls were served by a seat, each its own ballot of this run.
+    assert_eq!(read("a.rc").trim(), "0", "{}", read("a.err"));
+    assert_eq!(read("b.rc").trim(), "0", "{}", read("b.err"));
+    assert!(read("a.out").contains("claude: "), "{}", read("a.out"));
+    assert!(
+        read("a.out").contains("Name one rule."),
+        "{}",
+        read("a.out")
+    );
+    let seen = seats.seen.lock().unwrap().clone();
+    let claude: Vec<&Answered> = seen
+        .iter()
+        .filter(|(_, seat, _)| seat.as_deref() == Some("claude"))
         .collect();
+    assert_eq!(claude.len(), 2, "{seen:?}");
+    assert_ne!(claude[0].0, claude[1].0, "distinct ballot ids: {seen:?}");
+    for (ballot, _, parent) in &claude {
+        assert_ne!(ballot, &run_id, "a ballot is not the run itself");
+        assert_eq!(parent.as_deref(), Some(run_id.as_str()), "{seen:?}");
+    }
+    // The codex call is refused by name: a repository-bound run benches codex at launch, and the
+    // channel admits only the run's own seats (core#1905). No codex seat ran.
+    assert_ne!(read("c.rc").trim(), "0");
     assert!(
-        stray.is_empty(),
-        "the domain run changed {stray:?}:\n{changed}"
+        read("c.err").contains("the `codex` seat is benched for this run"),
+        "{}",
+        read("c.err")
     );
-    // Operator ruling 2026-10-31: the graph is saved into the repo's estate store and read from
-    // there (crew's read, `requirements_graph_for_repo`); no JSON file lands in the checkout or the
-    // worktree.
-    for dir in [&repo, &wt] {
+    assert!(!tree.join("c.out").exists());
+    assert!(
+        !seen
+            .iter()
+            .any(|(_, seat, _)| seat.as_deref() == Some("codex")),
+        "{seen:?}"
+    );
+}
+
+/// (coord ruling B') A `domain-extraction` launch with no scope is refused by name, and so is a
+/// scope on another launch or a malformed one; nothing is persisted.
+#[test]
+fn a_launch_without_its_scope_or_with_a_stray_one_is_refused_by_name() {
+    let rig = rig("refused");
+    let (core, entry) = (&rig.core, &rig.entry);
+    let pid = std::process::id();
+    let none = core
+        .launch_run(spec(
+            &format!("de-none-{pid}"),
+            &entry.id,
+            "domain-extraction",
+            None,
+        ))
+        .expect_err("a domain-extraction launch needs a scope");
+    assert!(
+        none.to_string()
+            .contains("domain-extraction needs a scope (Start carries it from the preview)"),
+        "{none}"
+    );
+    let stray = core
+        .launch_run(spec(
+            &format!("de-stray-{pid}"),
+            &entry.id,
+            "feature",
+            Some(serde_json::json!({"intent": "refunds"})),
+        ))
+        .expect_err("a scope is only for domain-extraction");
+    assert!(
+        stray
+            .to_string()
+            .contains("a scope is only for a domain-extraction launch"),
+        "{stray}"
+    );
+    let bad = core
+        .launch_run(spec(
+            &format!("de-bad-{pid}"),
+            &entry.id,
+            "domain-extraction",
+            Some(serde_json::json!({"intent": "refunds", "phrases": null})),
+        ))
+        .expect_err("a malformed scope is refused");
+    assert!(
+        bad.to_string()
+            .contains("the scope's phrases are not a list of non-empty strings"),
+        "{bad}"
+    );
+    for id in ["de-none", "de-stray", "de-bad"] {
         assert!(
-            !dir.join(".wicked-estate/requirements/requirements_graph.json")
-                .exists()
-                && !dir.join("requirements_graph.json").exists(),
-            "no requirements JSON file under {}",
-            dir.display()
+            core.session_detail(&format!("{id}-{pid}"))
+                .unwrap()
+                .is_none(),
+            "{id}: nothing persisted"
         );
     }
-    let daemon = wicked_apps_core::open_store_ro(Some(&dbp)).unwrap();
-    let read = wicked_core::requirements_graph_for_repo(&daemon, &dbp, &repo_id).unwrap();
-    let graph = read["graph"].clone();
-    assert!(
-        graph.is_object(),
-        "the graph reads back from estate: {read}"
-    );
-    assert_eq!(read["coverage"]["real_pct"], 100, "{read}");
-    assert_eq!(
-        graph["metadata"]["coverage"]["real_pct"], 100,
-        "the graph carries its coverage label: {graph}"
-    );
-    assert_eq!(graph["metadata"]["coverage"]["min_pct"], 80);
-    let req = &graph["domains"]["billing"]["requirements"]["REQ-001"];
-    assert_eq!(
-        req["corroboration"]["status"], "unconfirmed",
-        "a function nothing calls is unconfirmed: {req}"
-    );
-    assert_eq!(req["corroboration"]["why"]["code"], "dead_code");
-
-    // Approve the human gate → the run completes.
-    core.confirm_gate(
-        "run-happy",
-        HumanDecision::Approve {
-            amend: None,
-            amend_scope: Default::default(),
-        },
-    )
-    .expect("approve the domain-graph gate");
-    wait_status(&core, "run-happy", SessionStatus::Completed)
-        .expect("approving the final gate completes the governed run");
-    // wicked-core#1338: the launch's deliver step was dropped, so no unit delivers.
-    let done = core
-        .sessions_detail()
-        .unwrap()
-        .into_iter()
-        .find(|v| v.session.id == "run-happy")
-        .unwrap();
-    assert!(
-        done.units
-            .iter()
-            .all(|u| u.catalog.as_deref() != Some("deliver")),
-        "a mapping run has no deliver unit: {:?}",
-        done.units
-            .iter()
-            .map(|u| u.catalog.clone())
-            .collect::<Vec<_>>()
-    );
 }
 
-// --- TEST 2: a policy violation in a phase's output denies the phase ---
-
+/// The arming rule through the actor (coord fold 1, C0): a project preset that shadows the
+/// built-in's NAME with its exact steps is armed (the existing rule, asserted as such); a project
+/// preset under another name with byte-identical steps, and a registered workflow with the same
+/// `domain-run` step, are not. They cannot carry a scope (only `domain-extraction` takes one), so
+/// their step refuses by name before the launcher runs, and no seat answers anything.
 #[test]
-fn a_policy_violation_denies_a_phase_and_halts_the_run() {
-    let db = db_in("deny");
-    // Trip a deny on the extractor phase (`extract`) via a token in its output.
-    let (core, repo_id, dbp, _repo) = setup(
-        "deny",
-        DomainExtractionRunner {
-            db,
-            out_override: Some(("extract", "emitting LEAKTOKEN in the output".into())),
-        },
-        true,
-    );
-    {
-        let mut store = open_store(Some(&dbp)).unwrap();
-        register_policy(&mut store, &deny_policy("extract", "LEAKTOKEN")).unwrap();
-    }
-    launch(&core, "run-deny", &repo_id);
-    // A policy violation in the extractor phase's output denies it → the run pauses at the
-    // escalation gate on that phase (core#464).
-    drive_until(&core, "run-deny", "the extract deny", |v| {
-        rejected(v, "extract")
-    });
-    // Attribute the failure to the EXTRACTOR phase specifically — not an unrelated gate — so the test
-    // proves the policy-over-output deny, not just "some failure".
-    let views = core.sessions_detail().unwrap();
-    let v = views.iter().find(|v| v.session.id == "run-deny").unwrap();
-    let extract = v.units.iter().find(|u| u.id == "run-deny:extract").unwrap();
-    assert_eq!(
-        extract.status,
-        UnitStatus::Rejected,
-        "the extractor phase is the denied unit"
-    );
-    let daemon = wicked_apps_core::open_store_ro(Some(&dbp)).unwrap();
-    let read = wicked_core::requirements_graph_for_repo(&daemon, &dbp, &repo_id).unwrap();
-    assert!(
-        read["graph"].is_null(),
-        "the run halted at the denied phase — no requirements graph in estate: {read}"
-    );
-}
-
-// --- TEST 3: a conformance rule is recalled into the run as an obligation ---
-
-#[test]
-fn a_conformance_rule_is_recalled_onto_the_run_claims() {
-    let db = db_in("recall");
-    let (core, repo_id, dbp, _repo) = setup(
-        "recall",
-        DomainExtractionRunner {
-            db,
-            out_override: None,
-        },
-        true,
-    );
-    {
-        let mut store = open_store(Some(&dbp)).unwrap();
-        register_rule(
-            &mut store,
-            &ConformanceRule {
-                id: "PAT-777".into(),
-                rule_type: RuleType::Pattern,
-                statement: "no plaintext secrets in output".into(),
-                severity: ConfSeverity::Critical,
-                confidence: 0.95,
-                targets: Targets::default(),
-                symbol_ref: None,
-                compliance: None,
-                provenance: RuleProvenance::default(),
-                retired: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    }
-    let events = core.subscribe();
-    launch(&core, "run-recall", &repo_id);
-    drive_until(&core, "run-recall", "the domain-graph gate", |v| {
-        paused_at(v, "domain-graph")
-    });
-    // core#396: admitted against the fixture generation, and only it (see TEST 1).
-    let snapshot = skills_snapshot_root();
-    let handed = handed_generations(&events, "run-recall");
-    assert!(
-        !handed.is_empty()
-            && handed.iter().all(|(path, gen, root)| {
-                path == "tool_cmd"
-                    && gen.as_deref() == Some("000001")
-                    && skills_fixture::names_generation(root, &snapshot)
-            }),
-        "admitted against generation 000001 at {}: {handed:?}",
-        snapshot.display()
-    );
-
-    // The recall→gate wiring fires per unit: at least one persisted conformance claim carries the rule
-    // as an obligation. Before this milestone, no run claim ever carried a recalled rule.
-    let store = open_store(Some(&dbp)).unwrap();
-    let claims = store
-        .find_symbols(&SymbolQuery {
-            kinds: vec![NodeKind::Other(CONFORMANCE_CLAIM.to_string())],
-            ..Default::default()
+fn only_the_shipped_name_arms_its_step_and_a_copy_under_another_name_runs_no_seat() {
+    let rig = rig("ident");
+    let (core, seats, repo, entry) = (&rig.core, &rig.seats, &rig.repo, &rig.entry);
+    let pid = std::process::id();
+    let project = core.project_create("j6-ident", None).unwrap();
+    for name in ["domain-extraction", "my-domain"] {
+        core.put_preset(PresetSpec {
+            name: name.into(),
+            project_id: Some(project.id.clone()),
+            steps: shipped_steps(),
+            created_by: "api".into(),
         })
-        .unwrap();
-    let has_obligation = claims.iter().any(|c| {
-        c.metadata
-            .get("obligations")
-            .and_then(|o| o.as_array())
-            .is_some_and(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .any(|s| s.contains("PAT-777"))
-            })
-    });
-    assert!(
-        has_obligation,
-        "a registered conformance rule is recalled as an obligation on a run's output claim (M6/M7 \
-         wiring live in the loop). claims found: {}",
-        claims.len()
-    );
-
-    let _ = core.cancel_run("run-recall");
-}
-
-// --- TEST 4: a coverage HOLE is DENIED by the pinned coverage validator IN A RUN ---
-
-/// The enforcement proof (vs TEST 1's happy path): seed a store BELOW full coverage so the coverage
-/// phase's recomputed report is < 1.0, and assert the pinned coverage validator DENIES it in the run —
-/// so the gate genuinely has teeth (a regression that disconnected the pinned validator would let this
-/// through). Also proves the agent-judge PASS shim does NOT rescue a coverage hole: the DETERMINISTIC
-/// validator's deny dominates the agent's PASS.
-#[test]
-fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
-    let db = db_in("hole");
-    let (core, repo_id, _db, repo) = setup(
-        "hole",
-        DomainExtractionRunner {
-            db,
-            out_override: None,
-        },
-        false, // a BARE function → an unaccounted hole → coverage < 1.0
-    );
-    launch(&core, "run-hole", &repo_id);
-    // The coverage validator's deny escalates to the human gate on `coverage`; approve every gate
-    // before it (the plan's, and any floor phase's).
-    let approved = drive_until(&core, "run-hole", "the coverage deny", |v| {
-        rejected(v, "coverage")
-    });
-
-    // Poll until the coverage phase is REJECTED — the deterministic coverage
-    // validator denied the sub-1.0 report. A not-pass verdict on the `human_confirm_if verdict_not_pass`
-    // coverage gate escalates rather than hard-failing, so assert on the UNIT, not the session status.
-    let deadline = Instant::now() + RUN_DEADLINE;
-    let mut rejected = false;
-    let mut last = None;
-    while Instant::now() < deadline {
-        if let Ok(views) = core.sessions_detail() {
-            if let Some(v) = views.iter().find(|v| v.session.id == "run-hole") {
-                let coverage = v.units.iter().find(|u| u.id == "run-hole:coverage");
-                if coverage.map(|u| u.status) == Some(UnitStatus::Rejected) {
-                    rejected = true;
-                    break;
-                }
-                last = Some((v.session.status, coverage.map(|u| u.status)));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(15));
+        .unwrap_or_else(|e| panic!("put_preset {name}: {e}"));
     }
+    let def = serde_json::json!({
+        "id": "my-domain-flow",
+        "phases": [{
+            "id": "domain-run", "kind": "recon", "gate": "auto",
+            "executor": serde_json::to_value(&shipped_steps()[0].executor).unwrap()
+        }]
+    });
+    core.register_workflow(def.to_string())
+        .expect("register workflow");
+
+    // The same-name project shadow with the exact steps: armed.
+    let shadow = format!("de-shadow-{pid}");
+    let mut s = spec(&shadow, &entry.id, "domain-extraction", Some(a_scope()));
+    s.project_id = Some(project.id.clone());
+    let ev = core.subscribe();
+    core.launch_run(s).expect("launch the shadow");
+    let (end, gated) = wait_terminal(&ev, &shadow);
+    let tree = run_tree(repo, &shadow).join(".wicked/domain/e2e");
+    let read = |f: &str| std::fs::read_to_string(tree.join(f)).unwrap_or_default();
     assert!(
-        rejected,
-        "the pinned coverage validator DENIES a sub-1.0 coverage report in a run (the gate has teeth; \
-         the agent-PASS shim does not rescue a hole) — the coverage unit was never rejected within {}s; \
-         last seen: {last:?}; gates approved first: {approved:?}",
-        RUN_DEADLINE.as_secs()
+        matches!(end, CoreEvent::SessionCompleted { .. }) && !gated,
+        "{end:?}: {}",
+        read("a.err")
     );
-    let wt = worktree(&repo, "run-hole");
-    // The report WAS written (< 1.0) — so the deny is the sub-1.0 coverage path, not a missing-file
-    // rejection that would pass for the wrong reason.
-    assert!(
-        wt.join("coverage-report.json").is_file(),
-        "the coverage phase produced a report; the rejection is a genuine sub-1.0 deny, not a missing file"
+    assert_eq!(read("a.rc").trim(), "0", "{}", read("a.err"));
+    let served = seats.seen.lock().unwrap().len();
+    assert_eq!(served, 2, "the shadow's two claude calls");
+
+    // Another name, byte-identical steps; and a registered workflow with the same step.
+    for (run, workflow, project_id) in [
+        (
+            format!("de-copy-{pid}"),
+            "my-domain",
+            Some(project.id.clone()),
+        ),
+        (format!("de-flow-{pid}"), "my-domain-flow", None),
+    ] {
+        let mut s = spec(&run, &entry.id, workflow, None);
+        s.project_id = project_id;
+        let ev = core.subscribe();
+        core.launch_run(s)
+            .unwrap_or_else(|e| panic!("launch {workflow}: {e}"));
+        let (end, _) = wait_terminal(&ev, &run);
+        assert!(
+            !matches!(end, CoreEvent::SessionCompleted { .. }),
+            "{workflow}: its step has no scope and refuses: {end:?}"
+        );
+        assert!(
+            !run_tree(repo, &run)
+                .join(".wicked/domain/e2e/args")
+                .exists(),
+            "{workflow}: the launcher never ran"
+        );
+    }
+    assert_eq!(
+        seats.seen.lock().unwrap().len(),
+        served,
+        "no seat answered a copy"
     );
-    assert!(
-        !wt.join("requirements_graph.json").is_file(),
-        "the run halted at the denied coverage phase — the domain-graph artifact was never produced"
-    );
-
-    let _ = core.cancel_run("run-hole");
-}
-
-// ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
-/// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
-/// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
-/// no shared store configured those spool — which must land in a per-process temp file, never in
-/// the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue. Every
-/// binary in this suite carries this block; `harness_hygiene.rs` fails the suite if one is missing.
-///
-/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
-/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
-#[ctor::ctor(unsafe)]
-fn arm_hermetic_emit_spool() {
-    wicked_apps_core::emit::hermetic_test_spool();
-}
-
-/// The folder beside the checkout `repo` that holds its run trees (core#1109).
-fn trees_beside(repo: &std::path::Path) -> std::path::PathBuf {
-    let mut name = repo.file_name().unwrap().to_os_string();
-    name.push(".wicked");
-    repo.with_file_name(name)
-}
-
-/// Where the engine mints run `id`'s tree for the checkout `repo`:
-/// `<parent>/<name>.wicked/wicked-worktrees/<id>`, beside it (core#1109).
-fn run_tree(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
-    trees_beside(repo).join("wicked-worktrees").join(id)
-}
-
-/// Remove a test checkout and the folder beside it that holds its run trees.
-fn rm_repo(repo: &std::path::Path) {
-    let _ = std::fs::remove_dir_all(trees_beside(repo));
-    let _ = std::fs::remove_dir_all(repo);
 }

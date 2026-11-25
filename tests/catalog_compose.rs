@@ -8,10 +8,14 @@
 //! defines (dumped from crew `main` 4870c87 — see `tests/fixtures/catalog/README.md`), and from
 //! `tests/fixtures/catalog/migrated-defs.json` for the consumers whose def a migration seam
 //! deleted — since X-MIG M11 that includes core's own (`feature`, `bug`, `migration`,
-//! `mcp-server`, `domain-extraction`, copied from the retired `workflows/*.json`): the fixture
-//! keeps pinning the built-in presets that replaced them. The steps and the bold cells are
+//! `mcp-server`, copied from the retired `workflows/*.json`): the fixture keeps pinning the
+//! built-in presets that replaced them. The steps and the bold cells are
 //! `tests/fixtures/catalog/mappings.json`; the bold cells are fixed values, and the migration
 //! cleanup cells are pinned again below in code.
+//!
+//! `domain-extraction` left this suite in J6 v3: its preset is now two host steps (`domain-run`,
+//! `domain-graph`) that map none of the old def's phases, so there is no today-def for it to
+//! equal. `src/catalog.rs` and `src/domain_extraction.rs` pin its steps.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,8 +24,8 @@ use serde_json::{json, Map, Value};
 use wicked_core::{catalog, compose, plan_from_def, PlanRefusal, PlanSteps, WorkflowDef};
 
 const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
-/// `COVERAGE_VALIDATOR_PIN`: shipped and APPROVED (the `domain_coverage` entry's pin).
-const COVERAGE_PIN: &str = "9a2c71609c3e3ced";
+/// A pin other than any entry's own (compose reads the pin as a string; it never opens the vault).
+const OTHER_PIN: &str = "9a2c71609c3e3ced";
 
 /// The acceptance tuple, in the DES's order.
 const FIELDS: [&str; 10] = [
@@ -39,8 +43,8 @@ const FIELDS: [&str; 10] = [
 
 /// Every §11.2 consumer row that still exists. `survey-repo`, `memories`, `domain-graph-slice`
 /// and `collab` were deleted outright (operator decision, 2026-09-26: nothing launched them), so
-/// they have no preset and no fixture.
-const CONSUMERS: [&str; 14] = [
+/// they have no preset and no fixture; `domain-extraction` left the suite in J6 v3 (module doc).
+const CONSUMERS: [&str; 13] = [
     "feature",
     "bug",
     "migration",
@@ -48,7 +52,6 @@ const CONSUMERS: [&str; 14] = [
     "chat",
     "onboarding",
     "capture-learnings",
-    "domain-extraction",
     "steering-author",
     "interactive-chat",
     "interactive-draft",
@@ -159,48 +162,11 @@ fn compose_of_every_mapping_equals_todays_def_except_the_bold_cells() {
         bold_total += bold.len();
     }
     // feature 2 (test/review role), migration 5 (cutover pin+role, cleanup pin+code+role),
-    // domain-extraction 1, steering-author 1 (collab's 2 left with the deleted workflow), and
-    // mcp-server 1 (test role; M12, DES-W7-M12).
-    assert_eq!(bold_total, 10, "§11.2 (plus M12's row) has ten bold cells");
-}
-
-/// domain-extraction's coverage maps onto `domain_coverage`, which carries the coverage pin as
-/// data: the mapping restates it (a no-op), no §11.2 step swaps a pin, and the composed phase is
-/// today's in every acceptance field and still satisfies `BINARY_PINNED_PHASES`.
-#[test]
-fn domain_extraction_coverage_composes_from_its_own_pinned_entry() {
-    let maps = mappings();
-    for consumer in CONSUMERS {
-        for step in maps[consumer]["steps"].as_array().unwrap() {
-            let Some(pin) = step.get("validator_pin") else {
-                continue;
-            };
-            let entry = wicked_core::catalog_entry(step["catalog"].as_str().unwrap()).unwrap();
-            if let Some(own) = entry.validator_pin.as_deref() {
-                assert_eq!(
-                    pin,
-                    &json!(own),
-                    "{consumer}/{}: swaps its entry's pin",
-                    step["id"]
-                );
-            }
-        }
-    }
-    let def = compose(catalog(), &steps_of(&maps["domain-extraction"])).unwrap();
-    let today = today_defs();
-    let before = today["domain-extraction"]
-        .phases
-        .iter()
-        .find(|p| p.id == "coverage")
-        .unwrap();
-    let after = def.phases.iter().find(|p| p.id == "coverage").unwrap();
-    assert_eq!(tuple(after), tuple(before), "coverage is unchanged");
-    assert_eq!(after.verified_evidence, before.verified_evidence);
-    assert_eq!(after.required_deliverables, before.required_deliverables);
-    // `BINARY_PINNED_PHASES` is `[("domain-extraction", "coverage", COVERAGE_VALIDATOR_PIN)]`.
+    // steering-author 1 (collab's 2 left with the deleted workflow), and mcp-server 1 (test role;
+    // M12, DES-W7-M12). domain-extraction's 1 (`extract.kind`) left with its row (J6 v3).
     assert_eq!(
-        after.validator_pin.as_deref(),
-        Some(wicked_core::COVERAGE_VALIDATOR_PIN)
+        bold_total, 9,
+        "§11.2 (plus M12's row, less domain-extraction's) has nine bold cells"
     );
 }
 
@@ -316,10 +282,10 @@ fn a_step_that_weakens_its_entry_is_refused_with_a_named_reason() {
 
 /// Operator decision (follow-up to #615): a step may ADD a pin to an unpinned entry, but never
 /// SWAP the pin an entry carries — not even for another APPROVED pin. Here `build`'s evidence
-/// floor is swapped for the shipped, approved coverage pin: refused as `pin_changed`.
+/// floor is swapped for another pin: refused as `pin_changed`.
 #[test]
 fn a_step_cannot_swap_its_entrys_pin_for_another_approved_pin() {
-    let r = refusal(json!([{"catalog": "build", "id": "b", "validator_pin": COVERAGE_PIN}]));
+    let r = refusal(json!([{"catalog": "build", "id": "b", "validator_pin": OTHER_PIN}]));
     assert_eq!(r.reason(), "pin_changed", "{r}");
     assert!(r.to_string().starts_with("pin_changed"), "{r}");
     // Restating the entry's own pin is a no-op, and removal stays `pin_removed`.
@@ -344,7 +310,7 @@ fn a_step_that_strengthens_its_entry_is_accepted() {
          "validator_pin": EVIDENCE_FLOOR_PIN, "owner": "team"},
         {"catalog": "produce", "id": "p", "executes_code": true, "validator_pin": EVIDENCE_FLOOR_PIN,
          "depends_on": ["u"], "role": "creator"},
-        {"catalog": "critique", "id": "t", "validator_pin": COVERAGE_PIN, "depends_on": ["p"],
+        {"catalog": "critique", "id": "t", "validator_pin": OTHER_PIN, "depends_on": ["p"],
          "gate": {"human_confirm": {"unconditional": false}}},
         {"catalog": "run", "id": "r", "kind": "test", "depends_on": ["t"],
          "executor": {"type": "tool", "cmd": ["true"]}},
@@ -361,7 +327,7 @@ fn a_step_that_strengthens_its_entry_is_accepted() {
     );
     assert_eq!(v["phases"][1]["executes_code"], json!(true));
     // An ADD on the unpinned `critique` entry (a swap on a pinned entry is `pin_changed`).
-    assert_eq!(v["phases"][2]["validator_pin"], json!(COVERAGE_PIN));
+    assert_eq!(v["phases"][2]["validator_pin"], json!(OTHER_PIN));
     assert_eq!(v["phases"][3]["kind"], json!("test"));
     assert_eq!(
         v["phases"][3]["executor"],
@@ -529,11 +495,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
             (
                 vec![
                     ("full", json!({"validator_pin": null}), "pin_removed"),
-                    (
-                        "full",
-                        json!({"validator_pin": COVERAGE_PIN}),
-                        "pin_changed",
-                    ),
+                    ("full", json!({"validator_pin": OTHER_PIN}), "pin_changed"),
                 ],
                 ("full", json!({"validator_pin": EVIDENCE_FLOOR_PIN})),
             ),
@@ -774,11 +736,11 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     let def = compose_one(
         "tool",
         json!({"executor": {"type": "tool", "cmd": ["true"]}, "skill_ref": "s",
-               "instructions": "i", "allowed_skills": ["a"], "validator_pin": COVERAGE_PIN}),
+               "instructions": "i", "allowed_skills": ["a"], "validator_pin": OTHER_PIN}),
     )
     .unwrap();
     assert_eq!(def.phases[0].skill_ref.as_deref(), Some("s"));
-    assert_eq!(def.phases[0].validator_pin.as_deref(), Some(COVERAGE_PIN));
+    assert_eq!(def.phases[0].validator_pin.as_deref(), Some(OTHER_PIN));
 }
 
 /// C1 acceptance (c): a misspelled step key is refused at parse.

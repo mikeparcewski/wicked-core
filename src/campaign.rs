@@ -97,6 +97,7 @@ impl RunSpec {
                 .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
         );
         Ok(LaunchSpec {
+            scope: None,
             base_ref: None,
             problem: self.problem.clone(),
             clis: self.clis.clone(),
@@ -2619,6 +2620,7 @@ mod tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -2792,6 +2794,7 @@ mod tests {
                 team_plan: None,
                 exclude_seats: Vec::new(),
                 evidence_root: None,
+                scope: None,
                 assurance: Default::default(),
                 power: None,
                 run_context: None,

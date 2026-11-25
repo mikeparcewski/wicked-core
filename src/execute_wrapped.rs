@@ -16622,8 +16622,6 @@ mod tests {
                 "decide/score",
                 "demo/review",
                 "docs/check",
-                "domain-extraction/coverage",
-                "domain-extraction/critique",
                 "editor-plugin/security-review",
                 "editor-plugin/test",
                 "feature/adversarial-review",
@@ -21743,6 +21741,7 @@ mod project_graph_end_to_end_tests {
         graph_with(&repo_graph, &["alpha"]);
 
         let spec = |id: &str, pg: Option<crate::ProjectGraphBinding>| crate::LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "Do the one task".into(),

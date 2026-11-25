@@ -1507,6 +1507,7 @@ pub(crate) fn run(
                     // …and no orchestrator to hear a voice (core#1216).
                     voice: _,
                     stand_in,
+                    scope,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1547,6 +1548,12 @@ pub(crate) fn run(
                     Ok(None) if reduced_assurance => Err(anyhow::anyhow!(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
+                    )),
+                    // (J6 C1b) A scope is persisted on the governed dispatch's session for its
+                    // domain-run step: refused here rather than silently dropped.
+                    Ok(None) if scope.is_some() => Err(anyhow::anyhow!(
+                        "a launch with a scope must use launch_run: the straight-through path \
+                         runs no domain-run step to hand it to"
                     )),
                     // (QE acceptance) …and so is a QE word: an explicit skip or force, or the
                     // host's standing skip (which only `launch_run` resolves against a contract).
@@ -1677,6 +1684,13 @@ pub(crate) fn run(
                     // (core#1216) The orchestrator's voice block: bounded, refused with NO
                     // session persisted.
                     crate::power::validate_voice(spec.voice.as_deref())?;
+                    // (J6 C1b) A domain-extraction launch carries its scope, and no other launch
+                    // does: refused with NO session persisted.
+                    crate::domain_extraction::check_launch_scope(
+                        spec.workflow.as_deref(),
+                        spec.scope.as_ref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
                     // (DES-STANDIN-001 §3.8, rev 3 N4) Stand-in facts that cannot hold together
                     // (aware + reduced, consent on an unaware launch, a malformed consent) are
                     // refused with NO session persisted.
@@ -1952,6 +1966,7 @@ pub(crate) fn run(
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
                         // (WT-C2) Validated with the write roots above; in the launch record.
                         evidence_root: spec.evidence_root.clone(),
+                        scope: spec.scope.clone(),
                         // (core#850) The run's assurance contract: the workflow's declared
                         // instruments (or the default) and the launch's explicit opt-in.
                         // (QE acceptance) The operator's explicit skip or force, refused before
@@ -6037,6 +6052,9 @@ pub(crate) fn launch_run_inner(
         }
         // (core#1216) The orchestrator's voice block: same synchronous refusal.
         crate::power::validate_voice(spec.voice.as_deref())?;
+        // (J6 C1b) The domain-extraction scope: same synchronous refusal.
+        crate::domain_extraction::check_launch_scope(spec.workflow.as_deref(), spec.scope.as_ref())
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
     // (DES-APPS-001 K0) The same Apps admission as the interactive path, before anything is
     // created; `plan_and_distribute` records the contract on the session it writes.
@@ -6100,17 +6118,23 @@ pub(crate) fn launch_run_inner(
         spec.reduced_assurance,
         &spec.qe_acceptance,
     )?;
-    if let Some((state, _, _)) = team {
+    if team.is_some() || spec.scope.is_some() {
         let mut s = crate::domain::get_session(store, &run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} planned no session"))?;
-        s.team_plan = Some(state);
-        // The pick is a team fact: recorded on the team state so `path.started` names it and a
-        // re-pick counts from it. A legacy run with a chosen seat keeps only the rotated roster.
-        if let Some(p) = primary {
-            s.team
-                .get_or_insert_with(crate::domain::RunTeamState::default)
-                .primary = Some(p);
+        if let Some((state, _, _)) = team {
+            s.team_plan = Some(state);
+            // The pick is a team fact: recorded on the team state so `path.started` names it and
+            // a re-pick counts from it. A legacy run with a chosen seat keeps only the rotated
+            // roster.
+            if let Some(p) = primary {
+                s.team
+                    .get_or_insert_with(crate::domain::RunTeamState::default)
+                    .primary = Some(p);
+            }
         }
+        // (J6 C1b) This path persists no launch stub, so the checked scope is recorded here,
+        // before the first unit runs.
+        s.scope = spec.scope.clone();
         put_node(store, s.to_node())?;
     }
     report_identity_missing(subscribers, &run_id, identity_missing);
@@ -9426,122 +9450,6 @@ fn apply_step_result(
         }
     }
 
-    // ── PAGE FLOOR (core#1724) ───────────────────────────────────────────────────────────────
-    // A domain map's extract step states ONE page: every unit of the worklist the host framed. A
-    // seat that stated 79 of 500 units and left the rest "for subsequent pages" passed as a whole
-    // page (its file conformed; the page's review judges what was stated), and the map's minimum
-    // came hours later. The page's own deliverable (the rules file) is measured against the page:
-    // a partial page is asked for again ONCE, automatically, naming what is left — the units
-    // already stated stay in the file — and a page still partial after that round goes on,
-    // disclosed with its count (the units left are framed again by the next page).
-    if unit.tool_cmd.is_none()
-        && unit.role == crate::workflow::PhaseRole::Creator
-        && unit
-            .required_deliverables
-            .iter()
-            .any(|d| d == crate::domain_extraction::RULES_REL)
-    {
-        let cwd = session
-            .workdir
-            .clone()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
-        if let Some(page) = crate::domain_extraction::page_stated(&cwd).filter(|p| p.left() > 0) {
-            let asked = unit
-                .rework_amendment
-                .as_deref()
-                .is_some_and(|a| a.contains(PAGE_ROUND_MARKER));
-            if !asked {
-                let why = format!(
-                    "page incomplete: the rules file states {} of the {} worklist units on this \
-                     page ({} not stated)",
-                    page.stated,
-                    page.units,
-                    page.left()
-                );
-                unit.status = crate::domain::UnitStatus::Rejected;
-                unit.denial_reason = Some(why.clone());
-                unit.denial = Some(crate::domain::UnitDenial::new(
-                    PAGE_INCOMPLETE_SOURCE,
-                    why.clone(),
-                ));
-                put_node(store, unit.to_node())?;
-                persist_rejected_transcript(store, &session, unit, &output.output);
-                emit(
-                    subscribers,
-                    CoreEvent::StepFailed {
-                        session: run_id.clone(),
-                        ord,
-                        attempt: output.attempt,
-                        detail: format!("{why} — asking the seat once more for the whole page"),
-                        // Core's veto over a healthy seat: never a seat failure.
-                        failure_kind: crate::event::StepFailureKind::SubstanceRejected,
-                    },
-                );
-                // The attempt's governance record is folded before the rewind, as on the
-                // deliverable floor: the re-dispatch reads a new attempt's log (review r2).
-                let phase = crate::scope::unit_phase(ord);
-                let _ = crate::gate_hook::fold_input_denial(
-                    store,
-                    &run_id,
-                    output.attempt,
-                    &phase,
-                    true,
-                );
-                // A send-back this attempt answered stays in force beside the page's ask (review
-                // r2): the round replaces the unit's amendment.
-                let note = match unit
-                    .rework_amendment
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                {
-                    Some(prev) => format!(
-                        "{}\n\nStill in force from the round this attempt answered:\n{prev}",
-                        page_round_note(&page)
-                    ),
-                    None => page_round_note(&page),
-                };
-                let mut scratch_in_flight = HashSet::new();
-                return match rewind_to_creator_scoped(
-                    store,
-                    subscribers,
-                    runner,
-                    self_tx,
-                    &mut scratch_in_flight,
-                    session.clone(),
-                    &run_id,
-                    Some(note),
-                    PAGE_ROUND_SCOPE,
-                    lifecycle_maps,
-                    actor_maps,
-                    process_gen,
-                    is_acp,
-                )? {
-                    SessionStatus::Executing => Ok(StepApplied::Continuing),
-                    SessionStatus::AwaitingHuman => Ok(StepApplied::Paused),
-                    _ => Ok(StepApplied::Finished),
-                };
-            }
-            emit(
-                subscribers,
-                CoreEvent::UnitOutputDelta {
-                    session: run_id.clone(),
-                    ord,
-                    attempt: output.attempt,
-                    text: format!(
-                        "\n[wicked-core] partial page: stated {} of {} worklist units after the \
-                         automatic page round; the {} left are framed again by the next page \
-                         (core#1724)\n",
-                        page.stated,
-                        page.units,
-                        page.left()
-                    ),
-                },
-            );
-        }
-    }
-
     // (DES-DEMO-RECORD-001 §3.3) The plan a later `demo_record` records is snapshotted NOW, into the
     // engine's own `approved/<gen>/`: the person's gate shows that snapshot and the recorder reads
     // only it, so what records is what was approved. A plan that cannot be snapshotted is denied
@@ -9996,53 +9904,6 @@ fn vault_host_validator(
 
 /// (core#651) The `unitReworkAmended.scope` token of the automatic creator-floor round.
 pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
-
-/// (core#1724) The `unitReworkAmended.scope` token of the automatic page round.
-pub(crate) const PAGE_ROUND_SCOPE: &str = "page_incomplete";
-
-/// (core#1724) The denial source of a partial page (the extract step's rules file states only
-/// part of its worklist).
-pub(crate) const PAGE_INCOMPLETE_SOURCE: &str = "page_incomplete";
-
-/// (core#1724) The marker the automatic page round's amendment carries: present on the unit's
-/// `rework_amendment`, the round was taken (a send-back replaces the amendment, and the next page
-/// clears it, so each re-run of the page gets its own round).
-const PAGE_ROUND_MARKER: &str = "[automatic page round — 1 of 1 (core#1724)]";
-
-/// (core#1724) What the automatic page round asks for: the whole page, with what is left.
-fn page_round_note(page: &crate::domain_extraction::PageStated) -> String {
-    let sample = if page.unstated.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " (among them {}{})",
-            page.unstated
-                .iter()
-                .map(|id| format!("`{id}`"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            if page.left() > page.unstated.len() {
-                ", …"
-            } else {
-                ""
-            }
-        )
-    };
-    format!(
-        "{PAGE_ROUND_MARKER} This page's worklist (`{wl}`) has {units} units and `{rules}` states \
-         {stated}: {left} are not stated yet{sample}. A page is the whole worklist: no unit is left \
-         for a later page. Keep the entries already in the file and add one for every unit it does \
-         not hold yet — the rule its source shows, or an empty statement where the source shows \
-         none. If the harness stopped at its time budget, run it again: it resumes after the units \
-         already stated. Then run `--check-rules` with `--worklist` until it reports 0 worklist \
-         units not stated. A page still partial after this round goes on with its count shown.",
-        wl = crate::domain_extraction::WORKLIST_REL,
-        rules = crate::domain_extraction::RULES_REL,
-        units = page.units,
-        stated = page.stated,
-        left = page.left(),
-    )
-}
 
 /// (core#651) The marker the automatic round's amendment carries after the floor's own denial
 /// (which already names each failing check with its stdout/stderr tails).
@@ -13826,7 +13687,7 @@ fn dispatch_unit_with(
     // and takes none.
     //
     // …and for a bound agent unit that is NEITHER guarded NOR floored too (a creator whose
-    // deliverable is not code, followed by a verifying phase: domain-extraction's `extract`). The
+    // deliverable is not code, followed by a verifying phase: a `produce` before its critique). The
     // baseline carries the git dir pinned from the registered repository, and the seat container
     // refuses a worktree with no pinned git dir (`verify_linked_worktree`, fail closed): without
     // one, every such unit failed `root_unresolvable` on every seat and the run could not go on
@@ -14910,6 +14771,7 @@ fn dispatch_unit_with(
             (
                 runner.clone(),
                 model_call_admission(&session, in_process_governance().is_some()),
+                session.scope.clone(),
             )
         });
         std::thread::spawn(move || {
@@ -15129,13 +14991,23 @@ fn dispatch_unit_with(
                         // (DES-j6-build D1, C0) The model-call channel lives until the command
                         // exits (this scope); a channel that could not be armed leaves the
                         // variables unset, and the client says so.
-                        let _model_call = model_calls.as_ref().and_then(|(r, admit)| {
-                            match crate::model_call::arm(
+                        let _model_call = model_calls.as_ref().and_then(|(r, admit, scope)| {
+                            let armed = crate::model_call::arm(
                                 r.clone(),
                                 admit.clone(),
                                 &input.run_id,
                                 ord,
-                            ) {
+                            )
+                            .and_then(|mut ch| {
+                                // (J6 C1b) The run's scope, in the channel's own directory; a
+                                // run without one leaves `WICKED_DOMAIN_SCOPE` unset, and the
+                                // step says so.
+                                if let Some(scope) = scope {
+                                    ch.hand_scope(scope)?;
+                                }
+                                Ok(ch)
+                            });
+                            match armed {
                                 Ok(ch) => Some(ch),
                                 Err(e) => {
                                     eprintln!(
@@ -17579,9 +17451,19 @@ impl Drop for ChildExitHook {
 /// (core#1905) The seats `session`'s model calls may use ([`crate::model_call::admission`]): its
 /// launch roster (the instances and the launcher's health probe, [`launch_roster`]), less the run's
 /// own benches and its launch benches as the ballot rule reads them ([`council_roster`]). A run
-/// with no launch roster has no seat to call.
+/// with no launch roster has no seat to call; one whose roster does not parse refuses every call
+/// with the parse error.
 fn model_call_admission(session: &AgentSession, contained: bool) -> crate::model_call::Admission {
-    let roster = launch_roster(session).unwrap_or_default();
+    let roster = match launch_roster(session) {
+        Ok(roster) => roster,
+        Err(e) => {
+            let why = format!("{e:#}");
+            return crate::model_call::FAMILIES
+                .iter()
+                .map(|f| (f.to_string(), Err(why.clone())))
+                .collect();
+        }
+    };
     let launch_bench =
         crate::distribute::launch_benched(&roster, session.repo_ref.is_some(), contained);
     crate::model_call::admission(&roster, &session.benched_seats, &launch_bench)
@@ -24325,6 +24207,7 @@ pub(crate) mod sessions_detail_fold_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -24659,6 +24542,7 @@ mod gate_pause_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -24985,6 +24869,7 @@ mod terminal_gate_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -25326,6 +25211,7 @@ retry the deliver phase";
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -26122,6 +26008,7 @@ mod substance_gate_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -28166,6 +28053,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
@@ -28250,6 +28138,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
@@ -29715,6 +29604,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
             run_context: None,
@@ -29864,6 +29754,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
             run_context: None,
@@ -30573,6 +30464,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -36646,6 +36538,7 @@ mod code_evidence_floor_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -37286,6 +37179,7 @@ mod deliverable_floor_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -37365,147 +37259,6 @@ mod deliverable_floor_tests {
             .unwrap()
             .remove(0);
         (session, unit)
-    }
-
-    /// core#1724 (J6, train 11): a domain map's extract seat stated 79 of its page's 500
-    /// worklist units ("for subsequent pages"); its file conformed, so the page passed whole and
-    /// the map's minimum came hours later. A rules file that conforms but covers only part of the
-    /// worklist is asked for again ONCE, automatically, with the count; still partial after that
-    /// round, the page goes on with its count disclosed.
-    #[test]
-    fn core_1724_a_partial_page_is_asked_for_again_once_then_goes_on_disclosed() {
-        let wd = tmp("page-partial");
-        std::fs::create_dir_all(wd.join(".wicked/domain")).unwrap();
-        std::fs::write(
-            wd.join(crate::domain_extraction::WORKLIST_REL),
-            r#"{"units":[{"symbol_id":"a#"},{"symbol_id":"b#"},{"symbol_id":"c#"},{"symbol_id":"d#"}]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            wd.join(crate::domain_extraction::RULES_REL),
-            r#"{"schema":"wicked-garden/domain-rules@1","seat":"pi","rules":[
-                {"symbol_id":"a#","statement":"A refund needs a receipt.","confidence":0.9},
-                {"symbol_id":"b#","statement":"","confidence":0.5}]}"#,
-        )
-        .unwrap();
-        let run_id = format!("page-partial-{}", std::process::id());
-        let mut store = open_store(Some(":memory:")).unwrap();
-        seed(
-            &mut store,
-            &run_id,
-            Some(wd.to_string_lossy().into_owned()),
-            Vec::new(),
-            vec![crate::domain_extraction::RULES_REL.to_string()],
-        );
-        // What `dispatch_unit` stamped when attempt 0 ran.
-        let mut u = crate::domain::session_units(&store, &run_id)
-            .unwrap()
-            .remove(0);
-        u.last_attempt = Some(0);
-        put_node(&mut store, u.to_node()).unwrap();
-        let mut subs = crate::event_log::EventSink::default();
-        let (esub, erx) = channel();
-        subs.push(esub);
-
-        let (session, unit) = fold(&mut store, &mut subs, &run_id);
-        assert_eq!(
-            unit.status,
-            UnitStatus::Distributed,
-            "a partial page is asked for again, never passed: {:?}",
-            unit.denial_reason
-        );
-        assert_eq!(
-            (session.status, session.attempt),
-            (SessionStatus::Executing, 1)
-        );
-        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
-        let amendment = evs
-            .iter()
-            .find_map(|e| match e {
-                CoreEvent::UnitReworkAmended {
-                    amendment, scope, ..
-                } if scope == "page_incomplete" => Some(amendment.clone()),
-                _ => None,
-            })
-            .expect("unitReworkAmended{page_incomplete}");
-        assert!(
-            amendment.contains("states 2 of the 4 worklist units")
-                && amendment.contains("`c#`")
-                && amendment.contains("`d#`"),
-            "{amendment}"
-        );
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                CoreEvent::StepFailed { detail, failure_kind, .. }
-                    if *failure_kind == crate::event::StepFailureKind::SubstanceRejected
-                        && detail.contains("2 of the 4")
-            )),
-            "{evs:?}"
-        );
-
-        // Still partial after the round: one round only, and the page goes on, disclosed.
-        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
-        assert_eq!(
-            unit.status,
-            UnitStatus::Done,
-            "no second automatic round: {:?}",
-            unit.denial_reason
-        );
-        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
-        assert!(
-            !evs.iter()
-                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
-            "{evs:?}"
-        );
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                CoreEvent::UnitOutputDelta { text, .. } if text.contains("stated 2 of 4 worklist units")
-            )),
-            "{evs:?}"
-        );
-        let _ = std::fs::remove_dir_all(&wd);
-    }
-
-    /// core#1724: a page whose every worklist unit is stated (an empty statement counts) passes
-    /// with no automatic round.
-    #[test]
-    fn core_1724_a_whole_page_passes_with_no_round() {
-        let wd = tmp("page-whole");
-        std::fs::create_dir_all(wd.join(".wicked/domain")).unwrap();
-        std::fs::write(
-            wd.join(crate::domain_extraction::WORKLIST_REL),
-            r#"{"units":[{"symbol_id":"a#"},{"symbol_id":"b#"}]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            wd.join(crate::domain_extraction::RULES_REL),
-            r#"{"rules":[{"symbol_id":"a#","statement":"A refund needs a receipt."},
-                {"symbol_id":"b#","statement":""}]}"#,
-        )
-        .unwrap();
-        let run_id = format!("page-whole-{}", std::process::id());
-        let mut store = open_store(Some(":memory:")).unwrap();
-        seed(
-            &mut store,
-            &run_id,
-            Some(wd.to_string_lossy().into_owned()),
-            Vec::new(),
-            vec![crate::domain_extraction::RULES_REL.to_string()],
-        );
-        let mut subs = crate::event_log::EventSink::default();
-        let (esub, erx) = channel();
-        subs.push(esub);
-        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
-        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
-        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
-        assert!(
-            !evs.iter()
-                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
-            "{evs:?}"
-        );
-        let _ = std::fs::remove_dir_all(&wd);
     }
 
     #[test]
@@ -38137,6 +37890,7 @@ mod seat_failover_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -40259,6 +40013,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -40374,6 +40129,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -40480,6 +40236,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -40843,6 +40600,7 @@ mod terminal_worktree_reap_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -41828,6 +41586,7 @@ mod terminal_worktree_reap_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -42025,6 +41784,7 @@ mod worker_code_graph_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -42499,6 +42259,7 @@ mod project_graph_binding_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -43258,6 +43019,7 @@ mod phase_boundary_governance_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -43731,6 +43493,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -44519,6 +44282,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -44587,6 +44351,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -44673,6 +44438,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -45889,6 +45655,7 @@ mod dead_seat_park_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -46040,6 +45807,7 @@ mod plan_gate_confirm_tests {
             }),
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -46575,6 +46343,7 @@ mod catalog_alias_governance_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -46703,6 +46472,7 @@ mod consent_plan_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -46995,6 +46765,7 @@ mod work_author_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -47407,6 +47178,7 @@ mod council_ballot_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            scope: None,
             assurance: Default::default(),
             power: None,
             run_context: None,
@@ -47416,15 +47188,33 @@ mod council_ballot_tests {
     /// (core#1905) A model call's seats are the run's own: its launch roster as the launch persists
     /// it (`team_plan.roster`, the instances and the launcher's health), less its own benches and
     /// its launch benches the ballot way (a governed-only bench does not bind it; the codex
-    /// worktree bench of a bound run on the host floor does). A run with no launch roster has none.
+    /// worktree bench of a bound run on the host floor does). A run with no launch roster has none;
+    /// one whose roster does not parse refuses with the parse error.
     #[test]
     fn a_model_call_reads_the_runs_launch_roster_and_its_benches() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        let prev = (
-            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
-            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        // Restored on drop, so a failed assert leaks neither into later tests in this binary.
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                "WICKED_CODEX_WORKTREE_OK",
+                crate::container_floor::SEAT_FLOOR_ENV,
+            ]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect(),
         );
         std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
         std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
@@ -47473,12 +47263,15 @@ mod council_ballot_tests {
         };
         s.benched_seats = vec![bench("codex", "host floor", true)];
         assert_eq!(verdict(&s, true)[1].1, Ok("codex".to_string()));
-        s.benched_seats = vec![bench("claude", "quota", false)];
+        s.benched_seats = vec![bench("claude#2", "quota", false)];
         assert!(verdict(&s, true)[0]
             .1
             .as_ref()
             .unwrap_err()
             .contains("benched for this run: quota"));
+        // a bench matches the exact instance, as dispatch does: `claude` leaves `claude#2` serving
+        s.benched_seats = vec![bench("claude", "quota", false)];
+        assert_eq!(verdict(&s, true)[0].1, Ok("claude#2".to_string()));
         // the launch bench: a bound run's codex on a store that cannot arm its units in seats
         let s = with_roster(&[seat("claude"), seat("codex")]);
         assert!(verdict(&s, false)[1].1.is_err());
@@ -47488,14 +47281,18 @@ mod council_ballot_tests {
         assert!(v
             .iter()
             .all(|(_, r)| r.as_ref().unwrap_err().contains("on this run's roster")));
-        for (k, v) in [
-            ("WICKED_CODEX_WORKTREE_OK", prev.0),
-            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
-        ] {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
+        // a roster that does not parse: every call is refused with the parse error itself
+        let mut s = bound_run();
+        s.team_plan = Some(crate::plan_gate::TeamPlanState {
+            roster: vec![serde_json::json!({"key": 7})],
+            ..Default::default()
+        });
+        let v = verdict(&s, true);
+        assert_eq!(v.len(), crate::model_call::FAMILIES.len());
+        for (_, r) in &v {
+            let e = r.as_ref().unwrap_err();
+            assert!(e.contains("the launch roster does not parse"), "{e}");
+            assert!(!e.contains("on this run's roster"), "{e}");
         }
     }
 
@@ -47873,12 +47670,18 @@ mod git_identity_missing_tests {
 mod upstream_agents_tests {
     use super::*;
 
+    /// A Tool step's env names the agents of the steps it transitively follows, by their current
+    /// assignment. A neutral fixture: a seat step, its review, then a host Tool.
     #[test]
-    fn extract_apply_env_uses_done_transitive_agents_current_assignment() {
-        let plan = crate::plan::PlanSteps {
-            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
-            ..Default::default()
-        };
+    fn a_tool_env_uses_done_transitive_agents_current_assignment() {
+        let plan: crate::plan::PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "understand", "id": "survey"},
+            {"catalog": "produce", "id": "extract", "depends_on": ["survey"]},
+            {"catalog": "critique", "id": "critique", "depends_on": ["extract"]},
+            {"catalog": "run", "id": "apply", "depends_on": ["critique"],
+             "executor": {"type": "tool", "cmd": ["true"]}}
+        ]}))
+        .unwrap();
         let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
         let mut units = crate::plan::plan_from_def(&def, "map", "upstream");
         for u in &mut units {
@@ -47890,7 +47693,7 @@ mod upstream_agents_tests {
         }
         let apply = units
             .iter()
-            .find(|u| u.phase_id() == Some("extract-apply"))
+            .find(|u| u.phase_id() == Some("apply"))
             .unwrap();
         let env = ToolRunEnv {
             run_id: "upstream".into(),
@@ -47917,7 +47720,7 @@ mod upstream_agents_tests {
             .assigned_cli = Some("bad,seat".into());
         let apply = units
             .iter()
-            .find(|u| u.phase_id() == Some("extract-apply"))
+            .find(|u| u.phase_id() == Some("apply"))
             .unwrap();
         assert!(!upstream_agents(apply, &units)
             .iter()

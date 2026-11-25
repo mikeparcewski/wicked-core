@@ -143,6 +143,7 @@ fn launch(f: &Fixture, run: &str) {
 fn launch_with(f: &Fixture, run: &str, human_confirm: crate::HumanConfirm) {
     f.core
         .launch_run(crate::LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "Do the one step".into(),

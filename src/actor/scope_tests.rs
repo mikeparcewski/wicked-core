@@ -37,6 +37,7 @@ fn launch_preset_with_qe(
 ) {
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "x1 preset launch".into(),
@@ -330,6 +331,7 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
     let w = by_unit(|_| None);
     let e = engine("x635", w.clone());
     let spec = |run: &str, workflow: Option<&str>, plan: Option<PlanSteps>| LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "core#635".into(),
@@ -386,6 +388,7 @@ fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
     let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
     let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
     let spec = LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "core#635".into(),
@@ -1081,6 +1084,7 @@ fn x3_inbox(run: &str) -> std::path::PathBuf {
 fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::Path) {
     e.core
         .launch_run(LaunchSpec {
+            scope: None,
             base_ref: None,
             project_id: None,
             problem: "x3 preset launch".into(),

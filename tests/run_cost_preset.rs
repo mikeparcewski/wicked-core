@@ -176,6 +176,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(run_id: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "what would 40 bug fixes a month cost?".into(),

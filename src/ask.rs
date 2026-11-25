@@ -545,6 +545,7 @@ mod tests {
                 team_plan: None,
                 exclude_seats: vec![],
                 evidence_root: None,
+                scope: None,
                 assurance: Default::default(),
                 intent_amendments: vec![],
                 power: None,

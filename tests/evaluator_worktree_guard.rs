@@ -478,6 +478,7 @@ fn core_for(name: &str, verify: VerifyBehaviour) -> (Core, Arc<Mutex<Vec<String>
 
 fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Fix the bug in src/app.ts".into(),
@@ -1996,6 +1997,7 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
 /// launch is scored from the plan (no PA scope step) and accepted by the engine.
 fn plan_run(session_id: &str, repo_ref: &str, steps: serde_json::Value) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         workflow: None,
         problem: "Write the redesign spec under docs/design".into(),
         plan: Some(serde_json::from_value(steps).expect("a plan")),

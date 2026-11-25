@@ -103,6 +103,7 @@ fn spec(sid: &str) -> LaunchSpec {
     let mut claude = cli("claude");
     claude.health = Some(SeatHealth::unusable("signed out"));
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),

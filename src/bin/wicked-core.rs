@@ -654,6 +654,7 @@ fn main() {
             };
             let events = core.subscribe();
             let sid = core.launch(LaunchSpec {
+                scope: None,
                 base_ref: None,
                 problem,
                 clis: registry_roster(),
@@ -972,6 +973,7 @@ fn run_interactive(core: &Core, args: &[String]) {
     };
     let events = core.subscribe();
     let run_id = match core.launch_run(LaunchSpec {
+        scope: None,
         base_ref: None,
         problem,
         clis,

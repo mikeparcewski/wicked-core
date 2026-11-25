@@ -142,6 +142,7 @@ fn spawn(db: &str) -> Rig {
 
 fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         problem: "add SSO login".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
@@ -618,7 +619,9 @@ fn f_presets_survive_a_restart() {
 }
 
 /// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
-const NO_MAPPING_ROW: [&str; 30] = [
+/// `domain-extraction` left the suite when J6 v3 replaced its migrated steps (C1b); its two host
+/// steps are pinned by `domain_extraction::tests`.
+const NO_MAPPING_ROW: [&str; 31] = [
     "analyze",
     "analyze-codebase",
     "apps-publish",
@@ -628,6 +631,7 @@ const NO_MAPPING_ROW: [&str; 30] = [
     "demo",
     "demo-human-review",
     "docs",
+    "domain-extraction",
     "editor-plugin",
     "interactive-draft-sourced",
     "investigate-incident",

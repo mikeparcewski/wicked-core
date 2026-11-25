@@ -284,6 +284,7 @@ fn run(name: &str, texts: &[&str]) -> Run {
     }))
     .unwrap();
     core.launch_run(LaunchSpec {
+        scope: None,
         problem: "draft a one-page brief".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

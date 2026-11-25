@@ -206,6 +206,14 @@ export interface LaunchOptions {
    * Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
    */
   forceQeAcceptance?: boolean
+  /**
+   * (J6 C1b) A `domain-extraction` run's scope, as JSON: `{"intent": "...", "phrases"?: [...],
+   * "scope_hash"?: "...", "description"?: "..."}` (Start carries it from the preview). A
+   * `domain-extraction` launch without it is REJECTED by name, as is a scope on any other launch
+   * or one that is malformed or over 64 KiB. Check `supportsDomainScope` first: an older addon
+   * drops this field.
+   */
+  scopeJson?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -304,6 +312,12 @@ export declare class Core {
    * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
    */
   static supportsPowerMode(): boolean
+  /**
+   * (J6 C1b) Whether this addon carries a domain-extraction run's scope (`LaunchOptions.scopeJson`).
+   * An older addon drops the field (napi ignores an undeclared one), and its engine runs the old
+   * loop, so the launcher keys on this first.
+   */
+  static supportsDomainScope(): boolean
   /**
    * What this process's engine knows about its connection to the bus file at `path`
    * (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus

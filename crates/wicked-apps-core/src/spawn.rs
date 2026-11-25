@@ -96,6 +96,10 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     // it starts for a QE review, and garden reads it as "this session was started for the review
     // alone". Inherited by any other child, it would license an inline (self-graded) review.
     "WICKED_QE_REVIEW_SESSION",
+    // (J6 C1b) The scope file of a `domain-run` step: the engine hands it to that one armed step,
+    // from the run's checked scope. Inherited instead, a step whose scope could not be handed
+    // would read the daemon's value, another run's scope, instead of refusing.
+    "WICKED_DOMAIN_SCOPE",
 ];
 
 /// The env var the engine's ACP spawn path resolves the persistent worker config home from

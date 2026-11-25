@@ -154,6 +154,7 @@ const NO_QE: &str = r#"{"id":"qe-none","phases":[
 
 fn spec(sid: &str, workflow: &str, qe: QeOverride) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Fix the thing.".into(),

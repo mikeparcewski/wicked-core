@@ -118,6 +118,7 @@ fn make_git_repo(name: &str) -> PathBuf {
 
 fn spec(session_id: &str, repo_ref: &str) -> LaunchSpec {
     LaunchSpec {
+        scope: None,
         base_ref: None,
         project_id: None,
         problem: "Do the one task".into(),
