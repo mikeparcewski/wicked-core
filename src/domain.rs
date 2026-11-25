@@ -3014,6 +3014,8 @@ mod tests {
             registered_at: 1,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let run = AgentSession {
             id: "under-b".to_string(),

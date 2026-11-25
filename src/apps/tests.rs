@@ -614,6 +614,7 @@ fn input_for(u: &WorkUnit, db_path: &str, apps: Option<&str>) -> StepInput {
             optional_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
+            seat_layers_off: Vec::new(),
             human_confirm: HumanConfirm::None,
             apps: apps.map(str::to_string),
         }),

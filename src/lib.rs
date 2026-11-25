@@ -1594,6 +1594,27 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#1043 part 2) Turn the seat layers `off` off for the repo `repo_id` (`[]` turns every
+    /// layer back on): its seats' images leave them out from the next unit dispatched. Each id must
+    /// be in the layer catalog (`go`, `java`, `node`, `python`, `rust`); an unknown id or repo is
+    /// refused by name. Returns the updated [`RepoEntry`], whose `seat_layers` show the result.
+    pub fn set_repo_seat_layers_off(
+        &self,
+        repo_id: &str,
+        off: Vec<String>,
+    ) -> anyhow::Result<RepoEntry> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::SetRepoSeatLayersOff {
+                repo_id: repo_id.to_string(),
+                off,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// List every registered repository.
     pub fn list_repos(&self) -> anyhow::Result<Vec<RepoEntry>> {
         let (reply, rx) = channel();

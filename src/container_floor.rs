@@ -2871,6 +2871,7 @@ pub(crate) fn arm_noting(
     before_copy: &mut dyn FnMut(&MountView) -> Result<(), String>,
     warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
     timeout: Duration,
+    layers_off: &[String],
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let argv_in = argv;
     let wsl = is_wsl(
@@ -2994,10 +2995,17 @@ pub(crate) fn arm_noting(
     let rt = runtime().map_err(|w| (w, String::new()))?;
     // (core#1043) The toolchains the unit's tree needs, composed onto its seat image; none on an
     // operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's toolchain.
+    // (part 2) Not the layers the run's repo turned off (`layers_off`, from its governance).
     let layers = if configured_base().is_some() || image_override(cli).is_some() {
         Vec::new()
     } else {
-        crate::seat_layers::for_tree(&spec.tree)
+        crate::seat_layers::for_tree_except(
+            &spec.tree,
+            std::env::var(crate::seat_layers::LAYERS_ENV)
+                .ok()
+                .as_deref(),
+            layers_off,
+        )
     };
     let (image, built_in, fell_back) = ensure_seat_image_noting(&rt, cli, &layers)?;
     // Egress is never widened for a layer: the unit is told which of its hosts the allowlist
@@ -3960,7 +3968,7 @@ fn layers_arg(
 }
 
 /// [`BASE_IMAGE_ENV`], when the operator set one.
-fn configured_base() -> Option<String> {
+pub(crate) fn configured_base() -> Option<String> {
     std::env::var(BASE_IMAGE_ENV)
         .ok()
         .map(|b| b.trim().to_string())
@@ -4756,6 +4764,7 @@ esac
                     &mut |_| Ok(()),
                     None,
                     crate::workflow::unit_timeout_ceiling(),
+                    &[],
                 ) else {
                     panic!("stub refuses submission");
                 };
@@ -4969,6 +4978,7 @@ esac
             &mut before_copy,
             None,
             crate::workflow::unit_timeout_ceiling(),
+            &[],
         );
         match out {
             Err((why, detail)) => {

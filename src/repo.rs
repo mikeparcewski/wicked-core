@@ -78,6 +78,31 @@ pub struct RepoEntry {
     /// Today's codes: [`FINDING_IN_TREE_CODE_GRAPH_IGNORED`], [`FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE`].
     #[serde(default)]
     pub findings: Vec<RepoFinding>,
+    /// (core#1043 part 2) The toolchain layers this repo's seats get, for the repo card —
+    /// **derived on every read like `findings`**, never authoritative in the record: the layers
+    /// detected in the registered checkout (`seat_layers::detect`), in catalog order, each with
+    /// whether it is on and what turned it off. Always serialized (an array, possibly empty).
+    #[serde(default)]
+    pub seat_layers: Vec<RepoSeatLayer>,
+    /// (core#1043 part 2) The layer ids a person turned off for this repo
+    /// ([`set_seat_layers_off`]), sorted, each in the layer catalog. Persisted; dispatch hands it to
+    /// each unit's governance (`GovernanceContext::seat_layers_off`) and the arm leaves those
+    /// layers out of the seat image. Kept by a re-registration. Absent on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_layers_off: Vec<String>,
+}
+
+/// (core#1043 part 2) One toolchain layer a repo's seats get ([`RepoEntry::seat_layers`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSeatLayer {
+    /// The layer id (`go`, `java`, `node`, `python`, `rust`).
+    pub id: String,
+    /// Whether the layer is composed onto the repo's seat images.
+    pub enabled: bool,
+    /// What turned it off, when it is off: `repo` (this repo's switch), `daemon`
+    /// (`WICKED_SEAT_LAYERS=off`) or `operator_base` (`WICKED_SEAT_BASE_IMAGE` is set: the
+    /// operator's base image is the toolchain). `null` when it is on.
+    pub off_by: Option<String>,
 }
 
 /// One diagnostic on a registered repo (core#406) — what the repo card shows and the daemon logs
@@ -145,8 +170,22 @@ impl FromNode for RepoEntry {
             code_graph_db_and_findings(&entry.id, &entry.root_path, &entry.graph_key);
         entry.code_graph_db = code_graph_db;
         entry.findings = findings;
+        entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
         Ok(entry)
     }
+}
+
+/// (core#1043 part 2) The repo card's layer rows for the checkout at `root_path`, under this
+/// daemon's layer setting and seat base.
+fn seat_layer_rows(root_path: &str, off: &[String]) -> Vec<RepoSeatLayer> {
+    crate::seat_layers::rows(
+        Path::new(root_path),
+        off,
+        std::env::var(crate::seat_layers::LAYERS_ENV)
+            .ok()
+            .as_deref(),
+        crate::container_floor::configured_base().is_some(),
+    )
 }
 
 /// This repo's absolute code-graph path, derived from its persisted key through the ONE resolver
@@ -337,11 +376,13 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         .to_string_lossy()
         .into_owned();
     let id = slug(&spec.name);
-    let graph_key = match get_repo(store, &id)? {
-        Some(entry) => entry.graph_key,
-        None => crate::code_graph::mint_repo_graph_key(&id),
+    // A re-registration keeps the repo's graph identity and the layers a person turned off.
+    let (graph_key, seat_layers_off) = match get_repo(store, &id)? {
+        Some(entry) => (entry.graph_key, entry.seat_layers_off),
+        None => (crate::code_graph::mint_repo_graph_key(&id), Vec::new()),
     };
     let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
+    let seat_layers = seat_layer_rows(&root_path, &seat_layers_off);
     let entry = RepoEntry {
         id,
         name: spec.name,
@@ -351,6 +392,8 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         root_path,
         default_branch,
         registered_at: spec.registered_at,
+        seat_layers,
+        seat_layers_off,
     };
     // Once, at registration (the record re-derives on every read; logging there would repeat the
     // same line once a step): the daemon log names what the repo card shows.
@@ -362,6 +405,41 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
     }
     put_node(store, entry.to_node())?;
     Ok(entry)
+}
+
+/// (core#1043 part 2) Turn the seat layers `off` off for the repo `repo_id` (`[]` turns every
+/// layer back on), returning the updated entry. Each id must be in the layer catalog; an unknown
+/// one, or an unknown repo, is refused by name. The list is stored sorted and deduplicated.
+pub fn set_seat_layers_off(
+    store: &mut dyn GraphStore,
+    repo_id: &str,
+    off: &[String],
+) -> anyhow::Result<RepoEntry> {
+    let Some(mut entry) = get_repo(store, repo_id)? else {
+        anyhow::bail!("no registered repo `{repo_id}`");
+    };
+    let layers = crate::seat_layers::parse(&off.join(",")).map_err(|why| anyhow::anyhow!(why))?;
+    // `parse` reads `none` as no layer; a list naming it is not a layer id.
+    if let Some(none) = off.iter().find(|o| o.trim().eq_ignore_ascii_case("none")) {
+        anyhow::bail!("no seat layer `{none}`");
+    }
+    let mut ids: Vec<String> = layers.iter().map(|l| l.id.to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    entry.seat_layers_off = ids;
+    put_node(store, entry.to_node())?;
+    // The stored record never carries the derived rows; the caller gets them as a read would.
+    entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
+    Ok(entry)
+}
+
+/// (core#1043 part 2) The layer ids the run's repo turned off, for the unit's governance at
+/// dispatch: none for a repo-less run or a repo the store no longer has.
+pub(crate) fn seat_layers_off_for(store: &dyn GraphRead, repo_ref: Option<&str>) -> Vec<String> {
+    repo_ref
+        .and_then(|id| get_repo(store, id).ok().flatten())
+        .map(|e| e.seat_layers_off)
+        .unwrap_or_default()
 }
 
 /// Remove only the registry node, returning false if it is unknown. Leaves the checkout folder,
@@ -3085,6 +3163,8 @@ mod tests {
             registered_at: 42,
             code_graph_db: code_graph_db("/tmp/demo"),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         assert_eq!(RepoEntry::from_node(&e.to_node()).unwrap(), e);
     }
@@ -3110,6 +3190,8 @@ mod tests {
             registered_at: 7,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         }
         .to_node();
         node.metadata.remove("graph_key");
@@ -3196,6 +3278,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: db.clone(),
             findings: findings.clone(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let notice = boot_notice(&entry).expect("in-tree graph + no live graph ⇒ a boot notice");
         assert!(
@@ -3234,6 +3318,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         }
         .to_node();
         node.metadata.remove("findings");
@@ -3266,6 +3352,8 @@ mod tests {
                 registered_at: 0,
                 code_graph_db: db,
                 findings,
+                seat_layers: Vec::new(),
+                seat_layers_off: Vec::new(),
             }),
             None,
             "a clean checkout gets no boot notice"
@@ -5311,6 +5399,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let live: HashSet<String> = ["run-old-live".to_string(), "run-new".to_string()]
             .into_iter()
@@ -5498,6 +5588,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         reap_orphan_worktrees(&[repo], &HashSet::new(), &HashSet::new(), Some("daemon-me"));
         assert!(
@@ -5534,6 +5626,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let live: HashSet<String> = ["run-live".to_string()].into_iter().collect();
         let terminal: HashSet<String> = ["run-done".to_string(), "run-dirty".to_string()]
@@ -6279,6 +6373,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let none: HashSet<String> = HashSet::new();
         // A daemon with no id owns nothing: nothing is removed on an unknown id.
@@ -6381,6 +6477,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let none: HashSet<String> = HashSet::new();
         reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, Some("daemon-a"));
@@ -6434,6 +6532,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         let none: HashSet<String> = HashSet::new();
         let terminal: HashSet<String> = ["camp:old:a0".to_string()].into_iter().collect();
@@ -6821,6 +6921,8 @@ mod tests {
             registered_at: 0,
             code_graph_db: String::new(),
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         };
         // The store holds RAW ids — matching happens across spellings inside the reaper.
         let live: HashSet<String> = ["camp:live:a0".to_string()].into_iter().collect();

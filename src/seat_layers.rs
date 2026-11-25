@@ -294,9 +294,50 @@ pub(crate) fn for_tree_with(tree: &Path, setting: Option<&str>) -> Vec<&'static 
     detect(tree)
 }
 
-/// [`for_tree_with`] this daemon's [`LAYERS_ENV`].
-pub(crate) fn for_tree(tree: &Path) -> Vec<&'static Layer> {
-    for_tree_with(tree, std::env::var(LAYERS_ENV).ok().as_deref())
+/// (core#1043 part 2) [`for_tree_with`] without the layers a repo turned off (its
+/// `RepoEntry::seat_layers_off`, carried to the arm on the unit's governance). An id the tree
+/// does not need changes nothing.
+pub(crate) fn for_tree_except(
+    tree: &Path,
+    setting: Option<&str>,
+    off: &[String],
+) -> Vec<&'static Layer> {
+    for_tree_with(tree, setting)
+        .into_iter()
+        .filter(|l| !off.iter().any(|o| o == l.id))
+        .collect()
+}
+
+/// (core#1043 part 2) The repo card's rows for the checkout at `tree`: every layer it is detected
+/// to need, in catalog order, and what turned one off. `off` is the repo's own switch; `setting`
+/// is [`LAYERS_ENV`]'s value and `operator_base` whether the operator set a seat base image, either
+/// of which turns every layer off for every repo.
+pub(crate) fn rows(
+    tree: &Path,
+    off: &[String],
+    setting: Option<&str>,
+    operator_base: bool,
+) -> Vec<crate::repo::RepoSeatLayer> {
+    let daemon_off = setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    detect(tree)
+        .into_iter()
+        .map(|l| {
+            let off_by = if operator_base {
+                Some("operator_base")
+            } else if daemon_off {
+                Some("daemon")
+            } else if off.iter().any(|o| o == l.id) {
+                Some("repo")
+            } else {
+                None
+            };
+            crate::repo::RepoSeatLayer {
+                id: l.id.to_string(),
+                enabled: off_by.is_none(),
+                off_by: off_by.map(str::to_string),
+            }
+        })
+        .collect()
 }
 
 /// The layers a comma-separated id list names (`seat-image --layers`), in catalog order; empty or

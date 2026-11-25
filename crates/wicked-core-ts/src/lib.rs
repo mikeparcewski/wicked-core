@@ -2044,6 +2044,24 @@ impl Core {
         })
     }
 
+    /// (core#1043 part 2) Turn seat layers off for a repo: `offJson` is a JSON array of layer ids
+    /// (`[]` turns every layer back on). Resolves to the updated `RepoEntry` JSON object, whose
+    /// `seat_layers` rows (`{id, enabled, off_by}`) show the result. Rejects naming an unknown
+    /// layer id or repo.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_repo_seat_layers_off(
+        &self,
+        repo_id: String,
+        off_json: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let off: Vec<String> = serde_json::from_str(&off_json).map_err(err)?;
+            let entry = core.set_repo_seat_layers_off(&repo_id, off).map_err(err)?;
+            serde_json::to_string(&entry).map_err(err)
+        })
+    }
+
     // ── Presets (DES-TEAMING-002 §8.4, seam C2) ────────────────────────────────
     // Commands through the actor (the single writer), reads included, so a list reflects every
     // write the actor has acknowledged.

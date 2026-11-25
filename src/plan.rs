@@ -3252,6 +3252,10 @@ mod tests {
                 .unwrap_or_default(),
             graph_key,
             findings: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
+            seat_layers: Vec::new(),
+            seat_layers_off: Vec::new(),
         }
     }
 

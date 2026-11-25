@@ -165,6 +165,13 @@ pub(crate) enum Command {
         repo_id: String,
         reply: Sender<anyhow::Result<bool>>,
     },
+    /// (core#1043 part 2) Turn seat layers off for a repo (`[]` turns them all back on); the
+    /// single writer persists `RepoEntry::seat_layers_off` and replies with the updated entry.
+    SetRepoSeatLayersOff {
+        repo_id: String,
+        off: Vec<String>,
+        reply: Sender<anyhow::Result<RepoEntry>>,
+    },
     /// List every registered repository.
     ListRepos {
         reply: Sender<anyhow::Result<Vec<RepoEntry>>>,
@@ -753,6 +760,7 @@ impl Command {
             Command::CancelRun { .. } => "CancelRun",
             Command::RegisterRepo { .. } => "RegisterRepo",
             Command::UnregisterRepo { .. } => "UnregisterRepo",
+            Command::SetRepoSeatLayersOff { .. } => "SetRepoSeatLayersOff",
             Command::ListRepos { .. } => "ListRepos",
             Command::ProjectCreate { .. } => "ProjectCreate",
             Command::ProjectUpdate { .. } => "ProjectUpdate",
