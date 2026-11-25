@@ -2968,7 +2968,7 @@ impl WrappedCliStepRunner {
 
     /// Register a cancellation token for one actor-dispatched wrapped worker. The caller passes
     /// the token to [`run_bounded`] and MUST call [`Self::unregister_token`] when it returns.
-    fn register_token(&self, input: &StepInput) -> CancelToken {
+    pub(crate) fn register_token(&self, input: &StepInput) -> CancelToken {
         let key = Self::worker_key(input);
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
@@ -2979,7 +2979,7 @@ impl WrappedCliStepRunner {
         token
     }
 
-    fn unregister_token(&self, input: &StepInput, token: &CancelToken) {
+    pub(crate) fn unregister_token(&self, input: &StepInput, token: &CancelToken) {
         let key = Self::worker_key(input);
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(v) = guard.tokens.get_mut(&key) {

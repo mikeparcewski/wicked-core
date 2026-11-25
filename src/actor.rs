@@ -1248,6 +1248,8 @@ pub(crate) fn run(
     // threshold that no live turn holds, so another engine's live views on the same temp dir
     // are never touched).
     crate::acp_runner::sweep_stale_member_views();
+    // (C1) Model-call channel directories a daemon that is gone left behind (never a live one's).
+    crate::model_call::sweep_stale();
 
     // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): the launch poller `Core::spawn*` arms (when
     // `WICKED_BUS_DB` is set) on the caller's thread while this one starts, with a bounded handshake —
@@ -14890,19 +14892,26 @@ fn dispatch_unit_with(
         let apps_unarmed = apps_tool && apps_channel.is_none();
         // (DES-j6-build D1, C0) A declared Tool step of a SHIPPED preset can ask the daemon's own
         // seats for a model call (`wicked-core model-call`); a repo-defined Tool step cannot
-        // ([`crate::model_call::shipped_step`]). The step runner and the seat registry it is armed
-        // with are read here on the actor (the registry as the judges read it).
+        // ([`crate::model_call::shipped_step`]; the repo is read only for a declared step). The
+        // step runner and the run's seats (core#1905, [`model_call_admission`]) are read here on
+        // the actor.
         let model_calls = (run_env.is_some()
             && crate::model_call::shipped_step(
                 session.team_plan.as_ref().and_then(|p| p.preset.as_deref()),
                 unit,
-                session
-                    .repo_ref
-                    .as_deref()
-                    .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-                    .as_ref(),
+                || {
+                    session
+                        .repo_ref
+                        .as_deref()
+                        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                },
             ))
-        .then(|| (runner.clone(), judge_registries().1));
+        .then(|| {
+            (
+                runner.clone(),
+                model_call_admission(&session, in_process_governance().is_some()),
+            )
+        });
         std::thread::spawn(move || {
             let (_apps_token, _apps_binding, apps_env) = match apps_channel {
                 Some((t, b, env)) => (Some(t), Some(b), env),
@@ -15120,9 +15129,13 @@ fn dispatch_unit_with(
                         // (DES-j6-build D1, C0) The model-call channel lives until the command
                         // exits (this scope); a channel that could not be armed leaves the
                         // variables unset, and the client says so.
-                        let _model_call = model_calls.as_ref().and_then(|(r, reg)| {
-                            match crate::model_call::arm(r.clone(), reg.clone(), &input.run_id, ord)
-                            {
+                        let _model_call = model_calls.as_ref().and_then(|(r, admit)| {
+                            match crate::model_call::arm(
+                                r.clone(),
+                                admit.clone(),
+                                &input.run_id,
+                                ord,
+                            ) {
                                 Ok(ch) => Some(ch),
                                 Err(e) => {
                                     eprintln!(
@@ -15136,6 +15149,12 @@ fn dispatch_unit_with(
                         if let Some(ch) = &_model_call {
                             run_vars.extend(ch.env());
                         }
+                        // (core#1906) The channel closes when the command's own process exits,
+                        // not when its output pipes drain: a descendant that kept a pipe open does
+                        // not keep the step's calls running.
+                        let _close_on_exit = _model_call
+                            .as_ref()
+                            .map(|ch| ChildExitHook::set(Box::new(ch.closer())));
                         // (core#802) The garden root the run was admitted against rides every
                         // generic Tool unit as `WICKED_GARDEN_ROOT`, so a def runs
                         // `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from the
@@ -17383,7 +17402,7 @@ impl ToolRunEnv {
 /// What stopped a Tool child before it exited on its own (core#500 / F-BM-008): the pid of the
 /// process-group leader the engine killed, the invalidation signal the child observed, and how
 /// long it had run.
-struct ToolKilled {
+pub(crate) struct ToolKilled {
     pid: u32,
     reason: &'static str,
     ran_ms: u64,
@@ -17526,6 +17545,48 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
     }
 }
 
+thread_local! {
+    /// (core#1906) What runs once when the Tool command this thread runs has exited
+    /// ([`ChildExitHook`]).
+    static CHILD_EXIT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// (core#1906) A hook the Tool runner fires when the command's own process exits, before it waits
+/// for the command's output pipes to drain ([`run_tool_cmd`]). Set on the thread that runs the
+/// command; cleared when this guard drops.
+pub(crate) struct ChildExitHook;
+
+impl ChildExitHook {
+    pub(crate) fn set(f: Box<dyn Fn()>) -> Self {
+        CHILD_EXIT.with(|h| *h.borrow_mut() = Some(f));
+        ChildExitHook
+    }
+
+    fn fire() {
+        if let Some(f) = CHILD_EXIT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+impl Drop for ChildExitHook {
+    fn drop(&mut self) {
+        CHILD_EXIT.with(|h| h.borrow_mut().take());
+    }
+}
+
+/// (core#1905) The seats `session`'s model calls may use ([`crate::model_call::admission`]): its
+/// launch roster (the instances and the launcher's health probe, [`launch_roster`]), less the run's
+/// own benches and its launch benches as the ballot rule reads them ([`council_roster`]). A run
+/// with no launch roster has no seat to call.
+fn model_call_admission(session: &AgentSession, contained: bool) -> crate::model_call::Admission {
+    let roster = launch_roster(session).unwrap_or_default();
+    let launch_bench =
+        crate::distribute::launch_benched(&roster, session.repo_ref.is_some(), contained);
+    crate::model_call::admission(&roster, &session.benched_seats, &launch_bench)
+}
+
 /// Spawn a Tool command and poll it to completion the way `execute_wrapped::run_bounded` polls a
 /// seat (core#500 / F-BM-008): the child runs in its OWN process group (unix), the loop wakes
 /// every 50 ms, and `stop()` returning `Some(reason)` — the run's launch identity was invalidated
@@ -17550,7 +17611,7 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
 // index, or any def's) is bounded by that tree's index budget ([`crate::index_budget`]), the same
 // one a launch's base re-index and the repo watcher's re-index get. Every other step is unbounded,
 // as before.
-fn run_tool_cmd(
+pub(crate) fn run_tool_cmd(
     cmd: &[String],
     workdir: Option<&str>,
     extra_env: &[(String, String)],
@@ -17817,6 +17878,9 @@ fn run_tool_cmd_jailed_once(
                 }
             }
         };
+        // (core#1906) The command's own process is gone: before waiting on its pipes (a
+        // descendant may hold them open), end what was tied to its life.
+        ChildExitHook::fire();
         (
             out_h.join().unwrap_or_default(),
             err_h.join().unwrap_or_default(),
@@ -47346,6 +47410,92 @@ mod council_ballot_tests {
             assurance: Default::default(),
             power: None,
             run_context: None,
+        }
+    }
+
+    /// (core#1905) A model call's seats are the run's own: its launch roster as the launch persists
+    /// it (`team_plan.roster`, the instances and the launcher's health), less its own benches and
+    /// its launch benches the ballot way (a governed-only bench does not bind it; the codex
+    /// worktree bench of a bound run on the host floor does). A run with no launch roster has none.
+    #[test]
+    fn a_model_call_reads_the_runs_launch_roster_and_its_benches() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        let mut claude2 = seat("claude");
+        claude2.key = "claude#2".into();
+        let mut sick = seat("codex");
+        sick.health = Some(wicked_council::types::SeatHealth {
+            usable: false,
+            reason: Some("signed out".into()),
+        });
+        // the shape the launch writes (`launch_run`'s `TeamPlanState { roster, .. }`)
+        let with_roster = |clis: &[crate::AgenticCli]| AgentSession {
+            team_plan: Some(crate::plan_gate::TeamPlanState {
+                roster: clis
+                    .iter()
+                    .filter_map(|c| serde_json::to_value(c).ok())
+                    .collect(),
+                ..Default::default()
+            }),
+            ..bound_run()
+        };
+        let verdict = |s: &AgentSession, contained: bool| {
+            model_call_admission(s, contained)
+                .into_iter()
+                .map(|(f, v)| (f, v.map(|c| c.key)))
+                .collect::<Vec<_>>()
+        };
+        // the instance answers for its family; an unusable codex is refused with its reason
+        let v = verdict(&with_roster(&[claude2.clone(), sick]), true);
+        assert_eq!(v[0], ("claude".to_string(), Ok("claude#2".to_string())));
+        assert!(v[1]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("not usable: signed out"));
+        // the run's own bench (not governed-only) binds; a governed-only one does not
+        let mut s = with_roster(&[claude2.clone(), seat("codex")]);
+        let bench = |cli: &str, reason: &str, governed_only: bool| crate::domain::BenchedSeat {
+            cli: cli.into(),
+            reason: reason.into(),
+            source: "launcher".into(),
+            governed_only,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
+        };
+        s.benched_seats = vec![bench("codex", "host floor", true)];
+        assert_eq!(verdict(&s, true)[1].1, Ok("codex".to_string()));
+        s.benched_seats = vec![bench("claude", "quota", false)];
+        assert!(verdict(&s, true)[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("benched for this run: quota"));
+        // the launch bench: a bound run's codex on a store that cannot arm its units in seats
+        let s = with_roster(&[seat("claude"), seat("codex")]);
+        assert!(verdict(&s, false)[1].1.is_err());
+        assert_eq!(verdict(&s, true)[1].1, Ok("codex".to_string()));
+        // no launch roster: no seat, whatever the registry holds
+        let v = verdict(&bound_run(), true);
+        assert!(v
+            .iter()
+            .all(|(_, r)| r.as_ref().unwrap_err().contains("on this run's roster")));
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 
