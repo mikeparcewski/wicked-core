@@ -907,16 +907,17 @@ fn changed_fields(a: &PlanStep, b: &PlanStep) -> Vec<String> {
 }
 
 /// (core#1925 follow-up) The words a person sees for the step field whose wire key is `key`
-/// (studio's plan editor says "worker pool", not `pool`). A key with no entry reads with spaces.
-fn field_words(key: &str) -> String {
-    let words = match key {
+/// (studio's plan editor says "worker pool", not `pool`): a noun phrase, read after "its". `None`
+/// for a key with no words here.
+fn known_field_words(key: &str) -> Option<&'static str> {
+    Some(match key {
         "instructions" => "instructions",
         "catalog" => "step type",
         "gate" => "approval gate",
         "gate_type" => "gate type",
         "validator_pin" => "validator",
-        "executes_code" => "whether it runs code",
-        "writes_nothing" => "whether it writes files",
+        "executes_code" => "runs-code setting",
+        "writes_nothing" => "writes-nothing setting",
         "verified_evidence" => "evidence check",
         "requires_capture_report" => "capture report",
         "answer_only" => "answer-only setting",
@@ -932,15 +933,20 @@ fn field_words(key: &str) -> String {
         "role" => "role",
         "repeat_from" => "repeat point",
         "rubric" => "rubric",
-        other => return other.replace('_', " "),
-    };
-    words.to_string()
+        _ => return None,
+    })
+}
+
+/// [`known_field_words`], or the key with spaces for one it does not know.
+fn field_words(key: &str) -> String {
+    known_field_words(key).map_or_else(|| key.replace('_', " "), str::to_string)
 }
 
 /// (core#1925) The refusal of an edit that changes `fields` (wire keys) of the step `id`, which
 /// ran, naming them as a person reads them: "a, b and c".
 fn ran_refusal(id: &str, fields: &[String]) -> String {
-    let words: Vec<String> = fields.iter().map(|f| field_words(f)).collect();
+    let mut words: Vec<String> = fields.iter().map(|f| field_words(f)).collect();
+    words.sort();
     let list = match words.split_last() {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
