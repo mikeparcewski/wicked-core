@@ -2860,9 +2860,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-core"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d90c13b89f267bc47bdde65184f1de29d64e059af038dd29568b8cd5b145c54"
+checksum = "efb8b3b467549a8dd0797bf1c5e4be0dbc26024776765d74ea7f4a63ee93d4a2"
 dependencies = [
  "async-trait",
  "regex",
@@ -2873,9 +2873,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-knowledge"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "350759fa2522838122c17d545cc2d0f550a876c49d2f49ab79a92965568acb9d"
+checksum = "67bce3d95dec210144f279b4ba7343fa1e373cad557daf49e0ba72d54274658c"
 dependencies = [
  "anyhow",
  "serde",
@@ -2890,9 +2890,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20b75316e509c3d7698af6500c0ccc6d3df7f7e2fdf124099bf9374c058521b6"
+checksum = "57d8922f83b37342672c1720e0eeb2275ce518e6d18437da36613c506f8473e6"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -2908,9 +2908,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory-api"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9d01eb36cae0e31b3f373259605eac1c64ab60042299fb20342c5048093d506"
+checksum = "9b2a8a6cdc355599031df8748e06f9a292a02acb5d46730bcb7b69f48da4b7a0"
 dependencies = [
  "serde",
  "wicked-estate-memory-core",
@@ -2918,9 +2918,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory-core"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcb219effff82ed35036af57656413a7648aca0b16dbeb963ac74125e6956654"
+checksum = "5b450a1a57db13a4cf36b48b7f07aa9b4b6e3cecde86b57ca821367925f27223"
 dependencies = [
  "gaoya",
  "serde",
@@ -2931,9 +2931,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-observe"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a6259b254864d54114bdf7d326e856966448fae8363cb26f9a70d4c4950a979"
+checksum = "b9a7ec9c04085f7206604fb64da417f0f59c12ac73e78118df1afaf0bc8bc997"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -2942,9 +2942,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-overlay"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b97b31106d570cb100d85cc86c47b5d311378438fb584aa8352b3bc68a7c71f"
+checksum = "c0071bae5b934a0c70fe3222522a10657b3979a2011cc0f25aded77d9454a518"
 dependencies = [
  "rusqlite",
  "tokio",
@@ -2954,9 +2954,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-rank"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f2918b1dde789dcb184d2aeea8ebf78dcd24de9a81f7399cd6f0377915d6f8"
+checksum = "41c4807507b31f103c0962a29a3f24b0b23029ecd68fd6c6a38b1ebf1ef79e66"
 dependencies = [
  "petgraph",
  "serde",
@@ -2965,9 +2965,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-retrieve"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61de70eb2db81a43b7fc78ce5af5a5416a911fb3858d1bb33de12abb0f2b4c94"
+checksum = "b2a83f400600320b7e0be19fed7ef10f5552c1d8159bbb7b33624a2f196ae6c5"
 dependencies = [
  "model2vec-rs",
  "serde",
@@ -2979,9 +2979,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-store"
-version = "0.35.11"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a45e2a295d3d25bb7113e263192eb80dbf0d3e9188b6638152bae025de4c815"
+checksum = "21b4cb4f030995c6b7494c9defe0a741155aeb9af27831cfce33ca3c9d0bb965"
 dependencies = [
  "async-trait",
  "deadpool",
