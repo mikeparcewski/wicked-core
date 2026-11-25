@@ -198,57 +198,79 @@ fn placeholders_are_not_real_and_non_product_files_are_not_counted() {
 }
 
 /// core#1924: the configured minimum is gone, and every way to ask for it is refused by name before
-/// anything is opened: the 1.1.0 `domain-graph` build, its `--coverage` and `--min-coverage-pct`,
-/// `coverage --min-coverage-pct` (never an exit 0 a caller would read as "met"), and the
-/// `requirements-target` and `seed-domain-validators` commands (unknown now: usage, exit 2).
+/// anything is opened (a store that does not exist stays absent): the 1.1.0 `domain-graph` build and
+/// its `--coverage` / `--min-coverage-pct` in either spelling, a `--schema-version` with no value or
+/// given twice, the same on `--retire`, `coverage --min-coverage-pct` (never an exit 0 a caller would
+/// read as "met"), and the `requirements-target` and `seed-domain-validators` commands (usage, exit
+/// 2, before the engine starts).
 #[test]
 fn the_removed_minimum_is_refused_by_name() {
     let dir = scratch("removed");
     let db = dir.join("estate.db");
     seed_many(db.to_str().unwrap(), 5, 4);
     let dbs = db.to_str().unwrap();
+    let missing = dir.join("never.db");
+    let ms = missing.to_str().unwrap();
+    let bus = dir.join("bus.db");
     let root = dir.join("repo");
     std::fs::create_dir_all(&root).unwrap();
     let roots = root.to_str().unwrap();
-    let run = |args: &[&str]| Command::new(BIN).args(args).output().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env("WICKED_BUS_DB", &bus)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let dg = |extra: &[&'static str]| {
+        let mut v = vec!["domain-graph", "--db", ms, "--repo-root", roots];
+        v.extend_from_slice(extra);
+        v
+    };
     for (args, says) in [
         (
-            vec!["domain-graph", "--db", dbs, "--schema-version", "1.1.0"],
+            dg(&["--schema-version", "1.1.0"]),
             "--schema-version 1.1.0 is not built any more",
         ),
         (
-            vec![
-                "domain-graph",
-                "--db",
-                dbs,
-                "--repo-root",
-                roots,
-                "--min-coverage-pct",
-                "80",
-            ],
+            dg(&["--schema-version=1.1.0"]),
+            "--schema-version 1.1.0 is not built any more",
+        ),
+        (dg(&["--schema-version"]), "--schema-version needs a value"),
+        (
+            dg(&["--schema-version", "1.2.0", "--schema-version", "1.1.0"]),
+            "--schema-version is given more than once",
+        ),
+        (
+            dg(&["--min-coverage-pct", "80"]),
             "--min-coverage-pct was a 1.1.0 option and was removed",
         ),
         (
-            vec![
-                "domain-graph",
-                "--db",
-                dbs,
-                "--repo-root",
-                roots,
-                "--coverage",
-                "c.json",
-            ],
+            dg(&["--min-coverage-pct=80"]),
+            "--min-coverage-pct was a 1.1.0 option and was removed",
+        ),
+        (
+            dg(&["--coverage", "c.json"]),
             "--coverage was a 1.1.0 option and was removed",
         ),
         (
-            vec![
-                "coverage",
-                "--db",
-                dbs,
-                "--json",
-                "--min-coverage-pct",
-                "80",
-            ],
+            dg(&["--coverage=c.json"]),
+            "--coverage was a 1.1.0 option and was removed",
+        ),
+        (
+            dg(&["--retire", "billing::REQ-001", "--min-coverage-pct", "80"]),
+            "--min-coverage-pct was a 1.1.0 option and was removed",
+        ),
+        (
+            dg(&["--retire", "billing::REQ-001", "--schema-version", "1.1.0"]),
+            "--schema-version 1.1.0 is not built any more",
+        ),
+        (
+            vec!["coverage", "--db", ms, "--json", "--min-coverage-pct", "80"],
+            "--min-coverage-pct was removed",
+        ),
+        (
+            vec!["coverage", "--db", ms, "--json", "--min-coverage-pct=80"],
             "--min-coverage-pct was removed",
         ),
     ] {
@@ -257,16 +279,31 @@ fn the_removed_minimum_is_refused_by_name() {
         assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
         assert!(err.contains(says), "{args:?}: {err}");
         assert!(o.stdout.is_empty(), "{args:?} printed nothing to stdout");
+        assert!(!missing.exists(), "{args:?} opened no store");
     }
     for cmd in ["requirements-target", "seed-domain-validators"] {
-        let o = run(&[cmd, "--db", dbs]);
-        assert_eq!(
-            o.status.code(),
-            Some(2),
-            "{cmd} is not a command any more: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        let o = run(&[cmd, "--db", ms]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{cmd}: {err}");
+        assert!(err.contains("was removed (core#1924)"), "{cmd}: {err}");
+        assert!(!missing.exists(), "{cmd} opened no store");
+        assert!(!bus.exists(), "{cmd} started no engine");
     }
+    // The version that is built is still accepted by name: an empty model builds (no v3 rows).
+    let ok = run(&[
+        "domain-graph",
+        "--db",
+        dbs,
+        "--repo-root",
+        roots,
+        "--schema-version",
+        "1.2.0",
+    ]);
+    assert!(
+        ok.status.success(),
+        "--schema-version 1.2.0 is not refused: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

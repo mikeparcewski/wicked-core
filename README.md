@@ -17,8 +17,8 @@ and records every verdict.
 In power mode the code-writing build step runs as one agent's checkpointed turns while the engine
 re-scores the diff (other required steps can run separately); a failed review or qualifying check
 failure goes back to that agent, up to three hand-off attempts in all, and problems that need the
-operator's judgment pause for them. It also builds a repository's requirements graph and measures
-real coverage against a minimum. Underneath, a single-writer store actor owns the SQLite file, so
+operator's judgment pause for them. It also builds a repository's domain model and reports how
+much of the code is mapped (no minimum since core#1924). Underneath, a single-writer store actor owns the SQLite file, so
 the daemon, the UI and the MCP servers compose through one command API and a live event stream
 without racing on the database. Not end-user-facing: wicked-crew drives it through the
 `wicked-core-ts` bindings.

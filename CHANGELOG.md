@@ -16,14 +16,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **The requirements minimum is gone from the engine** (core#1924, J6 C3; phase 2 after crew#1930 and studio#1434).
   A 1.2.0 domain model has no minimum, and the last configured minimum went with the 1.1.0 build. Removed, each
-  refused by name where a caller could still send it:
+  refused by name before anything is opened (a flag in either spelling, `--name value` or `--name=value`, exit 1;
+  a removed command, exit 2 with usage, before the engine starts):
   - `wicked-core domain-graph --schema-version 1.1.0` (the 1.1.0 build from confidence annotations), with its
-    `--coverage <F>` and `--min-coverage-pct <N>`; `domain-graph` builds 1.2.0 only. Stored 1.1.0 graphs are
-    still read.
+    `--coverage <F>` and `--min-coverage-pct <N>`; `domain-graph` builds 1.2.0 only (`--schema-version 1.2.0`
+    is still accepted; with no value or given twice it is refused), and `--retire` is checked the same way.
+    Stored 1.1.0 graphs are still read.
   - `wicked-core coverage --min-coverage-pct [N]` (its exit 3); `coverage` only reports.
   - `wicked-core requirements-target` (the repository's own target; a stored target node stays inert) and
     `wicked-core seed-domain-validators` (the coverage validator, its script, its criterion and its pin
-    `COVERAGE_VALIDATOR_PIN`, and the preset's plan-time seed).
+    `COVERAGE_VALIDATOR_PIN`, and the preset's plan-time seed). A stored workflow that still pins that validator
+    (`9a2c71609c3e3ced`) is refused by name at plan time.
   - `WICKED_REQUIREMENTS_MIN_COVERAGE_PCT` and, in `wicked-governance`, `MIN_COVERAGE_ENV`,
     `DEFAULT_MIN_COVERAGE_PCT`, `parse_min_coverage_pct`, `min_coverage_pct_from_env`, `repo_min_coverage_pct`,
     `set_repo_min_coverage_pct` and `effective_min_coverage_pct`.

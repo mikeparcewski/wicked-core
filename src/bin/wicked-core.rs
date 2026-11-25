@@ -475,6 +475,14 @@ fn main() {
         Some("approve-validator") => return approve_validator_cmd(&args),
         Some("gate-phase") => return gate_phase_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
+        // core#1924: answered here, before the engine starts, so a removed command opens nothing.
+        Some(removed @ ("requirements-target" | "seed-domain-validators")) => {
+            eprintln!(
+                "wicked-core {removed} was removed (core#1924): a domain model has no minimum"
+            );
+            eprintln!("{ROOT_USAGE}");
+            std::process::exit(2);
+        }
         Some("domain-ruling") => return domain_ruling_cmd(&args),
         Some("model-call") => return model_call_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
@@ -1156,6 +1164,11 @@ fn print_status(core: &Core) {
 /// 1.2.0, `--coverage` and `--min-coverage-pct` are refused by name. Stored 1.1.0 graphs are still
 /// read.
 fn domain_graph_cmd(args: &[String]) {
+    // Checked first, for every form (a build and `--retire` alike), before anything is opened.
+    if let Some(why) = domain_graph_removed_option(args) {
+        fail(&format!("domain-graph: {why}"));
+        return;
+    }
     // `--retire` with no target is refused, never read as a full build (review r1).
     if args.iter().any(|a| a == "--retire") {
         domain_graph_retire(args, &flag(args, "--retire").unwrap_or_default());
@@ -1167,26 +1180,50 @@ fn domain_graph_cmd(args: &[String]) {
     // EXPORT file; nothing in the run reads it.
     let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
     let out_path = flag(args, "--out");
-    if let Some(v) = flag(args, "--schema-version").filter(|v| v != wicked_governance::SCHEMA_V3) {
-        fail(&format!(
-            "domain-graph: --schema-version {v} is not built any more: only {} is (the 1.1.0 build \
-             and its minimum were removed, core#1924); stored 1.1.0 graphs are still read",
-            wicked_governance::SCHEMA_V3
-        ));
-        return;
-    }
-    // The 1.2.0 model has no minimum: a caller asking for one would otherwise get no check.
-    if let Some(f) = ["--coverage", "--min-coverage-pct"]
-        .into_iter()
-        .find(|f| args.iter().any(|a| a == f))
-    {
-        fail(&format!(
-            "domain-graph: {f} was a 1.1.0 option and was removed (core#1924); the model has no \
-             minimum, it counts accounted targets and open statements"
-        ));
-        return;
-    }
     domain_graph_v3(args, repo_root, out_path);
+}
+
+/// Why `args` asks `domain-graph` for something core#1924 removed, if it does: a `--schema-version`
+/// other than 1.2.0 (in either spelling, missing its value, or given twice), or the 1.1.0 build's
+/// `--coverage` / `--min-coverage-pct` (in either spelling).
+fn domain_graph_removed_option(args: &[String]) -> Option<String> {
+    if let Some(f) = removed_minimum_flag(args, &["--coverage", "--min-coverage-pct"]) {
+        return Some(format!(
+            "{f} was a 1.1.0 option and was removed (core#1924); the model has no minimum, it \
+             counts accounted targets and open statements"
+        ));
+    }
+    let v3 = wicked_governance::SCHEMA_V3;
+    let mut versions = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--schema-version" {
+            versions.push(args.get(i + 1).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("--schema-version=") {
+            versions.push(v.to_string());
+        }
+    }
+    match versions.as_slice() {
+        [] => None,
+        [v] if v == v3 => None,
+        [v] if v.is_empty() || v.starts_with("--") => Some(format!(
+            "--schema-version needs a value: only {v3} is built"
+        )),
+        [v] => Some(format!(
+            "--schema-version {v} is not built any more: only {v3} is (the 1.1.0 build and its \
+             minimum were removed, core#1924); stored 1.1.0 graphs are still read"
+        )),
+        _ => Some(format!(
+            "--schema-version is given more than once: give it once, as {v3}"
+        )),
+    }
+}
+
+/// The first of `names` that `args` carries, as `--name` or `--name=value`.
+fn removed_minimum_flag<'a>(args: &[String], names: &[&'a str]) -> Option<&'a str> {
+    names.iter().copied().find(|n| {
+        args.iter()
+            .any(|a| a == n || a.strip_prefix(n).is_some_and(|r| r.starts_with('=')))
+    })
 }
 
 /// `wicked-core domain-graph` at 1.2.0 (J6 v3, DES-C2-v2): the model garden's domain-run wrote,
@@ -1300,12 +1337,12 @@ fn domain_graph_retire(args: &[String], target: &str) {
 
 /// `wicked-core coverage [--out F]` — recompute the front-half coverage report DIRECTLY from the store
 /// and emit `coverage-report.json` (schema-exact). `--out` defaults to a bare `coverage-report.json` in
-/// the cwd so the shipped grep validator (which reads that path from the phase worktree) finds it
-/// (DES-OUTGOV-005 decision #4). Opens the store directly for a brief read; never spawns the actor.
+/// the cwd (DES-OUTGOV-005 decision #4). It only reports: core#1924 removed its minimum check. Opens the
+/// store directly for a brief read; never spawns the actor.
 fn coverage_cmd(args: &[String]) {
     // core#1924 removed the check: a caller still asking for one is refused by name, never handed
     // an exit 0 it would read as "met".
-    if args.iter().any(|a| a == "--min-coverage-pct") {
+    if removed_minimum_flag(args, &["--min-coverage-pct"]).is_some() {
         fail(
             "coverage: --min-coverage-pct was removed (core#1924): the domain model has no \
              minimum; this command only reports",

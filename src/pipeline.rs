@@ -262,6 +262,11 @@ pub(crate) fn resolve_workflow_def(
     }
 }
 
+/// The pin of the domain-extraction coverage validator core#1924 removed (a domain model has no
+/// minimum). A store seeded before then may still hold it vaulted and approved, so a stored workflow
+/// that pins it would attach a check whose command is gone: it is refused by name at plan time.
+const RETIRED_DOMAIN_COVERAGE_PIN: &str = "9a2c71609c3e3ced";
+
 /// Attach each phase's PINNED, already-approved validator to its unit (the producer half that makes the
 /// rev0.4 dual-validator gate ENGAGE). Units are 1:1 with `def.phases` in declaration order, so this zips
 /// them and, for every phase that declares a `validator_pin`, LOADS that validator from the vault (a pure
@@ -280,8 +285,8 @@ fn attach_pinned_validators(
     // floor as authored (registration REFUSES a `verified_evidence` phase with no pin — nothing is
     // armed here), and a composed plan's pins come from the phase catalog (DES-TEAMING-002 §10,
     // seam C1): the `build`, `test`, `review` and `security_review` entries carry the evidence
-    // floor as data and `domain_coverage` the coverage pin (`catalog.rs`); a step may add a pin to
-    // an unpinned entry only, never swap or remove one (`plan::apply_step`).
+    // floor as data; a step may add a pin to an unpinned entry only, never swap or remove one
+    // (`plan::apply_step`). The domain-extraction coverage pin is retired (core#1924) and refused.
     // A phase with no pin still leaves the unit's validator `None` (ungated). Operators author
     // phase-specific criteria via `wicked-core provision-validator --criterion "..."` then
     // `wicked-core approve-validator --pin <pin>`, and put the approved pin in a def's `validator_pin`.
@@ -289,6 +294,15 @@ fn attach_pinned_validators(
         let Some(pin) = phase.validator_pin.as_deref() else {
             continue;
         };
+        if pin == RETIRED_DOMAIN_COVERAGE_PIN {
+            anyhow::bail!(
+                "workflow `{}` phase `{}` pins `{pin}`, the domain-extraction coverage validator, \
+                 which was removed with core#1924 (a domain model has no minimum): remove the \
+                 `validator_pin` from that phase",
+                def.id,
+                phase.id
+            );
+        }
         match crate::validator_vault::load_validator(store, pin)? {
             // The pin must resolve to an APPROVED validator (Lane D finding 2). An UNAPPROVED-but-vaulted
             // pin would attach and then DENY EVERY run at gate time (run_validator fails closed on an
@@ -649,7 +663,7 @@ pub(crate) fn pre_distribute(
 /// plans (DES-TEAMING-002 T3, codex round 4): the tool preflight (core#120), the base-skill intake
 /// (core#468), repo-placeholder binding, the governed unit limit and the pinned-validator attach
 /// (fail-closed on an unvaulted pin). Writes nothing of the run's: only the idempotent,
-/// content-addressed built-in floor / coverage validator seeds the attach reads. [`pre_distribute`]
+/// content-addressed built-in floor validator seed the attach reads. [`pre_distribute`]
 /// calls it, and the plan gate calls it on an edited plan BEFORE it answers the gate or touches
 /// the old units — one checker, so what was proven is what runs.
 pub(crate) fn planned_units(
@@ -4970,6 +4984,32 @@ mod resolve_tests {
             msg.contains("deadbeefdeadbeef") && msg.contains("not in the vault"),
             "the fail-closed error must name the missing pin: {msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#1924: the retired domain-extraction coverage pin is refused by name at plan time, before
+    /// the vault is read, so a store that still holds it approved never attaches it.
+    #[test]
+    fn the_retired_domain_coverage_pin_is_refused_by_name() {
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-pin-retired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(
+            r#"{ "id": "old", "phases": [ { "id": "coverage", "kind": "build", "validator_pin": "9a2c71609c3e3ced" } ] }"#,
+        )
+        .unwrap();
+        def.validate().unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        let msg = attach_pinned_validators(&store, &mut units, &def)
+            .expect_err("the retired pin is refused")
+            .to_string();
+        assert!(
+            msg.contains("core#1924") && msg.contains("phase `coverage`"),
+            "{msg}"
+        );
+        assert!(units.iter().all(|u| u.validator.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

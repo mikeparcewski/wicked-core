@@ -4073,7 +4073,8 @@ mod tests {
             let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
             let built_at = wicked_governance::ModelCoverage {
                 real_pct: 23,
-                min_pct: Some(80),
+                // Not the old default: the read must name what this build recorded (core#1924).
+                min_pct: Some(66),
                 behavior_bearing: 5786,
                 real: 1362,
                 placeholders: 4397,
@@ -4102,7 +4103,7 @@ mod tests {
         );
         assert_eq!(moved["build"]["coverage"]["real_pct"], 23);
         assert_eq!(
-            moved["coverage"]["min_pct"], 80,
+            moved["coverage"]["min_pct"], 66,
             "the read names the minimum the listed build recorded"
         );
         assert_eq!(
