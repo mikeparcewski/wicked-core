@@ -861,8 +861,8 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// governance), so without this a review-change judge cannot check a single `path:line` finding:
 /// run f1d5b8e9's judge said so, and its reply never closed. Each cited `path:line` or
 /// `path:line-line` that names a regular file under the worktree root (relative, no `..`, the
-/// canonical path inside the canonical root) is shown with two lines of context, redacted like
-/// the activity feed; a cited path the tree lacks is named as such. Bounded: the first
+/// file opened beneath the root with no link followed) is shown with two lines of context,
+/// redacted like the activity feed; a cite the harness cannot read is named as such. Bounded: the first
 /// [`CITED_MAX`] distinct cites, [`CITED_SPAN`] lines each, [`CITED_CAP`] bytes in all. `None`
 /// when the WORK cites nothing.
 fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<String> {
@@ -888,32 +888,49 @@ fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<Strin
     );
     for (path, first, last) in seen {
         let mut block = String::new();
-        let file = root.join(&path);
-        let inside = std::fs::canonicalize(&file)
+        // Opened beneath the root with no link followed and read through the open handle, so a
+        // path swapped for a link or a FIFO after the cite was parsed cannot lead the read out.
+        let bytes = crate::draft_render::open_beneath(&root, &root.join(&path))
             .ok()
-            .filter(|f| f.starts_with(&root) && f.is_file())
-            .filter(|f| f.metadata().is_ok_and(|m| m.len() <= CITED_FILE_MAX))
-            .and_then(|f| std::fs::read(f).ok());
-        match inside {
-            None => block.push_str(&format!("{path}:{first}: (no such file in the worktree)\n")),
+            .and_then(|f| {
+                use std::io::Read;
+                if !f.metadata().ok()?.is_file() {
+                    return None;
+                }
+                let mut buf = Vec::new();
+                f.take(CITED_FILE_MAX + 1).read_to_end(&mut buf).ok()?;
+                (buf.len() as u64 <= CITED_FILE_MAX).then_some(buf)
+            });
+        match bytes {
+            None => block.push_str(&format!(
+                "{path}:{first}: (not read: no regular file at that path in the worktree, a \
+                 link, or over {CITED_FILE_MAX} bytes)\n"
+            )),
             Some(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
-                let lines: Vec<&str> = text.lines().collect();
-                if first > lines.len() {
+                // Redacted whole, so a secret continued onto the next line is still cut; shown
+                // only when redaction kept the line numbering.
+                let redacted = crate::tool_activity::redact_prose(&text);
+                let lines: Vec<&str> = redacted.lines().collect();
+                if lines.len() != text.lines().count() {
+                    block.push_str(&format!(
+                        "{path}:{first}: (not shown: redacting the file moved its lines)\n"
+                    ));
+                } else if first > lines.len() {
                     block.push_str(&format!(
                         "{path}:{first}: (past the end: the file has {} lines)\n",
                         lines.len()
                     ));
-                }
-                let from = first.saturating_sub(2).max(1);
-                let to = last
-                    .min(first + CITED_SPAN)
-                    .saturating_add(2)
-                    .min(lines.len());
-                for n in from..=to {
-                    let line: String = lines[n - 1].chars().take(240).collect();
-                    let line = crate::tool_activity::redact_prose(&line);
-                    block.push_str(&format!("{path}:{n}: {line}\n"));
+                } else {
+                    let from = first.saturating_sub(2).max(1);
+                    let to = last
+                        .min(first.saturating_add(CITED_SPAN))
+                        .saturating_add(2)
+                        .min(lines.len());
+                    for n in from..=to {
+                        let line: String = lines[n - 1].chars().take(240).collect();
+                        block.push_str(&format!("{path}:{n}: {line}\n"));
+                    }
                 }
             }
         }
@@ -946,7 +963,7 @@ fn parse_cite(token: &str) -> Option<(String, usize, usize)> {
         d.parse().ok().filter(|n| *n > 0)
     };
     let first = digits(rest)?;
-    let after = &rest[first.to_string().len()..];
+    let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let last = after
         .strip_prefix('-')
         .and_then(digits)
@@ -8968,6 +8985,64 @@ mod tests {
                 governed: false,
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cited_source_stays_in_the_worktree_and_bounded_1945() {
+        assert_eq!(
+            parse_cite("src/a.js:007-009"),
+            Some(("src/a.js".into(), 7, 9))
+        );
+        assert_eq!(
+            parse_cite("src/a.js:12:5"),
+            Some(("src/a.js".into(), 12, 12))
+        );
+        for not_a_cite in [
+            "../x.js:1",
+            "/etc/hosts.txt:1",
+            "src/./a.js:1",
+            "note:3",
+            "http://example.com:80",
+            "src/a.js:0",
+        ] {
+            assert_eq!(parse_cite(not_a_cite), None, "{not_a_cite}");
+        }
+        let dir = std::env::temp_dir().join(format!("core-1945-cite-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("core-1945-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "OUTSIDE-THE-TREE\n").unwrap();
+        std::fs::write(dir.join("src/a.js"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(
+            dir.join("src/env.sh"),
+            "API_KEY=\\\nOpaqueValue0123456789\nNot logged in\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("src/link.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+        let shown = cited_source_for_judge(
+            &dir,
+            &format!(
+                "src/a.js:{} src/a.js:2 src/link.txt:1 out/secret.txt:1 src/env.sh:2",
+                usize::MAX
+            ),
+        )
+        .unwrap();
+        assert!(shown.contains("src/a.js:2: two"), "{shown}");
+        assert!(shown.contains("past the end"), "{shown}");
+        assert!(!shown.contains("OUTSIDE-THE-TREE"), "{shown}");
+        assert!(shown.contains("src/link.txt:1: (not read"), "{shown}");
+        assert!(shown.contains("out/secret.txt:1: (not read"), "{shown}");
+        assert!(!shown.contains("OpaqueValue0123456789"), "{shown}");
+        // Many cites stay within the budget.
+        let many: String = (1..=200).map(|n| format!("src/f{n}.js:{n} ")).collect();
+        let shown = cited_source_for_judge(&dir, &many).unwrap();
+        assert!(shown.len() <= CITED_CAP + 200, "{}", shown.len());
+        assert_eq!(shown.matches("(not read").count(), CITED_MAX);
+        assert!(cited_source_for_judge(&dir, "no cites here").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

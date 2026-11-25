@@ -243,7 +243,10 @@ pub(crate) fn resolve_draft(
 /// on the directory just opened: no link anywhere below the root is followed, so a directory swapped
 /// for a link after [`resolve_draft`] cannot lead the read out of the root.
 #[cfg(unix)]
-fn open_beneath(root: &std::path::Path, real: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_beneath(
+    root: &std::path::Path,
+    real: &std::path::Path,
+) -> Result<std::fs::File, String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     let rel = real
@@ -305,7 +308,10 @@ fn open_beneath(root: &std::path::Path, real: &std::path::Path) -> Result<std::f
 }
 
 #[cfg(not(unix))]
-fn open_beneath(_root: &std::path::Path, real: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_beneath(
+    _root: &std::path::Path,
+    real: &std::path::Path,
+) -> Result<std::fs::File, String> {
     std::fs::File::open(real).map_err(|e| format!("the draft could not be opened: {e}"))
 }
 
