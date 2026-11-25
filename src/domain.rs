@@ -1991,6 +1991,18 @@ pub enum RoutingInfo {
 }
 
 impl WorkUnit {
+    /// (core#1925) The unit was dispatched at least once: a dispatch stamp (`plan_rev`, or
+    /// `last_attempt` for a unit dispatched before `plan_rev` existed; neither is cleared by a
+    /// rewind) or a finished status. `Distributed` alone is not proof: distribution assigns every
+    /// planned unit a seat before any runs (`pipeline::apply_distributions`). Conservative: a
+    /// unit planned fresh on an ord that ran inherits that ord's attempt floor and reads as
+    /// dispatched.
+    pub fn was_dispatched(&self) -> bool {
+        self.plan_rev.is_some()
+            || self.last_attempt.is_some()
+            || matches!(self.status, UnitStatus::Done | UnitStatus::Rejected)
+    }
+
     /// Build a fresh `Pending` unit for the plan.
     pub fn pending(
         id: impl Into<String>,

@@ -1224,9 +1224,17 @@ fn a_send_back_loses_a_check_moved_off_its_work_by_rename_or_id_reuse() {
 
 /// The held first-creator proposal of [`held_first_creator`], with a held review after the build.
 fn held_build_and_review(hc: &HumanConfirm) -> TeamPlanState {
+    held_with(
+        hc,
+        r#"[{"catalog":"build","id":"build"},{"catalog":"review","id":"review","depends_on":["build"]}]"#,
+    )
+}
+
+/// `answer-1` accepted and run, then the PA's first-creator `steps` held at its boundary.
+fn held_with(hc: &HumanConfirm, steps: &str) -> TeamPlanState {
     let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, hc);
     let change = pa_block(
-        r#"[{"catalog":"build","id":"build"},{"catalog":"review","id":"review","depends_on":["build"]}]"#,
+        steps,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
             graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
@@ -1286,11 +1294,38 @@ fn a_gate_edit_amends_the_instructions_of_a_held_step() {
     );
 }
 
-/// (core#1925) …and a new catalog on a step that carries no check (a creator here): the step is
-/// re-catalogued, and the fields the person left out keep the held values.
+/// (core#1925) …and a new catalog on a step that carries no check (the probe's `produce` draft
+/// made an `understand`): the step is re-catalogued, and the fields the person left out keep the
+/// held values. A `build` step carries its entry's evidence-floor validator, so it is a check and
+/// keeps its catalog.
 #[test]
 fn a_gate_edit_recatalogues_a_held_step_that_carries_no_check() {
     let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"draft","instructions":"Write the page."}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"understand","id":"draft"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let draft = accepted_step(&r, "draft");
+    assert_eq!(draft.catalog, "understand");
+    assert_eq!(draft.instructions.as_deref(), Some("Write the page."));
     let held = held_first_creator(&hc);
     let r = revise(
         "r",
@@ -1305,12 +1340,7 @@ fn a_gate_edit_recatalogues_a_held_step_that_carries_no_check() {
         0,
     )
     .unwrap();
-    assert!(
-        matches!(r.outcome, Outcome::Accepted { .. }),
-        "{}",
-        describe(&r.outcome)
-    );
-    assert_eq!(accepted_step(&r, "build").catalog, "produce");
+    refused_naming(&r, &held, "step `build` is a `build` check");
 }
 
 /// (core#1925) A step that already ran cannot be changed at the gate: the whole edit is refused,
@@ -1446,7 +1476,10 @@ fn a_gate_edit_reinstructs_a_held_review() {
 #[test]
 fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
     let hc = HumanConfirm::None;
-    let mut held = held_build_and_review(&hc);
+    let mut held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"build"},{"catalog":"review","id":"review","depends_on":["build"]}]"#,
+    );
     held.deliverables = vec!["docs/out.md".to_string()];
     let edit = |build: serde_json::Value| {
         gate_edit(json!([
@@ -1458,7 +1491,7 @@ fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
     let r = revise(
         "r",
         &held,
-        edit(json!({"catalog":"produce","id":"build"})),
+        edit(json!({"catalog":"build","id":"build"})),
         &["answer-1".into()],
         &hc,
         Some(1),
@@ -1489,4 +1522,161 @@ fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
         o => panic!("{}", describe(o)),
     }
     assert_eq!(r.state, held, "the run keeps its plan");
+}
+
+fn refused_naming(r: &Revised, held: &TeamPlanState, needle: &str) {
+    match &r.outcome {
+        Outcome::Refused { reason } => assert!(reason.contains(needle), "{reason}"),
+        o => panic!("{}", describe(o)),
+    }
+    assert_eq!(&r.state, held, "the run keeps its plan");
+}
+
+/// (core#1925, codex r1 on the fix) A step's own pin is never swapped, and a capture report it
+/// declares is never dropped, at the gate.
+#[test]
+fn a_gate_edit_cannot_swap_a_steps_pin_or_drop_its_capture_report() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        &json!([{"catalog":"produce","id":"build",
+                 "validator_pin": crate::builtin_floors::EVIDENCE_FLOOR_PIN,
+                 "requires_capture_report": true}])
+        .to_string(),
+    );
+    for build in [
+        json!({"catalog":"produce","id":"build",
+               "validator_pin": crate::builtin_floors::WALKTHROUGH_LINT_PIN}),
+        json!({"catalog":"produce","id":"build","requires_capture_report":false}),
+    ] {
+        let r = revise(
+            "r",
+            &held,
+            gate_edit(json!([{"catalog":"understand","id":"answer-1"}, build])),
+            &["answer-1".into()],
+            &hc,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        refused_naming(&r, &held, "`build`");
+    }
+}
+
+/// (core#1925, pi r1 on the fix) A step that carries no check still never stops reading an input
+/// it read.
+#[test]
+fn a_gate_edit_cannot_drop_a_dependency_of_a_step_without_a_check() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"build","id":"build","depends_on":["answer-1"]}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build","depends_on":[]}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(&r, &held, "step `build` can't stop reading `answer-1`");
+}
+
+/// (core#1925, codex r1 on the fix) A check may be made stricter at the gate: a raised gate.
+#[test]
+fn a_gate_edit_may_raise_a_checks_gate() {
+    let hc = HumanConfirm::None;
+    let held = held_build_and_review(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build"},
+            {"catalog":"review","id":"review","gate":{"human_confirm":{"unconditional":true}}}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    assert!(accepted_step(&r, "review").gate.is_some());
+}
+
+/// (core#1925, codex r1 on the fix, P1) The launch's deliverables never move onto a creator step
+/// that already ran, where no unit would judge them: an edit that would put them there is refused.
+#[test]
+fn a_gate_edit_never_moves_the_deliverables_onto_a_step_that_ran() {
+    let hc = HumanConfirm::None;
+    let mut held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"early"},{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
+    );
+    held.deliverables = vec!["docs/out.md".to_string()];
+    let r = revise_with_ran(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","id":"early"},
+            {"catalog":"understand","id":"build"}
+        ])),
+        &["answer-1".into()],
+        &["answer-1".into(), "early".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(&r, &held, "the step `early` already ran");
+}
+
+/// (core#1925, codex r1 on the fix) An edit whose only amendment the plan's normalization undoes
+/// (dropping a launch deliverable the plan then re-applies) changes nothing: "adds no step".
+#[test]
+fn a_gate_edit_whose_amendment_normalizes_away_adds_no_step() {
+    let hc = HumanConfirm::None;
+    let mut held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
+    );
+    held.deliverables = vec!["docs/out.md".to_string()];
+    let steps: Vec<Value> = held
+        .pending
+        .as_ref()
+        .unwrap()
+        .steps
+        .steps
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(super::without_provenance(s)).unwrap();
+            if s.id == "build" {
+                v["required_deliverables"] = json!([]);
+            }
+            v
+        })
+        .collect();
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(Value::Array(steps)),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(&r, &held, "adds no step");
 }

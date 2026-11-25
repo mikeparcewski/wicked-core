@@ -1,5 +1,7 @@
 //! Seam T4 (DES-TEAMING-002 §8.7): re-deciding mid-run. The plan only GROWS: a revision adds
 //! steps after the cursor, never removes one and never touches a unit already dispatched or done.
+//! One exception (core#1925): a person's edit at the gate also AMENDS the held steps it restates
+//! that never ran ([`amend_restated`]); the PA's and the members' changes only add.
 //!
 //! Three triggers reach the actor, each on the actor's own command channel (it never reads the
 //! bus):
@@ -422,6 +424,7 @@ pub(crate) fn revise_with_ran(
     // (the rule above only grows the plan for the PA and the members): what they set replaces
     // the held value, what they left out keeps it. A step that ran, or a check it would loosen,
     // refuses the whole edit by name (below, once the proposal is on the record).
+    let held_steps = base.steps.clone();
     let (base, amend) = if human_gate_edit {
         let amendment: &[PlanStep] = match &change {
             Change::Steps { steps, .. } => steps,
@@ -568,7 +571,7 @@ pub(crate) fn revise_with_ran(
             outcome: Outcome::Refused { reason },
         })
     };
-    let amended = match amend {
+    let mut amended = match amend {
         Ok(n) => n,
         Err(why) => return refuse(events, why),
     };
@@ -615,6 +618,41 @@ pub(crate) fn revise_with_ran(
         floor_override: base.floor_override.clone(),
         monitors: base.monitors.clone(),
     });
+    if amended > 0 {
+        // (core#1925) An amended plan still carries the launch's declared deliverables on a
+        // creator step: when the edit took them off (a re-catalogued creator), they ride the last
+        // creator step, as a whole-plan edit at the launch gate does (`decide`).
+        let carried = prior.deliverables.is_empty()
+            || merged.steps.iter().any(|s| {
+                crate::plan::is_creator_step(catalog, s)
+                    && s.required_deliverables
+                        .as_ref()
+                        .is_some_and(|r| prior.deliverables.iter().all(|d| r.contains(d)))
+            });
+        if !carried {
+            merged = match super::with_deliverables(merged, &prior.deliverables) {
+                Ok(p) => p,
+                Err(e) => return refuse(events, format!("{e:#}")),
+            };
+        }
+        // What the edit changed once the plan is normalized: a step that ran never changes (the
+        // deliverables never move onto finished work), and amendments the normalization undid
+        // change nothing.
+        amended = 0;
+        for s in &merged.steps {
+            let Some(held) = held_steps.iter().find(|h| h.id == s.id) else {
+                continue;
+            };
+            let changed = changed_fields(held, s);
+            if changed.is_empty() {
+                continue;
+            }
+            if ran.contains(&s.id) {
+                return refuse(events, ran_refusal(&s.id, &changed));
+            }
+            amended += 1;
+        }
+    }
     // A human's answer that declines a held proposal's additions changes the plan by dropping
     // them, and one that amends held steps changes it by those amendments (core#1925): neither
     // is "adds no step".
@@ -624,15 +662,6 @@ pub(crate) fn revise_with_ran(
         && amended == 0
     {
         return refuse(events, "the proposal adds no step".to_string());
-    }
-    // (core#1925) An amended plan carries the launch's declared deliverables on its last creator
-    // step, as a whole-plan edit at the launch gate does (`decide`): a re-catalogued creator never
-    // takes them with it.
-    if amended > 0 {
-        merged = match super::with_deliverables(merged, &prior.deliverables) {
-            Ok(p) => p,
-            Err(e) => return refuse(events, format!("{e:#}")),
-        };
     }
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
     let mut filled = match crate::plan::floor_fill(
@@ -845,7 +874,11 @@ fn amend_restated(
         if changed_fields(held, &new).is_empty() {
             continue;
         }
-        if let Some(why) = edit_refusal(held, &new, ran) {
+        let inputs: Vec<String> = inputs_of(&base.steps, at)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if let Some(why) = edit_refusal(held, &new, &inputs, ran) {
             return (base, Err(why));
         }
         base.steps[at] = new;
@@ -922,23 +955,33 @@ fn changed_fields(a: &PlanStep, b: &PlanStep) -> Vec<String> {
         .collect()
 }
 
+/// (core#1925) The refusal of an edit that changes `fields` of the step `id`, which ran.
+fn ran_refusal(id: &str, fields: &[String]) -> String {
+    format!(
+        "the step `{id}` already ran, so its {} can't change; edit only the steps that have not \
+         run",
+        fields.join(", ")
+    )
+}
+
 /// (core#1925, DES-1925 §2-3) Why a person may not turn the held step `held` into `new` at the
 /// gate, if they may not: a step that ran never changes; a validator pin is never cleared or
-/// swapped; a dependency is never removed; and a step that carries a check
-/// ([`carries_check`]) keeps its catalog entry and changes only its instructions or what makes
-/// it stricter.
-fn edit_refusal(held: &PlanStep, new: &PlanStep, ran: &[String]) -> Option<String> {
+/// swapped; no step stops reading an input it read (`inputs`, its declared or implicit
+/// [`inputs_of`]); and a step that carries a check ([`carries_check`]) keeps its catalog entry
+/// and changes only its instructions or what makes it stricter.
+fn edit_refusal(
+    held: &PlanStep,
+    new: &PlanStep,
+    inputs: &[String],
+    ran: &[String],
+) -> Option<String> {
     let id = &held.id;
     let changed = changed_fields(held, new);
     if changed.is_empty() {
         return None;
     }
     if ran.contains(id) {
-        return Some(format!(
-            "the step `{id}` already ran, so its {} can't change; edit only the steps that have \
-             not run",
-            changed.join(", ")
-        ));
+        return Some(ran_refusal(id, &changed));
     }
     if held.validator_pin != new.validator_pin
         && (matches!(held.validator_pin, Some(Some(_))) || matches!(new.validator_pin, Some(None)))
@@ -947,15 +990,15 @@ fn edit_refusal(held: &PlanStep, new: &PlanStep, ran: &[String]) -> Option<Strin
             "the check on step `{id}` can't be removed or changed at the gate"
         ));
     }
-    if let Some(lost) = held
-        .depends_on
-        .iter()
-        .flatten()
-        .find(|d| !new.depends_on.as_ref().is_some_and(|n| n.contains(*d)))
-    {
-        return Some(format!(
-            "step `{id}` can't lose its dependency on `{lost}` at the gate"
-        ));
+    // An edit never sets `depends_on` back to absent (an absent field keeps the held value), so
+    // a changed one is the person's own list.
+    if held.depends_on != new.depends_on {
+        let listed = new.depends_on.as_deref().unwrap_or_default();
+        if let Some(lost) = inputs.iter().find(|d| !listed.contains(d)) {
+            return Some(format!(
+                "step `{id}` can't stop reading `{lost}` at the gate"
+            ));
+        }
     }
     if !carries_check(held) {
         return None;
@@ -966,12 +1009,32 @@ fn edit_refusal(held: &PlanStep, new: &PlanStep, ran: &[String]) -> Option<Strin
             held.catalog
         ));
     }
+    let entry = crate::catalog::catalog_entry(&held.catalog);
+    let gate_rank = |s: &PlanStep| {
+        s.gate
+            .or_else(|| entry.map(|e| e.gate))
+            .map(crate::plan::gate_rank_of)
+    };
+    let budget = |s: &PlanStep| s.budget_secs.or_else(|| entry.and_then(|e| e.budget_secs));
     let stricter = |f: &str| match f {
-        "instructions" | "validator_pin" => true,
+        // (the pin rule above refuses a cleared or swapped pin, so a changed one is added)
+        "instructions" | "validator_pin" | "depends_on" => true,
         "executes_code" => new.executes_code == Some(true),
         "verified_evidence" => new.verified_evidence == Some(true),
         "requires_capture_report" => new.requires_capture_report == Some(true),
-        "depends_on" => held.depends_on.is_some(),
+        "gate" => gate_rank(new) >= gate_rank(held),
+        "budget_secs" => match (budget(held), budget(new)) {
+            (Some(h), Some(n)) => n <= h,
+            (None, _) => true,
+            (Some(_), None) => false,
+        },
+        "required_deliverables" => {
+            let n = new.required_deliverables.as_deref().unwrap_or_default();
+            held.required_deliverables
+                .iter()
+                .flatten()
+                .all(|d| n.contains(d))
+        }
         _ => false,
     };
     if changed.iter().all(|f| stricter(f)) {

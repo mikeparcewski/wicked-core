@@ -2025,6 +2025,82 @@ fn a_mid_run_gate_edit_reaches_the_units_that_run_1925() {
     release_all(&w);
 }
 
+/// (core#1925, pi r1 on the fix) End to end, an edit at the mid-run gate that changes a step that
+/// ran is refused by name, and the run keeps its plan.
+#[test]
+fn a_mid_run_gate_edit_to_a_step_that_ran_is_refused_1925() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"docs"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("gr1925", w.clone());
+    launch(
+        &e,
+        "gr",
+        HumanConfirm::None,
+        plan(json!({"steps": [
+            {"catalog": "understand", "id": "answer-1"},
+            {"catalog": "understand", "id": "answer-2"}
+        ]})),
+    );
+    e.wait_awaiting("gr", "plan_approval", 1);
+    let before: Vec<String> = view(&e, "gr").units.iter().map(|u| u.id.clone()).collect();
+    let _ = e.core.confirm_gate(
+        "gr",
+        HumanDecision::EditPlan {
+            plan: plan(json!({"steps": [
+                {"catalog": "understand", "id": "answer-1", "instructions": "Answer it again."},
+                {"catalog": "produce", "id": "docs"},
+                {"catalog": "understand", "id": "answer-2"}
+            ]})),
+            note: None,
+        },
+    );
+    wait_for("the edit's refusal", || {
+        payloads(&e, "gr", tev::PLAN_REFUSED).iter().any(|p| {
+            p["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("the step `answer-1` already ran"))
+        })
+    });
+    let after: Vec<String> = view(&e, "gr").units.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(after, before, "the run keeps its units");
+    assert!(
+        !e.worker.calls().iter().any(|c| c.2 == "gr:answer-2"),
+        "nothing ran past the gate"
+    );
+    release_all(&w);
+}
+
+/// (core#1925, codex r1 on the fix) Distribution assigns every planned unit a seat before any
+/// runs, so `Distributed` is not "ran"; a dispatch stamp is, and survives a rewind's reset.
+#[test]
+fn a_unit_was_dispatched_by_its_stamps_not_by_distribution_1925() {
+    use crate::domain::{UnitStatus, WorkUnit};
+    let mut u = WorkUnit::pending("r:a", "r", 1, "a");
+    assert!(!u.was_dispatched());
+    u.status = UnitStatus::Distributed;
+    assert!(!u.was_dispatched(), "a seat was assigned, nothing ran");
+    // Dispatched before `plan_rev` existed, then reset by a rewind.
+    u.status = UnitStatus::Pending;
+    u.last_attempt = Some(0);
+    assert!(u.was_dispatched());
+    u.last_attempt = None;
+    u.plan_rev = Some(2);
+    assert!(u.was_dispatched());
+    u.plan_rev = None;
+    u.status = UnitStatus::Rejected;
+    assert!(u.was_dispatched());
+}
+
 /// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for
 /// DIFFERENT work: the held `produce:design` (a creator step under an odd id) is dropped and the
 /// human's id-less `design` defaults onto that id. The stored unit is a replacement, not a kept

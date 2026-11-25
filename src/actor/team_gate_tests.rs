@@ -3372,8 +3372,9 @@ fn an_accepted_edit_applies_only_after_its_gate_decided_lands() {
     assert_eq!(unit_ids(&e, "r9h"), EDITED_UNITS);
 }
 
-/// (core#1925) Each unit records the plan revision it ran under: after an edit accepted at the
-/// plan gate (rev 2), the units the run released ran from rev 2, and the run view says so.
+/// (core#1925) Each unit records the plan revision it was dispatched under: after an edit
+/// accepted at the plan gate (rev 2), the units the run released ran from rev 2, and the run view
+/// says so; a unit not yet dispatched has none.
 #[test]
 fn units_record_the_plan_rev_they_ran_under() {
     let rig = rig("prrev");
@@ -3381,19 +3382,26 @@ fn units_record_the_plan_rev_they_ran_under() {
     at_the_plan_gate(&rig, &e, "prr");
     let s = e.core.confirm_gate("prr", the_edit()).unwrap();
     assert_ne!(s, SessionStatus::AwaitingHuman);
-    wait_status(&e, "prr", SessionStatus::Completed);
+    let revs = || -> Vec<(String, Option<u32>)> {
+        e.core
+            .sessions_detail()
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.session.id == "prr")
+            .flat_map(|v| v.units)
+            .map(|u| (u.id.clone(), u.plan_rev))
+            .collect()
+    };
+    wait_for("a unit dispatched under the edit's rev", || {
+        revs().iter().any(|(_, r)| r.is_some())
+    });
     assert_eq!(plan_revs(&e, "prr"), (2, 2));
-    let revs: Vec<(String, Option<u32>)> = e
-        .core
-        .sessions_detail()
-        .unwrap()
-        .into_iter()
-        .filter(|v| v.session.id == "prr")
-        .flat_map(|v| v.units)
-        .map(|u| (u.id.clone(), u.plan_rev))
-        .collect();
+    let revs = revs();
     assert_eq!(revs.len(), EDITED_UNITS.len(), "{revs:?}");
-    assert!(revs.iter().all(|(_, r)| *r == Some(2)), "{revs:?}");
+    assert!(
+        revs.iter().all(|(_, r)| r.is_none() || *r == Some(2)),
+        "{revs:?}"
+    );
 }
 
 /// Round 9 (2): the edit's `gate.decided` fails past the bound → the run pauses
