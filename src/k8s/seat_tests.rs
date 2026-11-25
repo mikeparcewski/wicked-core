@@ -7574,8 +7574,7 @@ fn k8s_core_1463_a_required_root_over_the_cap_still_refuses() {
     let err = with_cap(seat::NOTE_RESERVE + 4000, || {
         seat::copy_in_stream(None, &tree, &roots, false, &Default::default())
     })
-    .err()
-    .expect("a required root over the cap refuses the unit");
+    .expect_err("a required root over the cap refuses the unit");
     assert!(matches!(err.why, FloorUnarmed::CopyInRefused), "{err:?}");
     assert!(err.detail.contains("larger than"), "{}", err.detail);
 }
