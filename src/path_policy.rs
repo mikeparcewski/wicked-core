@@ -1009,10 +1009,6 @@ mod tests {
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
     }
 
-    /// core#294 — the launch-time judgement on launcher-declared READ roots mirrors the write one
-    /// rule for rule: a scratch source dir is admitted; relative, pin-tree-containing (either
-    /// direction) and HOME-less declarations are refused. Read-only never relaxes the vetting —
-    /// the grant is still a grant.
     /// (core#1463) An optional read root only marks a declared read root; it never grants one.
     #[test]
     fn optional_read_roots_must_be_declared_read_roots() {
@@ -1029,6 +1025,10 @@ mod tests {
         assert!(validate_optional_read_roots(&["/srv/a".to_string()], &[]).is_err());
     }
 
+    /// core#294 — the launch-time judgement on launcher-declared READ roots mirrors the write one
+    /// rule for rule: a scratch source dir is admitted; relative, pin-tree-containing (either
+    /// direction) and HOME-less declarations are refused. Read-only never relaxes the vetting —
+    /// the grant is still a grant.
     #[test]
     fn extra_read_roots_validation_mirrors_the_write_rules() {
         let home = scratch("xrr_home");

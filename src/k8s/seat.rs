@@ -1437,7 +1437,9 @@ pub(crate) enum OverCap {
     Files(usize),
 }
 
-/// (core#1463) The note a left-out optional root carries: what happened and what to do. `fit` is
+/// (core#1463) The note a left-out optional root carries: what happened and what to do. An
+/// optional root need not be a repository, and a root nested in it keeps its own copy (R2 F2), so
+/// the note names a folder and only its own files. `fit` is
 /// how much of the root the copy-in had counted before the cap it passed (codex r1 #2: the entry
 /// that passed it was never read, so it is not counted).
 pub(crate) fn left_out_note(fit: u64, over: OverCap) -> String {
@@ -1446,9 +1448,10 @@ pub(crate) fn left_out_note(fit: u64, over: OverCap) -> String {
         OverCap::Files(n) => format!("{n} files"),
     };
     format!(
-        "This repository was left out of this turn's read-only copy: the copy is capped at {cap} \
-         and this repository did not fit (about {} MiB of it fit before the cap). Its files are \
-         not in this container. Ask about it in a chat scoped to this repository.\n",
+        "This folder was left out of this turn's read-only copy: the copy is capped at {cap} and \
+         it did not fit (about {} MiB of it fit before the cap). Its own files are not in this \
+         container; a folder inside it that was copied on its own may still be here. To read it, \
+         ask in a chat scoped to it.\n",
         fit.div_ceil(1 << 20)
     )
 }
