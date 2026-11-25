@@ -5400,6 +5400,136 @@ esac
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// [`image_stub`] whose build fails on a recipe carrying the Go layer (apt's own words on
+    /// stderr), and whose `image ls` prints `listed`.
+    fn layer_stub(dir: &Path, present: &[&str], listed: &[&str]) -> PathBuf {
+        let rt = dir.join("docker");
+        let have = dir.join("have");
+        std::fs::write(
+            &have,
+            present.iter().map(|p| format!("{p}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let ls = dir.join("listed");
+        std::fs::write(&ls, listed.iter().map(|p| format!("{p}\n")).collect::<String>()).unwrap();
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'image inspect') last=; for a in \"$@\"; do last=$a; done\n\
+                   case \"$*\" in *Volumes*) echo null; exit 0 ;; esac\n\
+                   [ \"$last\" = sha256:{id} ] && {{ echo sha256:{id}; exit 0; }}\n\
+                   grep -qx \"$last\" '{have}' || exit 1\n\
+                   echo sha256:{id}; exit 0 ;;\n\
+                 'image ls') cat '{ls}'; exit 0 ;;\n\
+                 esac\n\
+                 if [ \"$1\" = build ]; then cat > '{dockerfile}'; t=; while [ $# -gt 0 ]; do\n\
+                   [ \"$1\" = -t ] && t=$2; shift; done\n\
+                   if grep -q golang-go '{dockerfile}'; then\n\
+                     echo 'E: Unable to locate package golang-go' >&2; exit 100; fi\n\
+                   echo \"$t\" >> '{have}'; fi\n\
+                 exit 0\n",
+                log = dir.join("calls.log").display(),
+                dockerfile = dir.join("Dockerfile").display(),
+                have = have.display(),
+                ls = ls.display(),
+                id = "b".repeat(64)
+            ),
+        );
+        rt
+    }
+
+    /// (coord R2 F1 on core#1043) A layer that cannot build never blocks the unit: it runs on the
+    /// plain seat image, told which layer failed, the build's own error and the exact command to
+    /// retry with the layers; a later unit does not rebuild the failed set.
+    #[test]
+    fn a_layer_that_fails_to_build_falls_back_to_the_plain_seat_image_with_a_note() {
+        let checks = crate::checks_container::image_tag();
+        let dir = tmp("layer-fails");
+        let rt = Runtime::answering(layer_stub(&dir, &[checks.as_str()], &[]));
+        let default = SeatBase {
+            image: checks.clone(),
+            operator: false,
+            recipe: None,
+        };
+        // A set no other test uses (the failed-set memory is process-wide).
+        let layers = crate::seat_layers::parse("go,java").unwrap();
+        let layered = seat_image_tag("codex", &checks, None, &layers).unwrap();
+        let plain = seat_image_tag("codex", &checks, None, &[]).unwrap();
+        let (tag, _, note) =
+            ensure_layered_seat_image(&rt, "codex", None, &default, &layers).unwrap();
+        assert_eq!(tag, plain, "the unit runs on the plain seat image");
+        let note = note.expect("the unit is told");
+        for want in [
+            "go, java",
+            "E: Unable to locate package golang-go",
+            "wicked-core seat-image build codex --layers go,java",
+            "WICKED_SEAT_LAYERS=off",
+        ] {
+            assert!(note.contains(want), "{want:?} in {note}");
+        }
+        let layered_builds = |calls: &str| {
+            calls
+                .lines()
+                .filter(|l| l.starts_with("build") && l.contains(&format!("-t {layered} ")))
+                .count()
+        };
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(layered_builds(&calls), 1, "{calls}");
+        // The next unit runs on the plain image again, told again, with no second layered build.
+        let (tag, _, note) =
+            ensure_layered_seat_image(&rt, "codex", None, &default, &layers).unwrap();
+        assert_eq!(tag, plain);
+        assert!(note.is_some_and(|n| n.contains("golang-go")));
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(layered_builds(&calls), 1, "{calls}");
+        // No layer to build: no note.
+        let (tag, _, note) = ensure_layered_seat_image(&rt, "codex", None, &default, &[]).unwrap();
+        assert_eq!((tag.as_str(), note), (plain.as_str(), None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// (coord R2 F2 on core#1043) A layered seat image superseded by a new build of the same layer
+    /// set (a CLI pin bump, a recipe change) is reclaimed; the current tag, pins, other layer sets
+    /// and other CLIs are not.
+    #[test]
+    fn a_new_layered_build_reclaims_the_superseded_images_of_its_layer_set() {
+        let checks = crate::checks_container::image_tag();
+        let dir = tmp("layer-reclaim");
+        let layers = crate::seat_layers::parse("python").unwrap();
+        let current = seat_image_tag("pi", &checks, None, &layers).unwrap();
+        let pin = format!("wicked-seat-pi:id-{}", "c".repeat(64));
+        let rt = Runtime::answering(layer_stub(
+            &dir,
+            &[checks.as_str()],
+            &[
+                "wicked-seat-pi:0123456789ab",
+                current.as_str(),
+                pin.as_str(),
+                "wicked-seat-codex:0123456789ab",
+            ],
+        ));
+        let default = SeatBase {
+            image: checks.clone(),
+            operator: false,
+            recipe: None,
+        };
+        let (tag, _, note) = ensure_layered_seat_image(&rt, "pi", None, &default, &layers).unwrap();
+        assert_eq!((tag.as_str(), note), (current.as_str(), None));
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            calls.contains("image ls --filter label=wicked.seat.layers=python"),
+            "{calls}"
+        );
+        let removed: Vec<&str> = calls
+            .lines()
+            .filter_map(|l| l.strip_prefix("image rm "))
+            .collect();
+        assert_eq!(removed, vec!["wicked-seat-pi:0123456789ab"], "{calls}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn seat_image_layers_arg_names_or_detects_the_layers() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

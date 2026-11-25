@@ -498,6 +498,20 @@ mod tests {
         std::fs::remove_dir_all(&t).unwrap();
     }
 
+    /// (coord R2 F6 on core#1043) The cap keeps the first entries BY NAME, whatever order the
+    /// filesystem lists them in.
+    #[test]
+    fn the_entry_cap_keeps_the_first_names_whatever_the_listing_order() {
+        let mut listed: Vec<(String, bool, bool)> = (0..MAX_ENTRIES + 4)
+            .map(|i| (format!("z{i:05}"), true, false))
+            .collect();
+        listed.push(("go.mod".to_string(), true, false));
+        let kept = first_by_name(listed.into_iter());
+        assert_eq!(kept.len(), MAX_ENTRIES);
+        assert_eq!(kept[0].0, "go.mod");
+        assert_eq!(kept[MAX_ENTRIES - 1].0, format!("z{:05}", MAX_ENTRIES - 2));
+    }
+
     #[test]
     fn each_catalog_marker_detects_its_layer() {
         for layer in CATALOG {
