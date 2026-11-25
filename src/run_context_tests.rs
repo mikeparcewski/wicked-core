@@ -1117,6 +1117,12 @@ const SEAT_BUILDERS: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "validator.rs",
+        "confirm_unclosed",
+        1,
+        "under the per-unit Stamping runner (the gate judge's one confirm call, core#1945)",
+    ),
+    (
+        "validator.rs",
         "reprobe_seat",
         1,
         "EXEMPT: seat readiness probe (takes_block refuses it)",

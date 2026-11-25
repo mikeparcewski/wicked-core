@@ -3130,13 +3130,13 @@ fn agent_validate_inner(
     out
 }
 
-/// (core#1945) A reply that OPENED `PASS` or `REJECT` and never closed with the word alone fails
+/// (core#1945) A reply that OPENED `PASS` and never closed with the word alone fails
 /// closed (FINDING-085), and on a seat that keeps answering in that shape every retry of the step
 /// is the same denial (run f1d5b8e9: the review step could never finish). So such a reply gets
 /// ONE confirm call on the same seat and run (`unit` is the call that answered), which shows the
 /// seat its reply and asks for the one word. A one-word answer is appended as the closing line and
-/// the parser decides as before: the same word closes the reply, the other word is drift and
-/// fails closed, so a confirm can never turn a REJECT into a PASS. Anything else leaves the reply
+/// the parser decides as before: `PASS` closes the reply, `REJECT` is drift and fails closed, so
+/// a confirm can only keep a PASS or turn it into a REJECT. Anything else leaves the reply
 /// as it was, failing closed; a provider refusal or a seat that could not run is also reported
 /// through `on_refusal` for the bench. A stop or a timeout is the caller's to handle, as on its
 /// first call. Never a second confirm; whether a reply is unclosed is the parser's structural
@@ -4074,8 +4074,9 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
 /// the OTHER verdict all fail closed. That is what stops a model from committing to a token and then
 /// reasoning its way to the opposite conclusion underneath it, which no first-token rule can see.
 ///
-/// The flag is true only for a reply whose decision line is a well-formed verdict and whose
-/// closing line is missing (core#1945: the one case [`confirm_unclosed`] confirms).
+/// The flag is true only for a reply whose decision line is a well-formed `PASS` and whose closing
+/// line is missing (core#1945: the one case [`confirm_unclosed`] confirms). An unclosed `REJECT` is
+/// a REJECT whatever a confirm says, so it is never confirmed.
 fn parse_verdict(raw: &str) -> (AgentVerdict, bool) {
     // Normalize a token: drop leading/trailing non-alphanumerics (so `PASS.`/`REJECT:` normalize) then
     // uppercase.
@@ -4202,7 +4203,7 @@ fn parse_verdict(raw: &str) -> (AgentVerdict, bool) {
                      unconfirmed — failing closed (FINDING-085)]"
                 ),
                 },
-                true,
+                first == "PASS",
             );
         }
         if closing != first {
@@ -8119,10 +8120,10 @@ mod tests {
         assert!(v.pass, "{v:?}");
         assert_eq!(asked.len(), 2);
         assert!(asked[1].contains("PASS — the work holds."), "{}", asked[1]);
-        // Opened REJECT, "confirmed" PASS: drift, so it fails closed.
+        // An unclosed REJECT is a REJECT whatever a confirm would say: no confirm call.
         let (v, asked) = judge(vec!["REJECT — the work misses the task.", "PASS"]);
         assert!(!v.pass, "{v:?}");
-        assert_eq!(asked.len(), 2);
+        assert_eq!(asked.len(), 1);
         // A confirm that is not the bare word fails closed; there is no third call.
         let (v, asked) = judge(vec!["PASS — fine.", "PASS, as I said"]);
         assert!(!v.pass, "{v:?}");
