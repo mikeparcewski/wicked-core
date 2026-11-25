@@ -75,21 +75,25 @@ pub(crate) struct SeatBallots {
     /// there before its seat runs and released after, so the step's end refuses or cancels it
     /// ([`crate::model_call::StepCalls`]).
     step_calls: Option<Arc<crate::model_call::StepCalls>>,
-    /// Whether the step's end refused or cancelled a ballot of this carrier.
-    step_ended: std::sync::atomic::AtomicBool,
+    /// Whether the step's end refused or cancelled a ballot of this carrier (set when the ballot's
+    /// worker is released, on the ballot's own thread).
+    step_ended: Arc<std::sync::atomic::AtomicBool>,
+    /// The ballot run ids this carrier admitted into [`Self::step_calls`].
+    admitted: std::sync::Mutex<Vec<String>>,
 }
 
-/// (core#1906) Releases an admitted ballot from its step's calls when the ballot is done, on every
-/// path out of [`SeatBallots::run_ballot`], noting whether the step's end cancelled it.
-struct Admitted<'a> {
-    calls: &'a crate::model_call::StepCalls,
-    id: &'a str,
-    ended: &'a std::sync::atomic::AtomicBool,
+/// (core#1906) Releases an admitted ballot from its step's calls when its worker is done: it moves
+/// into the ballot's own thread, so a ballot that outlived its budget (held by the reaper) stays
+/// admitted, and a later close still cancels it. Notes whether the step's end cancelled it.
+struct Admitted {
+    calls: Arc<crate::model_call::StepCalls>,
+    id: String,
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Drop for Admitted<'_> {
+impl Drop for Admitted {
     fn drop(&mut self) {
-        if self.calls.release(self.id) {
+        if self.calls.release(&self.id) {
             self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -169,7 +173,8 @@ impl SeatBallots {
             stdin: false,
             answer_cap: None,
             step_calls: None,
-            step_ended: std::sync::atomic::AtomicBool::new(false),
+            step_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            admitted: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -182,7 +187,18 @@ impl SeatBallots {
     /// (core#1906) Whether the step's end refused or cancelled a ballot of this carrier: its
     /// answer is then "the step ended", whatever the seat returned.
     pub(crate) fn step_ended(&self) -> bool {
-        self.step_ended.load(std::sync::atomic::Ordering::SeqCst)
+        if self.step_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        // A ballot still running (one past its budget, held by the reaper) that the close caught.
+        let Some(calls) = &self.step_calls else {
+            return false;
+        };
+        self.admitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|id| calls.cancelled(id))
     }
 
     /// (DES-j6-build C0) Run every ballot as a tool-free model call, its prompt on stdin
@@ -213,7 +229,7 @@ impl SeatBallots {
     }
 
     #[cfg(test)]
-    fn with_drain(mut self, drain: std::time::Duration) -> Self {
+    pub(crate) fn with_drain(mut self, drain: std::time::Duration) -> Self {
         self.drain = drain;
         self
     }
@@ -271,8 +287,9 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
         let answer_cap = self.answer_cap;
         let run_id = ballot_run_id(task_id, &cli.key);
-        // (core#1906) Admitted before the seat runs, released when this returns.
-        let _admitted = match &self.step_calls {
+        // (core#1906) Admitted before the seat runs; released by the ballot's own thread when its
+        // worker is done.
+        let admitted = match &self.step_calls {
             Some(calls) if !calls.admit(&run_id) => {
                 self.step_ended
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -281,11 +298,17 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
                     crate::model_call::STEP_ENDED,
                 ));
             }
-            Some(calls) => Some(Admitted {
-                calls,
-                id: &run_id,
-                ended: &self.step_ended,
-            }),
+            Some(calls) => {
+                self.admitted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(run_id.clone());
+                Some(Admitted {
+                    calls: calls.clone(),
+                    id: run_id.clone(),
+                    ended: self.step_ended.clone(),
+                })
+            }
             None => None,
         };
         let mut unit = crate::domain::WorkUnit::pending(
@@ -323,6 +346,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         // (core#1290) The wrapped runner keeps at most `stdout_cap` of this ballot's output, bounded
         // as it reads (`execute_wrapped::with_stdout_cap`, on this ballot's own thread).
         let ballot = std::thread::spawn(move || {
+            let _admitted = admitted;
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::execute_wrapped::with_stdout_cap(stdout_cap, || {
                     crate::execute_wrapped::with_prompt_on_stdin(on_stdin, || {

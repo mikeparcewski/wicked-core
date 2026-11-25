@@ -191,6 +191,11 @@ impl StepCalls {
         true
     }
 
+    /// Whether call `id`, still live, was cancelled by the close.
+    pub(crate) fn cancelled(&self, id: &str) -> bool {
+        self.state().live.get(id).copied().unwrap_or(false)
+    }
+
     /// Release call `id` after its seat returned: whether the close cancelled it.
     pub(crate) fn release(&self, id: &str) -> bool {
         self.state().live.remove(id).unwrap_or(false)
@@ -1308,6 +1313,8 @@ mod tests {
     struct Hold {
         st: Mutex<HoldState>,
         cv: std::sync::Condvar,
+        /// Ignores its cancels: it stops only when released (a seat slow to stop).
+        deaf: bool,
     }
 
     #[derive(Default)]
@@ -1325,7 +1332,7 @@ mod tests {
             self.cv.notify_all();
             let st = self
                 .cv
-                .wait_while(st, |s| !s.open && !s.cancelled.contains(&id))
+                .wait_while(st, |s| !s.open && (self.deaf || !s.cancelled.contains(&id)))
                 .unwrap();
             let cancelled = st.cancelled.contains(&id);
             drop(st);
@@ -1444,6 +1451,47 @@ mod tests {
         assert!(out.is_err());
         assert!(carrier.step_ended());
         assert!(hold.entered().is_empty());
+    }
+
+    /// (core#1906) A call past its budget whose seat has not stopped (held by the reaper) is still
+    /// the step's: a close then cancels it, and the call answers "the step ended".
+    #[test]
+    fn a_call_past_its_budget_whose_seat_still_runs_is_ended_by_the_close() {
+        use wicked_council::types::BallotCarrier;
+        let hold = Arc::new(Hold {
+            deaf: true,
+            ..Default::default()
+        });
+        let calls = Arc::new(StepCalls::default());
+        let carrier = crate::decision::SeatBallots::new(hold.clone(), Some("run-t"))
+            .model_calls()
+            .step_calls(calls.clone())
+            .with_drain(Duration::from_millis(50));
+        let out = carrier.run_ballot(
+            &seat("claude"),
+            "t",
+            "p",
+            Duration::from_millis(200),
+            None,
+            64,
+        );
+        assert!(out.is_err(), "past its budget");
+        assert!(!carrier.step_ended());
+        assert_eq!(
+            carrier.reaper().reap(Duration::from_millis(10)),
+            1,
+            "still running"
+        );
+        // the close still finds it, and cancels it by its own id
+        let ids = calls.close();
+        assert_eq!(ids, hold.entered());
+        assert!(carrier.step_ended());
+        hold.release();
+        assert_eq!(carrier.reaper().reap(Duration::from_secs(5)), 0);
+        assert!(
+            carrier.step_ended(),
+            "released after the close: still ended"
+        );
     }
 
     /// (core#1906) Two channels of one run are separate: ending one step leaves the other's call
@@ -1728,6 +1776,10 @@ mod tests {
     /// and hands its command this engine's binary.
     #[test]
     fn a_channel_directory_names_its_daemon() {
+        // other tests set WICKED_CORE_EXE under this lock; hold it across both resolutions
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let ch = arm(Arc::new(Echo::default()), adm(vec![]), "run-n", 1).unwrap();
         let name = ch.dir.file_name().unwrap().to_str().unwrap().to_string();
         assert_eq!(owner_pid(&name), Some(std::process::id() as libc::pid_t));
