@@ -175,6 +175,7 @@ fn a_repo_defined_tool_step_gets_no_model_call_channel() {
         workflow: Some("test-model-call".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
         deliver_step: None,
