@@ -7177,6 +7177,15 @@ mod discard_minted_tests {
             1,
             "the setter's reply shows the rows"
         );
+        // (round 1 codex P3) A record carrying stale rows (an older engine wrote them): no read
+        // serves them.
+        let mut planted = get_repo(&store, &entry.id).unwrap().unwrap();
+        planted.seat_layers = vec![RepoSeatLayer {
+            id: "java".into(),
+            enabled: true,
+            off_by: None,
+        }];
+        put_node(&mut store, planted.to_node()).unwrap();
         crate::seat_layers::forget_detected(&root);
 
         let before = reads();

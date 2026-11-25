@@ -311,17 +311,21 @@ static DETECTED: std::sync::LazyLock<
 /// added or removed in the checkout shows within that time. Not for the arm, which detects on the
 /// unit's own worktree every time.
 pub(crate) fn detect_cached(tree: &Path) -> Vec<&'static Layer> {
+    detect_cached_at(tree, std::time::Instant::now())
+}
+
+/// [`detect_cached`] at the time `now`.
+fn detect_cached_at(tree: &Path, now: std::time::Instant) -> Vec<&'static Layer> {
     let cache = || DETECTED.lock().unwrap_or_else(|p| p.into_inner());
-    let now = std::time::Instant::now();
     if let Some((at, ids)) = cache().get(tree) {
-        if now.duration_since(*at) < DETECT_TTL {
+        if now.saturating_duration_since(*at) < DETECT_TTL {
             return CATALOG.iter().filter(|l| ids.contains(&l.id)).collect();
         }
     }
     let layers = detect(tree);
     let mut cache = cache();
     if cache.len() >= DETECT_CACHE_MAX && !cache.contains_key(tree) {
-        cache.retain(|_, (at, _)| now.duration_since(*at) < DETECT_TTL);
+        cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < DETECT_TTL);
         if cache.len() >= DETECT_CACHE_MAX {
             let oldest = cache
                 .iter()
@@ -778,6 +782,31 @@ mod tests {
             "a layer the tree does not need changes nothing"
         );
         assert!(for_tree_except(&t, Some("off"), &[]).is_empty());
+    }
+
+    /// (core#1933, round 1 codex/pi P2) The repo card's detection is reused until the TTL passes,
+    /// then runs again and shows a marker added or removed meanwhile.
+    #[test]
+    fn the_cards_detection_is_reused_until_the_ttl_passes() {
+        let t = tree("ttl");
+        std::fs::write(t.join("Cargo.toml"), "").unwrap();
+        let reads = || DIR_READS.with(|n| n.get());
+        let t0 = std::time::Instant::now();
+        assert_eq!(ids(&detect_cached_at(&t, t0)), ["rust"]);
+        std::fs::write(t.join("go.mod"), "module x\n").unwrap();
+        let before = reads();
+        let just_inside = t0 + DETECT_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(ids(&detect_cached_at(&t, just_inside)), ["rust"], "reused");
+        assert_eq!(reads(), before, "a reuse lists no directory");
+        let t1 = t0 + DETECT_TTL;
+        assert_eq!(ids(&detect_cached_at(&t, t1)), ["go", "rust"], "added");
+        assert!(reads() > before, "the TTL passed: detected again");
+        std::fs::remove_file(t.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            ids(&detect_cached_at(&t, t1 + DETECT_TTL)),
+            ["go"],
+            "removed"
+        );
     }
 
     /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.

@@ -1234,3 +1234,33 @@ fn a_repos_layers_turned_off_ride_its_units_governance() {
     assert_eq!(seen.lock().unwrap()[0], ["go"]);
     release_all(&w);
 }
+
+/// (core#1933, round 1 codex P2) The repo list a person gets (`Core::list_repos`, the binding's
+/// `listRepos`) carries the seat-layer rows, with the switch applied; the engine's own reads do not.
+#[test]
+fn the_repo_list_a_person_sees_shows_the_seat_layers_1933() {
+    let e = engine("layerslist", Worker::scripted(|_, _| hold()));
+    let (path, _) = git_repo(&e.rig.dir);
+    std::fs::write(path.join("go.mod"), "module x\n").unwrap();
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "layers-list".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    e.core
+        .set_repo_seat_layers_off(&entry.id, vec!["go".into()])
+        .unwrap();
+    let listed = e.core.list_repos().unwrap();
+    let shown = &listed
+        .iter()
+        .find(|r| r.id == entry.id)
+        .unwrap()
+        .seat_layers;
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].id, "go");
+    assert!(!shown[0].enabled);
+    assert_eq!(shown[0].off_by.as_deref(), Some("repo"));
+}

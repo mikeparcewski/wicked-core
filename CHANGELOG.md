@@ -23,7 +23,8 @@ Two release tracks share this file, newest entry first regardless of track:
   per checkout, so a marker added or removed shows within 10 seconds.
 
 - **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
-  core seam). `RepoEntry.seat_layers` is derived on every read from the registered checkout: one row
+  core seam). `RepoEntry.seat_layers` is derived from the registered checkout on the reads a person sees
+  (core#1933): one row
   `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
   or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
   `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,
