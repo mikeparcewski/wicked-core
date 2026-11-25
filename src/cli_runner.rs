@@ -856,6 +856,114 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// (core#1945) The lines the WORK cites, read by the harness from the run's worktree. The judge runs
+/// with no tree of its own ([`crate::validator`]'s judge calls carry no workdir and no
+/// governance), so without this a review-change judge cannot check a single `path:line` finding:
+/// run f1d5b8e9's judge said so, and its reply never closed. Each cited `path:line` or
+/// `path:line-line` that names a regular file under the worktree root (relative, no `..`, the
+/// canonical path inside the canonical root) is shown with two lines of context, redacted like
+/// the activity feed; a cited path the tree lacks is named as such. Bounded: the first
+/// [`CITED_MAX`] distinct cites, [`CITED_SPAN`] lines each, [`CITED_CAP`] bytes in all. `None`
+/// when the WORK cites nothing.
+fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<String> {
+    let root = std::fs::canonicalize(workdir).ok()?;
+    let mut seen: Vec<(String, usize, usize)> = Vec::new();
+    for cite in work
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | ':')))
+        .filter_map(parse_cite)
+    {
+        if seen.len() == CITED_MAX {
+            break;
+        }
+        if !seen.contains(&cite) {
+            seen.push(cite);
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "\n\nCITED SOURCE (read by the harness from the run's worktree at each path:line the work \
+         cites; you have no repository access, so check the citations against these lines):\n",
+    );
+    for (path, first, last) in seen {
+        let mut block = String::new();
+        let file = root.join(&path);
+        let inside = std::fs::canonicalize(&file)
+            .ok()
+            .filter(|f| f.starts_with(&root) && f.is_file())
+            .filter(|f| f.metadata().is_ok_and(|m| m.len() <= CITED_FILE_MAX))
+            .and_then(|f| std::fs::read(f).ok());
+        match inside {
+            None => block.push_str(&format!("{path}:{first}: (no such file in the worktree)\n")),
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                if first > lines.len() {
+                    block.push_str(&format!(
+                        "{path}:{first}: (past the end: the file has {} lines)\n",
+                        lines.len()
+                    ));
+                }
+                let from = first.saturating_sub(2).max(1);
+                let to = last
+                    .min(first + CITED_SPAN)
+                    .saturating_add(2)
+                    .min(lines.len());
+                for n in from..=to {
+                    let line: String = lines[n - 1].chars().take(240).collect();
+                    let line = crate::tool_activity::redact_prose(&line);
+                    block.push_str(&format!("{path}:{n}: {line}\n"));
+                }
+            }
+        }
+        if out.len() + block.len() > CITED_CAP {
+            out.push_str("… [further cited lines elided by the harness]\n");
+            break;
+        }
+        out.push_str(&block);
+    }
+    Some(out)
+}
+
+/// At most this many distinct cites are shown to the judge.
+const CITED_MAX: usize = 12;
+/// A cited range shows at most this many lines past its first.
+const CITED_SPAN: usize = 20;
+/// The CITED SOURCE section's byte budget.
+const CITED_CAP: usize = 6 * 1024;
+/// A cited file larger than this is not read.
+const CITED_FILE_MAX: u64 = 4 << 20;
+
+/// One `path:line` or `path:line-line` cite (a trailing `:column` is ignored), as
+/// `(path, first, last)`. The path is relative, has no `..` or empty component, and its last
+/// component has an extension, so prose such as `note:3` or a URL is not a cite.
+fn parse_cite(token: &str) -> Option<(String, usize, usize)> {
+    let token = token.trim_end_matches(['.', ':', '-']);
+    let (path, rest) = token.split_once(':')?;
+    let digits = |s: &str| -> Option<usize> {
+        let d: String = s.chars().take_while(char::is_ascii_digit).collect();
+        d.parse().ok().filter(|n| *n > 0)
+    };
+    let first = digits(rest)?;
+    let after = &rest[first.to_string().len()..];
+    let last = after
+        .strip_prefix('-')
+        .and_then(digits)
+        .filter(|l| *l >= first)
+        .unwrap_or(first);
+    let ok_path = !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|c| !c.is_empty() && c != ".." && c != ".")
+        && path
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.rsplit_once('.'))
+            .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+    ok_path.then(|| (path.to_string(), first, last))
+}
+
 /// (DES-RULE-CHECK-001 S2) Whether this attempt's gate runs the steering-rule check: a review
 /// (Evaluator-role) agent unit that answered, bound to a worktree, on a run with a policy store —
 /// not a tool, deliver or team-member step.
@@ -6367,6 +6475,15 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .and_then(worktree_evidence_for_judge)
     {
         Some(evidence) => std::borrow::Cow::Owned(format!("{work_owned}{evidence}")),
+        None => work_owned,
+    };
+    // (core#1945) …and the lines the work cites, read from the same worktree.
+    let work_owned = match will_judge
+        .then_some(input.workdir.as_deref())
+        .flatten()
+        .and_then(|dir| cited_source_for_judge(dir, &work_owned))
+    {
+        Some(cited) => std::borrow::Cow::Owned(format!("{work_owned}{cited}")),
         None => work_owned,
     };
     // (DES-STANDIN-001 §3.4) A stand-in judge never reads the team's ledger or comms: its work is

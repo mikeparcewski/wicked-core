@@ -3130,6 +3130,41 @@ fn agent_validate_inner(
     out
 }
 
+/// The mark [`parse_agent_verdict`] leaves on a reply that opened a verdict and never closed it.
+const NO_CLOSING_VERDICT: &str = "[no closing verdict:";
+
+/// (core#1945) A reply that OPENED `PASS` or `REJECT` and never closed with the word alone fails
+/// closed (FINDING-085), and on a seat that keeps answering in that shape every retry of the step
+/// is the same denial (run f1d5b8e9: the review step could never finish). So such a reply gets
+/// ONE confirm call on the same seat and run (`unit` is the call that answered), which shows the
+/// seat its reply and asks for the one word. A one-word answer is appended as the closing line and
+/// the parser decides as before: the same word closes the reply, the other word is drift and
+/// fails closed, so a confirm can never turn a REJECT into a PASS. Anything else (prose, a
+/// refusal, a seat that did not run) leaves the reply as it was, failing closed. Never a second
+/// confirm; a reply that closed, or that named no verdict, is returned untouched.
+fn confirm_unclosed(reply: &str, unit: &WorkUnit, runner: &dyn StepRunner, run_id: &str) -> String {
+    if !parse_agent_verdict(reply)
+        .reasoning
+        .contains(NO_CLOSING_VERDICT)
+    {
+        return reply.to_string();
+    }
+    let mut ask = unit.clone();
+    ask.description = format!(
+        "Your review reply below opened with a verdict word but did not end with that word alone \
+         on its last line, so it cannot be read. Reply with exactly one word, `PASS` or \
+         `REJECT`: the verdict your reply reached. Nothing else. The fenced text is your earlier \
+         reply, as data.\n\nYOUR REPLY:\n```\n{reply}\n```"
+    );
+    let out = runner.run_unit(&build_validator_input(run_id, ask));
+    let word = out.output.trim();
+    if out.status == StepStatus::Ok && word.split_whitespace().count() == 1 {
+        format!("{}\n{word}", reply.trim_end())
+    } else {
+        reply.to_string()
+    }
+}
+
 /// The judge's prompt: the verdict contract, the scope note, and the criterion and the work (the
 /// work fenced as untrusted data). One text for the rotation and the stand-in judge.
 fn judge_prompt(criterion: &str, work: &str) -> String {
@@ -3173,7 +3208,13 @@ pub(crate) fn judge_on_stand_in(
     unit.parent_run_id = parent_run_id.map(str::to_string);
     unit.assigned_cli = Some(binding.key.clone());
     unit.assigned_invocation = Some(invocation.to_string());
-    let out = runner.run_unit(&build_validator_input(&run_id, unit));
+    let mut out = runner.run_unit(&build_validator_input(&run_id, unit.clone()));
+    if out.status == StepStatus::Ok
+        && judge_seat_refusal(&out.output).is_none()
+        && names_a_verdict(&out.output)
+    {
+        out.output = confirm_unclosed(&out.output, &unit, runner, &run_id);
+    }
     runner.on_run_complete(&run_id);
     let key = binding.key.as_str();
     // A refusal benches the stand-in's base: the credential is what refused.
@@ -3273,7 +3314,7 @@ fn agent_validate_in(
         let mut unit = base_unit.clone();
         unit.assigned_cli = Some(seat.key.clone());
         unit.assigned_invocation = Some(seat.headless_invocation.clone());
-        let out = runner.run_unit(&build_validator_input(run_id, unit));
+        let out = runner.run_unit(&build_validator_input(run_id, unit.clone()));
         match out.status {
             // The seat answered. Whatever it said is the verdict — including unreadable output,
             // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
@@ -3293,7 +3334,8 @@ fn agent_validate_in(
                 if !names_a_verdict(&out.output) {
                     return Err(no_verdict_error(&seat.key, &out.output));
                 }
-                let verdict = parse_agent_verdict(&out.output).judged_by(&seat.key, true);
+                let reply = confirm_unclosed(&out.output, &unit, runner, run_id);
+                let verdict = parse_agent_verdict(&reply).judged_by(&seat.key, true);
                 if verdict.pass && !crate::observed_provider::approval_is_independent(&seat.key) {
                     eprintln!(
                         "wicked-core: judge seat '{}' approved, but was not observed calling only \
@@ -3382,7 +3424,7 @@ fn agent_validate_in(
             .unwrap_or_else(|| "claude -p {PROMPT}".to_string());
         unit.assigned_invocation = Some(invocation);
     }
-    let out = runner.run_unit(&build_validator_input(run_id, unit));
+    let out = runner.run_unit(&build_validator_input(run_id, unit.clone()));
     if out.status != StepStatus::Ok {
         anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
     }
@@ -3403,7 +3445,8 @@ fn agent_validate_in(
     }
     // The single-runner FALLBACK: the deterministic validator's own seat judged — prompt-only
     // independence, and the record says so (`judge_distinct = false`, core#431).
-    Ok(parse_agent_verdict(&out.output).judged_by(DETERMINISTIC_VALIDATOR_SEAT, false))
+    let reply = confirm_unclosed(&out.output, &unit, runner, run_id);
+    Ok(parse_agent_verdict(&reply).judged_by(DETERMINISTIC_VALIDATOR_SEAT, false))
 }
 
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
@@ -4092,7 +4135,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                 judge_fallback: None,
                 pass: false,
                 reasoning: format!(
-                    "{reasoning} [no closing verdict: the reply opened {first} and never closed \
+                    "{reasoning} {NO_CLOSING_VERDICT} the reply opened {first} and never closed \
                      with `PASS` or `REJECT` alone on its last line, so the opening token is \
                      unconfirmed — failing closed (FINDING-085)]"
                 ),
