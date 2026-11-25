@@ -2386,6 +2386,36 @@ fn run_rule_check(
         emit_delta,
         None,
         None,
+        None,
+    )
+}
+
+/// (core#1944, T-R9) [`run_rule_check`] on a consented stand-in-aware run: `stand_in` is the
+/// judge stand-in the run's actor offered the unit ([`crate::standin::judge_offer`]).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check_standing_in(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+    stand_in: &crate::standin::StandInBinding,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    run_rule_check_with(
+        input,
+        creators,
+        creator_bins,
+        pool,
+        registry,
+        None,
+        runner,
+        emit_delta,
+        None,
+        None,
+        Some(stand_in),
     )
 }
 
@@ -2411,7 +2441,9 @@ fn run_rule_check_with(
     emit_delta: &DeltaSink,
     settle: Option<Settle<'_>>,
     stop: Option<crate::repo_checks::FloorStop>,
+    stand_in: Option<&crate::standin::StandInBinding>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
+    let _ = stand_in;
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
     let baseline = input.unit.worktree_baseline.as_ref();
@@ -7150,6 +7182,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 council_pool: &eligible_run,
             }),
             stop.clone(),
+            fallback.stand_in_judge.and_then(|j| j.offer.as_ref()),
         )
     } else {
         None

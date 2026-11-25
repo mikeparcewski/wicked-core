@@ -2950,3 +2950,196 @@ fn core1855_a_later_broken_on_the_same_change_is_never_skipped_for_an_older_kept
     ];
     assert_eq!(pick(&shuffled, &["pi"]), none);
 }
+
+/// (core#1944) Answers as a rule judge on any seat; records who was asked, on what, and what.
+struct StandInJudgeRunner {
+    asked: Mutex<Vec<(String, String, String)>>,
+    provider: String,
+}
+
+impl StepRunner for StandInJudgeRunner {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let who = input.unit.assigned_cli.clone().unwrap_or_default();
+        // A stand-in calls its base's provider, which is the work's: never a reason to refuse it.
+        crate::observed_provider::record_receipt(&who, Some(vec![self.provider.clone()]));
+        self.asked.lock().unwrap().push((
+            who,
+            input.unit.assigned_invocation.clone().unwrap_or_default(),
+            input.unit.description.clone(),
+        ));
+        let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: format!(
+                "BEGIN VERDICTS {nonce}\nRULE R1: KEPT — src/a.rs:2 typed signature\n\
+                 RULE R2: BROKEN — src/a.rs:2 no test\nEND VERDICTS {nonce}"
+            ),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// (core#1944) Run b0ade71f's shape: only Claude Code signed in, consent for this job, the review
+/// on the evaluator stand-in `claude~1`, and the judge stand-in the actor offers that unit.
+fn one_cli_consented_review(
+    tag: &str,
+) -> (
+    StepInput,
+    crate::standin::StandInBinding,
+    String,
+    std::path::PathBuf,
+) {
+    use wicked_apps_core::ToNode;
+    let (repo, base, db) = fixture(tag);
+    let mut input = review_input(&repo, &base, &db);
+    input.unit.assigned_cli = Some("claude~1".into());
+    let mut run = crate::standin::LaunchStandIn {
+        aware: true,
+        consent: Some(crate::standin::StandInConsent {
+            scope: crate::standin::SCOPE_JOB.into(),
+            by: "local (human)".into(),
+            at: 1,
+            via: "launch".into(),
+        }),
+        ..Default::default()
+    }
+    .apply(crate::assurance::RunAssurance::default());
+    run.stand_ins.push(crate::standin::StandInBinding {
+        key: "claude~1".into(),
+        base: "claude".into(),
+        role: crate::standin::Role::Evaluator,
+        slot: 1,
+        model: None,
+        builder_model: None,
+        lens: None,
+        ord: Some(2),
+        attempt: None,
+        subject: None,
+        evidence: None,
+        invocation: "e1".into(),
+        reason: crate::standin::Reason::OnlyOneHelper {
+            cli: "Claude Code".into(),
+        },
+        state: crate::standin::STATE_SEATED.into(),
+        display: Some("Claude Code".into()),
+    });
+    let offer = crate::standin::judge_offer(
+        &run,
+        &input.unit,
+        0,
+        &[seat("claude")],
+        &["claude".to_string()],
+        &[],
+    )
+    .expect("a consented aware run offers the review's judge a stand-in");
+    assert_eq!(offer.key, "claude~2");
+    // The builder's step, observed calling the provider its stand-ins call too.
+    let provider = format!("rule-standin-{tag}-{}:443", uuid::Uuid::new_v4());
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut build = crate::domain::WorkUnit::pending("s:build", "s", 1, "build");
+        build.stage = crate::domain::StageKind::Build;
+        build.assigned_cli = Some("claude".into());
+        build.observed_providers = vec![provider.clone()];
+        crate::domain::put_node(&mut store, build.to_node()).unwrap();
+    }
+    (input, offer, provider, repo)
+}
+
+/// T-R9 (DES-STANDIN-001 §3.6, core#1944): the rule judge on a one-seat repo run with consent.
+/// No real seat is distinct from the creator, so the judge stand-in the run offered checks the
+/// rules: on its base's invocation, its prompt opened by the stand-in preface, its approvals not
+/// refused for sharing the work's provider (a stand-in shares it by definition), and every row it
+/// ruled names it. Red: every rule `unchecked`, "no signed-in judge seat distinct from the work's
+/// creators [claude]", and nobody asked.
+#[test]
+fn t_r9_a_one_cli_consented_review_is_rule_checked_by_its_judge_stand_in() {
+    let (input, offer, provider, _repo) = one_cli_consented_review("t-r9");
+    let pool = vec![seat("claude")];
+    let runner = StandInJudgeRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+    };
+    let sink = |_: &str| {};
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &sink,
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let asked = runner.asked.lock().unwrap();
+    assert!(!asked.is_empty(), "the stand-in is asked: {report:?}");
+    for (who, invocation, prompt) in asked.iter() {
+        assert_eq!(
+            who, "claude~2",
+            "only the stand-in, never the creator's own seat"
+        );
+        assert_eq!(invocation, "claude -p {PROMPT}", "on its base's invocation");
+        assert!(
+            prompt.starts_with(&crate::standin::preface(None)),
+            "a stand-in's prompt opens with the preface: {prompt}"
+        );
+    }
+    assert_eq!(report.note, None, "{report:?}");
+    let row = |id: &str| report.rows.iter().find(|r| r.rule_id == id).unwrap();
+    assert_eq!(
+        row("R1").status,
+        crate::rule_check::RuleStatus::Kept,
+        "{:?}",
+        row("R1")
+    );
+    assert_eq!(row("R2").status, crate::rule_check::RuleStatus::Broken);
+    for id in ["R1", "R2"] {
+        assert_eq!(row(id).judge.as_deref(), Some("claude~2"), "{:?}", row(id));
+        // A council never seats the stand-in's base for a row it ruled: the identities are its
+        // base's.
+        assert!(
+            row(id).judge_ids.iter().any(|i| i == "claude"),
+            "{:?}",
+            row(id)
+        );
+    }
+}
+
+/// (core#1944) A base the launch excluded from this unit stands in for nothing: the rules stay
+/// unchecked and nobody is asked.
+#[test]
+fn a_launch_excluded_base_never_stands_in_for_the_rule_judge() {
+    let (mut input, offer, provider, _repo) = one_cli_consented_review("excluded");
+    input.unit.exclude_seats = vec!["claude".into()];
+    let pool = vec![seat("claude")];
+    let runner = StandInJudgeRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+    };
+    let sink = |_: &str| {};
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &sink,
+        &offer,
+    )
+    .expect("a report");
+    assert!(runner.asked.lock().unwrap().is_empty());
+    assert!(report
+        .rows
+        .iter()
+        .filter(|r| r.rule_id == "R1" || r.rule_id == "R2")
+        .all(|r| r.status == crate::rule_check::RuleStatus::Unchecked));
+}
