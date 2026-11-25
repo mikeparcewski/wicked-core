@@ -7949,6 +7949,66 @@ mod tests {
         );
     }
 
+    /// (core#1945) A judge seat that answers each call with the next scripted reply.
+    struct ScriptedJudge(
+        std::sync::Mutex<Vec<&'static str>>,
+        std::sync::Mutex<Vec<String>>,
+    );
+
+    impl StepRunner for ScriptedJudge {
+        fn run_unit(&self, input: &StepInput) -> crate::workflow::StepOutput {
+            self.1.lock().unwrap().push(input.unit.description.clone());
+            let mut replies = self.0.lock().unwrap();
+            let output = if replies.is_empty() {
+                String::new()
+            } else {
+                replies.remove(0).to_string()
+            };
+            crate::workflow::StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output,
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn an_unclosed_verdict_is_confirmed_once_and_a_confirm_never_flips_it_1945() {
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let judge = |replies: Vec<&'static str>| {
+            let runner = ScriptedJudge(std::sync::Mutex::new(replies), Default::default());
+            let v = agent_validate("c", "w", &["claude"], &roster, &runner).expect("a verdict");
+            let asked = runner.1.into_inner().unwrap();
+            (v, asked)
+        };
+        // Opened PASS, confirmed PASS: a pass, after exactly one confirm call that shows the reply.
+        let (v, asked) = judge(vec!["PASS — the work holds.\n- reason", "PASS"]);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(asked.len(), 2);
+        assert!(asked[1].contains("PASS — the work holds."), "{}", asked[1]);
+        // Opened REJECT, "confirmed" PASS: drift, so it fails closed.
+        let (v, asked) = judge(vec!["REJECT — the work misses the task.", "PASS"]);
+        assert!(!v.pass, "{v:?}");
+        assert_eq!(asked.len(), 2);
+        // A confirm that is not the bare word fails closed; there is no third call.
+        let (v, asked) = judge(vec!["PASS — fine.", "PASS, as I said"]);
+        assert!(!v.pass, "{v:?}");
+        assert_eq!(asked.len(), 2);
+        // A closed reply needs no confirm.
+        let (v, asked) = judge(vec!["PASS\nfine\nPASS"]);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(asked.len(), 1);
+    }
+
     #[test]
     fn agent_validate_runs_under_the_distinct_seat_when_the_roster_allows() {
         // Prove the SEAT SELECTION reaches the dispatched unit (no live CLI): a recording stub captures

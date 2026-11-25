@@ -8815,6 +8815,118 @@ mod tests {
         }
     }
 
+    /// (core#1945) A review whose finding cites `src/math.js:2`; a judge that answers `PASS` with
+    /// its reason on the same line and no closing line, then the bare word when asked to confirm.
+    #[derive(Default)]
+    struct CitingRunner(std::sync::Mutex<Vec<StepInput>>);
+
+    impl StepRunner for CitingRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let mut calls = self.0.lock().unwrap();
+            calls.push(input.clone());
+            let judged = calls
+                .iter()
+                .filter(|i| i.unit.session_id == "validator")
+                .count();
+            let output = match (input.unit.session_id == "validator", judged) {
+                (false, _) => {
+                    "FINDING (high): src/math.js:2 starts the loop at 1, so sum() \
+                               skips the first element.\nRECOMMENDATION: reject\nVERDICT: PASS"
+                }
+                (true, 1) => {
+                    "PASS — the cited line starts the loop at 1, as the review says.\n\
+                              - src/math.js:2 holds `for (let i = 1; ...)`"
+                }
+                (true, _) => "PASS",
+            };
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: output.into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_review_judge_reads_the_cited_lines_and_confirms_an_unclosed_verdict_1945() {
+        let dir = std::env::temp_dir().join(format!("core-1945-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/math.js"),
+            "function sum(xs) {\n  for (let i = 1; i < xs.length; i++) {}\n}\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        let mut input = report_input(&dir);
+        input.unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&dir, &dir).unwrap());
+        let roster = [
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let rec = Arc::new(CitingRunner::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        let (_, verdict, _) = run_unit_and_judge_on(
+            &runner,
+            &input,
+            None,
+            &|_| {},
+            &roster,
+            &[],
+            &[],
+            JudgeFallbackCtx::default(),
+            None,
+            None,
+            None,
+        );
+        let calls = rec.0.lock().unwrap();
+        let judge: Vec<&StepInput> = calls
+            .iter()
+            .filter(|i| i.unit.session_id == "validator")
+            .collect();
+        // The judge has no tree of its own: the harness hands it the cited lines.
+        let asked = &judge[0].unit.description;
+        assert!(asked.contains("CITED SOURCE"), "{asked}");
+        assert!(
+            asked.contains("src/math.js:2: ") && asked.contains("for (let i = 1; i < xs.length"),
+            "{asked}"
+        );
+        // An opening PASS with no closing line is confirmed once by the same seat, not denied.
+        assert_eq!(judge.len(), 2, "one confirm call");
+        assert_eq!(judge[1].unit.assigned_cli, judge[0].unit.assigned_cli);
+        let verdict = verdict.expect("a verdict");
+        assert!(verdict.pass, "{verdict:?}");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_guarded_report_gets_a_judge_of_its_own_output_or_an_explicit_skip() {
         let dir = std::env::temp_dir().join(format!("core-report-{}", uuid::Uuid::new_v4()));
