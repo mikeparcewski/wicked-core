@@ -1417,7 +1417,10 @@ fn every_step_field_has_a_plain_word() {
         let words = super::known_field_words(key)
             .unwrap_or_else(|| panic!("the step field `{key}` has no words for a person"));
         assert!(!words.contains('_'), "{key}: {words}");
-        assert!(!words.starts_with("whether"), "{key} reads after \"its\": {words}");
+        assert!(
+            !words.starts_with("whether"),
+            "{key} reads after \"its\": {words}"
+        );
     }
     for (key, word) in [
         ("validator_pin", "validator"),
