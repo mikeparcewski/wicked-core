@@ -7196,7 +7196,11 @@ mod discard_minted_tests {
             let err = set_seat_layers_off(&mut store, &entry.id, &[bad.into()]);
             assert!(err.is_err(), "`{bad}` is not a layer id");
             let kept = get_repo(&store, &entry.id).unwrap().unwrap();
-            assert_eq!(kept.seat_layers_off, ["go"], "`{bad}` left the list as it was");
+            assert_eq!(
+                kept.seat_layers_off,
+                ["go"],
+                "`{bad}` left the list as it was"
+            );
         }
         let cleared = set_seat_layers_off(&mut store, &entry.id, &[]).unwrap();
         assert!(cleared.seat_layers_off.is_empty());

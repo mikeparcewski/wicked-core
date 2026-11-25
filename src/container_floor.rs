@@ -2857,7 +2857,11 @@ fn carry_prompt_scoped(
 /// none on an operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's
 /// toolchain. (part 2) Not the layers the run's repo turned off (`layers_off`, from the unit's
 /// governance).
-fn arm_layers(tree: &Path, cli: &str, layers_off: &[String]) -> Vec<&'static crate::seat_layers::Layer> {
+fn arm_layers(
+    tree: &Path,
+    cli: &str,
+    layers_off: &[String],
+) -> Vec<&'static crate::seat_layers::Layer> {
     if configured_base().is_some() || image_override(cli).is_some() {
         return Vec::new();
     }
@@ -5025,13 +5029,19 @@ esac
         for k in keys {
             std::env::remove_var(k);
         }
-        let dir = RemoveOnDrop(tmp(&format!("arm-layers-{}", uuid::Uuid::new_v4().simple())));
+        let dir = RemoveOnDrop(tmp(&format!(
+            "arm-layers-{}",
+            uuid::Uuid::new_v4().simple()
+        )));
         std::fs::create_dir_all(&dir.0).unwrap();
         std::fs::write(dir.0.join("Cargo.toml"), "").unwrap();
         std::fs::write(dir.0.join("go.mod"), "module x\n").unwrap();
         let ids = |off: &[&str]| -> Vec<&'static str> {
             let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
-            arm_layers(&dir.0, "claude", &off).iter().map(|l| l.id).collect()
+            arm_layers(&dir.0, "claude", &off)
+                .iter()
+                .map(|l| l.id)
+                .collect()
         };
         assert_eq!(ids(&[]), ["go", "rust"]);
         assert_eq!(ids(&["go"]), ["rust"], "the repo turned go off");
