@@ -71,6 +71,28 @@ pub(crate) struct SeatBallots {
     /// (coord round 2 on garden#1557) A claude ballot's answer cap in output tokens
     /// ([`crate::execute_wrapped::with_answer_cap`]); none = the seat's own default.
     answer_cap: Option<u32>,
+    /// (core#1906) The calls of the Tool step this carrier answers for: each ballot is admitted
+    /// there before its seat runs and released after, so the step's end refuses or cancels it
+    /// ([`crate::model_call::StepCalls`]).
+    step_calls: Option<Arc<crate::model_call::StepCalls>>,
+    /// Whether the step's end refused or cancelled a ballot of this carrier.
+    step_ended: std::sync::atomic::AtomicBool,
+}
+
+/// (core#1906) Releases an admitted ballot from its step's calls when the ballot is done, on every
+/// path out of [`SeatBallots::run_ballot`], noting whether the step's end cancelled it.
+struct Admitted<'a> {
+    calls: &'a crate::model_call::StepCalls,
+    id: &'a str,
+    ended: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        if self.calls.release(self.id) {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// (core#1290) The handle that reaps a council's carried ballots (judges and runoffs included:
@@ -146,7 +168,21 @@ impl SeatBallots {
             model_calls: false,
             stdin: false,
             answer_cap: None,
+            step_calls: None,
+            step_ended: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// (core#1906) Admit every ballot into `calls`, the calls of the Tool step it answers for.
+    pub(crate) fn step_calls(mut self, calls: Arc<crate::model_call::StepCalls>) -> Self {
+        self.step_calls = Some(calls);
+        self
+    }
+
+    /// (core#1906) Whether the step's end refused or cancelled a ballot of this carrier: its
+    /// answer is then "the step ended", whatever the seat returned.
+    pub(crate) fn step_ended(&self) -> bool {
+        self.step_ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// (DES-j6-build C0) Run every ballot as a tool-free model call, its prompt on stdin
@@ -235,6 +271,23 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         let on_stdin = self.stdin || cli.input_mode == InputMode::Stdin;
         let answer_cap = self.answer_cap;
         let run_id = ballot_run_id(task_id, &cli.key);
+        // (core#1906) Admitted before the seat runs, released when this returns.
+        let _admitted = match &self.step_calls {
+            Some(calls) if !calls.admit(&run_id) => {
+                self.step_ended
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(SeatFailure::new(
+                    SeatFailureKind::SpawnFailed,
+                    crate::model_call::STEP_ENDED,
+                ));
+            }
+            Some(calls) => Some(Admitted {
+                calls,
+                id: &run_id,
+                ended: &self.step_ended,
+            }),
+            None => None,
+        };
         let mut unit = crate::domain::WorkUnit::pending(
             crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
             "council",
