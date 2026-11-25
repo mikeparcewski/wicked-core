@@ -1219,3 +1219,452 @@ fn a_send_back_loses_a_check_moved_off_its_work_by_rename_or_id_reuse() {
     prefixed.extend(held.clone());
     assert!(super::lost_checks(&held, &[], &prefixed).is_empty());
 }
+
+// ── core#1925: a person's edit at a mid-run plan gate reaches the plan ──────────────────────────
+
+/// The held first-creator proposal of [`held_first_creator`], with a held review after the build.
+fn held_build_and_review(hc: &HumanConfirm) -> TeamPlanState {
+    held_with(
+        hc,
+        r#"[{"catalog":"build","id":"build"},{"catalog":"review","id":"review","depends_on":["build"]}]"#,
+    )
+}
+
+/// `answer-1` accepted and run, then the PA's first-creator `steps` held at its boundary.
+fn held_with(hc: &HumanConfirm, steps: &str) -> TeamPlanState {
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, hc);
+    let change = pa_block(
+        steps,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], hc, Some(1), 0).unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Held { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    r.state
+}
+
+fn accepted_step<'a>(r: &'a Revised, id: &str) -> &'a PlanStep {
+    r.state
+        .accepted
+        .as_ref()
+        .expect("an accepted rev")
+        .steps
+        .steps
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap_or_else(|| panic!("no step `{id}` in the accepted rev"))
+}
+
+/// (core#1925) A person who restates a held step with new instructions at the gate gets those
+/// instructions in the rev they approve: the edit amends the step, field by field, and an edit
+/// that only amends held steps is a change, not "adds no step".
+#[test]
+fn a_gate_edit_amends_the_instructions_of_a_held_step() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build","instructions":"Retire it, and add an epic for billing."}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    assert_eq!(r.state.accepted.as_ref().unwrap().by, "human");
+    assert_eq!(
+        accepted_step(&r, "build").instructions.as_deref(),
+        Some("Retire it, and add an epic for billing.")
+    );
+}
+
+/// (core#1925) A step's catalog entry carries contracts the engine enforces by catalog, so a
+/// gate edit that moves a step to another entry is refused by name (the issue's other answer),
+/// for the probe's `produce` draft as for a `build` with its evidence floor; the fields a
+/// person may change keep working (above).
+#[test]
+fn a_gate_edit_that_recatalogues_a_held_step_is_refused_by_name() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"draft","instructions":"Write the page."}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"understand","id":"draft"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(
+        &r,
+        &held,
+        "step `draft` can't change from `produce` to `understand` at the gate",
+    );
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","id":"build"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(&r, &held, "step `build` can't change from `build`");
+}
+
+/// (core#1925) A step that already ran cannot be changed at the gate: the whole edit is refused,
+/// naming the step, and the run keeps its plan. Restating it unchanged is fine (above).
+#[test]
+fn a_gate_edit_that_changes_a_step_that_ran_is_refused_by_name() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1","instructions":"Answer it differently."},
+            {"catalog":"build","id":"build"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    match &r.outcome {
+        Outcome::Refused { reason } => assert!(
+            reason.contains("the step `answer-1` already ran"),
+            "{reason}"
+        ),
+        o => panic!("{}", describe(o)),
+    }
+    assert_eq!(r.state, held, "the run keeps its plan");
+}
+
+/// (core#1925, codex DES r1) "Ran" is not only the prefix before the cursor: a step a rewind moved
+/// behind it ran too, and is refused the same way.
+#[test]
+fn a_gate_edit_that_changes_a_rewound_step_that_ran_is_refused() {
+    let hc = HumanConfirm::None;
+    let held = held_build_and_review(&hc);
+    let r = revise_with_ran(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build"},
+            {"catalog":"review","id":"review","instructions":"Look again."}
+        ])),
+        &["answer-1".into()],
+        &["answer-1".into(), "review".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    match &r.outcome {
+        Outcome::Refused { reason } => {
+            assert!(reason.contains("the step `review` already ran"), "{reason}")
+        }
+        o => panic!("{}", describe(o)),
+    }
+}
+
+/// (core#1925, codex DES r2/r3) A step that carries a check keeps it: at the gate only its
+/// instructions can change (its catalog, pin, capture report and dependencies cannot).
+#[test]
+fn a_gate_edit_cannot_drop_a_held_steps_check() {
+    let hc = HumanConfirm::None;
+    let held = held_build_and_review(&hc);
+    for review in [
+        json!({"catalog":"critique","id":"review"}),
+        json!({"catalog":"review","id":"review","validator_pin":null}),
+        // (codex DES r3) No weakening within the catalog either.
+        json!({"catalog":"review","id":"review","requires_capture_report":false}),
+        json!({"catalog":"review","id":"review","depends_on":[]}),
+    ] {
+        let r = revise(
+            "r",
+            &held,
+            gate_edit(json!([
+                {"catalog":"understand","id":"answer-1"},
+                {"catalog":"build","id":"build"},
+                review
+            ])),
+            &["answer-1".into()],
+            &hc,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        match &r.outcome {
+            Outcome::Refused { reason } => assert!(reason.contains("`review`"), "{reason}"),
+            o => panic!("{review}: {}", describe(o)),
+        }
+    }
+}
+
+/// (core#1925) A check-bearing step's instructions can change at the gate.
+#[test]
+fn a_gate_edit_reinstructs_a_held_review() {
+    let hc = HumanConfirm::None;
+    let held = held_build_and_review(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build"},
+            {"catalog":"review","id":"review","instructions":"Check the billing epic too."}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let review = accepted_step(&r, "review");
+    assert_eq!(
+        review.instructions.as_deref(),
+        Some("Check the billing epic too.")
+    );
+    assert_eq!(
+        review.depends_on.as_deref(),
+        Some(&["build".to_string()][..])
+    );
+}
+
+/// (core#1925) A step never drops a deliverable at the gate: the launch's declared deliverables
+/// ride a creator step from launch (`decide`), and a catalog never changes, so they stay put.
+#[test]
+fn a_gate_edit_cannot_drop_a_steps_deliverable() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"build","required_deliverables":["docs/out.md"]}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","id":"build","required_deliverables":[]}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(
+        &r,
+        &held,
+        "step `build` can't drop its deliverable `docs/out.md`",
+    );
+}
+
+/// (core#1925, pi r2) A restatement that names no id amends the held step of its catalog entry,
+/// and adds no second one.
+#[test]
+fn a_gate_edit_without_ids_amends_the_step_of_its_catalog() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"draft","instructions":"Write the page."}]"#,
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","instructions":"Write the page and a billing epic."}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let steps = &r.state.accepted.as_ref().unwrap().steps.steps;
+    assert_eq!(
+        steps.iter().filter(|s| s.catalog == "produce").count(),
+        1,
+        "{steps:?}"
+    );
+    assert_eq!(
+        accepted_step(&r, "draft").instructions.as_deref(),
+        Some("Write the page and a billing epic.")
+    );
+}
+
+/// (core#1925, codex r2) The steps the actor holds to a floor by catalog carry a check.
+#[test]
+fn the_actors_catalog_floors_carry_a_check() {
+    for catalog in [
+        crate::editor_conformance::CATALOG,
+        crate::demo_record::PROBE_CATALOG,
+        crate::demo_record::RECORD_CATALOG,
+    ] {
+        let step = PlanStep {
+            catalog: catalog.to_string(),
+            ..PlanStep::default()
+        };
+        assert!(super::carries_check(&step), "{catalog}");
+    }
+    let produce = PlanStep {
+        catalog: "produce".to_string(),
+        ..PlanStep::default()
+    };
+    assert!(!super::carries_check(&produce));
+}
+
+fn refused_naming(r: &Revised, held: &TeamPlanState, needle: &str) {
+    match &r.outcome {
+        Outcome::Refused { reason } => assert!(reason.contains(needle), "{reason}"),
+        o => panic!("{}", describe(o)),
+    }
+    assert_eq!(&r.state, held, "the run keeps its plan");
+}
+
+/// (core#1925, codex r1 on the fix) A step's own pin is never swapped, and a capture report it
+/// declares is never dropped, at the gate.
+#[test]
+fn a_gate_edit_cannot_swap_a_steps_pin_or_drop_its_capture_report() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        &json!([{"catalog":"produce","id":"build",
+                 "validator_pin": crate::builtin_floors::EVIDENCE_FLOOR_PIN,
+                 "requires_capture_report": true}])
+        .to_string(),
+    );
+    for build in [
+        json!({"catalog":"produce","id":"build",
+               "validator_pin": crate::builtin_floors::WALKTHROUGH_LINT_PIN}),
+        json!({"catalog":"produce","id":"build","requires_capture_report":false}),
+    ] {
+        let r = revise(
+            "r",
+            &held,
+            gate_edit(json!([{"catalog":"understand","id":"answer-1"}, build])),
+            &["answer-1".into()],
+            &hc,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        refused_naming(&r, &held, "`build`");
+    }
+}
+
+/// (core#1925, pi r1 on the fix) A step that carries no check still never stops reading an input
+/// it read.
+#[test]
+fn a_gate_edit_cannot_drop_a_dependency_of_a_step_without_a_check() {
+    let hc = HumanConfirm::None;
+    let held = held_with(
+        &hc,
+        r#"[{"catalog":"produce","id":"build","depends_on":["answer-1"]}]"#,
+    );
+    let build = held
+        .pending
+        .as_ref()
+        .unwrap()
+        .steps
+        .steps
+        .iter()
+        .find(|s| s.id == "build");
+    assert!(
+        !super::carries_check(build.unwrap()),
+        "a step without a check"
+    );
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"produce","id":"build","depends_on":[]}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    refused_naming(&r, &held, "step `build` can't stop reading `answer-1`");
+}
+
+/// (core#1925, round 1 passes 2-3) A check changes only its instructions at the gate: not a
+/// "stricter" setting either (a consent gate moves the person's judgment before the work,
+/// `executes_code` lifts a reviewer's write guard, and a pin over the entry's own validator
+/// swaps it).
+#[test]
+fn a_gate_edit_changes_only_a_checks_instructions() {
+    let hc = HumanConfirm::None;
+    let held = held_build_and_review(&hc);
+    for review in [
+        json!({"catalog":"review","id":"review","gate":{"human_confirm":{"unconditional":true}}}),
+        json!({"catalog":"review","id":"review","gate":"consent_before"}),
+        json!({"catalog":"review","id":"review","executes_code":true}),
+        json!({"catalog":"review","id":"review",
+               "validator_pin": crate::builtin_floors::WALKTHROUGH_LINT_PIN}),
+    ] {
+        let r = revise(
+            "r",
+            &held,
+            gate_edit(json!([
+                {"catalog":"understand","id":"answer-1"},
+                {"catalog":"build","id":"build"},
+                review
+            ])),
+            &["answer-1".into()],
+            &hc,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        refused_naming(
+            &r,
+            &held,
+            "step `review` is a check; only its instructions can change",
+        );
+    }
+}

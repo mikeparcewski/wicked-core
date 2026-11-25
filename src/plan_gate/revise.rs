@@ -1,5 +1,7 @@
 //! Seam T4 (DES-TEAMING-002 §8.7): re-deciding mid-run. The plan only GROWS: a revision adds
 //! steps after the cursor, never removes one and never touches a unit already dispatched or done.
+//! One exception (core#1925): a person's edit at the gate also AMENDS the held steps it restates
+//! that never ran ([`amend_restated`]); the PA's and the members' changes only add.
 //!
 //! Three triggers reach the actor, each on the actor's own command channel (it never reads the
 //! bus):
@@ -307,6 +309,32 @@ pub(crate) fn revise(
     reviewing_ord: Option<u32>,
     now: i64,
 ) -> anyhow::Result<Revised> {
+    revise_with_ran(
+        run_id,
+        prior,
+        change,
+        done,
+        done,
+        human_confirm,
+        reviewing_ord,
+        now,
+    )
+}
+
+/// [`revise`], where `ran` names every step of the run that was ever dispatched: the done prefix
+/// and any step a `request_changes` rewind moved back behind the cursor (core#1925). A person's
+/// edit at the gate may change only the steps that never ran.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn revise_with_ran(
+    run_id: &str,
+    prior: &TeamPlanState,
+    change: Change,
+    done: &[String],
+    ran: &[String],
+    human_confirm: &HumanConfirm,
+    reviewing_ord: Option<u32>,
+    now: i64,
+) -> anyhow::Result<Revised> {
     let auto = is_auto(human_confirm);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
     let catalog = crate::catalog::catalog();
@@ -391,6 +419,19 @@ pub(crate) fn revise(
             0,
         ),
         (None, None) => anyhow::bail!("run {run_id} has no accepted plan to revise"),
+    };
+    // (core#1925) A person's edit at the gate AMENDS the held steps it restates, field by field
+    // (the rule above only grows the plan for the PA and the members): what they set replaces
+    // the held value, what they left out keeps it. A step that ran, or a check it would loosen,
+    // refuses the whole edit by name (below, once the proposal is on the record).
+    let (base, amend) = if human_gate_edit {
+        let amendment: &[PlanStep] = match &change {
+            Change::Steps { steps, .. } => steps,
+            Change::Floor(_) => &[],
+        };
+        amend_restated(base, amendment, ran)
+    } else {
+        (base, Ok(0))
     };
     let mut events = Vec::new();
     let mut obligations = prior.obligations.clone();
@@ -529,6 +570,10 @@ pub(crate) fn revise(
             outcome: Outcome::Refused { reason },
         })
     };
+    let amended = match amend {
+        Ok(n) => n,
+        Err(why) => return refuse(events, why),
+    };
     // §8.5 ratchet: the floor band is the maximum any score of the run has reached.
     let max_score = prior.max_score.max(score);
     let destructive = prior.destructive || destructive;
@@ -573,8 +618,13 @@ pub(crate) fn revise(
         monitors: base.monitors.clone(),
     });
     // A human's answer that declines a held proposal's additions changes the plan by dropping
-    // them: that is not "adds no step".
-    if proposal_id.is_some() && merged.steps.len() == base.steps.len() && dropped == 0 {
+    // them, and one that amends held steps changes it by those amendments (core#1925): neither
+    // is "adds no step".
+    if proposal_id.is_some()
+        && merged.steps.len() == base.steps.len()
+        && dropped == 0
+        && amended == 0
+    {
         return refuse(events, "the proposal adds no step".to_string());
     }
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
@@ -757,6 +807,198 @@ pub(crate) fn revise(
             })
         }
     }
+}
+
+/// (core#1925) `base` with each of its steps that `amendment` restates — by id, or, for a step
+/// that names no id, by its catalog entry, both read on the held plan as it was — amended by it
+/// ([`amended`]), and how many steps that changed. `Err` names the first change a person may not
+/// make at the gate ([`edit_refusal`]).
+fn amend_restated(
+    mut base: PlanSteps,
+    amendment: &[PlanStep],
+    ran: &[String],
+) -> (PlanSteps, Result<usize, String>) {
+    let held_steps = base.steps.clone();
+    let mut seen: Vec<usize> = Vec::new();
+    let mut changed = 0;
+    for n in amendment {
+        let Some(at) = held_steps.iter().position(|b| {
+            if n.id.is_empty() {
+                b.catalog == n.catalog
+            } else {
+                b.id == n.id
+            }
+        }) else {
+            continue;
+        };
+        if seen.contains(&at) {
+            continue;
+        }
+        seen.push(at);
+        let held = &held_steps[at];
+        let new = amended(held, n);
+        if changed_fields(held, &new).is_empty() {
+            continue;
+        }
+        let inputs: Vec<String> = inputs_of(&held_steps, at)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if let Some(why) = edit_refusal(held, &new, &inputs, ran) {
+            return (base, Err(why));
+        }
+        base.steps[at] = new;
+        changed += 1;
+    }
+    (base, Ok(changed))
+}
+
+/// (core#1925) `held` amended by a person's restatement `edit` ("an absent field keeps the
+/// entry's value", [`PlanStep`]): every field `edit` sets replaces the held one; the id, place
+/// and provenance stay the held step's. (A new catalog is refused by [`edit_refusal`].)
+fn amended(held: &PlanStep, edit: &PlanStep) -> PlanStep {
+    fn or<T: Clone>(edit: &Option<T>, held: &Option<T>) -> Option<T> {
+        edit.as_ref().or(held.as_ref()).cloned()
+    }
+    PlanStep {
+        catalog: edit.catalog.clone(),
+        id: held.id.clone(),
+        instructions: or(&edit.instructions, &held.instructions),
+        gate: or(&edit.gate, &held.gate),
+        gate_type: or(&edit.gate_type, &held.gate_type),
+        validator_pin: or(&edit.validator_pin, &held.validator_pin),
+        executes_code: or(&edit.executes_code, &held.executes_code),
+        writes_nothing: or(&edit.writes_nothing, &held.writes_nothing),
+        verified_evidence: or(&edit.verified_evidence, &held.verified_evidence),
+        requires_capture_report: or(&edit.requires_capture_report, &held.requires_capture_report),
+        answer_only: or(&edit.answer_only, &held.answer_only),
+        budget_secs: or(&edit.budget_secs, &held.budget_secs),
+        pool: or(&edit.pool, &held.pool),
+        skill_ref: or(&edit.skill_ref, &held.skill_ref),
+        allowed_skills: or(&edit.allowed_skills, &held.allowed_skills),
+        required_deliverables: or(&edit.required_deliverables, &held.required_deliverables),
+        depends_on: or(&edit.depends_on, &held.depends_on),
+        executor: or(&edit.executor, &held.executor),
+        owner: or(&edit.owner, &held.owner),
+        kind: or(&edit.kind, &held.kind),
+        role: or(&edit.role, &held.role),
+        added_by: held.added_by,
+        floor_reason: held.floor_reason.clone(),
+        floor_rule: held.floor_rule.clone(),
+        repeat_from: or(&edit.repeat_from, &held.repeat_from),
+        rubric: or(&edit.rubric, &held.rubric),
+    }
+}
+
+/// The fields (wire names) whose values differ between `a` and `b`, provenance aside.
+fn changed_fields(a: &PlanStep, b: &PlanStep) -> Vec<String> {
+    let wire = |s: &PlanStep| match serde_json::to_value(without_provenance(s)) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let (a, b) = (wire(a), wire(b));
+    let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect()
+}
+
+/// (core#1925) The refusal of an edit that changes `fields` of the step `id`, which ran.
+fn ran_refusal(id: &str, fields: &[String]) -> String {
+    format!(
+        "the step `{id}` already ran, so its {} can't change; edit only the steps that have not \
+         run",
+        fields.join(", ")
+    )
+}
+
+/// (core#1925, DES-1925 §2-3) Why a person may not turn the held step `held` into `new` at the
+/// gate, if they may not: a step that ran never changes; no step changes its catalog entry (a
+/// step's entry carries contracts the engine enforces by catalog: validators, deliverable,
+/// conformance and demo floors, and the inputs of the checks after it); a validator pin is never
+/// cleared or swapped; no step drops a deliverable or stops reading an input it read (`inputs`,
+/// its declared or implicit [`inputs_of`]); and a step that carries a check ([`carries_check`])
+/// changes only its instructions.
+fn edit_refusal(
+    held: &PlanStep,
+    new: &PlanStep,
+    inputs: &[String],
+    ran: &[String],
+) -> Option<String> {
+    let id = &held.id;
+    let changed = changed_fields(held, new);
+    if changed.is_empty() {
+        return None;
+    }
+    if ran.contains(id) {
+        return Some(ran_refusal(id, &changed));
+    }
+    if new.catalog != held.catalog {
+        return Some(format!(
+            "step `{id}` can't change from `{}` to `{}` at the gate; edit its instructions, or \
+             add a new step",
+            held.catalog, new.catalog
+        ));
+    }
+    if held.validator_pin != new.validator_pin
+        && (matches!(held.validator_pin, Some(Some(_))) || matches!(new.validator_pin, Some(None)))
+    {
+        return Some(format!(
+            "the check on step `{id}` can't be removed or changed at the gate"
+        ));
+    }
+    // An edit never sets `depends_on` back to absent (an absent field keeps the held value), so
+    // a changed one is the person's own list.
+    if held.depends_on != new.depends_on {
+        let listed = new.depends_on.as_deref().unwrap_or_default();
+        if let Some(lost) = inputs.iter().find(|d| !listed.contains(d)) {
+            return Some(format!(
+                "step `{id}` can't stop reading `{lost}` at the gate"
+            ));
+        }
+    }
+    let listed = new.required_deliverables.as_deref().unwrap_or_default();
+    if let Some(lost) = held
+        .required_deliverables
+        .iter()
+        .flatten()
+        .find(|d| !listed.contains(d))
+    {
+        return Some(format!(
+            "step `{id}` can't drop its deliverable `{lost}` at the gate"
+        ));
+    }
+    if !carries_check(held) {
+        return None;
+    }
+    // Only its instructions. A "stricter" setting is not reliably stricter: a higher gate can
+    // move the person's judgment before the work, `executes_code` lifts a reviewer's write
+    // guard, and a pin over the entry's own validator swaps it (round 1 pass 3).
+    if changed.iter().all(|f| f == "instructions") {
+        None
+    } else {
+        Some(format!(
+            "step `{id}` is a check; only its instructions can change at the gate"
+        ))
+    }
+}
+
+/// (core#1925) The held step carries a check a gate edit must not lose: a check step
+/// ([`is_check_step`]), one whose entry or own fields declare a validator, re-verified evidence
+/// or a capture report, or one the actor holds to a floor of its own by catalog (the editor
+/// conformance run, the demo probe and recorder).
+fn carries_check(s: &PlanStep) -> bool {
+    is_check_step(s)
+        || s.catalog == crate::editor_conformance::CATALOG
+        || crate::demo_record::is_demo_catalog(Some(&s.catalog))
+        || crate::catalog::catalog_entry(&s.catalog).is_some_and(|e| {
+            e.validator_pin.is_some() || e.verified_evidence || e.requires_capture_report
+        })
+        || s.verified_evidence == Some(true)
+        || s.requires_capture_report == Some(true)
 }
 
 /// (DES-CATALOG-002 §2.4) A step of a held plan that is a CHECK: a send-back's re-plan keeps it,

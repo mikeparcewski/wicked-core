@@ -13692,6 +13692,17 @@ fn dispatch_unit_with(
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
     }
+    // (core#1925) …and the accepted plan revision it is dispatched under (a team run's; a run
+    // with no team plan has none).
+    let plan_rev = session
+        .team_plan
+        .as_ref()
+        .map(|t| t.accepted_rev)
+        .filter(|r| *r > 0);
+    let plan_rev_changed = plan_rev.is_some() && unit.plan_rev != plan_rev;
+    if plan_rev_changed {
+        unit.plan_rev = plan_rev;
+    }
     // DES-TEAMING-002 P1: a team unit of an un-teamed run carries `transport: none` in its
     // snapshot BEFORE its turn starts — stamped from the run's persisted state, never the worker.
     let team_snapshot = team_gate::unit_snapshot(&session, &unit);
@@ -13805,6 +13816,7 @@ fn dispatch_unit_with(
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
+        || plan_rev_changed
         || advice_scope_changed
         || team_changed
     {
@@ -19452,9 +19464,10 @@ fn stage_edit(
     now: i64,
 ) -> anyhow::Result<StagedEdit> {
     let run_id = session.id.as_str();
-    // (DES-TEAMING-002 T4, §8.7) An edit at a MID-RUN plan gate (units already ran): the plan
-    // only grows, so the edit's steps are ADDED to the held plan and the units before the cursor
-    // are kept as they ran — never a whole-plan replace that would re-plan finished work.
+    // (DES-TEAMING-002 T4, §8.7) An edit at a MID-RUN plan gate (units already ran): the edit's
+    // new steps are ADDED to the held plan, the held steps it restates that never ran are
+    // amended (core#1925), and the units that ran are kept as they ran — never a whole-plan
+    // replace that would re-plan finished work.
     let units = crate::domain::session_units(&*store, run_id)?;
     let cursor = session.unit_ix.min(units.len());
     if cursor > 0 {
@@ -19462,7 +19475,15 @@ fn stage_edit(
             .iter()
             .map(|u| u.phase_id().unwrap_or_default().to_string())
             .collect();
-        let r = crate::plan_gate::revise(
+        // (core#1925) Every step that was ever dispatched — the done prefix and a step a
+        // `request_changes` rewind moved back behind the cursor — never changes at the gate.
+        let ran: Vec<String> = units
+            .iter()
+            .filter(|u| u.was_dispatched())
+            .map(|u| u.phase_id().unwrap_or_default().to_string())
+            .chain(done.iter().cloned())
+            .collect();
+        let r = crate::plan_gate::revise_with_ran(
             run_id,
             state,
             crate::plan_gate::Change::Steps {
@@ -19477,6 +19498,7 @@ fn stage_edit(
                 scoring: None,
             },
             &done,
+            &ran,
             &session.human_confirm,
             pending.reviewing_ord,
             now,
