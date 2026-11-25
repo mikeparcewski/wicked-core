@@ -2182,3 +2182,205 @@ fn two_seats_of_one_step_send_tool_frames_with_their_own_cli() {
         ]
     );
 }
+
+/// The run's contract as a stand-in-aware launch persists it (`LaunchStandIn::apply`).
+fn aware(mut s: AgentSession, consent: bool) -> AgentSession {
+    s.assurance = crate::standin::LaunchStandIn {
+        aware: true,
+        parties: Vec::new(),
+        consent: consent.then(|| crate::standin::StandInConsent {
+            scope: crate::standin::SCOPE_JOB.into(),
+            by: "operator".into(),
+            at: 1,
+            via: "launch".into(),
+        }),
+    }
+    .apply(s.assurance);
+    s
+}
+
+fn registry() -> Vec<crate::AgenticCli> {
+    wicked_council::registry::builtin()
+}
+
+/// T-R11 (DES-STANDIN-001 §3.2): on a one-seat run the QE reviewer has no real seat (the only seat
+/// built the work); with consent the reviewer is a stand-in on that seat's credential, a binding
+/// with the base's own invocation and basis `stand_in`. A real seat always wins: a second CLI is
+/// the reviewer and no stand-in is offered beside it.
+#[test]
+fn t_r11_a_one_seat_consented_run_reviews_qe_on_a_stand_in() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let units = vec![creator(2, "claude")];
+    let u = qe_unit("claude", ledger);
+    let reg = registry();
+    let s = aware(session(&["claude"], false), true);
+    assert!(candidates(&s, &units, &u).is_empty());
+    let (seat, b) = stand_in_reviewer(&s, &units, &u, 4, &reg, &reg).expect("a stand-in reviewer");
+    assert_eq!(
+        (seat.seat.as_str(), seat.basis.as_str(), b.base.as_str()),
+        ("claude~1", BASIS_STAND_IN, "claude")
+    );
+    assert_eq!(b.role, crate::standin::Role::QeReviewer);
+    assert_eq!((b.ord, b.attempt), (Some(3), Some(4)));
+    let claude = reg.iter().find(|c| c.key == "claude").unwrap();
+    assert_eq!(
+        seat.invocation.as_deref(),
+        Some(claude.headless_invocation.as_str())
+    );
+    assert_eq!(
+        b.reason,
+        crate::standin::Reason::OnlyOneHelper {
+            cli: claude.display_name.clone()
+        }
+    );
+    // The same attempt reuses the binding the run already holds; a later attempt mints the next.
+    let mut held = s.clone();
+    held.assurance.stand_ins.push(b.clone());
+    let (again, b2) = stand_in_reviewer(&held, &units, &u, 4, &reg, &reg).unwrap();
+    assert_eq!(
+        (again.seat.as_str(), b2.invocation.as_str()),
+        ("claude~1", b.invocation.as_str())
+    );
+    let (next, _) = stand_in_reviewer(&held, &units, &u, 5, &reg, &reg).unwrap();
+    assert_eq!(next.seat, "claude~2");
+    // Real seats win: a second CLI reviews, and the caller never asks for a stand-in.
+    let two = aware(session(&["claude", "codex"], false), true);
+    assert_eq!(
+        seats_of(&candidates(&two, &units, &u)),
+        vec!["codex".to_string()]
+    );
+}
+
+fn seats_of(c: &[QeReviewerSeat]) -> Vec<String> {
+    c.iter().map(|c| c.seat.clone()).collect()
+}
+
+/// T-R11 controls: no stand-in without consent, on an unaware run, on a reduced run, on an Apps
+/// publish (C3b's), or when the only seat is benched or launch-excluded (a stand-in never makes up
+/// for a credential that cannot run).
+#[test]
+fn t_r11_no_stand_in_reviewer_without_consent_awareness_or_a_usable_base() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let units = vec![creator(2, "claude")];
+    let u = qe_unit("claude", ledger);
+    let reg = registry();
+    let none = |s: &AgentSession| stand_in_reviewer(s, &units, &u, 1, &reg, &reg).is_none();
+    assert!(
+        none(&aware(session(&["claude"], false), false)),
+        "no consent"
+    );
+    assert!(none(&session(&["claude"], false)), "unaware");
+    let mut reduced = aware(session(&["claude"], false), true);
+    reduced.assurance.mode = a::MODE_REDUCED.into();
+    assert!(none(&reduced), "reduced");
+    let mut benched = aware(session(&["claude"], false), true);
+    benched.benched_seats.push(BenchedSeat {
+        cli: "claude".into(),
+        reason: "quota_exhausted".into(),
+        source: "worker".into(),
+        governed_only: false,
+        benched_until: None,
+        strikes: 0,
+        replaced: None,
+    });
+    assert!(none(&benched), "benched base");
+    let mut excluded = aware(session(&["claude"], false), true);
+    excluded.exclude_seats = vec!["claude".into()];
+    assert!(none(&excluded), "launch-excluded base");
+    let mut publish = aware(session(&["claude"], false), true);
+    publish.assurance.apps = Some(crate::apps::AppsContract {
+        preset: crate::apps::APPS_PUBLISH.into(),
+    });
+    assert!(none(&publish), "Apps publish (C3b)");
+    assert!(stand_in_bases(&publish, &units, &u).is_empty());
+}
+
+/// T-R11 (§3.8): the hold. No consent, no reviewer seat (or every one failed as a seat), and a
+/// signed-in base: `stand_in_hold`. With consent, unaware, a verdict, or no usable base: not.
+#[test]
+fn t_r11_a_missing_qe_reviewer_is_a_stand_in_hold_only_when_a_base_could_stand_in() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let units = vec![creator(2, "claude")];
+    let u = qe_unit("claude", ledger);
+    let review = |outcome: &str, attempts: Vec<QeReviewAttempt>| QeReview {
+        outcome: outcome.into(),
+        reason: String::new(),
+        evidence_dir: None,
+        qe_run_id: None,
+        tree: None,
+        verdict: None,
+        attempts,
+    };
+    let attempt = |status: &str| QeReviewAttempt {
+        seat: "claude".into(),
+        basis: BASIS_DISTINCT.into(),
+        same_cli: false,
+        status: status.into(),
+        session: String::new(),
+        governed: false,
+        tool_activity: false,
+        attempt: 1,
+    };
+    let s = aware(session(&["claude"], false), false);
+    assert!(stand_in_hold(
+        &s,
+        &units,
+        &u,
+        &review(OUTCOME_UNAVAILABLE, Vec::new())
+    ));
+    assert!(stand_in_hold(
+        &s,
+        &units,
+        &u,
+        &review(OUTCOME_UNAVAILABLE, vec![attempt("seat_failure:quota")])
+    ));
+    // A reviewer that ran and gave no verdict is not a missing reviewer.
+    assert!(!stand_in_hold(
+        &s,
+        &units,
+        &u,
+        &review(OUTCOME_UNAVAILABLE, vec![attempt("invalid")])
+    ));
+    assert!(!stand_in_hold(
+        &s,
+        &units,
+        &u,
+        &review(OUTCOME_FAIL, Vec::new())
+    ));
+    let consented = aware(session(&["claude"], false), true);
+    assert!(!stand_in_hold(
+        &consented,
+        &units,
+        &u,
+        &review(OUTCOME_UNAVAILABLE, Vec::new())
+    ));
+    let unaware = session(&["claude"], false);
+    assert!(!stand_in_hold(
+        &unaware,
+        &units,
+        &u,
+        &review(OUTCOME_UNAVAILABLE, Vec::new())
+    ));
+}
+
+/// §3.4: a stand-in reviewer's turn opens with the stand-in preface; a real reviewer's never does.
+#[test]
+fn a_stand_in_qe_reviewer_turn_opens_with_the_preface() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let unit = qe_unit("claude", ledger);
+    let input = input_for(unit);
+    let seat = |k: &str, basis: &str| QeReviewerSeat {
+        seat: k.into(),
+        basis: basis.into(),
+        same_cli: false,
+        invocation: None,
+    };
+    let stood = reviewer_input(&input, &seat("claude~1", BASIS_STAND_IN), "/e", "n1");
+    assert_eq!(stood.prior_outputs.len(), 1);
+    assert_eq!(stood.prior_outputs[0].label, crate::standin::PREFACE_LABEL);
+    assert!(stood.prior_outputs[0]
+        .output
+        .starts_with("You are a stand-in reviewer."));
+    let real = reviewer_input(&input, &seat("codex", BASIS_DISTINCT), "/e", "n1");
+    assert!(real.prior_outputs.is_empty());
+}

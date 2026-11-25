@@ -1662,3 +1662,44 @@ mod tests {
         );
     }
 }
+
+    /// core#1847: the preflight takes the launch's QE word through the launch's own contract
+    /// (`apps::contract`): an Apps publish refuses a skip (its QE is forced), an Apps turn refuses
+    /// a skip or a force, and any other workflow takes the word as before.
+    #[test]
+    fn an_apps_qe_word_is_refused_as_the_launch_refuses_it() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::preset::seed_builtins(&mut store, 10).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let shape = |workflow: &str, skip: Option<&str>, force: bool| PreflightShape {
+            workflow: Some(workflow.into()),
+            skip_qe_acceptance_reason: skip.map(str::to_string),
+            force_qe_acceptance: force,
+            ..PreflightShape::default()
+        };
+        let refused = |s: PreflightShape| {
+            preflight_contract(&store, &registry, &s)
+                .expect_err("refused as the launch refuses it")
+                .to_string()
+        };
+        let e = refused(shape(crate::apps::APPS_PUBLISH, Some("no time"), false));
+        assert!(e.contains("cannot be skipped on an Apps publish"), "{e}");
+        let e = refused(shape(crate::apps::APPS_TURN, None, true));
+        assert!(e.contains("an Apps turn has no QE acceptance"), "{e}");
+        let e = refused(shape(crate::apps::APPS_TURN, Some("no time"), false));
+        assert!(e.contains("an Apps turn has no QE acceptance"), "{e}");
+        // The publish's QE stays required, and a plain workflow still takes either word.
+        assert!(
+            preflight_contract(
+                &store,
+                &registry,
+                &shape(crate::apps::APPS_PUBLISH, None, false)
+            )
+            .unwrap()
+            .qe
+        );
+        assert!(
+            preflight_contract(&store, &registry, &shape("bug", Some("no time"), false)).is_ok()
+        );
+        assert!(preflight_contract(&store, &registry, &shape("bug", None, true)).is_ok());
+    }

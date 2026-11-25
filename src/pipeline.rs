@@ -7094,6 +7094,248 @@ mod judge_bench_tests {
                 tree: tree.into(),
                 taken_at_ms: 0,
                 git_dir: None,
+    /// (DES-STANDIN-001 T-R11) The fold of a QE reviewer record on a STAND-IN-AWARE run (roster
+    /// `a`, the run's contract as an aware launch persists it), with or without consent and with
+    /// any bindings the dispatch recorded: the winning denial source and the persisted unit.
+    fn fold_qe_review_aware(
+        sid: &str,
+        aware: bool,
+        consent: bool,
+        outcome: &str,
+        attempts: Vec<crate::domain::QeReviewAttempt>,
+        bindings: Vec<crate::standin::StandInBinding>,
+    ) -> (Option<String>, crate::domain::WorkUnit) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            // Two seats, full assurance: an aware run is never reduced (`LaunchStandIn::validate`).
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            false,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        let mut s = crate::domain::get_session(&store, sid)
+            .unwrap()
+            .expect("the plan wrote the run");
+        // What an aware launch persists (`LaunchStandIn::apply`), plus what dispatch recorded.
+        s.assurance = crate::standin::LaunchStandIn {
+            aware,
+            parties: Vec::new(),
+            consent: consent.then(|| crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+        }
+        .apply(s.assurance);
+        s.assurance.stand_ins = bindings;
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let review = crate::domain::QeReview {
+            outcome: outcome.into(),
+            reason: format!("the reviewer said {outcome}"),
+            evidence_dir: Some("/l/.wicked-qe/evidence/x".into()),
+            qe_run_id: Some("x".into()),
+            tree: Some("t".into()),
+            verdict: (outcome == "pass").then(|| "PASS".to_string()),
+            attempts,
+        };
+        let evidence = crate::workflow::UnitEvidence {
+            qe_review: Some(review),
+            ..Default::default()
+        };
+        let output = crate::workflow::stub_output(&units[0]);
+        let outcome = apply_and_finish_unit(
+            &mut store,
+            &mut units[0],
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            0,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |_e| {},
+            None,
+        )
+        .expect("apply");
+        let persisted = crate::domain::session_units(&store, sid).unwrap()[0].clone();
+        (outcome.denial.map(|d| d.source), persisted)
+    }
+
+    fn qe_attempt(seat: &str, status: &str) -> crate::domain::QeReviewAttempt {
+        crate::domain::QeReviewAttempt {
+            seat: seat.into(),
+            basis: "stand_in".into(),
+            same_cli: false,
+            status: status.into(),
+            session: String::new(),
+            governed: false,
+            tool_activity: false,
+            attempt: 0,
+        }
+    }
+
+    /// T-R11 (DES-STANDIN-001 §3.8, §3.10): on a stand-in-aware run with no consent, a QE review
+    /// no seat could take (none admitted, or every one failed as a seat) is the `stand_in_needed`
+    /// hold, because the run's signed-in helper could stand in. Without awareness, or with
+    /// consent already given, it stays today's `qe_reviewer_unavailable`.
+    #[test]
+    fn t_r11_a_qe_review_with_no_reviewer_holds_for_a_stand_in_on_an_aware_run() {
+        let pid = std::process::id();
+        let (source, _) = fold_qe_review_aware(
+            &format!("tr11-hold-{pid}"),
+            true,
+            false,
+            "unavailable",
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(source.as_deref(), Some("stand_in_needed"));
+        let lost = vec![qe_attempt("a", "seat_failure:quota")];
+        let (source, _) = fold_qe_review_aware(
+            &format!("tr11-lost-{pid}"),
+            true,
+            false,
+            "unavailable",
+            lost,
+            Vec::new(),
+        );
+        assert_eq!(source.as_deref(), Some("stand_in_needed"));
+        // Controls: an unaware run, and a consented one, keep the operator's judgment gate.
+        let (source, _) = fold_qe_review_aware(
+            &format!("tr11-unaware-{pid}"),
+            false,
+            false,
+            "unavailable",
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(source.as_deref(), Some("qe_reviewer_unavailable"));
+        let (source, _) = fold_qe_review_aware(
+            &format!("tr11-consent-{pid}"),
+            true,
+            true,
+            "unavailable",
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(source.as_deref(), Some("qe_reviewer_unavailable"));
+    }
+
+    /// T-R11 (DES-STANDIN-001 §5.1): the gate receipt of an aware run names the QE reviewer's role:
+    /// `stand_in` (answered) for the binding the run recorded, `real` for a roster seat, `none` for
+    /// a `~` key the run never recorded (fail closed).
+    #[test]
+    fn t_r11_the_receipt_records_the_qe_reviewer_role() {
+        let pid = std::process::id();
+        let binding = crate::standin::StandInBinding {
+            key: "a~1".into(),
+            base: "a".into(),
+            role: crate::standin::Role::QeReviewer,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: Some(0),
+            attempt: Some(0),
+            subject: None,
+            evidence: None,
+            invocation: "i-1".into(),
+            reason: crate::standin::Reason::OnlyOneHelper { cli: "a".into() },
+            state: crate::standin::STATE_SEATED.into(),
+            display: Some("a".into()),
+        };
+        let qe_role = |u: &crate::domain::WorkUnit| {
+            u.assurance
+                .as_ref()
+                .and_then(|r| r.roles.as_ref())
+                .and_then(|roles| roles.iter().find(|r| r.role == "qe_reviewer").cloned())
+        };
+        let (source, u) = fold_qe_review_aware(
+            &format!("tr11-rec-standin-{pid}"),
+            true,
+            true,
+            "pass",
+            vec![qe_attempt("a~1", "verdict")],
+            vec![binding.clone()],
+        );
+        assert_eq!(source, None);
+        let role = qe_role(&u).expect("the QE reviewer's role is on the receipt");
+        assert_eq!(
+            (
+                role.filled.as_str(),
+                role.state.as_str(),
+                role.seat.as_deref()
+            ),
+            ("stand_in", "answered", Some("a~1"))
+        );
+        assert!(role
+            .stand_in
+            .is_some_and(|s| s.label.contains("stood in for the QE review")));
+        let receipt = u.assurance.as_ref().unwrap();
+        assert_eq!(receipt.independence.as_deref(), Some("stand_in"));
+        let (_, u) = fold_qe_review_aware(
+            &format!("tr11-rec-real-{pid}"),
+            true,
+            true,
+            "pass",
+            vec![qe_attempt("b", "verdict")],
+            vec![binding],
+        );
+        let role = qe_role(&u).expect("a real reviewer's role");
+        assert_eq!(
+            (role.filled.as_str(), role.seat.as_deref()),
+            ("real", Some("b"))
+        );
+        let (_, u) = fold_qe_review_aware(
+            &format!("tr11-rec-forged-{pid}"),
+            true,
+            true,
+            "pass",
+            vec![qe_attempt("a~9", "verdict")],
+            Vec::new(),
+        );
+        assert_eq!(qe_role(&u).map(|r| r.filled), Some("none".to_string()));
+        // An unaware run's receipt stays on the legacy path: no roles at all.
+        let (_, u) = fold_qe_review_aware(
+            &format!("tr11-rec-unaware-{pid}"),
+            false,
+            false,
+            "pass",
+            vec![qe_attempt("b", "verdict")],
+            Vec::new(),
+        );
+        assert!(u.assurance.as_ref().is_some_and(|r| r.roles.is_none()));
+    }
+
             };
             let evidence = crate::workflow::UnitEvidence {
                 worktree_guard: Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(
@@ -8045,6 +8287,7 @@ mod guarded_read_step_tests {
         let provider = format!("gate-fact-{}:443", uuid::Uuid::new_v4());
         let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "gate-fact-author");
         build.observed_providers = vec![provider.clone()];
+            qe: None,
         let review = unit(
             2,
             StageKind::Review,
@@ -8142,6 +8385,7 @@ mod denials_behind_tests {
         v.as_ref()
             .map(|v| v.iter().map(|d| d.source.as_str()).collect())
     }
+                qe: None,
     /// An attempt whose seat ran (a retry, a rework); [`floor_only`] is one whose seat did not.
     fn refresh(floor_carried: bool, tree: &str, judge: bool, qe: bool) -> FoldRefresh {
         FoldRefresh {

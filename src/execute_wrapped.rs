@@ -15330,6 +15330,146 @@ mod tests {
             "the worktree is never a writable root; got: {}",
             out.output
         );
+    /// (core#1881) A host-floor stand-in keeps no session in its base's home and reads no
+    /// auto-memory there: each CLI's own switch, before the prompt guard; any other CLI refused.
+    #[test]
+    fn a_host_stand_in_runs_with_its_clis_no_session_switches() {
+        use wicked_apps_core::spawn::SeatCli;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut claude = s(&["/opt/bin/claude", "-p", "--", "the prompt"]);
+        let env = host_stand_in_fresh(&mut claude, SeatCli::Claude).unwrap();
+        assert_eq!(
+            claude,
+            s(&[
+                "/opt/bin/claude",
+                "-p",
+                "--no-session-persistence",
+                "--",
+                "the prompt"
+            ])
+        );
+        assert_eq!(env, vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]);
+        // Applied twice (a template that states it): one flag, never two.
+        host_stand_in_fresh(&mut claude, SeatCli::Claude).unwrap();
+        assert_eq!(
+            claude
+                .iter()
+                .filter(|a| *a == "--no-session-persistence")
+                .count(),
+            1
+        );
+        let mut codex = s(&["/opt/bin/codex", "exec", "--", "the prompt"]);
+        assert!(host_stand_in_fresh(&mut codex, SeatCli::Codex)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            codex,
+            s(&["/opt/bin/codex", "exec", "--ephemeral", "--", "the prompt"])
+        );
+        let mut pi = s(&["/opt/bin/pi", "-p", "the prompt"]);
+        host_stand_in_fresh(&mut pi, SeatCli::Pi).unwrap();
+        assert_eq!(pi, s(&["/opt/bin/pi", "-p", "the prompt", "--no-session"]));
+        // codex outside `exec` has no `--ephemeral`: refused, never run sharing its stores.
+        let mut interactive = s(&["/opt/bin/codex", "the prompt"]);
+        assert!(host_stand_in_fresh(&mut interactive, SeatCli::Codex).is_err());
+        for cli in [
+            SeatCli::Copilot,
+            SeatCli::Opencode,
+            SeatCli::Agy,
+            SeatCli::Other,
+        ] {
+            let mut argv = s(&["/opt/bin/x", "the prompt"]);
+            let why = host_stand_in_fresh(&mut argv, cli).unwrap_err();
+            assert!(why.contains("container floor"), "{why}");
+            assert_eq!(argv, s(&["/opt/bin/x", "the prompt"]), "nothing added");
+        }
+    }
+
+    /// (core#1881) END-TO-END through `run_unit` on the host floor: a codex stand-in runs
+    /// `exec --ephemeral` on its base's home and the base's own turn does not; a copilot stand-in
+    /// is refused before it spawns.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_stand_in_unit_runs_ephemeral_and_its_base_does_not() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let _host = VarGuard::unset(crate::container_floor::SEAT_FLOOR_ENV);
+        let home = std::env::temp_dir().join(format!(
+            "wicked-host-stand-in-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = fake_cli(&dir, "codex");
+        let copilot = fake_cli(&dir, "copilot");
+        let run = |key: &str, invocation: String| {
+            let mut u = WorkUnit::pending("s:review", "s", 2, "review the work");
+            u.role = crate::workflow::PhaseRole::Evaluator;
+            u.assigned_cli = Some(key.to_string());
+            u.assigned_invocation = Some(invocation);
+            let input = StepInput {
+                base_commit: None,
+                run_id: "run-host-stand-in".to_string(),
+                unit_ix: 1,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            WrappedCliStepRunner::default().run_unit(&input)
+        };
+        let stand_in = run("codex~1", format!("{codex} exec {{PROMPT}}"));
+        assert_eq!(stand_in.status, StepStatus::Ok, "{}", stand_in.output);
+        assert!(
+            stand_in.output.contains("--ephemeral"),
+            "{}",
+            stand_in.output
+        );
+        let base = run("codex", format!("{codex} exec {{PROMPT}}"));
+        assert_eq!(base.status, StepStatus::Ok, "{}", base.output);
+        assert!(!base.output.contains("--ephemeral"), "{}", base.output);
+        let refused = run("copilot~1", format!("{copilot} -p {{PROMPT}}"));
+        assert_eq!(refused.status, StepStatus::Failed, "{}", refused.output);
+        assert!(
+            refused.output.contains("container floor"),
+            "{}",
+            refused.output
+        );
+        assert!(
+            !refused.output.contains("ARGV="),
+            "never spawned: {}",
+            refused.output
+        );
+        // The worker home holds the base's home only: no `~`-named directory.
+        let worker = home.join(".wicked-worker");
+        let mut tilde = Vec::new();
+        let mut stack = vec![worker.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().contains('~') {
+                    tilde.push(e.path());
+                }
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(e.path());
+                }
+            }
+        }
+        assert!(tilde.is_empty(), "{tilde:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
         // The prompt names the tree to run commands in, as the seat mounts it (resolved:
         // artifact-runs-fix, a `/var/folders` temp dir is `/private/var/folders` in the seat).
         assert!(
