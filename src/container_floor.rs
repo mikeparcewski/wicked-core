@@ -2713,9 +2713,16 @@ pub(crate) fn arm_noting(
         .or_else(|| wicked_apps_core::spawn::worker_home_base().ok());
     // The unit's mounts and the view of them, settled before any image or cluster work.
     let engine_k8s = state_home.as_ref().map(|h| h.join("k8s"));
+    // (core#1463 R2 F3) Each read path is resolved ONCE for the real build, the required-only
+    // build and the settle: a root spelled through a link that is retargeted mid-arm cannot
+    // resolve one way in one build and another way in the next.
+    let [read_resolved, required_resolved, optional_resolved] = resolve_once(
+        [read_roots, required_reads, optional],
+        crate::worker_sandbox::canon_lenient,
+    );
     let (mut mounts, mut argv) = unit_mounts(
         &spec,
-        read_roots,
+        &read_resolved,
         argv,
         prompt,
         read_view,
@@ -2729,14 +2736,14 @@ pub(crate) fn arm_noting(
     } else {
         let (required, _) = unit_mounts(
             &spec,
-            required_reads,
+            &required_resolved,
             argv_in,
             prompt,
             read_view,
             gateway_dir,
             engine_k8s.as_deref(),
         )?;
-        settle_optional(&mounts, &required, optional)
+        settle_optional(&mounts, &required, &optional_resolved)
     };
     // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
@@ -3372,6 +3379,23 @@ fn unit_mounts(
     cover_gateway_dir(&mut mounts, engine_k8s)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     Ok((mounts, argv))
+}
+
+/// (core#1463 R2 F3) `lists` with every distinct path resolved by `canon` exactly once, so a path
+/// named in several lists resolves the same in each. A path `canon` cannot resolve is dropped from
+/// every list (each consumer already skips one: a read root is not mounted, an optional root is
+/// not left out).
+pub(crate) fn resolve_once<const N: usize>(
+    lists: [&[PathBuf]; N],
+    mut canon: impl FnMut(&Path) -> Option<PathBuf>,
+) -> [Vec<PathBuf>; N] {
+    let mut seen: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    lists.map(|list| {
+        list.iter()
+            .filter_map(|p| seen.entry(p.clone()).or_insert_with(|| canon(p)).clone())
+            .collect()
+    })
 }
 
 /// (core#1463) The declared optional read roots that may be left out of a unit's copy-in, as the
@@ -7282,8 +7306,6 @@ esac
         assert!(!has(&["--bind-tcp", "3000"]));
     }
 
-    /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
-    /// container launch, never over a mask.
     /// (core#1463) An optional read root stays optional only when nothing the unit requires lies in
     /// it. Both builds are the real mount steps (`add_read_roots`, `mount_argv_paths`): the unit's
     /// mounts from every read root, and the required-only build, where nothing optional can absorb
@@ -7409,6 +7431,33 @@ esac
         );
     }
 
+    /// (core#1463 R2 F3) A path named in several read lists is resolved once: even when the link
+    /// it is spelled through answers differently on every lookup (retargeted mid-arm), each list
+    /// gets the same answer, so the builds and the settle agree on it.
+    #[test]
+    fn core_1463_a_read_path_resolves_once_for_every_build() {
+        let (link, other) = (PathBuf::from("/h/link"), PathBuf::from("/h/other"));
+        let mut calls = 0;
+        let [all, required, optional] = resolve_once(
+            [
+                &[link.clone(), other.clone()][..],
+                &[link.clone()][..],
+                &[link.clone(), PathBuf::from("/h/gone")][..],
+            ],
+            |p| {
+                calls += 1;
+                (p != Path::new("/h/gone")).then(|| PathBuf::from(format!("/t{calls}")))
+            },
+        );
+        assert_eq!(calls, 3, "one lookup per distinct path");
+        assert_eq!(all, [PathBuf::from("/t1"), PathBuf::from("/t2")]);
+        assert_eq!(required, [PathBuf::from("/t1")]);
+        // An unresolvable path is dropped (never optional), the resolved one is the same.
+        assert_eq!(optional, [PathBuf::from("/t1")]);
+    }
+
+    /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
+    /// container launch, never over a mask.
     #[test]
     fn read_roots_are_mounted_read_only_unless_covered_or_masked() {
         let base = tmp("rr");
