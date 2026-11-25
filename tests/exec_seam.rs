@@ -479,17 +479,31 @@ fn a_dispatched_but_uncompleted_task_re_runs_after_a_restart() {
             "the run reached Executing (a unit was dispatched)"
         );
         let bus = BusDb::open(&bus_db).unwrap();
-        // `Executing` is persisted before the dispatch's bus event is written, so wait for the event
-        // rather than read it once: on a slow runner (Windows CI) the single read raced it.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while bus.poll(TASK_DISPATCHED, 0, 100).unwrap().is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        // THROWAWAY REPRO (core#1935): how long after Executing does task.dispatched appear?
+        let t0 = Instant::now();
+        let mut first_read = None;
+        let mut polls = 0u32;
+        while Instant::now() < t0 + Duration::from_secs(15) {
+            let n = bus.poll(TASK_DISPATCHED, 0, 100).unwrap().len();
+            first_read.get_or_insert(n);
+            polls += 1;
+            if n > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            bus.poll(TASK_DISPATCHED, 0, 100).unwrap().len(),
-            1,
-            "exactly one task.dispatched (unit 0)"
-        );
+        let n = bus.poll(TASK_DISPATCHED, 0, 100).unwrap().len();
+        // Conditional so the code after it stays reachable (clippy -D warnings).
+        if polls < u32::MAX {
+            panic!(
+                "REPRO-1935 {}: first read {:?} events; {} event(s) after {} ms ({} polls)",
+                sys_label(),
+                first_read,
+                n,
+                t0.elapsed().as_millis(),
+                polls
+            );
+        }
         assert_eq!(
             bus.poll(TASK_COMPLETED, 0, 100).unwrap().len(),
             0,
@@ -1123,4 +1137,8 @@ fn live_output_streams_from_the_cli_runner_under_exec_mediation() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+fn sys_label() -> &'static str {
+    "estate-0.36.0"
 }
