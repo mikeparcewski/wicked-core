@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The stand-in gate's hold reads as a person's sentence** (core#1930 F7). On a stand-in-aware run with no
+  consent, a judge or a QE reviewer that no helper could be holds the run at `stand_in_needed`, and the gate
+  prompt shows the hold's reason as written. That reason began "the run requires QE acceptance (qe_acceptance)
+  and no helper …" (and "the run requires a judge (judge) …"): a lowercase sentence start and an engine token.
+  It now reads "The job needs a QE review of its evidence, and no helper that did not build the work can do it:
+  …" and "The job needs a judge, and no helper that did not build the work can be it: …". A QE hold an engine
+  already wrote in the old words stays the QE layer's (a run waiting at its gate across an upgrade).
+
 - **core-ts 0.15.50** — 2026-11-25 — patch release on the train-14 cut 0059bfc3, carrying 22 PRs since 0.15.49: #1890, #1895, #1899, #1898, #1900, #1896, #1897, #1901, #1894, #1908, #1911, #1910, #1917, #1918, #1923, #1907, #1914, #1929, #1931, #1932, #1934, #1935.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 
