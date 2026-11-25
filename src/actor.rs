@@ -13967,6 +13967,54 @@ fn dispatch_unit_with(
         } else {
             Vec::new()
         };
+        // (DES-STANDIN-001 §3.2, T-R11) No real seat can review the QE evidence: a consented,
+        // stand-in-aware run seats a stand-in reviewer, persisted on the run's contract and
+        // announced before the reviewer runs. A real seat always wins (only an empty list asks).
+        if stamped.qe_reviewer_seats.is_empty() && crate::qe_acceptance::review::applies(&stamped) {
+            let registry = crate::registry_roster();
+            let launch = launch_roster(&session)?;
+            let roster: Vec<crate::AgenticCli> = if launch.is_empty() {
+                session
+                    .clis
+                    .iter()
+                    .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
+                    .collect()
+            } else {
+                launch
+            };
+            if let Some((seat, binding)) = crate::qe_acceptance::review::stand_in_reviewer(
+                &session,
+                &units,
+                &stamped,
+                session.attempt,
+                &roster,
+                &registry,
+            ) {
+                if let Some(mut fresh) = crate::domain::get_session(store, run_id)? {
+                    if !fresh
+                        .assurance
+                        .stand_ins
+                        .iter()
+                        .any(|b| b.key == binding.key)
+                    {
+                        let display = binding.display().to_string();
+                        fresh.assurance.stand_ins.push(binding.clone());
+                        crate::standin::note_label(&mut fresh.assurance, &binding, &display);
+                        put_node(store, fresh.to_node())?;
+                        emit(
+                            subscribers,
+                            CoreEvent::StandInSeated {
+                                session: run_id.to_string(),
+                                ord: Some(unit.ord),
+                                label: crate::standin::label(&binding, &display),
+                                binding,
+                            },
+                        );
+                    }
+                }
+                stamped.qe_reviewer_seats = vec![seat];
+            }
+        }
         // (rig run 1d372696) What the run's own floor proved on the tree this QE unit starts on.
         // The tree is read FRESH here (xreview on #1211): the baseline is kept across a
         // restart's redispatch, so it may not be the tree this attempt starts on. No reading, no note.
@@ -20450,6 +20498,18 @@ pub(crate) fn confirm_gate_expecting(
                 grant,
                 actor.as_deref(),
             )? {
+                // (T-R11) A QE unit held for its reviewer: the unit runs again, and its dispatch
+                // seats the reviewer (a real helper first, else the stand-in the grant allows).
+                stand_in_gate::Answered::Run
+                    if crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .is_some_and(stand_in_gate::qe_reviewer_held) =>
+                {
+                    crate::workflow::HumanDecision::Approve {
+                        amend: None,
+                        amend_scope: crate::workflow::AmendScope::Cursor,
+                    }
+                }
                 // (T-R12) A check held after its seat ran (a missing judge): only the judge runs
                 // again, on the reviewed attempt's output and tree; no seat is re-dispatched.
                 stand_in_gate::Answered::Run

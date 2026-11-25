@@ -2051,6 +2051,33 @@ pub(crate) fn apply_and_finish_unit(
         .as_ref()
         .and_then(crate::qe_acceptance::review::denial)
     {
+        // (DES-STANDIN-001 §3.8, §3.10, T-R11) On a stand-in-aware run with no consent, a QE
+        // reviewer that no seat could be (none admitted, or every one failed as a seat) is the
+        // `stand_in_needed` hold when a signed-in base could stand in, never the operator's
+        // judgment. Same rank as `unavailable`: no verdict on the work.
+        Some(d)
+            if d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
+                && run_session.as_ref().is_some_and(|s| {
+                    let units =
+                        crate::domain::session_units(&*store, session_id).unwrap_or_default();
+                    evidence.qe_review.as_ref().is_some_and(|r| {
+                        crate::qe_acceptance::review::stand_in_hold(s, &units, unit, r)
+                    })
+                }) =>
+        {
+            (
+                Some(crate::domain::UnitDenial::new(
+                    crate::standin::DENIAL_SOURCE_STAND_IN_NEEDED,
+                    format!(
+                        "the run requires QE acceptance ({}) and no helper that did not build the \
+                         work can review its evidence: {}",
+                        crate::assurance::QE_ACCEPTANCE,
+                        d.reason
+                    ),
+                )),
+                None,
+            )
+        }
         // (j4-gates) …and so does `inconclusive` (the reviewer could not run its checks): no verdict
         // on the work, so it never outranks a layer that gave one.
         Some(d) if crate::qe_acceptance::review::could_not_judge(&d) => (Some(d), None),
@@ -2492,6 +2519,7 @@ pub(crate) fn apply_and_finish_unit(
             eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
             eval_error: eval_error.as_deref(),
             tree: evidence.verified_tree.clone(),
+            qe: evidence.qe_review.as_ref(),
         },
     );
     let mut receipt = receipt;
@@ -3926,6 +3954,9 @@ struct GateFacts<'a> {
     eval_ran: bool,
     eval_error: Option<&'a str>,
     tree: Option<String>,
+    /// (DES-STANDIN-001 §5.1, T-R11) The isolated QE reviewer's record at this gate, when the unit
+    /// took one: on a stand-in-aware run its seat is the `qe_reviewer` role.
+    qe: Option<&'a crate::domain::QeReview>,
 }
 
 /// (core#1799) Why the engine's judge did not run at `unit`'s gate, as the receipt says it: the
@@ -4282,6 +4313,31 @@ fn gate_receipt(
         r.ran(a::EVALUATOR_PASS);
     } else if let Some(e) = f.eval_error {
         r.skip(a::EVALUATOR_PASS, a::SKIP_ERROR, Some(e.to_string()));
+    }
+    // (DES-STANDIN-001 §5.1, T-R11) The isolated QE reviewer: the seat whose turn bound the verdict,
+    // real or a stand-in this run recorded; nobody when no turn reached a verdict. A `~` key the
+    // run never recorded is no reviewer (fail closed), as for the judge.
+    if let (Some(roles), Some(q)) = (roles.as_mut(), f.qe) {
+        let seat = q
+            .attempts
+            .iter()
+            .rev()
+            .find(|t| t.status == "verdict")
+            .map(|t| t.seat.as_str());
+        roles.push(match seat {
+            Some(k) => match crate::standin::binding_for(run, Some(k)) {
+                Some(b) => {
+                    let mut answered = b.clone();
+                    answered.state = crate::standin::STATE_ANSWERED.to_string();
+                    a::RoleRecord::stand_in(&answered, answered.display())
+                }
+                None if wicked_apps_core::spawn::seat_id::is_stand_in(k) => {
+                    a::RoleRecord::none(crate::standin::Role::QeReviewer, unit.ord, attempt)
+                }
+                None => a::RoleRecord::real(crate::standin::Role::QeReviewer, k, unit.ord, attempt),
+            },
+            None => a::RoleRecord::none(crate::standin::Role::QeReviewer, unit.ord, attempt),
+        });
     }
     if let Some(roles) = roles {
         r.independence = a::independence_of(&roles);
@@ -7038,62 +7094,6 @@ mod judge_bench_tests {
         )
     }
 
-    /// (codex/agy review on #1135) A guarded read step whose edit STAYS in the tree (the guard could
-    /// not restore it) authored that edit: the fold stamps its seat and binaries at once, so a later
-    /// reassign cannot erase the only reference to it. A restored edit stamps nothing.
-    #[test]
-    fn a_kept_guarded_edit_stamps_its_author_at_the_fold_a_restored_one_does_not() {
-        for restored in [false, true] {
-            let sid = format!("kept-guarded-{restored}-{}", std::process::id());
-            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
-            let mut sink = |_e: CoreEvent| {};
-            let Planned {
-                mut units,
-                workflow_id,
-                cli_keys,
-                ..
-            } = plan_and_distribute(
-                &mut store,
-                &[cli("a")],
-                "Do step one.",
-                EntityMode::Shared,
-                &sid,
-                crate::domain::HumanConfirm::None,
-                false,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-                None,
-                None,
-                &mut sink,
-                None,
-                false,
-                false,
-                Vec::new(),
-                None,
-                true,
-                &crate::assurance::QeOverride::Auto,
-            )
-            .expect("plan");
-            let mut session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
-            session.workdir = Some("/nonexistent/wt".into());
-            crate::domain::put_node(&mut store, session.to_node()).unwrap();
-            let u = &mut units[0];
-            u.stage = crate::domain::StageKind::Recon;
-            u.role = crate::workflow::PhaseRole::Neutral;
-            u.executes_code = false;
-            u.worktree_guarded = true;
-            u.assigned_cli = Some("codex".into());
-            u.authored_by.clear();
-            u.authored_binaries.clear();
-            let snap = |tree: &str| crate::worktree_guard::WorktreeSnapshot {
-                head: "h".into(),
-                head_ref: None,
-                tree: tree.into(),
-                taken_at_ms: 0,
-                git_dir: None,
     /// (DES-STANDIN-001 T-R11) The fold of a QE reviewer record on a STAND-IN-AWARE run (roster
     /// `a`, the run's contract as an aware launch persists it), with or without consent and with
     /// any bindings the dispatch recorded: the winning denial source and the persisted unit.
@@ -7336,6 +7336,62 @@ mod judge_bench_tests {
         assert!(u.assurance.as_ref().is_some_and(|r| r.roles.is_none()));
     }
 
+    /// (codex/agy review on #1135) A guarded read step whose edit STAYS in the tree (the guard could
+    /// not restore it) authored that edit: the fold stamps its seat and binaries at once, so a later
+    /// reassign cannot erase the only reference to it. A restored edit stamps nothing.
+    #[test]
+    fn a_kept_guarded_edit_stamps_its_author_at_the_fold_a_restored_one_does_not() {
+        for restored in [false, true] {
+            let sid = format!("kept-guarded-{restored}-{}", std::process::id());
+            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+            let mut sink = |_e: CoreEvent| {};
+            let Planned {
+                mut units,
+                workflow_id,
+                cli_keys,
+                ..
+            } = plan_and_distribute(
+                &mut store,
+                &[cli("a")],
+                "Do step one.",
+                EntityMode::Shared,
+                &sid,
+                crate::domain::HumanConfirm::None,
+                false,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                &mut sink,
+                None,
+                false,
+                false,
+                Vec::new(),
+                None,
+                true,
+                &crate::assurance::QeOverride::Auto,
+            )
+            .expect("plan");
+            let mut session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
+            session.workdir = Some("/nonexistent/wt".into());
+            crate::domain::put_node(&mut store, session.to_node()).unwrap();
+            let u = &mut units[0];
+            u.stage = crate::domain::StageKind::Recon;
+            u.role = crate::workflow::PhaseRole::Neutral;
+            u.executes_code = false;
+            u.worktree_guarded = true;
+            u.assigned_cli = Some("codex".into());
+            u.authored_by.clear();
+            u.authored_binaries.clear();
+            let snap = |tree: &str| crate::worktree_guard::WorktreeSnapshot {
+                head: "h".into(),
+                head_ref: None,
+                tree: tree.into(),
+                taken_at_ms: 0,
+                git_dir: None,
             };
             let evidence = crate::workflow::UnitEvidence {
                 worktree_guard: Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(
@@ -8231,6 +8287,7 @@ mod guarded_read_step_tests {
             rules: None,
             eval_ran: false,
             eval_error: None,
+            qe: None,
             tree: None,
         };
         let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&verdict)));
@@ -8287,7 +8344,6 @@ mod guarded_read_step_tests {
         let provider = format!("gate-fact-{}:443", uuid::Uuid::new_v4());
         let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "gate-fact-author");
         build.observed_providers = vec![provider.clone()];
-            qe: None,
         let review = unit(
             2,
             StageKind::Review,
@@ -8329,6 +8385,7 @@ mod guarded_read_step_tests {
                 rules: None,
                 eval_ran: false,
                 eval_error: None,
+                qe: None,
                 tree: None,
             },
         );
@@ -8385,7 +8442,6 @@ mod denials_behind_tests {
         v.as_ref()
             .map(|v| v.iter().map(|d| d.source.as_str()).collect())
     }
-                qe: None,
     /// An attempt whose seat ran (a retry, a rework); [`floor_only`] is one whose seat did not.
     fn refresh(floor_carried: bool, tree: &str, judge: bool, qe: bool) -> FoldRefresh {
         FoldRefresh {

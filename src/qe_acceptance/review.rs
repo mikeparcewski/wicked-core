@@ -48,6 +48,9 @@ const INCONCLUSIVE_WHAT_MAX: usize = 300;
 pub(crate) const BASIS_DISTINCT: &str = "distinct";
 pub(crate) const BASIS_EXECUTOR: &str = "executor_seat";
 pub(crate) const BASIS_REDUCED: &str = "reduced_assurance_creator";
+/// (DES-STANDIN-001 §3.2, T-R11) A stand-in reviewer: a fresh session on a signed-in base that
+/// built the work, seated only on a stand-in-aware, consented run with no real reviewer seat.
+pub(crate) const BASIS_STAND_IN: &str = "stand_in";
 
 /// The fold's denial source for a reviewer `fail` / `invalid` (class `verdict_not_pass`).
 pub(crate) const DENIAL_SOURCE_QE_REVIEW: &str = "qe_review";
@@ -367,9 +370,22 @@ pub(crate) fn reviewer_input(
              their absence from the evidence is not a gap.",
         );
     }
+    // (DES-STANDIN-001 §3.4) A stand-in reviewer's turn opens with the stand-in preface. The turn
+    // is already fresh (no prior outputs but the engine's own records), so the preface is all
+    // it adds.
+    let mut prior_outputs = engine_records;
+    if wicked_apps_core::spawn::seat_id::is_stand_in(&seat.seat) {
+        prior_outputs.insert(
+            0,
+            crate::workflow::PriorUnitOutput {
+                label: crate::standin::PREFACE_LABEL.to_string(),
+                output: crate::standin::preface(None),
+            },
+        );
+    }
     StepInput {
         unit,
-        prior_outputs: engine_records,
+        prior_outputs,
         ..input.clone()
     }
 }
@@ -410,36 +426,8 @@ pub(crate) fn candidates(
         }
     }
     let providers = crate::pipeline::work_author_providers(units, unit.ord);
-    let excluded = |k: &str| qe_seat_excluded(k, &session.exclude_seats);
-    // (codex r1 on the code) The launch roster's template for a seat, read off a unit the roster
-    // seated there — what the reviewer turn will actually run, and what admission judges.
-    let invocation = |k: &str| -> Option<String> {
-        if unit.assigned_cli.as_deref() == Some(k) {
-            return unit.assigned_invocation.clone();
-        }
-        units
-            .iter()
-            .filter(|u| u.assigned_cli.as_deref() == Some(k))
-            .find_map(|u| u.assigned_invocation.clone())
-    };
-    let shape = reviewer_unit(
-        unit,
-        &QeReviewerSeat {
-            seat: String::new(),
-            basis: String::new(),
-            same_cli: false,
-            invocation: None,
-        },
-        "",
-        None,
-    );
-    let pool: Vec<&String> = session
-        .clis
-        .iter()
-        .filter(|k| !session.benched_seats.iter().any(|b| &b.cli == *k))
-        .filter(|k| !excluded(k))
-        .filter(|k| crate::distribute::seat_admits_unit(&shape, k, invocation(k)))
-        .collect();
+    let invocation = |k: &str| seat_invocation(units, unit, k);
+    let pool = reviewer_pool(session, units, unit);
     let is_author = |k: &str| qe_seat_authored(k, None, &authors, &providers);
     let same_cli = |k: &str| authors.iter().any(|a| a != k && seat_key(a) == seat_key(k));
     let executor = unit.assigned_cli.as_deref();
@@ -471,6 +459,158 @@ pub(crate) fn candidates(
         }
     }
     out
+}
+
+/// (codex r1 on the code) The launch roster's template for a seat, read off a unit the roster
+/// seated there — what the reviewer turn will actually run, and what admission judges.
+fn seat_invocation(units: &[WorkUnit], unit: &WorkUnit, k: &str) -> Option<String> {
+    if unit.assigned_cli.as_deref() == Some(k) {
+        return unit.assigned_invocation.clone();
+    }
+    units
+        .iter()
+        .filter(|u| u.assigned_cli.as_deref() == Some(k))
+        .find_map(|u| u.assigned_invocation.clone())
+}
+
+/// The reviewer's absolute admission, before the author fence: the run's own seats that are not
+/// benched, not launch-excluded, and whose skills admit the reviewer, in roster order.
+fn reviewer_pool<'a>(
+    session: &'a AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+) -> Vec<&'a String> {
+    let shape = reviewer_unit(
+        unit,
+        &QeReviewerSeat {
+            seat: String::new(),
+            basis: String::new(),
+            same_cli: false,
+            invocation: None,
+        },
+        "",
+        None,
+    );
+    session
+        .clis
+        .iter()
+        .filter(|k| !session.benched_seats.iter().any(|b| &b.cli == *k))
+        .filter(|k| !qe_seat_excluded(k, &session.exclude_seats))
+        .filter(|k| crate::distribute::seat_admits_unit(&shape, k, seat_invocation(units, unit, k)))
+        .collect()
+}
+
+/// (DES-STANDIN-001 §3.2, T-R11) The credentials a stand-in QE reviewer may run on: every seat the
+/// reviewer's absolute admission keeps (not benched, not launch-excluded, admitting the QE skill),
+/// by its credential, the QE executor's first. Only the author fence made them short, and a
+/// stand-in is never a real reviewer. Empty unless the run is stand-in-aware and not reduced, and
+/// on an Apps publish (its QE stand-in path is C3b's).
+pub(crate) fn stand_in_bases(
+    session: &AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+) -> Vec<String> {
+    use wicked_apps_core::spawn::seat_id;
+    if !crate::standin::active(&session.assurance)
+        || session.assurance.reduced()
+        || crate::apps::is_publish(session)
+    {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for k in reviewer_pool(session, units, unit) {
+        if seat_id::is_stand_in(k) {
+            continue;
+        }
+        let c = seat_id::credential(k).to_string();
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    let executor = unit.assigned_cli.as_deref().map(seat_id::credential);
+    out.sort_by_key(|c| Some(c.as_str()) != executor);
+    out
+}
+
+/// (DES-STANDIN-001 §3.2, T-R11) The stand-in QE reviewer for a unit no real seat can review: a
+/// binding on [`stand_in_bases`]' first credential, with its base's exact invocation
+/// ([`crate::standin::resolve`]). `None` without consent, with no base, or when no record resolves
+/// the base (fail closed). The caller persists the binding before the reviewer runs. A binding
+/// this unit's attempt already holds is reused, so stamping the same attempt twice never mints a
+/// second one.
+pub(crate) fn stand_in_reviewer(
+    session: &AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+    attempt: u32,
+    roster: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+) -> Option<(QeReviewerSeat, crate::standin::StandInBinding)> {
+    use crate::standin as si;
+    let run = &session.assurance;
+    let consent = run.stand_in.as_ref()?;
+    let bases = stand_in_bases(session, units, unit);
+    let base = bases.first()?.clone();
+    let held = run.stand_ins.iter().find(|b| {
+        b.role == si::Role::QeReviewer && b.ord == Some(unit.ord) && b.attempt == Some(attempt)
+    });
+    let binding = match held {
+        Some(b) => b.clone(),
+        None => {
+            let reason = si::reason_from_run(roster, &session.clis, &session.benched_seats, &base);
+            match si::fill(si::FillRequest {
+                role: si::Role::QeReviewer,
+                need: 1,
+                real: Vec::new(),
+                bases,
+                builder_model: None,
+                consent: Some(consent),
+                reason,
+                scope: si::BindingScope {
+                    ord: Some(unit.ord),
+                    attempt: Some(attempt),
+                    ..Default::default()
+                },
+                taken: &run.stand_ins,
+            }) {
+                si::Fill::Seats { stand_ins, .. } => {
+                    let mut b = stand_ins.into_iter().next()?;
+                    b.display = Some(si::display_name(roster, &b.base));
+                    b
+                }
+                si::Fill::NeedConsent(_) | si::Fill::NoUsableBase(..) => return None,
+            }
+        }
+    };
+    let invocation = si::resolve(roster, registry, &binding.key)?;
+    Some((
+        QeReviewerSeat {
+            seat: binding.key.clone(),
+            basis: BASIS_STAND_IN.to_string(),
+            same_cli: false,
+            invocation: Some(invocation),
+        },
+        binding,
+    ))
+}
+
+/// (DES-STANDIN-001 §3.8, §3.10) Whether a QE reviewer record is the `stand_in_needed` hold: on a
+/// stand-in-aware run with no consent, no reviewer could review (no seat was admitted, or every one
+/// failed as a seat), and a signed-in base could stand in. A grant there re-dispatches the QE unit,
+/// which then seats the stand-in.
+pub(crate) fn stand_in_hold(
+    session: &AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+    review: &QeReview,
+) -> bool {
+    session.assurance.stand_in.is_none()
+        && review.outcome == OUTCOME_UNAVAILABLE
+        && review
+            .attempts
+            .iter()
+            .all(|a| a.status.starts_with("seat_failure:"))
+        && !stand_in_bases(session, units, unit).is_empty()
 }
 
 /// The LAST `QE-EVIDENCE:` line's path (decoration — bullets, emphasis, code ticks — tolerated).

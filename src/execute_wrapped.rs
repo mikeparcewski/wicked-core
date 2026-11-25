@@ -3963,6 +3963,25 @@ impl WrappedCliStepRunner {
         if seat_cli == wicked_apps_core::spawn::SeatCli::Codex {
             apply_seat_posture(&mut argv, &codex_shell_pins());
         }
+        // (DES-STANDIN-001 §3.4, core#1881) A stand-in on the HOST floor runs in its base's CLI
+        // home, where the base's credential lives: it keeps no session there and reads no
+        // auto-memory its base's builder turns wrote (a container stand-in has a home of its own,
+        // `seat_home_leaf`). A CLI with no such switch is refused, never run sharing the stores.
+        let host_stand_in_env = if wicked_apps_core::spawn::seat_id::is_stand_in(&cli_key)
+            && !uses_container_seat(runs_in_seat(input), container)
+        {
+            match host_stand_in_fresh(&mut argv, seat_cli) {
+                Ok(env) => env,
+                Err(why) => {
+                    return StepOutput {
+                        output: format!("(the stand-in's launch was refused: {why})"),
+                        ..posture_refusal(input, &why)
+                    }
+                }
+            }
+        } else {
+            Vec::new()
+        };
         if input.governance.is_some() && !ask_enabled {
             eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
@@ -4705,6 +4724,10 @@ impl WrappedCliStepRunner {
             // delivery and applied here AFTER `hardened()`: this seat's own configuration-home
             // variable set, every foreign one stripped, the inherit hatch touching nothing.
             seat_config.apply(&mut cmd);
+            // (core#1881) A host-floor stand-in's no-memory switch, after the seat's own variables.
+            for (k, v) in &host_stand_in_env {
+                cmd.env(k, v);
+            }
             // The env half of the claude unit's `CLAUDE.md` (its tree rides `--add-dir`, see
             // `inject_isolation_flags`): claude reads an additional directory's instruction files
             // only with this set. Never on a team member turn: its additional directory is the
@@ -7575,6 +7598,58 @@ pub(crate) fn apply_no_code_posture(
 /// the Debian seat image sets PATH for a non-root user to a fixed list, dropping every entry the
 /// carrier handed (measured on @openai/codex 0.162.1 in the seat image: a bare `wicked-garden`
 /// was "command not found" with the pin off and resolved from `<snapshot>/scripts` with it on).
+/// (core#1881) Claude Code's switch that turns its auto-memory off, reads and writes alike.
+pub(crate) const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
+/// (DES-STANDIN-001 §3.4, core#1881) A HOST-floor stand-in shares its base's CLI home: the
+/// credential lives there (claude's keychain entry is even keyed by its config dir), so the home
+/// cannot move. What must not be shared is what the base's builder turns left there: the session
+/// store and the auto-memory. Each CLI's own switch keeps the stand-in out of both, and the
+/// credential is untouched, so the base stays signed in:
+/// - claude: `--no-session-persistence` (nothing saved, nothing to resume) and auto-memory off
+///   ([`CLAUDE_DISABLE_AUTO_MEMORY_ENV`]); it never resumes (core#1863);
+/// - codex: `exec --ephemeral` (no session files);
+/// - pi: `--no-session`.
+///
+/// Returns the environment to set. Any other CLI, or a codex template that is not `exec`, is
+/// refused: no switch is known to keep it out of its base's stores.
+pub(crate) fn host_stand_in_fresh(
+    argv: &mut Vec<String>,
+    cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    let flags: &[&str] = match cli {
+        SeatCli::Claude => &["--no-session-persistence"],
+        SeatCli::Codex
+            if argv
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .is_some_and(|a| a == "exec") =>
+        {
+            &["--ephemeral"]
+        }
+        SeatCli::Pi => &["--no-session"],
+        other => {
+            return Err(format!(
+                "a stand-in on {other:?} would run in its base's home on the host floor and \
+                 could read the session store its base's builder left there; it runs only in a \
+                 seat container (the container floor)"
+            ));
+        }
+    };
+    let flags: Vec<String> = flags
+        .iter()
+        .filter(|f| !argv.iter().any(|a| a == *f))
+        .map(|f| f.to_string())
+        .collect();
+    apply_seat_posture(argv, &flags);
+    Ok(match cli {
+        SeatCli::Claude => vec![(CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")],
+        _ => Vec::new(),
+    })
+}
+
 fn codex_shell_pins() -> Vec<String> {
     vec!["-c".to_string(), "allow_login_shell=false".to_string()]
 }
@@ -15255,81 +15330,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// END-TO-END through `run_unit`: a unit whose phase declared `executes_code: false` on a
-    /// binary whose stem is `codex` — the argv must carry the check-scratch shape (core#503) and
-    /// NOT the worktree-rooted workspace-write posture the code phases get. The fixture is an executable named `codex`
-    /// because recognition reads the resolved binary, never the seat key.
-    #[cfg(unix)]
-    #[test]
-    fn governed_worker_argv_for_a_codex_binary_on_a_no_code_phase_is_read_only() {
-        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
-        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
-        let home = std::env::temp_dir().join(format!(
-            "wicked-ro-posture-home-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        let _home = HomeGuard::pin(&home);
-        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
-
-        let dir = home.join("wt");
-        std::fs::create_dir_all(&dir).unwrap();
-        let codex = fake_cli(&dir, "codex");
-
-        let mut u = WorkUnit::pending("s:verify", "s", 4, "verify the fix");
-        u.assigned_cli = Some("codex".to_string()); // the seat's posture: workspace-write
-        u.assigned_invocation = Some(format!("{codex} exec {{PROMPT}}"));
-        u.worktree_guarded = true; // the def said `executes_code: false`
-        let input = StepInput {
-            base_commit: None,
-            run_id: "run-ro-posture".to_string(),
-            unit_ix: 3,
-            attempt: 0,
-            unit: u,
-            workflow_id: "wf-x".to_string(),
-            entity_mode: crate::scope::EntityMode::Shared,
-            workdir: Some(dir.clone()),
-            governance: None,
-            prior_outputs: vec![],
-            elicitation_epoch: 0,
-            process_gen: None,
-            launch_seq: 0,
-            required_skills: Vec::new(),
-        };
-        let out = WrappedCliStepRunner::default().run_unit(&input);
-        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        // core#503 (operator ruling): codex's workspace-write sandbox ROOTED AT THE CHECK SCRATCH
-        // under the worker home, with the network open — and never the worktree as a root, so the
-        // kernel keeps denying writes to it.
-        let parent = home
-            .join(".wicked-worker")
-            .join("checks")
-            .join("run-ro-posture");
-        assert!(
-            out.output.contains(&format!(
-                "--sandbox workspace-write -C {}/4-a0-",
-                parent.display()
-            )),
-            "a no-code phase on codex runs its checks in the scratch; got: {}",
-            out.output
-        );
-        assert!(
-            out.output
-                .contains("sandbox_workspace_write.network_access=true"),
-            "the network is open for the checks; got: {}",
-            out.output
-        );
-        assert!(
-            !out.output.contains(&format!("-C {}", dir.display()))
-                && !out.output.contains(&format!("--add-dir {}", dir.display()))
-                && !out.output.contains("--sandbox read-only")
-                && !out.output.contains("--sandbox=read-only")
-                && !out.output.contains("dangerously-bypass"),
-            "the worktree is never a writable root; got: {}",
-            out.output
-        );
     /// (core#1881) A host-floor stand-in keeps no session in its base's home and reads no
     /// auto-memory there: each CLI's own switch, before the prompt guard; any other CLI refused.
     #[test]
@@ -15470,6 +15470,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// END-TO-END through `run_unit`: a unit whose phase declared `executes_code: false` on a
+    /// binary whose stem is `codex` — the argv must carry the check-scratch shape (core#503) and
+    /// NOT the worktree-rooted workspace-write posture the code phases get. The fixture is an executable named `codex`
+    /// because recognition reads the resolved binary, never the seat key.
+    #[cfg(unix)]
+    #[test]
+    fn governed_worker_argv_for_a_codex_binary_on_a_no_code_phase_is_read_only() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let home = std::env::temp_dir().join(format!(
+            "wicked-ro-posture-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
+
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = fake_cli(&dir, "codex");
+
+        let mut u = WorkUnit::pending("s:verify", "s", 4, "verify the fix");
+        u.assigned_cli = Some("codex".to_string()); // the seat's posture: workspace-write
+        u.assigned_invocation = Some(format!("{codex} exec {{PROMPT}}"));
+        u.worktree_guarded = true; // the def said `executes_code: false`
+        let input = StepInput {
+            base_commit: None,
+            run_id: "run-ro-posture".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        // core#503 (operator ruling): codex's workspace-write sandbox ROOTED AT THE CHECK SCRATCH
+        // under the worker home, with the network open — and never the worktree as a root, so the
+        // kernel keeps denying writes to it.
+        let parent = home
+            .join(".wicked-worker")
+            .join("checks")
+            .join("run-ro-posture");
+        assert!(
+            out.output.contains(&format!(
+                "--sandbox workspace-write -C {}/4-a0-",
+                parent.display()
+            )),
+            "a no-code phase on codex runs its checks in the scratch; got: {}",
+            out.output
+        );
+        assert!(
+            out.output
+                .contains("sandbox_workspace_write.network_access=true"),
+            "the network is open for the checks; got: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains(&format!("-C {}", dir.display()))
+                && !out.output.contains(&format!("--add-dir {}", dir.display()))
+                && !out.output.contains("--sandbox read-only")
+                && !out.output.contains("--sandbox=read-only")
+                && !out.output.contains("dangerously-bypass"),
+            "the worktree is never a writable root; got: {}",
+            out.output
+        );
         // The prompt names the tree to run commands in, as the seat mounts it (resolved:
         // artifact-runs-fix, a `/var/folders` temp dir is `/private/var/folders` in the seat).
         assert!(
