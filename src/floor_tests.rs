@@ -2632,7 +2632,7 @@ fn a_head_that_changes_a_derived_from_file_cannot_use_the_guide() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// Exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`): a red base and a failing head escalate as
+/// Exclusion turned OFF (`WICKED_FLOOR_EXCLUDE=off`): a red base and a failing head escalate as
 /// `base_red_unseparated`, saying so, and neither the base's list, a one-test run, nor a
 /// deselected head run is executed. The guide still names the check and is still checked.
 #[cfg(unix)]

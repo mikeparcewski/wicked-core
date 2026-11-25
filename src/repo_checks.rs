@@ -9043,10 +9043,12 @@ pub(crate) fn parse_results(
     }
 }
 
-/// The operator's switch for excluding a red base's own failures: `on` / `1` enables it; anything
-/// else, or unset, leaves it OFF — a red base then escalates as `base_red_unseparated` with both
-/// logs (the operator's floor override is the path through), and neither the base's list nor any
-/// one-test run, nor a deselected head run, is executed. A usable guide still names the checks.
+/// The operator's switch for excluding a red base's own failures. ON by default (core#1101 item 3,
+/// operator decision 2026-11-25): unset, `on` or `1`. `off` or `0` turns it OFF, and so does any
+/// other value (a typo fails toward escalating, never toward excluding): a red base then escalates
+/// as `base_red_unseparated` with both logs (the operator's floor override is the path through),
+/// and neither the base's list nor any one-test run, nor a deselected head run, is executed. A
+/// usable guide still names the checks.
 pub const FLOOR_EXCLUDE_ENV: &str = "WICKED_FLOOR_EXCLUDE";
 
 /// Is exclusion on ([`FLOOR_EXCLUDE_ENV`])? Read once per floor run.
@@ -9055,12 +9057,17 @@ pub(crate) fn exclusion_enabled() -> bool {
     if let Some(on) = test_seam::exclusion() {
         return on;
     }
-    exclusion_from(std::env::var(FLOOR_EXCLUDE_ENV).ok().as_deref())
+    match std::env::var(FLOOR_EXCLUDE_ENV) {
+        Ok(v) => exclusion_from(Some(&v)),
+        Err(std::env::VarError::NotPresent) => exclusion_from(None),
+        // Not Unicode: an unknown value, so off.
+        Err(std::env::VarError::NotUnicode(_)) => false,
+    }
 }
 
-/// The switch's value: exactly `on` or `1` (never trimmed, never case-folded) enables it.
+/// The switch's value: unset, or exactly `on` or `1` (never trimmed, never case-folded), is on.
 fn exclusion_from(value: Option<&str>) -> bool {
-    matches!(value, Some("on") | Some("1"))
+    matches!(value, None | Some("on") | Some("1"))
 }
 
 /// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
