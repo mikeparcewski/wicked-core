@@ -1234,7 +1234,11 @@ fn held_build_and_review(hc: &HumanConfirm) -> TeamPlanState {
         }),
     );
     let r = revise("r", &s, change, &["answer-1".into()], hc, Some(1), 0).unwrap();
-    assert!(matches!(r.outcome, Outcome::Held { .. }), "{}", describe(&r.outcome));
+    assert!(
+        matches!(r.outcome, Outcome::Held { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
     r.state
 }
 
@@ -1430,5 +1434,59 @@ fn a_gate_edit_reinstructs_a_held_review() {
         review.instructions.as_deref(),
         Some("Check the billing epic too.")
     );
-    assert_eq!(review.depends_on.as_deref(), Some(&["build".to_string()][..]));
+    assert_eq!(
+        review.depends_on.as_deref(),
+        Some(&["build".to_string()][..])
+    );
+}
+
+/// (core#1925) An amended plan carries the launch's declared deliverables on its last creator
+/// step, as `decide` does for an edit at the launch gate: a re-catalogued creator keeps them, and
+/// an edit that leaves no step to write them is refused.
+#[test]
+fn a_gate_edit_keeps_the_launch_deliverables_on_the_last_creator() {
+    let hc = HumanConfirm::None;
+    let mut held = held_build_and_review(&hc);
+    held.deliverables = vec!["docs/out.md".to_string()];
+    let edit = |build: serde_json::Value| {
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            build,
+            {"catalog":"review","id":"review"}
+        ]))
+    };
+    let r = revise(
+        "r",
+        &held,
+        edit(json!({"catalog":"produce","id":"build"})),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    assert_eq!(
+        accepted_step(&r, "build").required_deliverables.as_deref(),
+        Some(&["docs/out.md".to_string()][..])
+    );
+    let r = revise(
+        "r",
+        &held,
+        edit(json!({"catalog":"understand","id":"build"})),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    match &r.outcome {
+        Outcome::Refused { reason } => assert!(reason.contains("deliverables"), "{reason}"),
+        o => panic!("{}", describe(o)),
+    }
+    assert_eq!(r.state, held, "the run keeps its plan");
 }

@@ -13692,6 +13692,17 @@ fn dispatch_unit_with(
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
     }
+    // (core#1925) …and the accepted plan revision it is dispatched under (a team run's; a run
+    // with no team plan has none).
+    let plan_rev = session
+        .team_plan
+        .as_ref()
+        .map(|t| t.accepted_rev)
+        .filter(|r| *r > 0);
+    let plan_rev_changed = plan_rev.is_some() && unit.plan_rev != plan_rev;
+    if plan_rev_changed {
+        unit.plan_rev = plan_rev;
+    }
     // DES-TEAMING-002 P1: a team unit of an un-teamed run carries `transport: none` in its
     // snapshot BEFORE its turn starts — stamped from the run's persisted state, never the worker.
     let team_snapshot = team_gate::unit_snapshot(&session, &unit);
@@ -13805,6 +13816,7 @@ fn dispatch_unit_with(
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
+        || plan_rev_changed
         || advice_scope_changed
         || team_changed
     {
@@ -19411,7 +19423,21 @@ fn stage_edit(
             .iter()
             .map(|u| u.phase_id().unwrap_or_default().to_string())
             .collect();
-        let r = crate::plan_gate::revise(
+        // (core#1925) Every step that was ever dispatched — the done prefix and a step a
+        // `request_changes` rewind moved back behind the cursor — never changes at the gate.
+        // Its dispatch stamp says so; for a unit dispatched before the stamp, its status or a
+        // stored work record does.
+        let ran: Vec<String> = units
+            .iter()
+            .filter(|u| {
+                u.plan_rev.is_some()
+                    || u.status != crate::domain::UnitStatus::Pending
+                    || crate::domain::get_unit_transcript(&*store, &u.id).is_some()
+            })
+            .map(|u| u.phase_id().unwrap_or_default().to_string())
+            .chain(done.iter().cloned())
+            .collect();
+        let r = crate::plan_gate::revise_with_ran(
             run_id,
             state,
             crate::plan_gate::Change::Steps {
@@ -19426,6 +19452,7 @@ fn stage_edit(
                 scoring: None,
             },
             &done,
+            &ran,
             &session.human_confirm,
             pending.reviewing_ord,
             now,

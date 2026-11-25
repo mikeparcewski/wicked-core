@@ -1941,6 +1941,90 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
     release_all(&w);
 }
 
+/// (core#1925) The b7-crew probe's shape, end to end. At the mid-run gate the PA's `PLAN+` opened
+/// (`answer-1` ran), the person's edit restates the launch's own `answer-2` and the proposal's
+/// `docs` with new instructions. The units that then run carry those instructions, and each unit
+/// records the plan rev it was dispatched under: `answer-1` the launch's, the others the person's.
+#[test]
+fn a_mid_run_gate_edit_reaches_the_units_that_run_1925() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"docs"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("ge1925", w.clone());
+    launch(
+        &e,
+        "ge",
+        HumanConfirm::None,
+        plan(json!({"steps": [
+            {"catalog": "understand", "id": "answer-1"},
+            {"catalog": "understand", "id": "answer-2"}
+        ]})),
+    );
+    e.wait_awaiting("ge", "plan_approval", 1);
+    let status = e
+        .core
+        .confirm_gate(
+            "ge",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [
+                    {"catalog": "understand", "id": "answer-1"},
+                    {"catalog": "produce", "id": "docs",
+                     "instructions": "Write the page. Also add an epic for billing."},
+                    {"catalog": "understand", "id": "answer-2",
+                     "instructions": "Name the billing epic in the answer."}
+                ]})),
+                note: None,
+            },
+        )
+        .expect("the edit is an answer");
+    assert_ne!(status, crate::SessionStatus::Failed);
+    wait_for("docs and answer-2 to dispatch", || {
+        let calls = e.worker.calls();
+        ["ge:docs", "ge:answer-2"]
+            .iter()
+            .all(|u| calls.iter().any(|c| c.2 == *u))
+    });
+    assert!(payloads(&e, "ge", tev::PLAN_REFUSED).is_empty());
+    let accepted = payloads(&e, "ge", tev::PLAN_ACCEPTED);
+    let last = accepted.last().unwrap();
+    assert_eq!(last["by"], "human");
+    let rev = last["plan_rev"].as_u64().map(|r| r as u32);
+    let units = view(&e, "ge").units;
+    let unit = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("ge:{id}"))
+            .unwrap_or_else(|| panic!("no unit {id}"))
+    };
+    assert!(
+        unit("docs")
+            .description
+            .contains("Also add an epic for billing."),
+        "{}",
+        unit("docs").description
+    );
+    assert!(
+        unit("answer-2")
+            .description
+            .contains("Name the billing epic in the answer."),
+        "{}",
+        unit("answer-2").description
+    );
+    assert_eq!(unit("answer-1").plan_rev, Some(1));
+    assert_eq!(unit("docs").plan_rev, rev);
+    assert_eq!(unit("answer-2").plan_rev, rev);
+    release_all(&w);
+}
+
 /// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for
 /// DIFFERENT work: the held `produce:design` (a creator step under an odd id) is dropped and the
 /// human's id-less `design` defaults onto that id. The stored unit is a replacement, not a kept
