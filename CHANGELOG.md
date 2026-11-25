@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
+  repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
+  estate-command fence's raw-SQLite arm guards. Every path-shaped word of an interpreter's program text (`.`,
+  `f.name`) resolved from the worktree into `WICKED_HOME`, so crew's own taught apps self-check
+  (`python3 -c '...' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -`) was refused as
+  a raw SQLite open of the graph and no Apps build landed. A store location that holds the unit's own worktree now
+  names the store only through a path that resolves inside it and outside the worktree (same normalize and
+  symlink chain as the boundary): `sqlite3 $WICKED_HOME/memory.db`, `../../memory.db`, `cd <home> && sqlite3
+  memory.db` and an existing link in the tree to a store are still refused. Other store locations are judged as
+  before.
+
 - **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
   unset, `on` or `1` now enables pre-existing-failure exclusion: a head red only on tests its red base also
   fails passes with "N pre-existing excluded: …", when the base's build guide is usable and verified by every
