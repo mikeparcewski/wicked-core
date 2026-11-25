@@ -906,12 +906,49 @@ fn changed_fields(a: &PlanStep, b: &PlanStep) -> Vec<String> {
         .collect()
 }
 
-/// (core#1925) The refusal of an edit that changes `fields` of the step `id`, which ran.
+/// (core#1925 follow-up) The words a person sees for the step field whose wire key is `key`
+/// (studio's plan editor says "worker pool", not `pool`). A key with no entry reads with spaces.
+fn field_words(key: &str) -> String {
+    let words = match key {
+        "instructions" => "instructions",
+        "catalog" => "step type",
+        "gate" => "approval gate",
+        "gate_type" => "gate type",
+        "validator_pin" => "validator",
+        "executes_code" => "whether it runs code",
+        "writes_nothing" => "whether it writes files",
+        "verified_evidence" => "evidence check",
+        "requires_capture_report" => "capture report",
+        "answer_only" => "answer-only setting",
+        "budget_secs" => "time budget",
+        "pool" => "worker pool",
+        "skill_ref" => "skill",
+        "allowed_skills" => "allowed skills",
+        "required_deliverables" => "deliverables",
+        "depends_on" => "inputs",
+        "executor" => "command",
+        "owner" => "owner",
+        "kind" => "stage",
+        "role" => "role",
+        "repeat_from" => "repeat point",
+        "rubric" => "rubric",
+        other => return other.replace('_', " "),
+    };
+    words.to_string()
+}
+
+/// (core#1925) The refusal of an edit that changes `fields` (wire keys) of the step `id`, which
+/// ran, naming them as a person reads them: "a, b and c".
 fn ran_refusal(id: &str, fields: &[String]) -> String {
+    let words: Vec<String> = fields.iter().map(|f| field_words(f)).collect();
+    let list = match words.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "settings".to_string(),
+    };
     format!(
-        "the step `{id}` already ran, so its {} can't change; edit only the steps that have not \
-         run",
-        fields.join(", ")
+        "the step `{id}` already ran, so its {list} can't change; edit only the steps that have \
+         not run"
     )
 }
 
@@ -981,7 +1018,8 @@ fn edit_refusal(
         None
     } else {
         Some(format!(
-            "step `{id}` is a check; only its instructions can change at the gate"
+            "step `{id}` is a check; only its instructions can change at the gate, or add a new \
+             step"
         ))
     }
 }
