@@ -332,9 +332,9 @@ pub struct PreflightContract {
 /// Resolve the contract `shape` would launch under, through the launch's own code (`actor.rs`, the
 /// launch's sync fast path): a plan or a preset is a team run whose instruments are the preset's
 /// declaration (`preset::required_instruments`), else the registered def's `required_instruments`;
-/// then the QE word, refused as the launch refuses it. A team run that is not reduced never grades
-/// its own work, whatever its instruments (`distribute.rs`, `allow_same_seat`). Reads the store:
-/// the actor calls it.
+/// then the QE word, refused as the launch refuses it (`apps::contract`, core#1847). A team run
+/// that is not reduced never grades its own work, whatever its instruments (`distribute.rs`,
+/// `allow_same_seat`). Reads the store: the actor calls it.
 pub(crate) fn preflight_contract(
     store: &dyn wicked_apps_core::GraphRead,
     registry: &crate::workflow::WorkflowRegistry,
@@ -371,10 +371,15 @@ pub(crate) fn preflight_contract(
         )?
         .and_then(|d| d.required_instruments),
     };
-    let assurance =
-        crate::assurance::RunAssurance::new(instruments.as_deref(), shape.reduced_assurance)
-            .with_qe_override(&qe)
-            .map_err(anyhow::Error::msg)?;
+    // (core#1847) The QE word through the launch's own contract: an Apps preset's (a publish's QE
+    // is forced, so its skip is refused; an Apps turn takes neither word), else the plain override.
+    let apps = crate::apps::contract_for(store, project, shape.workflow.as_deref())?;
+    let assurance = crate::apps::contract(
+        crate::assurance::RunAssurance::new(instruments.as_deref(), shape.reduced_assurance),
+        apps,
+        &qe,
+    )
+    .map_err(anyhow::Error::msg)?;
     let rules = shape.repo_bound && {
         let query = wicked_governance::RuleQuery {
             projects: project.map(|p| vec![p.to_string()]).unwrap_or_default(),
@@ -1660,5 +1665,46 @@ mod tests {
             err.to_string().contains("planJson is not a valid plan"),
             "{err}"
         );
+    }
+
+    /// core#1847: the preflight takes the launch's QE word through the launch's own contract
+    /// (`apps::contract`): an Apps publish refuses a skip (its QE is forced), an Apps turn refuses
+    /// a skip or a force, and any other workflow takes the word as before.
+    #[test]
+    fn an_apps_qe_word_is_refused_as_the_launch_refuses_it() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::preset::seed_builtins(&mut store, 10).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let shape = |workflow: &str, skip: Option<&str>, force: bool| PreflightShape {
+            workflow: Some(workflow.into()),
+            skip_qe_acceptance_reason: skip.map(str::to_string),
+            force_qe_acceptance: force,
+            ..PreflightShape::default()
+        };
+        let refused = |s: PreflightShape| {
+            preflight_contract(&store, &registry, &s)
+                .expect_err("refused as the launch refuses it")
+                .to_string()
+        };
+        let e = refused(shape(crate::apps::APPS_PUBLISH, Some("no time"), false));
+        assert!(e.contains("cannot be skipped on an Apps publish"), "{e}");
+        let e = refused(shape(crate::apps::APPS_TURN, None, true));
+        assert!(e.contains("an Apps turn has no QE acceptance"), "{e}");
+        let e = refused(shape(crate::apps::APPS_TURN, Some("no time"), false));
+        assert!(e.contains("an Apps turn has no QE acceptance"), "{e}");
+        // The publish's QE stays required, and a plain workflow still takes either word.
+        assert!(
+            preflight_contract(
+                &store,
+                &registry,
+                &shape(crate::apps::APPS_PUBLISH, None, false)
+            )
+            .unwrap()
+            .qe
+        );
+        assert!(
+            preflight_contract(&store, &registry, &shape("bug", Some("no time"), false)).is_ok()
+        );
+        assert!(preflight_contract(&store, &registry, &shape("bug", None, true)).is_ok());
     }
 }

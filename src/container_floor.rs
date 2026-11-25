@@ -633,13 +633,44 @@ fn content_tag(parts: &[&str]) -> String {
 }
 
 /// The tag of `cli`'s seat image built on `base`: `wicked-seat-<cli>:<12 hex of sha256(Dockerfile,
-/// package, base)>`, so an edited Dockerfile, package or base is a new image, never a stale one.
-pub(crate) fn seat_image_tag(cli: &str, base: &str) -> Option<String> {
+/// package, base[, base id][, layers])>`, so an edited Dockerfile, package, base or layer recipe is
+/// a new image, never a stale one. `base_id` is an operator base's resolved image id (core#1043:
+/// a base rebuilt under the same name is a new seat image); the default base's name is already a
+/// hash of its recipe. With no id and no layer that builds, the tag is the one it always was.
+pub(crate) fn seat_image_tag(
+    cli: &str,
+    base: &str,
+    base_id: Option<&str>,
+    layers: &[&crate::seat_layers::Layer],
+) -> Option<String> {
     let package = seat_package(cli)?;
-    Some(format!(
-        "wicked-seat-{cli}:{}",
-        content_tag(&[SEAT_DOCKERFILE, &package.pin(), base])
-    ))
+    let pin = package.pin();
+    let extra = crate::seat_layers::tag_parts(layers);
+    let mut parts: Vec<&str> = vec![SEAT_DOCKERFILE, &pin, base];
+    if let Some(id) = base_id {
+        parts.push(id);
+    }
+    parts.extend(extra.iter().map(String::as_str));
+    Some(format!("wicked-seat-{cli}:{}", content_tag(&parts)))
+}
+
+/// The seat image a launch may REUSE on `base`: [`seat_image_tag`] with the default base's
+/// layers, or an operator base keyed by the image id the runtime reports for it now, composed with
+/// no layer (the operator's base is the toolchain). `None` for an operator base whose id the
+/// runtime does not report: nothing cached is reused then (codex r1 on core#1043), the build path
+/// settles the base and builds.
+fn seat_tag_on(
+    rt: &Runtime,
+    cli: &str,
+    base: &SeatBase,
+    layers: &[&crate::seat_layers::Layer],
+) -> Option<String> {
+    if base.operator {
+        let id = image_id(rt, &base.image)?;
+        seat_image_tag(cli, &base.image, Some(&id), &[])
+    } else {
+        seat_image_tag(cli, &base.image, None, layers)
+    }
 }
 
 /// The floor image's tag: `wicked-floor:<12 hex of sha256(its Dockerfile)>`.
@@ -678,11 +709,35 @@ pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
     output_within(c, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| o.status.success())
 }
 
-/// Build `cli`'s seat image, composing the embedded checks recipe by default (no build context).
-pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
+/// Build `cli`'s seat image with `layers`, composing the embedded checks recipe by default (no
+/// build context).
+pub(crate) fn build_seat_image(
+    rt: &Runtime,
+    cli: &str,
+    layers: &[&crate::seat_layers::Layer],
+) -> Result<String, String> {
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
-    build_seat_image_on(rt, cli, package, &SeatBase::from_env()).map_err(|(_, e)| e)
+    let base = SeatBase::from_env();
+    let built = build_seat_image_on(rt, cli, package, &base, layers).map_err(|(_, e)| e)?;
+    reclaim_after_build(rt, &base, &built, layers);
+    Ok(built)
+}
+
+/// [`reclaim_superseded_layer_images`] after `built` was built on the default base with layers.
+fn reclaim_after_build(
+    rt: &Runtime,
+    base: &SeatBase,
+    built: &str,
+    layers: &[&crate::seat_layers::Layer],
+) {
+    let ids: Vec<&str> = crate::seat_layers::built(layers)
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    if !base.operator && !ids.is_empty() {
+        reclaim_superseded_layer_images(rt, built, &ids.join(","));
+    }
 }
 
 /// The base the seat images build on: the operator's own ([`BASE_IMAGE_ENV`], with its recipe
@@ -750,9 +805,9 @@ fn build_seat_image_on(
     cli: &str,
     package: SeatPackage,
     base: &SeatBase,
+    layers: &[&crate::seat_layers::Layer],
 ) -> Result<String, (FloorUnarmed, String)> {
     let no_image = |e: String| (FloorUnarmed::NoSeatImage, e);
-    let tag = seat_image_tag(cli, &base.image).expect("package exists");
     // The recipe this call rebuilt the base from, for the diagnosis of a base still missing.
     let mut rebuilt: Option<&Path> = None;
     if base.operator {
@@ -784,12 +839,33 @@ fn build_seat_image_on(
         );
         build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[]).map_err(no_image)?;
     }
+    // Keyed after the base is settled (an operator base rebuilt just now has its new id), and built
+    // FROM a pin of exactly that id, held through the build: an operator rebuild of the base's name
+    // meanwhile cannot land under this id's tag (codex r1 on core#1043). A base whose id the runtime
+    // does not report is built on by name and keyed by name: a fresh build, which no later launch
+    // reuses ([`seat_tag_on`]).
     let mut args = vec![format!("CLI={cli}")];
-    let dockerfile = if base.operator {
-        args.push(format!("BASE={}", base.image));
-        SEAT_DOCKERFILE.to_string()
+    let mut _base_pin: Option<SeatPin> = None;
+    let (tag, dockerfile) = if base.operator {
+        let (tag, from) = match image_id(rt, &base.image) {
+            Some(id) => {
+                let pin = pin_seat_image(rt, &base.image, &id).map_err(no_image)?;
+                let from = pin.tag().to_string();
+                _base_pin = Some(pin);
+                (seat_image_tag(cli, &base.image, Some(&id), &[]), from)
+            }
+            None => (
+                seat_image_tag(cli, &base.image, None, &[]),
+                base.image.clone(),
+            ),
+        };
+        args.push(format!("BASE={from}"));
+        (tag.expect("package exists"), SEAT_DOCKERFILE.to_string())
     } else {
-        default_seat_dockerfile()
+        (
+            seat_image_tag(cli, &base.image, None, layers).expect("package exists"),
+            crate::seat_layers::compose(&default_seat_dockerfile(), layers),
+        )
     };
     args.extend(package.build_args());
     build_image(rt, &dockerfile, &tag, &args).map_err(|e| {
@@ -1380,19 +1456,154 @@ pub(crate) fn build_image(
 // The seat sign-in path (unix) and the tests use it; native Windows runs no container floor.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
-    ensure_seat_image_noting(rt, cli)
-        .map(|(tag, _)| tag)
+    ensure_seat_image_noting(rt, cli, &[])
+        .map(|(tag, _, _)| tag)
         .map_err(|(_, e)| e)
 }
 
 /// [`ensure_seat_image`], also saying how long the unit waited when the image was missing (a
 /// first use, or a runtime's image cleanup deleted it) and had to be built, by this call or by
 /// another unit it waited for, for the unit's note. `Err` carries the arm's typed reason.
+/// `layers` are the unit's toolchain layers ([`crate::seat_layers`]); none on an operator base.
+/// The third value is the unit's note when its layers did not build ([`ensure_layered_seat_image`]).
 pub(crate) fn ensure_seat_image_noting(
     rt: &Runtime,
     cli: &str,
-) -> Result<(String, Option<Duration>), (FloorUnarmed, String)> {
-    ensure_seat_image_with(rt, cli, image_override(cli), &SeatBase::from_env())
+    layers: &[&crate::seat_layers::Layer],
+) -> LayeredSeatImage {
+    ensure_layered_seat_image(rt, cli, image_override(cli), &SeatBase::from_env(), layers)
+}
+
+/// A unit's seat image: its tag, how long the unit waited for a build, and its note when its
+/// toolchain layers did not build; or the arm's typed reason.
+type LayeredSeatImage = Result<(String, Option<Duration>, Option<String>), (FloorUnarmed, String)>;
+
+/// (coord R2 F1 on core#1043) The layered seat images that failed to build in this process, by
+/// tag, with the build's error: a later unit runs on the plain image without building the set
+/// again, unless the image has since appeared (an operator's `seat-image build --layers`).
+static FAILED_LAYER_SETS: Mutex<std::collections::BTreeMap<String, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// [`ensure_seat_image_with`] for a unit with toolchain layers. A toolchain layer never blocks a
+/// run: when the layered image cannot be built, the unit runs on the plain seat image and the
+/// third value is its note (the layers, the build's own last words, the command to retry). An
+/// error is the plain image's own.
+fn ensure_layered_seat_image(
+    rt: &Runtime,
+    cli: &str,
+    over: Option<String>,
+    base: &SeatBase,
+    layers: &[&crate::seat_layers::Layer],
+) -> LayeredSeatImage {
+    let built = crate::seat_layers::built(layers);
+    if over.is_some() || built.is_empty() {
+        return ensure_seat_image_with(rt, cli, over, base, layers).map(|(t, w)| (t, w, None));
+    }
+    let failed = |tag: &str| {
+        FAILED_LAYER_SETS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(tag)
+            .cloned()
+    };
+    let key = seat_tag_on(rt, cli, base, layers);
+    let known = key
+        .as_deref()
+        .and_then(|k| failed(k).filter(|_| !image_present(rt, k)));
+    let error = match known {
+        Some(e) => e,
+        None => match ensure_seat_image_with(rt, cli, None, base, layers) {
+            Ok((tag, waited)) => return Ok((tag, waited, None)),
+            Err((_, e)) => {
+                eprintln!(
+                    "wicked-core: the {cli} seat image's toolchain layers did not build: {e}"
+                );
+                if let Some(k) = key {
+                    FAILED_LAYER_SETS
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(k, e.clone());
+                }
+                e
+            }
+        },
+    };
+    let (tag, waited) = ensure_seat_image_with(rt, cli, None, base, &[])?;
+    Ok((tag, waited, Some(layer_fallback_note(cli, &built, &error))))
+}
+
+/// The note of a unit whose layers did not build: which, the build's last line, how to retry.
+fn layer_fallback_note(cli: &str, built: &[&crate::seat_layers::Layer], error: &str) -> String {
+    let ids: Vec<&str> = built.iter().map(|l| l.id).collect();
+    let last = error.rsplit(" | ").next().unwrap_or(error).trim();
+    let last: String = last.chars().take(400).collect();
+    format!(
+        "[engine — seat toolchain] this repository's {} toolchain layer{} did not build, so this \
+         unit runs on the plain {cli} seat image without {}. The build said: {last}. To retry \
+         with the layers: `wicked-core seat-image build {cli} --layers {}` (a later unit uses the \
+         image once it is built). `WICKED_SEAT_LAYERS=off` turns layer detection off.",
+        ids.join(", "),
+        if ids.len() == 1 { "" } else { "s" },
+        if ids.len() == 1 { "it" } else { "them" },
+        ids.join(",")
+    )
+}
+
+/// (coord R2 F2 on core#1043) After `current` (a layered seat image) is built, remove the older
+/// content tags of the same CLI and layer set (`wicked.seat.layers` = `ids`): a CLI pin bump or
+/// a recipe change would otherwise leave one image per layer set behind. Pins (`:id-<hex>`)
+/// are [`cleanup_seat_image_pins`]'s, and every removal runs under the pins' lock: a tag a
+/// launch holds is never removed, and removing a tag whose image a pin still names only untags it.
+fn reclaim_superseded_layer_images(rt: &Runtime, current: &str, ids: &str) {
+    let Some((repo, _)) = current.rsplit_once(':') else {
+        return;
+    };
+    let mut list = rt.cmd();
+    list.args([
+        "image",
+        "ls",
+        "--filter",
+        &format!("label=wicked.seat.layers={ids}"),
+        "--format",
+        "{{.Repository}}:{{.Tag}}",
+        repo,
+    ]);
+    let result = crate::k8s::run_bounded(list, None, rt.bound(PROBE_TIMEOUT));
+    if !result.ok() {
+        eprintln!(
+            "wicked-core: cannot list older layered seat images: {}",
+            result.err_text()
+        );
+        return;
+    }
+    for tag in String::from_utf8_lossy(&result.stdout).lines() {
+        let Some((tag_repo, suffix)) = tag.rsplit_once(':') else {
+            continue;
+        };
+        if tag_repo != repo
+            || tag == current
+            || suffix.len() != current.len() - repo.len() - 1
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let held = seat_pins_held();
+        if held.contains_key(tag) {
+            continue;
+        }
+        let mut remove = rt.cmd();
+        remove.args(["image", "rm", tag]);
+        let result = crate::k8s::run_bounded(remove, None, rt.bound(PROBE_TIMEOUT));
+        drop(held);
+        if !result.ok() {
+            eprintln!(
+                "wicked-core: cannot remove superseded seat image {tag}: {}",
+                result.err_text()
+            );
+        }
+    }
 }
 
 /// A wait on another unit's build shorter than this is not a rebuild worth a note.
@@ -1404,6 +1615,7 @@ fn ensure_seat_image_with(
     cli: &str,
     over: Option<String>,
     base: &SeatBase,
+    layers: &[&crate::seat_layers::Layer],
 ) -> Result<(String, Option<Duration>), (FloorUnarmed, String)> {
     if let Some(img) = over {
         return Ok((img, None));
@@ -1415,19 +1627,20 @@ fn ensure_seat_image_with(
         )
     })?;
     static BUILD: Mutex<()> = Mutex::new(());
-    let tag = seat_image_tag(cli, &base.image).expect("package exists");
-    if image_present(rt, &tag) {
+    if let Some(tag) = seat_tag_on(rt, cli, base, layers).filter(|t| image_present(rt, t)) {
         return Ok((tag, None));
     }
     let start = Instant::now();
     let _one = BUILD.lock();
-    if image_present(rt, &tag) {
+    // Keyed again under the lock: another unit may have rebuilt the base and built on it.
+    if let Some(tag) = seat_tag_on(rt, cli, base, layers).filter(|t| image_present(rt, t)) {
         // Another unit built it while this one waited.
         let waited = start.elapsed();
         return Ok((tag, (waited >= BUILD_WAIT_NOTE).then_some(waited)));
     }
-    eprintln!("wicked-core: building seat image {tag} (it is not on the container runtime)");
-    let built = build_seat_image_on(rt, cli, package, base)?;
+    eprintln!("wicked-core: building the {cli} seat image (it is not on the container runtime)");
+    let built = build_seat_image_on(rt, cli, package, base, layers)?;
+    reclaim_after_build(rt, base, &built, layers);
     Ok((built, Some(start.elapsed())))
 }
 
@@ -2256,6 +2469,9 @@ pub(crate) struct ArmedContainer {
     /// (core#1848) The seat image pin the pod runs, held until the unit ends so no other launch's
     /// cleanup removes it under this one.
     pub(crate) seat_pin: SeatPin,
+    /// What the engine says on the unit's stream about this seat (core#1043: toolchain hosts the
+    /// egress allowlist does not name).
+    pub(crate) notes: Vec<String>,
 }
 
 /// A long prompt carried in a file (core#1228): `file` is mounted read-only into the seat; the
@@ -2284,6 +2500,7 @@ impl std::fmt::Debug for ArmedContainer {
             .field("view", &self.view)
             .field("prompt_file", &self.prompt_file)
             .field("seat_pin", &self.seat_pin)
+            .field("notes", &self.notes)
             .finish()
     }
 }
@@ -2713,9 +2930,16 @@ pub(crate) fn arm_noting(
         .or_else(|| wicked_apps_core::spawn::worker_home_base().ok());
     // The unit's mounts and the view of them, settled before any image or cluster work.
     let engine_k8s = state_home.as_ref().map(|h| h.join("k8s"));
+    // (core#1463 R2 F3) Each read path is resolved ONCE for the real build, the required-only
+    // build and the settle: a root spelled through a link that is retargeted mid-arm cannot
+    // resolve one way in one build and another way in the next.
+    let [read_resolved, required_resolved, optional_resolved] = resolve_once(
+        [read_roots, required_reads, optional],
+        crate::worker_sandbox::canon_lenient,
+    );
     let (mut mounts, mut argv) = unit_mounts(
         &spec,
-        read_roots,
+        &read_resolved,
         argv,
         prompt,
         read_view,
@@ -2729,14 +2953,14 @@ pub(crate) fn arm_noting(
     } else {
         let (required, _) = unit_mounts(
             &spec,
-            required_reads,
+            &required_resolved,
             argv_in,
             prompt,
             read_view,
             gateway_dir,
             engine_k8s.as_deref(),
         )?;
-        settle_optional(&mounts, &required, optional)
+        settle_optional(&mounts, &required, &optional_resolved)
     };
     // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
@@ -2768,7 +2992,30 @@ pub(crate) fn arm_noting(
     before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    let (image, built_in) = ensure_seat_image_noting(&rt, cli)?;
+    // (core#1043) The toolchains the unit's tree needs, composed onto its seat image; none on an
+    // operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's toolchain.
+    let layers = if configured_base().is_some() || image_override(cli).is_some() {
+        Vec::new()
+    } else {
+        crate::seat_layers::for_tree(&spec.tree)
+    };
+    let (image, built_in, fell_back) = ensure_seat_image_noting(&rt, cli, &layers)?;
+    // Egress is never widened for a layer: the unit is told which of its hosts the allowlist
+    // lacks (an offline seat chose no egress at all). A unit whose layers did not build is told
+    // that instead (coord R2 F1).
+    let notes: Vec<String> = match fell_back {
+        Some(note) => vec![note],
+        None => (!offline_seats())
+            .then(|| {
+                crate::seat_layers::egress_note(
+                    &layers,
+                    &crate::seat_gateway::egress_hosts_from_env(),
+                )
+            })
+            .flatten()
+            .into_iter()
+            .collect(),
+    };
     if let Some(waited) = built_in {
         on_built(&image, waited);
     }
@@ -3038,6 +3285,7 @@ pub(crate) fn arm_noting(
         copilot_account,
         view,
         seat_pin,
+        notes,
     })
 }
 
@@ -3374,6 +3622,23 @@ fn unit_mounts(
     Ok((mounts, argv))
 }
 
+/// (core#1463 R2 F3) `lists` with every distinct path resolved by `canon` exactly once, so a path
+/// named in several lists resolves the same in each. A path `canon` cannot resolve is dropped from
+/// every list (each consumer already skips one: a read root is not mounted, an optional root is
+/// not left out).
+pub(crate) fn resolve_once<const N: usize>(
+    lists: [&[PathBuf]; N],
+    mut canon: impl FnMut(&Path) -> Option<PathBuf>,
+) -> [Vec<PathBuf>; N] {
+    let mut seen: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    lists.map(|list| {
+        list.iter()
+            .filter_map(|p| seen.entry(p.clone()).or_insert_with(|| canon(p)).clone())
+            .collect()
+    })
+}
+
 /// (core#1463) The declared optional read roots that may be left out of a unit's copy-in, as the
 /// canonical paths the copy-in plan holds. `mounts` is the unit's real mount set; `required` is
 /// the same set built from the required read roots only, where no optional root can absorb a
@@ -3572,13 +3837,14 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         }
     };
     let json = args.iter().any(|a| a == "--json");
-    let rest: Vec<String> = args
-        .get(1..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|a| *a != "--json")
-        .cloned()
-        .collect();
+    let (layers, rest) = match layers_arg(args.get(1..).unwrap_or_default()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wicked-core seat-image: {e}");
+            return 2;
+        }
+    };
+    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--json").collect();
     let wanted: Vec<String> = if !rest.is_empty() && !rest.iter().any(|a| a == "all") {
         rest
     } else {
@@ -3589,8 +3855,8 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         .map(String::as_str)
         .filter(|c| seat_package(c).is_none() && image_override(c).is_none())
         .collect();
-    let usage = "usage: wicked-core seat-image build [<cli>…|all] | \
-                 seat-image status [--json] [<cli>…]";
+    let usage = "usage: wicked-core seat-image build [--layers <ids>|detect:<dir>] [<cli>…|all] | \
+                 seat-image status [--json] [--layers <ids>|detect:<dir>] [<cli>…]";
     match args.first().map(String::as_str) {
         Some("build" | "status") if !unknown.is_empty() => {
             eprintln!(
@@ -3622,7 +3888,7 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                     }
                     continue;
                 }
-                match build_seat_image(&rt, cli) {
+                match build_seat_image(&rt, cli, &layers) {
                     Ok(tag) => {
                         println!("{cli}: built {tag}");
                     }
@@ -3635,7 +3901,7 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             rc
         }
         Some("status") => {
-            let st = match image_status(&rt, &wanted) {
+            let st = match image_status(&rt, &wanted, &layers) {
                 Ok(st) => st,
                 Err(e) => {
                     eprintln!("wicked-core seat-image status: {e}");
@@ -3662,6 +3928,35 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// `seat-image`'s `--layers <ids>` (or `--layers detect:<dir>`, the layers that checkout needs;
+/// core#1043) taken out of `args`: the layers, then the other arguments. None given = no layers.
+fn layers_arg(
+    args: &[String],
+) -> Result<(Vec<&'static crate::seat_layers::Layer>, Vec<String>), String> {
+    let mut layers = Vec::new();
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let value = match a.strip_prefix("--layers=") {
+            Some(v) => v.to_string(),
+            None if a == "--layers" => it
+                .next()
+                .cloned()
+                .ok_or("--layers needs a value: <id>,<id>… or detect:<dir>")?,
+            None => {
+                rest.push(a.clone());
+                continue;
+            }
+        };
+        layers = match value.strip_prefix("detect:") {
+            Some(dir) if Path::new(dir).is_dir() => crate::seat_layers::detect(Path::new(dir)),
+            Some(dir) => return Err(format!("--layers detect:{dir}: not a directory")),
+            None => crate::seat_layers::parse(&value)?,
+        };
+    }
+    Ok((layers, rest))
 }
 
 /// [`BASE_IMAGE_ENV`], when the operator set one.
@@ -3728,8 +4023,12 @@ impl StatusConfig {
     }
 }
 
-fn image_status(rt: &Runtime, clis: &[String]) -> Result<ImageStatus, String> {
-    image_status_with(rt, clis, &StatusConfig::from_env(clis))
+fn image_status(
+    rt: &Runtime,
+    clis: &[String],
+    layers: &[&crate::seat_layers::Layer],
+) -> Result<ImageStatus, String> {
+    image_status_with(rt, clis, &StatusConfig::from_env(clis), layers)
 }
 
 /// Whether `recipe` is a regular file this process can read.
@@ -3741,10 +4040,14 @@ fn image_status_with(
     rt: &Runtime,
     clis: &[String],
     cfg: &StatusConfig,
+    layers: &[&crate::seat_layers::Layer],
 ) -> Result<ImageStatus, String> {
     let floor_tag = floor_image_tag();
     let listed = list_images(rt)?;
     let base_image = cfg.base.clone().unwrap_or_else(default_base);
+    // An operator base is the toolchain (no layer), keyed by its image id when it is present.
+    let base_id = cfg.base.as_deref().and_then(|b| image_id(rt, b));
+    let layers: &[&crate::seat_layers::Layer] = if cfg.base.is_some() { &[] } else { layers };
     // `operator`: a reference the operator wrote (an id, a digest, `docker.io/…`), which the
     // listing may spell differently: inspected alone when the listing has no match.
     let state = |image: &str, operator: bool| -> ImageState {
@@ -3776,12 +4079,16 @@ fn image_status_with(
         .iter()
         .filter_map(|cli| {
             let over = cfg.overrides.get(cli).cloned();
-            let image = over.clone().or_else(|| seat_image_tag(cli, &base_image))?;
+            let image = over
+                .clone()
+                .or_else(|| seat_image_tag(cli, &base_image, base_id.as_deref(), layers))?;
             let s = state(&image, over.is_some());
+            // An operator base the runtime reports no id for has no reusable seat image yet.
+            let unkeyed = over.is_none() && cfg.base.is_some() && base_id.is_none();
             Some(SeatImageState {
                 cli: cli.clone(),
                 image,
-                present: s.present,
+                present: s.present && !unkeyed,
                 operator_image: over.is_some(),
             })
         })
@@ -5130,7 +5437,7 @@ esac
             operator: true,
             recipe: Some(recipe.clone()),
         };
-        let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
+        let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         let base_build = calls
             .find("-t seat-base:rust -")
@@ -5139,7 +5446,11 @@ esac
             .find(&format!("-t {tag} -"))
             .expect("the seat image was built");
         assert!(base_build < seat_build, "{calls}");
-        assert!(calls.contains("--build-arg BASE=seat-base:rust"), "{calls}");
+        // (core#1043) Built FROM a pin of the rebuilt base's exact id.
+        assert!(
+            calls.contains(&format!("--build-arg BASE=seat-base:id-{}", "b".repeat(64))),
+            "{calls}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5234,7 +5545,7 @@ esac
                 operator: false,
                 recipe: None,
             };
-            let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
+            let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
             let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
             assert!(!calls.contains("--build-arg BASE="), "{calls}");
             let df = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
@@ -5251,6 +5562,266 @@ esac
         }
     }
 
+    /// core#1043: with no layer that builds, the default base's seat tag is the one main always
+    /// computed (no daemon rebuilds on upgrade); a layer set is a new tag, whatever its order.
+    #[test]
+    fn a_seat_tag_without_layers_is_unchanged_and_layers_key_it() {
+        let go = crate::seat_layers::parse("go").unwrap();
+        let both = crate::seat_layers::parse("python,go").unwrap();
+        let base = default_base();
+        for cli in seat_clis() {
+            let pin = seat_package(cli).unwrap().pin();
+            let before = format!(
+                "wicked-seat-{cli}:{}",
+                content_tag(&[SEAT_DOCKERFILE, &pin, &base])
+            );
+            assert_eq!(seat_image_tag(cli, &base, None, &[]).unwrap(), before);
+            let base_only = crate::seat_layers::parse("rust,node").unwrap();
+            assert_eq!(
+                seat_image_tag(cli, &base, None, &base_only).unwrap(),
+                before
+            );
+            let with_go = seat_image_tag(cli, &base, None, &go).unwrap();
+            let with_both = seat_image_tag(cli, &base, None, &both).unwrap();
+            assert!(
+                with_go.starts_with(&format!("wicked-seat-{cli}:")),
+                "{with_go}"
+            );
+            assert_ne!(with_go, before);
+            assert_ne!(with_go, with_both);
+            let reversed: Vec<&crate::seat_layers::Layer> = both.iter().rev().copied().collect();
+            assert_eq!(
+                seat_image_tag(cli, &base, None, &reversed).unwrap(),
+                with_both
+            );
+        }
+    }
+
+    /// core#1043: the layers are composed into the default build, before `ARG CLI` (one layer
+    /// build shared by every CLI); an operator base gets none, and its seat image is keyed by the
+    /// base's image id, so a base rebuilt under the same name is a new seat image (finding 3).
+    #[test]
+    fn layers_compose_on_the_default_base_and_an_operator_base_is_keyed_by_its_id() {
+        assert_eq!(
+            SEAT_DOCKERFILE.lines().filter(|l| *l == "ARG CLI").count(),
+            1
+        );
+        assert_eq!(
+            default_seat_dockerfile()
+                .lines()
+                .filter(|l| *l == "ARG CLI")
+                .count(),
+            1
+        );
+        let layers = crate::seat_layers::parse("go,java,python").unwrap();
+        let checks = crate::checks_container::image_tag();
+        let dir = tmp("layered-seat");
+        let rt = Runtime::answering(image_stub(&dir, &[checks.as_str()]));
+        let default = SeatBase {
+            image: checks.clone(),
+            operator: false,
+            recipe: None,
+        };
+        let pkg = seat_package("claude").unwrap();
+        let tag = build_seat_image_on(&rt, "claude", pkg, &default, &layers).unwrap();
+        assert_eq!(
+            tag,
+            seat_image_tag("claude", &checks, None, &layers).unwrap()
+        );
+        let df = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert_eq!(
+            df,
+            crate::seat_layers::compose(&default_seat_dockerfile(), &layers)
+        );
+        let (go, cli) = (
+            df.find("golang-go").unwrap(),
+            df.find("\nARG CLI\n").unwrap(),
+        );
+        assert!(go < cli && df.contains("openjdk-21-jdk-headless") && df.contains("uv-$t"));
+        // The ensure path builds the layered image once, then finds it.
+        let (again, built) =
+            ensure_seat_image_with(&rt, "claude", None, &default, &layers).unwrap();
+        assert_eq!((again.as_str(), built), (tag.as_str(), None));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = tmp("layered-operator");
+        let rt = Runtime::answering(image_stub(&dir, &["seat-base:rust"]));
+        let operator = SeatBase {
+            image: "seat-base:rust".into(),
+            operator: true,
+            recipe: None,
+        };
+        let tag = build_seat_image_on(&rt, "claude", pkg, &operator, &layers).unwrap();
+        let id = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(
+            tag,
+            seat_image_tag("claude", "seat-base:rust", Some(&id), &[]).unwrap()
+        );
+        assert_ne!(
+            tag,
+            seat_image_tag("claude", "seat-base:rust", None, &[]).unwrap(),
+            "the operator base's id is in the tag"
+        );
+        let df = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert_eq!(df, SEAT_DOCKERFILE, "no layer on an operator base");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// [`image_stub`] whose build fails on a recipe carrying the Go layer (apt's own words on
+    /// stderr), and whose `image ls` prints `listed`.
+    fn layer_stub(dir: &Path, present: &[&str], listed: &[&str]) -> PathBuf {
+        let rt = dir.join("docker");
+        let have = dir.join("have");
+        std::fs::write(
+            &have,
+            present.iter().map(|p| format!("{p}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let ls = dir.join("listed");
+        std::fs::write(
+            &ls,
+            listed.iter().map(|p| format!("{p}\n")).collect::<String>(),
+        )
+        .unwrap();
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'image inspect') last=; for a in \"$@\"; do last=$a; done\n\
+                   case \"$*\" in *Volumes*) echo null; exit 0 ;; esac\n\
+                   [ \"$last\" = sha256:{id} ] && {{ echo sha256:{id}; exit 0; }}\n\
+                   grep -qx \"$last\" '{have}' || exit 1\n\
+                   echo sha256:{id}; exit 0 ;;\n\
+                 'image ls') cat '{ls}'; exit 0 ;;\n\
+                 esac\n\
+                 if [ \"$1\" = build ]; then cat > '{dockerfile}'; t=; while [ $# -gt 0 ]; do\n\
+                   [ \"$1\" = -t ] && t=$2; shift; done\n\
+                   if grep -q golang-go '{dockerfile}'; then\n\
+                     echo 'E: Unable to locate package golang-go' >&2; exit 100; fi\n\
+                   echo \"$t\" >> '{have}'; fi\n\
+                 exit 0\n",
+                log = dir.join("calls.log").display(),
+                dockerfile = dir.join("Dockerfile").display(),
+                have = have.display(),
+                ls = ls.display(),
+                id = "b".repeat(64)
+            ),
+        );
+        rt
+    }
+
+    /// (coord R2 F1 on core#1043) A layer that cannot build never blocks the unit: it runs on the
+    /// plain seat image, told which layer failed, the build's own error and the exact command to
+    /// retry with the layers; a later unit does not rebuild the failed set.
+    #[test]
+    fn a_layer_that_fails_to_build_falls_back_to_the_plain_seat_image_with_a_note() {
+        let checks = crate::checks_container::image_tag();
+        let dir = tmp("layer-fails");
+        let rt = Runtime::answering(layer_stub(&dir, &[checks.as_str()], &[]));
+        let default = SeatBase {
+            image: checks.clone(),
+            operator: false,
+            recipe: None,
+        };
+        // A set no other test uses (the failed-set memory is process-wide).
+        let layers = crate::seat_layers::parse("go,java").unwrap();
+        let layered = seat_image_tag("codex", &checks, None, &layers).unwrap();
+        let plain = seat_image_tag("codex", &checks, None, &[]).unwrap();
+        let (tag, _, note) =
+            ensure_layered_seat_image(&rt, "codex", None, &default, &layers).unwrap();
+        assert_eq!(tag, plain, "the unit runs on the plain seat image");
+        let note = note.expect("the unit is told");
+        for want in [
+            "go, java",
+            "E: Unable to locate package golang-go",
+            "wicked-core seat-image build codex --layers go,java",
+            "WICKED_SEAT_LAYERS=off",
+        ] {
+            assert!(note.contains(want), "{want:?} in {note}");
+        }
+        let layered_builds = |calls: &str| {
+            calls
+                .lines()
+                .filter(|l| l.starts_with("build") && l.contains(&format!("-t {layered} ")))
+                .count()
+        };
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(layered_builds(&calls), 1, "{calls}");
+        // The next unit runs on the plain image again, told again, with no second layered build.
+        let (tag, _, note) =
+            ensure_layered_seat_image(&rt, "codex", None, &default, &layers).unwrap();
+        assert_eq!(tag, plain);
+        assert!(note.is_some_and(|n| n.contains("golang-go")));
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(layered_builds(&calls), 1, "{calls}");
+        // No layer to build: no note.
+        let (tag, _, note) = ensure_layered_seat_image(&rt, "codex", None, &default, &[]).unwrap();
+        assert_eq!((tag.as_str(), note), (plain.as_str(), None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// (coord R2 F2 on core#1043) A layered seat image superseded by a new build of the same layer
+    /// set (a CLI pin bump, a recipe change) is reclaimed; the current tag, pins, other layer sets
+    /// and other CLIs are not.
+    #[test]
+    fn a_new_layered_build_reclaims_the_superseded_images_of_its_layer_set() {
+        let checks = crate::checks_container::image_tag();
+        let dir = tmp("layer-reclaim");
+        let layers = crate::seat_layers::parse("python").unwrap();
+        let current = seat_image_tag("pi", &checks, None, &layers).unwrap();
+        let pin = format!("wicked-seat-pi:id-{}", "c".repeat(64));
+        let rt = Runtime::answering(layer_stub(
+            &dir,
+            &[checks.as_str()],
+            &[
+                "wicked-seat-pi:0123456789ab",
+                current.as_str(),
+                pin.as_str(),
+                "wicked-seat-codex:0123456789ab",
+            ],
+        ));
+        let default = SeatBase {
+            image: checks.clone(),
+            operator: false,
+            recipe: None,
+        };
+        let (tag, _, note) = ensure_layered_seat_image(&rt, "pi", None, &default, &layers).unwrap();
+        assert_eq!((tag.as_str(), note), (current.as_str(), None));
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            calls.contains("image ls --filter label=wicked.seat.layers=python"),
+            "{calls}"
+        );
+        let removed: Vec<&str> = calls
+            .lines()
+            .filter_map(|l| l.strip_prefix("image rm "))
+            .collect();
+        assert_eq!(removed, vec!["wicked-seat-pi:0123456789ab"], "{calls}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seat_image_layers_arg_names_or_detects_the_layers() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (l, rest) = layers_arg(&args(&["claude", "--layers", "python,go", "codex"])).unwrap();
+        let ids: Vec<&str> = l.iter().map(|l| l.id).collect();
+        assert_eq!(
+            (ids, rest),
+            (vec!["go", "python"], args(&["claude", "codex"]))
+        );
+        let (l, rest) = layers_arg(&args(&["--json"])).unwrap();
+        assert!(l.is_empty() && rest == args(&["--json"]));
+        let dir = tmp("layers-arg");
+        std::fs::write(dir.join("pom.xml"), "").unwrap();
+        let (l, _) = layers_arg(&args(&[&format!("--layers=detect:{}", dir.display())])).unwrap();
+        assert_eq!(l.iter().map(|l| l.id).collect::<Vec<_>>(), vec!["java"]);
+        assert!(layers_arg(&args(&["--layers"])).is_err());
+        assert!(layers_arg(&args(&["--layers", "cobol"])).is_err());
+        assert!(layers_arg(&args(&["--layers", "detect:/nonexistent-wicked"])).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_present_seat_base_is_not_rebuilt() {
         let dir = c4_temp();
@@ -5263,7 +5834,7 @@ esac
             operator: true,
             recipe: Some(recipe.clone()),
         };
-        build_seat_image_on(&rt, "codex", pkg, &base).unwrap();
+        build_seat_image_on(&rt, "codex", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         // The present base is not rebuilt; the seat image is built on it.
         assert!(!calls.contains("-t seat-base:rust"), "{calls}");
@@ -5297,7 +5868,7 @@ esac
             operator: true,
             recipe: None,
         };
-        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &base).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
         assert_eq!(why.as_str(), "seat_base_missing");
         assert!(e.contains("seat base image seat-base:rust"), "{e}");
@@ -5315,14 +5886,14 @@ esac
             ..base
         };
         std::fs::remove_file(&log).ok();
-        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
         assert!(e.contains(&recipe.display().to_string()), "{e}");
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(calls.matches("build").count(), 1, "{calls}");
         assert!(calls.contains("-t seat-base:rust -"), "{calls}");
         // The ensure path carries the same typed reason to the arm.
-        let (why, _) = ensure_seat_image_with(&rt, "claude", None, &with_recipe).unwrap_err();
+        let (why, _) = ensure_seat_image_with(&rt, "claude", None, &with_recipe, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::SeatBaseMissing);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5353,7 +5924,7 @@ esac
             operator: true,
             recipe: None,
         };
-        let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
+        let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(calls.contains(&format!("-t {tag} -")), "{calls}");
         std::fs::write(&fail, "").unwrap();
@@ -5363,7 +5934,7 @@ esac
             recipe: Some(recipe),
             ..base
         };
-        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &with_recipe, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5386,7 +5957,7 @@ esac
             operator: false,
             recipe: Some(PathBuf::from("/nonexistent")),
         };
-        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &default).unwrap_err();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &default, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
         assert!(!e.contains(BASE_DOCKERFILE_ENV), "{e}");
         assert!(e.contains("FAKE pull access denied"), "{e}");
@@ -5397,7 +5968,7 @@ esac
     fn status_reads_present_and_missing_images_in_one_listing() {
         let dir = c4_temp();
         let rt = dir.join("docker");
-        let claude = seat_image_tag("claude", &default_base()).unwrap();
+        let claude = seat_image_tag("claude", &default_base(), None, &[]).unwrap();
         let floor = floor_image_tag();
         let id = format!("sha256:{}", "e".repeat(64));
         crate::test_env::install_stub(
@@ -5417,8 +5988,8 @@ esac
             recipe: None,
             overrides: Default::default(),
         };
-        let st =
-            image_status_with(&rt, &["claude".to_string(), "codex".to_string()], &cfg).unwrap();
+        let st = image_status_with(&rt, &["claude".to_string(), "codex".to_string()], &cfg, &[])
+            .unwrap();
         assert!(st.floor.present);
         assert!(st.seats[0].present, "{:?}", st.seats);
         assert!(!st.seats[1].present);
@@ -5454,14 +6025,14 @@ esac
             recipe: Some(recipe.clone()),
             overrides: Default::default(),
         };
-        let st = image_status_with(&rt, &[], &cfg).unwrap();
+        let st = image_status_with(&rt, &[], &cfg, &[]).unwrap();
         assert!(st.base.as_ref().unwrap().present, "{:?}", st.base);
         // The recipe does not exist yet: not a recipe the engine can rebuild from.
         assert!(!st.base_recipe);
         std::fs::write(&recipe, "FROM x\n").unwrap();
-        assert!(image_status_with(&rt, &[], &cfg).unwrap().base_recipe);
+        assert!(image_status_with(&rt, &[], &cfg, &[]).unwrap().base_recipe);
         std::fs::write(dir.join("images-fails"), "").unwrap();
-        let e = image_status_with(&rt, &[], &cfg).unwrap_err();
+        let e = image_status_with(&rt, &[], &cfg, &[]).unwrap_err();
         assert!(e.contains("FAKE daemon busy"), "{e}");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5475,9 +6046,9 @@ esac
             operator: false,
             recipe: None,
         };
-        let (tag, built) = ensure_seat_image_with(&rt, "pi", None, &base).unwrap();
+        let (tag, built) = ensure_seat_image_with(&rt, "pi", None, &base, &[]).unwrap();
         assert!(built.is_some(), "a missing image is built and noted");
-        let (again, built) = ensure_seat_image_with(&rt, "pi", None, &base).unwrap();
+        let (again, built) = ensure_seat_image_with(&rt, "pi", None, &base, &[]).unwrap();
         assert_eq!(tag, again);
         assert!(built.is_none(), "a present image is not rebuilt");
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
@@ -6345,12 +6916,12 @@ esac
                 SeatPackage::Tarball(_) => assert_eq!(cli, "agy", "only agy is not on npm"),
             }
             assert!(pkg.version().is_some_and(|v| !v.is_empty()), "{cli}");
-            let a = seat_image_tag(cli, &default_base()).unwrap();
-            assert_eq!(a, seat_image_tag(cli, &default_base()).unwrap());
+            let a = seat_image_tag(cli, &default_base(), None, &[]).unwrap();
+            assert_eq!(a, seat_image_tag(cli, &default_base(), None, &[]).unwrap());
             assert!(a.starts_with(&format!("wicked-seat-{cli}:")), "{a}");
             assert_ne!(
                 a,
-                seat_image_tag(cli, "debian:trixie").unwrap(),
+                seat_image_tag(cli, "debian:trixie", None, &[]).unwrap(),
                 "base is in the tag"
             );
             tags.push(a.split_once(':').unwrap().1.to_string());
@@ -7282,8 +7853,6 @@ esac
         assert!(!has(&["--bind-tcp", "3000"]));
     }
 
-    /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
-    /// container launch, never over a mask.
     /// (core#1463) An optional read root stays optional only when nothing the unit requires lies in
     /// it. Both builds are the real mount steps (`add_read_roots`, `mount_argv_paths`): the unit's
     /// mounts from every read root, and the required-only build, where nothing optional can absorb
@@ -7409,6 +7978,33 @@ esac
         );
     }
 
+    /// (core#1463 R2 F3) A path named in several read lists is resolved once: even when the link
+    /// it is spelled through answers differently on every lookup (retargeted mid-arm), each list
+    /// gets the same answer, so the builds and the settle agree on it.
+    #[test]
+    fn core_1463_a_read_path_resolves_once_for_every_build() {
+        let (link, other) = (PathBuf::from("/h/link"), PathBuf::from("/h/other"));
+        let mut calls = 0;
+        let [all, required, optional] = resolve_once(
+            [
+                &[link.clone(), other.clone()][..],
+                &[link.clone()][..],
+                &[link.clone(), PathBuf::from("/h/gone")][..],
+            ],
+            |p| {
+                calls += 1;
+                (p != Path::new("/h/gone")).then(|| PathBuf::from(format!("/t{calls}")))
+            },
+        );
+        assert_eq!(calls, 3, "one lookup per distinct path");
+        assert_eq!(all, [PathBuf::from("/t1"), PathBuf::from("/t2")]);
+        assert_eq!(required, [PathBuf::from("/t1")]);
+        // An unresolvable path is dropped (never optional), the resolved one is the same.
+        assert_eq!(optional, [PathBuf::from("/t1")]);
+    }
+
+    /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
+    /// container launch, never over a mask.
     #[test]
     fn read_roots_are_mounted_read_only_unless_covered_or_masked() {
         let base = tmp("rr");

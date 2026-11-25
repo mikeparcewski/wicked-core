@@ -4131,6 +4131,58 @@ rebase.autosquash\0";
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// (DES-STANDIN-001 §3.3, core#1881) A stand-in's seat config on the host floor is its BASE's
+    /// home: creating it leaves no `~`-named directory anywhere in the worker home, for every CLI
+    /// with a home and every binding spelling. (The stand-in's session and memory are kept out of
+    /// that shared home by its CLI's own switches, `execute_wrapped::host_stand_in_fresh`.)
+    #[test]
+    fn a_stand_in_creates_no_tilde_named_directory_in_the_worker_home() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-apps-core-stand-in-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for cli in [
+            SeatCli::Claude,
+            SeatCli::Codex,
+            SeatCli::Pi,
+            SeatCli::Copilot,
+            SeatCli::Opencode,
+            SeatCli::Agy,
+        ] {
+            for key in ["x~1", "x#2~1", "x#cheap_2~3"] {
+                let config = seat_config_in(|| Ok(base.clone()), cli, key).expect("resolves");
+                config.ensure_dirs().expect("creates its base's home");
+            }
+        }
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("readable").flatten() {
+                out.push(e.path());
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(&e.path(), out);
+                }
+            }
+        }
+        let mut seen = Vec::new();
+        walk(&base, &mut seen);
+        assert!(!seen.is_empty(), "the base homes were created");
+        let tilde: Vec<_> = seen
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains('~'))
+            })
+            .collect();
+        assert!(
+            tilde.is_empty(),
+            "no `~`-named entry in the worker home: {tilde:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// (core#591, guarding #578) `refuse_symlinked_home` still refuses a PLANTED symlink — at an
     /// INSTANCE root exactly as at a base one. The failing state is CONSTRUCTED: the link is
     /// planted at `<base>/claude-2` and aimed at a decoy directory, and the decision is then

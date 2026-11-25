@@ -7457,7 +7457,12 @@ fn k8s_core_1463_an_optional_root_over_the_cap_is_left_out_with_a_note() {
         .collect();
     assert_eq!(names, vec![seat::LEFT_OUT_NOTE.to_string()], "{gamma:?}");
     let note = std::fs::read_to_string(gamma.join(seat::LEFT_OUT_NOTE)).unwrap();
-    assert!(note.contains("left out") && note.contains("chat scoped to this repository"));
+    assert!(note.contains("left out") && note.contains("ask in a chat scoped to it"));
+    // (R2 F2) Not every optional root is a repository, and a nested root keeps its own copy.
+    assert!(
+        !note.contains("repository") && note.contains("Its own files"),
+        "{note}"
+    );
     assert!(
         note.contains("capped at 1 MiB") && note.contains("about 0 MiB of it fit"),
         "{note}"

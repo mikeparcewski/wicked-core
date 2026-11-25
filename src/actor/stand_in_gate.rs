@@ -32,6 +32,18 @@ pub(crate) fn gate_open(cursor: Option<&WorkUnit>) -> bool {
         .is_some_and(|d| d.source == DENIAL_SOURCE_STAND_IN_NEEDED)
 }
 
+/// (T-R11) Whether the hold on `unit` is its QE reviewer's: the gate is `stand_in_needed` and the
+/// unit's isolated QE review found no seat to run on. Its answer re-dispatches the QE unit (the
+/// dispatch seats the reviewer), never a judge-only re-run.
+pub(crate) fn qe_reviewer_held(unit: &WorkUnit) -> bool {
+    gate_open(Some(unit))
+        && crate::qe_acceptance::review::applies(unit)
+        && unit
+            .qe_review
+            .as_ref()
+            .is_some_and(|r| r.outcome == crate::qe_acceptance::review::OUTCOME_UNAVAILABLE)
+}
+
 /// (§3.8, rev 3 N4) Refuse a `use_stand_ins` answer the run cannot take: not at this gate, on a
 /// run that is not stand-in-aware, on a reduced run, or with a scope that is not `job` | `always`.
 pub(crate) fn refuse_use_stand_ins(
