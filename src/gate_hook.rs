@@ -19382,7 +19382,7 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
             let hit = super::classify_estate_command(
                 &command,
                 true,
-                &[spaced.clone()],
+                std::slice::from_ref(&spaced),
                 &bases,
                 None,
                 Some(spaced_tree.as_path()),
