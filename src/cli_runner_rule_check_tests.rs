@@ -2967,15 +2967,22 @@ impl StepRunner for StandInJudgeRunner {
             input.unit.assigned_invocation.clone().unwrap_or_default(),
             input.unit.description.clone(),
         ));
-        let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+        // The review's own turn and the change's judge answer in their own words; only a rule
+        // judge's prompt carries the verdict frame.
+        let output = if input.unit.description.contains("BEGIN VERDICTS ") {
+            let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+            format!(
+                "BEGIN VERDICTS {nonce}\nRULE R1: KEPT — src/a.rs:2 typed signature\n\
+                 RULE R2: BROKEN — src/a.rs:2 no test\nEND VERDICTS {nonce}"
+            )
+        } else {
+            "VERDICT: PASS\nPASS".to_string()
+        };
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: 0,
             attempt: 0,
-            output: format!(
-                "BEGIN VERDICTS {nonce}\nRULE R1: KEPT — src/a.rs:2 typed signature\n\
-                 RULE R2: BROKEN — src/a.rs:2 no test\nEND VERDICTS {nonce}"
-            ),
+            output,
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
@@ -3142,4 +3149,87 @@ fn a_launch_excluded_base_never_stands_in_for_the_rule_judge() {
         .iter()
         .filter(|r| r.rule_id == "R1" || r.rule_id == "R2")
         .all(|r| r.status == crate::rule_check::RuleStatus::Unchecked));
+}
+
+/// (core#1944) Through the production unit runner (`run_unit_and_judge`): the judge stand-in the
+/// run's actor offered the review unit reaches its rule check, which rules on it alone. Red without
+/// the forwarding: every rule unchecked, no seat drawn.
+#[test]
+fn the_unit_runner_hands_its_judge_stand_in_to_the_rule_check() {
+    let (input, offer, provider, _repo) = one_cli_consented_review("runner");
+    let roster = vec![seat("claude")];
+    let runner = std::sync::Arc::new(StandInJudgeRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+    });
+    let dynr: std::sync::Arc<dyn StepRunner> = runner.clone();
+    let stand_in = crate::standin::JudgeStandIn {
+        aware: true,
+        offer: Some(offer),
+    };
+    let (_, _, evidence) = run_unit_and_judge_standing_in(
+        &dynr,
+        &input,
+        &roster,
+        &["claude".to_string()],
+        &[],
+        &stand_in,
+    );
+    crate::observed_provider::take_receipts();
+    let rc = evidence.rule_check.expect("the review's rule check ran");
+    assert_eq!(rc.seats, ["claude~2"], "{rc:?}");
+    let r1 = rc.rows.iter().find(|r| r.rule_id == "R1").expect("R1");
+    assert_eq!(r1.status, crate::rule_check::RuleStatus::Kept, "{r1:?}");
+    assert_eq!(r1.judge.as_deref(), Some("claude~2"));
+    assert!(runner
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, p)| p.contains("BEGIN VERDICTS "))
+        .all(|(who, _, _)| who == "claude~2"));
+}
+
+/// (core#1944) Fail closed: a judge stand-in that fails as a seat rules nothing. Every rule stays
+/// unchecked (the gate holds), and the check still names the stand-in among its seats, so the fold
+/// records it as having taken part.
+#[test]
+fn a_judge_stand_in_that_fails_leaves_the_rules_unchecked() {
+    struct Fails;
+    impl StepRunner for Fails {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: 0,
+                attempt: 0,
+                output: "not signed in".into(),
+                status: StepStatus::Failed,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let (input, offer, _, _repo) = one_cli_consented_review("fails");
+    let pool = vec![seat("claude")];
+    let sink = |_: &str| {};
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &Fails,
+        &sink,
+        &offer,
+    )
+    .expect("a report");
+    assert_eq!(report.seats, ["claude~2"]);
+    for id in ["R1", "R2"] {
+        let r = report.rows.iter().find(|r| r.rule_id == id).unwrap();
+        assert_eq!(r.status, crate::rule_check::RuleStatus::Unchecked, "{r:?}");
+        assert_eq!(r.judge, None, "{r:?}");
+    }
+    assert!(report.hold().is_some());
 }

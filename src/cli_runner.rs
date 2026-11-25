@@ -2608,9 +2608,12 @@ fn run_rule_check_with(
     );
     // (DES-STANDIN-001 §3.6, T-R9, core#1944) No real seat is left: the run's judge stand-in
     // judges the rules, labelled as one. Never beside a real seat, and never a council voter.
+    // Only a shortage of distinct seats: when the work's authorship is not known, a stand-in fixes
+    // nothing and the rules hold on that, as before (as `JudgeExclusions` reads provenance).
+    let provenance_known = no_agent_creator || (!creators.is_empty() && creator_bins.is_some());
     let stand_in_seat = rule_judge_stand_in(
         stand_in,
-        seats.is_empty(),
+        seats.is_empty() && provenance_known,
         &input.unit.exclude_seats,
         pool,
         registry,

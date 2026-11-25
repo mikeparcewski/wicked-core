@@ -68,6 +68,22 @@ fn fold_with_session(
     crate::domain::WorkUnit,
     crate::domain::AgentSession,
 ) {
+    fold_on(sid, report, verdict, false)
+}
+
+/// [`fold_with_session`], on a run that is stand-in-aware with consent (`stand_ins`), as the
+/// launch persists it (`standin::LaunchStandIn::apply`).
+fn fold_on(
+    sid: &str,
+    report: Option<RuleCheckReport>,
+    verdict: Option<&crate::validator::AgentVerdict>,
+    stand_ins: bool,
+) -> (
+    bool,
+    Option<crate::domain::UnitDenial>,
+    crate::domain::WorkUnit,
+    crate::domain::AgentSession,
+) {
     let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
     let mut sink = |_e: CoreEvent| {};
     let Planned {
@@ -101,6 +117,24 @@ fn fold_with_session(
         &crate::assurance::QeOverride::Auto,
     )
     .expect("plan");
+    if stand_ins {
+        use wicked_apps_core::ToNode;
+        let mut s = crate::domain::get_session(&store, sid)
+            .unwrap()
+            .expect("session");
+        s.assurance = crate::standin::LaunchStandIn {
+            aware: true,
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "local (human)".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(s.assurance);
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    }
     let evidence = crate::workflow::UnitEvidence {
         rule_check: report,
         ..Default::default()
@@ -484,4 +518,114 @@ fn core_1719_the_fold_records_a_seat_only_from_this_attempts_observed_provider()
         unit3.provider_shared_seats
     );
     crate::observed_provider::take_receipts();
+}
+
+/// (core#1944) A rule check on the judge stand-in the actor offered the unit (`a~1`: the unit's
+/// seat `a`, slot 1): the fold records the binding on the run, its verdicts stand, and the receipt
+/// names it as the `rule_judge`, filled by a stand-in. Through the production fold, on the
+/// session the launch persisted.
+#[test]
+fn a_rule_check_on_the_run_judge_stand_in_is_recorded_and_its_verdicts_stand() {
+    let mut kept = row("K", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:1");
+    kept.judge = Some("a~1".into());
+    let rc = RuleCheckReport {
+        rows: vec![kept],
+        seats: vec!["a~1".into()],
+        ..Default::default()
+    };
+    let (approved, denial, unit, session) = fold_on("rc-standin", Some(rc), None, true);
+    assert!(approved, "{denial:?}");
+    let b = session
+        .assurance
+        .stand_ins
+        .iter()
+        .find(|b| b.key == "a~1")
+        .expect("the binding is on the run's record");
+    assert_eq!(b.state, crate::standin::STATE_ANSWERED);
+    let receipt = unit.assurance.as_ref().expect("a receipt");
+    let rj = receipt
+        .roles
+        .as_ref()
+        .expect("canonical")
+        .iter()
+        .find(|r| r.role == "rule_judge")
+        .expect("the rule judge's role")
+        .clone();
+    assert_eq!(rj.filled, crate::assurance::FILLED_STAND_IN);
+    assert_eq!(rj.seat.as_deref(), Some("a~1"));
+    assert_eq!(rj.state, crate::standin::STATE_ANSWERED);
+    assert!(
+        rj.stand_in
+            .as_ref()
+            .is_some_and(|s| s.label.contains("stood in for the rule check")),
+        "{rj:?}"
+    );
+    assert_ne!(
+        receipt.independence.as_deref(),
+        Some(crate::assurance::INDEPENDENT),
+        "a stand-in took part: never independent"
+    );
+    assert_eq!(receipt.rules[0].status, RuleStatus::Kept);
+}
+
+/// (core#1944) Fail closed: a rule check that ran on a stand-in the run never offered this unit
+/// (`a~7`) keeps none of its verdicts. The KEPT it reported is unchecked and the gate holds; no
+/// binding and no role are recorded for it.
+#[test]
+fn a_rule_check_on_a_stand_in_the_run_did_not_offer_keeps_no_verdict() {
+    let mut kept = row("K", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:1");
+    kept.judge = Some("a~7".into());
+    let rc = RuleCheckReport {
+        rows: vec![kept],
+        seats: vec!["a~7".into()],
+        ..Default::default()
+    };
+    let (approved, denial, unit, session) = fold_on("rc-standin-forged", Some(rc), None, true);
+    assert!(!approved, "an unrecorded stand-in's KEPT never approves");
+    let d = denial.expect("held");
+    assert_eq!(d.source, crate::rule_check::DENIAL_SOURCE_UNCHECKED);
+    assert_eq!(d.rule_ids, ["K"]);
+    assert!(session.assurance.stand_ins.iter().all(|b| b.key != "a~7"));
+    let receipt = unit.assurance.as_ref().expect("a receipt");
+    assert_eq!(receipt.rules[0].status, RuleStatus::Unchecked);
+    assert_eq!(receipt.rules[0].judge, None);
+    assert!(!receipt
+        .roles
+        .as_ref()
+        .expect("canonical")
+        .iter()
+        .any(|r| r.role == "rule_judge"));
+}
+
+/// (core#1944) The judge stand-in seated for the rules that ruled none (every rule unchecked)
+/// still took part: its binding is recorded `failed` (its slot is spent) and the rules hold.
+#[test]
+fn a_rule_check_stand_in_that_ruled_nothing_is_recorded_failed() {
+    let rc = RuleCheckReport {
+        rows: vec![row(
+            "K",
+            RuleStatus::Unchecked,
+            RuleHow::None,
+            "the judge did not answer",
+        )],
+        seats: vec!["a~1".into()],
+        ..Default::default()
+    };
+    let (approved, _, unit, session) = fold_on("rc-standin-failed", Some(rc), None, true);
+    assert!(!approved);
+    let b = session
+        .assurance
+        .stand_ins
+        .iter()
+        .find(|b| b.key == "a~1")
+        .expect("recorded");
+    assert_eq!(b.state, crate::standin::STATE_FAILED);
+    let rj = unit
+        .assurance
+        .as_ref()
+        .and_then(|r| r.roles.as_ref())
+        .and_then(|roles| roles.iter().find(|r| r.role == "rule_judge"))
+        .expect("the role took part")
+        .clone();
+    assert_eq!(rj.state, crate::standin::STATE_FAILED);
 }
