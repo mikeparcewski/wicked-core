@@ -105,6 +105,7 @@ mod floor_log;
 pub mod floor_probe;
 mod mcp_isolation;
 mod memory;
+pub mod model_call;
 mod observed_provider;
 mod operator_config_fence;
 mod output_throttle;
