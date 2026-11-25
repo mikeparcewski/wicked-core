@@ -99,6 +99,8 @@ pub fn boot_seeded_rule_ids() -> anyhow::Result<std::collections::BTreeSet<Strin
         .map(|r| r.id)
         .collect())
 }
+#[cfg(test)]
+mod codegraph_gate_tests;
 pub mod floor_affected;
 pub mod floor_guide;
 mod floor_log;

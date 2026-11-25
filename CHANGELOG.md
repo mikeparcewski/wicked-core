@@ -22,33 +22,72 @@ Two release tracks share this file, newest entry first regardless of track:
   …" and "The job needs a judge, and no helper that did not build the work can be it: …". A QE hold an engine
   already wrote in the old words stays the QE layer's (a run waiting at its gate across an upgrade).
 
-- **Reading a repo no longer rescans its checkout** (core#1933, the core#1932 follow-up). Since core#1932
-  every `get_repo` and `list_repos` detected the repo's seat layers on the checkout inside the actor, listing
-  up to 257 directories: several times per dispatched unit, and once per repo on each studio poll. Now only
-  the reads a person sees derive `RepoEntry.seat_layers` (`Core::list_repos`, and the replies of
-  `register_repo` and `set_repo_seat_layers_off`). The engine's own reads carry no rows and list no
-  directory, and none serves the copy stored in the record. The list's detection is reused for 10 seconds
-  per checkout, so a marker added or removed shows within 10 seconds.
+- **core-ts 0.15.50** — 2026-11-25 — patch release on the train-14 cut 0059bfc3, carrying 22 PRs since 0.15.49: #1890, #1895, #1899, #1898, #1900, #1896, #1897, #1901, #1894, #1908, #1911, #1910, #1917, #1918, #1923, #1907, #1914, #1929, #1931, #1932, #1934, #1935.
+  The entries below were written from each PR's changelog entry (the PR title where it had none).
 
-- **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
-  core seam). `RepoEntry.seat_layers` is derived from the registered checkout on the reads a person sees
-  (core#1933): one row
-  `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
-  or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
-  `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,
-  re-registration keeps them, and `[]` clears them. Dispatch hands the list to each unit on
-  `GovernanceContext.seat_layers_off`, and the container arm leaves those layers out of the seat image. All
-  fields are additive.
+  - **Reading a repo no longer rescans its checkout** (core#1933, the core#1932 follow-up). Since core#1932
+    every `get_repo` and `list_repos` detected the repo's seat layers on the checkout inside the actor, listing
+    up to 257 directories: several times per dispatched unit, and once per repo on each studio poll. Now only
+    the reads a person sees derive `RepoEntry.seat_layers` (`Core::list_repos`, and the replies of
+    `register_repo` and `set_repo_seat_layers_off`). The engine's own reads carry no rows and list no
+    directory, and none serves the copy stored in the record. The list's detection is reused for 10 seconds
+    per checkout, so a marker added or removed shows within 10 seconds.
 
-- **A person's edit at a mid-run plan gate reaches the plan and the units that run** (core#1925). An edit that
-  restates a held step now amends it, field by field: what the person sets replaces the held value, and what they
-  leave out keeps it. Before, the edit added nothing for a restated step id, so the accepted rev was the held plan
-  unchanged, or the edit was refused as "the proposal adds no step". The edit is refused by name when it changes a
-  step that was ever dispatched, moves a step to another catalog entry, clears or swaps a validator pin, drops a
-  deliverable or an input a step read, or changes a check-bearing step beyond its instructions. The refusal names
-  the changes in the words studio shows (worker pool, validator, time budget) and says what the person can do
-  instead. Additive `WorkUnit.plan_rev`: the accepted plan revision a unit was last dispatched under (absent until
-  dispatch, kept through a rewind).
+  - **A repo shows the toolchain layers its seats get, and a person can turn one off** (core#1043 part 2,
+    core seam). `RepoEntry.seat_layers` is derived from the registered checkout on the reads a person sees
+    (core#1933): one row
+    `{id, enabled, off_by}` per detected layer, where `off_by` is `repo`, `daemon` (`WICKED_SEAT_LAYERS=off`)
+    or `operator_base` (`WICKED_SEAT_BASE_IMAGE`). `Core::set_repo_seat_layers_off(repo, ids)` (binding
+    `setRepoSeatLayersOff`) persists `RepoEntry.seat_layers_off`. Ids are checked against the layer catalog,
+    re-registration keeps them, and `[]` clears them. Dispatch hands the list to each unit on
+    `GovernanceContext.seat_layers_off`, and the container arm leaves those layers out of the seat image. All
+    fields are additive.
+
+  - **A person's edit at a mid-run plan gate reaches the plan and the units that run** (core#1925). An edit that
+    restates a held step now amends it, field by field: what the person sets replaces the held value, and what they
+    leave out keeps it. Before, the edit added nothing for a restated step id, so the accepted rev was the held plan
+    unchanged, or the edit was refused as "the proposal adds no step". The edit is refused by name when it changes a
+    step that was ever dispatched, moves a step to another catalog entry, clears or swaps a validator pin, drops a
+    deliverable or an input a step read, or changes a check-bearing step beyond its instructions. The refusal names
+    the changes in the words studio shows (worker pool, validator, time budget) and says what the person can do
+    instead. Additive `WorkUnit.plan_rev`: the accepted plan revision a unit was last dispatched under (absent until
+    dispatch, kept through a rewind).
+
+  - Retire a requirement whose code was deleted (#1698) (#1890)
+
+  - Say skipped CLIs' shared reason once (garden#1543) (#1895)
+
+  - Pytest/ruff/mypy caches are no left outputs, so test and lint are reused (core#1870) (#1899)
+
+  - A redirect target ends at a glued control operator (core#1852) (#1898)
+
+  - The latest same-change row decides before judge exclusions (core#1855) (#1900)
+
+  - Hand a ballot's prompt on stdin, byte-exact at any size, on both floors (DES-j6-build C0a) (#1896)
+
+  - A checkout whose parent folder cannot be written still starts runs (core#1860) (#1897)
+
+  - Never remove a seat image pin a starting launch still holds (core#1848) (#1901)
+
+  - A shipped Tool step makes model calls through the daemon's own seats (DES-j6-build C0) (#1894)
+
+  - Pass the refuse closure by value (clippy needless_borrows_for_generic_args) (#1908)
+
+  - Pin a container claude out of server-managed settings (core#1823) (#1911)
+
+  - Optional read roots; one over the copy-in cap is left out with a note (core#1463 item 1) (#1910)
+
+  - A run's own seats, the step's end cancels its calls, named overflow, startup sweep (J6 C1a) (#1917)
+
+  - Estate 0.35.11, so read-only estate 0.35.11 readers open the engine's stores (estate#601) (#1918)
+
+  - Follow-ups to core#1463 R2 (one path resolution, note wording, test docs) and the team_gate floor race (core#1916) (#1923)
+
+  - Compose a repository's toolchain layers into its seat image (core#1043, core half) (#1907)
+
+  - A stand-in QE reviewer for a one-CLI run; host-floor stand-ins start fresh (core#1847, #1881; part of #1843) (#1914)
+
+  - Core on the wicked-estate 0.36.0 crates (estate#601, train 14) (#1935)
 
 - **core-ts 0.15.49** — 2026-11-24 — patch release on the train-13 cut 919f3575, carrying 74 PRs since 0.15.48: #1734, #1735, #1739, #1736, #1755, #1756, #1754, #1751, #1752, #1760, #1763, #1770, #1777, #1764, #1759, #1765, #1771, #1766, #1774, #1768, #1782, #1783, #1784, #1788, #1787, #1790, #1793, #1778, #1798, #1797, #1800, #1796, #1802, #1804, #1806, #1807, #1809, #1811, #1812, #1813, #1815, #1816, #1818, #1819, #1820, #1824, #1825, #1826, #1827, #1829, #1830, #1831, #1834. #1828 was reverted by #1833 before this release, so neither is listed, #1839, #1840, #1841, #1844, #1850, #1851, #1849, #1865, #1856, #1866, #1867, #1871, #1872, #1874, #1878, #1880, #1879, #1883, #1885, #1854, #1891.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
