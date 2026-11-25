@@ -1632,29 +1632,39 @@ fn a_gate_edit_cannot_drop_a_dependency_of_a_step_without_a_check() {
     refused_naming(&r, &held, "step `build` can't stop reading `answer-1`");
 }
 
-/// (core#1925, codex r1 on the fix) A check may be made stricter at the gate: a raised gate.
+/// (core#1925, round 1 passes 2-3) A check changes only its instructions at the gate: not a
+/// "stricter" setting either (a consent gate moves the person's judgment before the work,
+/// `executes_code` lifts a reviewer's write guard, and a pin over the entry's own validator
+/// swaps it).
 #[test]
-fn a_gate_edit_may_raise_a_checks_gate() {
+fn a_gate_edit_changes_only_a_checks_instructions() {
     let hc = HumanConfirm::None;
     let held = held_build_and_review(&hc);
-    let r = revise(
-        "r",
-        &held,
-        gate_edit(json!([
-            {"catalog":"understand","id":"answer-1"},
-            {"catalog":"build","id":"build"},
-            {"catalog":"review","id":"review","gate":{"human_confirm":{"unconditional":true}}}
-        ])),
-        &["answer-1".into()],
-        &hc,
-        Some(1),
-        0,
-    )
-    .unwrap();
-    assert!(
-        matches!(r.outcome, Outcome::Accepted { .. }),
-        "{}",
-        describe(&r.outcome)
-    );
-    assert!(accepted_step(&r, "review").gate.is_some());
+    for review in [
+        json!({"catalog":"review","id":"review","gate":{"human_confirm":{"unconditional":true}}}),
+        json!({"catalog":"review","id":"review","gate":"consent_before"}),
+        json!({"catalog":"review","id":"review","executes_code":true}),
+        json!({"catalog":"review","id":"review",
+               "validator_pin": crate::builtin_floors::WALKTHROUGH_LINT_PIN}),
+    ] {
+        let r = revise(
+            "r",
+            &held,
+            gate_edit(json!([
+                {"catalog":"understand","id":"answer-1"},
+                {"catalog":"build","id":"build"},
+                review
+            ])),
+            &["answer-1".into()],
+            &hc,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        refused_naming(
+            &r,
+            &held,
+            "step `review` is a check; only its instructions can change",
+        );
+    }
 }

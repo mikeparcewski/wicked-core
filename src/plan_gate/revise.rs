@@ -921,7 +921,7 @@ fn ran_refusal(id: &str, fields: &[String]) -> String {
 /// conformance and demo floors, and the inputs of the checks after it); a validator pin is never
 /// cleared or swapped; no step drops a deliverable or stops reading an input it read (`inputs`,
 /// its declared or implicit [`inputs_of`]); and a step that carries a check ([`carries_check`])
-/// changes only its instructions or what makes it stricter.
+/// changes only its instructions.
 fn edit_refusal(
     held: &PlanStep,
     new: &PlanStep,
@@ -974,25 +974,10 @@ fn edit_refusal(
     if !carries_check(held) {
         return None;
     }
-    let entry = crate::catalog::catalog_entry(&held.catalog);
-    let gate_rank = |s: &PlanStep| {
-        s.gate
-            .or_else(|| entry.map(|e| e.gate))
-            .map(crate::plan::gate_rank_of)
-    };
-    // Stricter only. A budget is not on the list: what a check that runs out of time concludes
-    // is not this rule's to judge.
-    let stricter = |f: &str| match f {
-        // (the rules above refuse a cleared or swapped pin, a lost input and a lost deliverable,
-        // so a changed pin is added and changed lists only grow)
-        "instructions" | "validator_pin" | "depends_on" | "required_deliverables" => true,
-        "executes_code" => new.executes_code == Some(true),
-        "verified_evidence" => new.verified_evidence == Some(true),
-        "requires_capture_report" => new.requires_capture_report == Some(true),
-        "gate" => gate_rank(new) >= gate_rank(held),
-        _ => false,
-    };
-    if changed.iter().all(|f| stricter(f)) {
+    // Only its instructions. A "stricter" setting is not reliably stricter: a higher gate can
+    // move the person's judgment before the work, `executes_code` lifts a reviewer's write
+    // guard, and a pin over the entry's own validator swaps it (round 1 pass 3).
+    if changed.iter().all(|f| f == "instructions") {
         None
     } else {
         Some(format!(
