@@ -66,7 +66,8 @@ fn isolate_governance_root() {
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
-    // The floor's exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`); these tests exercise it ON.
+    // The floor's exclusion is ON by default (`WICKED_FLOOR_EXCLUDE`); pinned ON here so an
+    // operator's own setting never changes what these tests exercise.
     std::env::set_var("WICKED_FLOOR_EXCLUDE", "on");
     wicked_apps_core::emit::hermetic_test_spool();
 }

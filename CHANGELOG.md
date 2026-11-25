@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
+  unset, `on` or `1` now enables pre-existing-failure exclusion: a head red only on tests its red base also
+  fails passes with "N pre-existing excluded: …", when the base's build guide is usable and verified by every
+  required probe. `off` or `0` turns it off (and so does any other value, as before): a red base then escalates
+  as `base_red_unseparated`. The four exclusion-only fixes the switch waited for shipped in #1766.
+
 - **The stand-in gate's hold reads as a person's sentence** (core#1930 F7). On a stand-in-aware run with no
   consent, a judge or a QE reviewer that no helper could be holds the run at `stand_in_needed`, and the gate
   prompt shows the hold's reason as written. That reason began "the run requires QE acceptance (qe_acceptance)
