@@ -115,6 +115,22 @@ pub fn monitor_target(band: Option<&str>, asked: u8) -> u8 {
         .min(MAX_MONITORS)
 }
 
+/// (core#1952) A seat as a user reads it: a stand-in (`claude~1`, DES-STANDIN-001) by its CLI's
+/// display name and "a stand-in", never by the reserved key; a real seat by its key, which names
+/// the instance (`claude#2`).
+fn seat_words(host: &dyn MonitorHost, seat: &str) -> String {
+    use wicked_apps_core::spawn::seat_id;
+    if !seat_id::is_stand_in(seat) {
+        return seat.to_string();
+    }
+    let base = seat_id::credential(seat);
+    let name = host
+        .display_name(base)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| base.to_string());
+    format!("{name}, a stand-in")
+}
+
 // ── Councils (DES-001 §6.3, DES-002 §8.10) ──────────────────────────────────────────────────────
 
 /// What one council call came to.
@@ -807,7 +823,7 @@ impl UnitTeam {
                 None,
                 Some(format!(
                     "the roster has no seat distinct from the PA ({})",
-                    self.ctx.creator
+                    seat_words(host, &self.ctx.creator)
                 )),
             );
             return;

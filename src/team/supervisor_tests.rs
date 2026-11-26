@@ -152,6 +152,10 @@ impl FakeHost {
 }
 
 impl MonitorHost for FakeHost {
+    /// (core#1952) The built-in roster's name for its one display-named seat.
+    fn display_name(&self, seat: &str) -> Option<String> {
+        (seat == "claude").then(|| "Claude Code".to_string())
+    }
     fn one_shot(&self) -> bool {
         self.one_shot.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -2681,7 +2685,10 @@ fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
         !error.contains('~'),
         "no stand-in key in the words: {error}"
     );
-    assert!(error.contains("a stand-in"), "{error}");
+    assert!(
+        error.contains("(Claude Code, a stand-in)"),
+        "its CLI's display name: {error}"
+    );
 }
 
 fn help_scaffold(
