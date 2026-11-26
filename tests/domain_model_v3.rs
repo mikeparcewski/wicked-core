@@ -291,8 +291,9 @@ fn a_typescript_run_orders_housekeeping_last() {
 /// garden#1545, on the train-16 cert's shape (`mini-cobol-cert.sql`, gen_cert.py): MAIN-PARA's
 /// file open is cited only by a housekeeping rule the prose check withheld (the cert's 22 open and
 /// close paragraphs, g15.r/g16.r), its file close only by a shown housekeeping rule, READ-PARA's
-/// open statement by nothing. None of them is a requirement; each stays readable by id, so every
-/// group cite and every follow-up resolves.
+/// plain-rate statement only by a business detail the prose check withheld, and its open
+/// statement by nothing. None of them is a requirement; each stays readable by id, so every group
+/// cite and every follow-up resolves.
 #[test]
 fn a_statement_is_a_requirement_only_when_a_shown_business_sentence_cites_it() {
     let f = fixture_of("mini-cobol", "mini-cobol-cert", "cert");
@@ -313,12 +314,13 @@ fn a_statement_is_a_requirement_only_when_a_shown_business_sentence_cites_it() {
     assert_eq!(
         shape,
         vec![
-            ("business", false, 0),
+            ("business", false, 1),
             ("housekeeping", true, 1),
             ("housekeeping", false, 0)
         ],
         "the store holds the cert's shape"
     );
+    assert_eq!(groups[0]["withheld"][0]["cites"], json!([sid(2)]));
     assert_eq!(groups[1]["withheld"][0]["cites"], json!([main(0)]));
     assert_eq!(groups[2]["rule"]["cites"], json!([main(1)]));
     // One requirement: READ-PARA's, holding the statement the business rule cites.
@@ -329,14 +331,15 @@ fn a_statement_is_a_requirement_only_when_a_shown_business_sentence_cites_it() {
     assert_eq!(doc["domains"][PROG]["description"], "PAYCALC1");
     assert_eq!(
         split(&doc),
-        (vec![sid(0)], vec![main(0), main(1), sid(1)]),
-        "the open and close are not requirements; they and the open statement are the others"
+        (vec![sid(0)], vec![main(0), main(1), sid(1), sid(2)]),
+        "the open, the close and the withheld detail's statement are not requirements"
     );
     // Each keeps its status, key and claims where crew reads it.
     let rs = rules(&doc);
     assert_eq!(
-        [&rs[&main(0)], &rs[&main(1)], &rs[&sid(1)]].map(|r| r["status"].as_str().unwrap()),
-        ["Checked", "Checked", "open"]
+        [&rs[&main(0)], &rs[&main(1)], &rs[&sid(1)], &rs[&sid(2)]]
+            .map(|r| r["status"].as_str().unwrap()),
+        ["Checked", "Checked", "open", "Checked"]
     );
     assert!(rs
         .values()
@@ -372,8 +375,26 @@ fn a_statement_is_a_requirement_only_when_a_shown_business_sentence_cites_it() {
         .unwrap()
         .unwrap();
     assert_eq!(read["metadata"], built["metadata"]);
-    assert_eq!(read["metadata"]["statements"].as_array().unwrap().len(), 3);
+    assert_eq!(read["metadata"]["statements"].as_array().unwrap().len(), 4);
     validates(&read);
+    // Typed, the persisted model keeps its other statements; a 1.2.0 document from before the list
+    // reads with none, its other v3 lists intact.
+    let typed: wicked_governance::DomainModel = serde_json::from_value(read.clone()).unwrap();
+    let extract = typed.metadata.extract.expect("the v3 lists");
+    assert_eq!(extract.statements.len(), 4);
+    let mut older = read.clone();
+    older["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("statements");
+    let typed: wicked_governance::DomainModel = serde_json::from_value(older).unwrap();
+    let extract = typed
+        .metadata
+        .extract
+        .expect("the v3 lists of an older document");
+    assert!(extract.statements.is_empty());
+    assert_eq!(extract.rule_groups.len(), 3);
+    assert_eq!(extract.targets.len(), 4);
 }
 
 /// The truth table (§3.2, R10): a confirm settles only its statement; the target is accounted once

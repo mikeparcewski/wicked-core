@@ -1,6 +1,7 @@
 """Real-shape fixture for garden#1545: garden's real domain-run route on its mini-cobol tree, written by the real
 `wicked-estate write-batch`, dumped as SQL. Seat answers are fakes in the writer's and checker's output shapes
-(as gen.py), arranged as the train-16 J6 cert's model was: a Checked statement a business rule cites, MAIN-PARA's
+(as gen.py), arranged as the train-16 J6 cert's model was: a Checked statement a business rule cites, one only a
+business detail the prose check withheld cites, MAIN-PARA's
 file open cited only by a housekeeping rule the prose check withheld (the cert's open/close paragraphs), its file
 close cited only by a shown housekeeping rule, and an open statement no sentence cites. Usage: gen_cert.py <garden>
 <work> <out.sql>"""
@@ -42,7 +43,10 @@ class Seats:
                             dict(i=2, type="else", text="`PAY-AMOUNT` is `PAY-RATE * PAY-HOURS`", lines=[f"{PROG}:27-28"])]),
                         dict(anchor=dict(file=PROG, lines=t["lines"]), claims=[
                             dict(i=0, type="condition", text="the read reaches the end of `PAY-FILE`", lines=[f"{PROG}:21-22"]),
-                            dict(i=1, type="effect", text="`WS-EOF` is set to `'Y'`", when=[0], lines=[f"{PROG}:22"])])]))
+                            dict(i=1, type="effect", text="`WS-EOF` is set to `'Y'`", when=[0], lines=[f"{PROG}:22"])]),
+                        dict(anchor=dict(file=PROG, lines=[24, 28]), claims=[
+                            dict(i=0, type="condition", text="`PAY-HOURS > 40`", lines=[f"{PROG}:24"]),
+                            dict(i=1, type="else", text="`PAY-AMOUNT` is the plain rate times the hours", unless=[0], lines=[f"{PROG}:27-28"])])]))
                 elif t.get("name") == "MAIN-PARA":
                     out.append(dict(target=t["id"], not_rules=[], statements=[
                         dict(anchor=dict(file=PROG, lines=[15, 17]), claims=[
@@ -61,7 +65,8 @@ class Seats:
             rows = dict(re.findall(r"^\[(S\d+)\]\n(.*?)(?=\n\n\[S\d+\]|\Z)", prompt, re.M | re.S))
             of = lambda word: sorted((s for s, t in rows.items() if word in t), key=lambda s: int(s[1:]))
             groups = [dict(g=1, title="Overtime pay", area="PAYCALC1", kind="business",
-                           rule=dict(text="Hours over forty are paid at the overtime rate.", cites=of("overtime")), details=[]),
+                           rule=dict(text="Hours over forty are paid at the overtime rate.", cites=of("overtime")),
+                           details=[dict(text="Hours up to forty are paid at double the plain rate.", cites=of("plain rate"))]),
                       dict(g=2, title="Opening the pay file", area="PAYCALC1", kind="housekeeping",
                            rule=dict(text="The program opens the pay file before it reads a record.", cites=of("opened")), details=[]),
                       dict(g=3, title="Closing the pay file", area="PAYCALC1", kind="housekeeping",
@@ -89,7 +94,8 @@ class Seats:
             # the cert's g15.r/g16.r: the prose check withholds the housekeeping rule over the file open
             ids = re.findall(r"^\[(g\d+\.\w+)\]", prompt, re.M)
             return json.dumps(dict(verdicts=[dict(id=i, verdict="OVERREACH", reason="SCOPE: the statement says nothing of reading")
-                                             if i == "g2.r" else dict(id=i, verdict="SUPPORTED") for i in ids])), 0
+                                             if i == "g2.r" else dict(id=i, verdict="OVERREACH", reason="QUANTIFIER: the statement gives no multiplier")
+                                             if i == "g1.d1" else dict(id=i, verdict="SUPPORTED") for i in ids])), 0
         return "{}", 0
 
 
