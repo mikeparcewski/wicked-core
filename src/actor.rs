@@ -40070,6 +40070,85 @@ mod live_output_stream_tests {
         assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
     }
 
+    /// core#1979 (the core half of crew#1942): a broadcast sent while the step that owns it is
+    /// mid-turn (crew's working-document "Next" note) is held for the next step dispatched, not
+    /// refused: the running step cannot hear it, and the note is meant to steer what comes next.
+    /// With no later step it is refused, with the reason. A message for that step's own seat is
+    /// still refused (core#1964).
+    #[test]
+    fn a_broadcast_to_a_step_mid_turn_is_held_for_the_next_step_1979() {
+        use crate::command::InjectTarget;
+        use crate::domain::{put_nodes, UnitStatus, WorkUnit};
+        use wicked_apps_core::open_store;
+
+        // `at`: the cursor's unit (0 = the first of two steps, 1 = the last).
+        let seed = |tag: &str, at: usize| {
+            let run_id = format!("inject-1979-{tag}-{}", uuid::Uuid::new_v4());
+            let dir = std::env::temp_dir().join(&run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("estate.db");
+            {
+                let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+                let mut session = super::sessions_detail_fold_tests::session(&run_id);
+                session.status = SessionStatus::Executing;
+                session.unit_ix = at;
+                session.attempt = 1;
+                let mut first = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "review");
+                first.assigned_cli = Some("codex".into());
+                let mut second = WorkUnit::pending(format!("{run_id}:u2"), &run_id, 2, "test");
+                second.assigned_cli = Some("codex".into());
+                // The cursor's step is mid-turn: dispatched in this attempt.
+                for u in [&mut first, &mut second].into_iter().take(at + 1) {
+                    u.status = UnitStatus::Distributed;
+                    u.last_attempt = Some(1);
+                }
+                put_nodes(
+                    &mut store,
+                    &[session.to_node(), first.to_node(), second.to_node()],
+                )
+                .unwrap();
+            } // Release the seed writer before starting the actor.
+            let core = crate::Core::spawn_with_engine(
+                db.to_str().unwrap().to_string(),
+                Arc::new(StubDispatcher),
+                Arc::new(NoopRunner),
+            );
+            (run_id, core)
+        };
+        let heard = |run: &str, ord: u32| -> Vec<String> {
+            crate::power::take_operator_messages(run, "codex", ord)
+                .into_iter()
+                .map(|m| m.message)
+                .collect()
+        };
+
+        let (run, core) = seed("next", 0);
+        core.inject_worker_message(&run, "next: keep it small", InjectTarget::All)
+            .expect("held for the next step, not refused");
+        assert_eq!(
+            heard(&run, 2),
+            vec!["next: keep it small".to_string()],
+            "the next step dispatched hears it"
+        );
+        // The running step's own seat still cannot be reached mid-turn (core#1964).
+        let refused =
+            core.inject_worker_message(&run, "check the README", InjectTarget::Cli("codex".into()));
+        assert!(
+            refused.is_err(),
+            "a message for the running seat is refused"
+        );
+        assert!(heard(&run, 2).is_empty(), "a refused message is not queued");
+
+        // The last step mid-turn: no later step would hear it.
+        let (run, core) = seed("last", 1);
+        let err = core
+            .inject_worker_message(&run, "next: keep it small", InjectTarget::All)
+            .expect_err("no step after the last one hears it")
+            .to_string();
+        assert!(err.contains("no later step"), "{err}");
+        assert!(heard(&run, 2).is_empty() && heard(&run, 3).is_empty());
+    }
+
     #[test]
     fn live_output_redacts_tokens_at_every_chunk_split_on_the_wire() {
         let dir = std::env::temp_dir().join(format!("wicked-live-redact-{}", uuid::Uuid::new_v4()));
