@@ -2936,6 +2936,59 @@ mod tests {
         );
     }
 
+    /// (core#1994, codex-check on eb279c5) The default mapping plus a negative refspec (an
+    /// exclusion, `^refs/heads/tmp/*`) still gets the Azure DevOps credential, as on main.
+    #[test]
+    fn a_negative_refspec_beside_the_default_keeps_the_ado_credential_1994() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let names: Vec<&str> = std::iter::once(ADO_PAT_ENV)
+            .chain(ADO_SP_ENV.iter().copied())
+            .collect();
+        let prev: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for n in &names {
+            std::env::remove_var(n);
+        }
+        std::env::set_var(ADO_PAT_ENV, "fake-pat-for-the-1994-test"); // ggignore: a made-up test value, not a secret
+        let dir = scratch("ado-negative-1994");
+        run_git(&dir, &["init", "-q", "-b", "main", "."]);
+        run_git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://dev.azure.com/org/p/_git/repo",
+            ],
+        );
+        run_git(
+            &dir,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "^refs/heads/tmp/*",
+            ],
+        );
+        let env: Vec<(&str, &Path)> = vec![
+            ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+        ];
+        let got = ado_fetch_for(&dir, &env);
+        for (k, v) in names.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(
+            matches!(&got, Ok(Some(a)) if a.url == "https://dev.azure.com/org/p/_git/repo"),
+            "a default mapping with an exclusion keeps the credential: {:?}",
+            got.map(|a| a.map(|a| a.url))
+        );
+    }
+
     /// (core#1994) Which mappings the credentialed fetch keeps: every `refs/heads/<S>` onto
     /// `refs/remotes/origin/<S>`, the same `<S>`, forced or not. Nothing else.
     #[test]
@@ -4927,6 +4980,89 @@ mod tests {
             run_git(&clone, &["rev-parse", "refs/remotes/origin/main"]),
             tip,
             "origin/main is the remote's tip"
+        );
+    }
+
+    /// (core#1994, codex-check on eb279c5) A real `git clone --single-branch --branch release`
+    /// maps only `release`. The credentialed retry must fetch what that mapping names, as the plain
+    /// fetch would: `origin/release` moves to the remote's new tip, and no `origin/main` appears
+    /// for run-base selection to pick.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_branch_release_clone_gets_no_origin_main_from_the_retry_1994() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_single_branch_release_clone_gets_no_origin_main_from_the_retry_1994",
+        ) {
+            return;
+        }
+        let base = scratch("gh-single-release-1994");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("README.md"), "base\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        run_git(&seed, &["branch", "release"]);
+        std::fs::write(seed.join("README.md"), "main\n").unwrap();
+        run_git(&seed, &["commit", "-qam", "main moves on"]);
+        let served = base.join("srv").join("private.git");
+        std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                served.to_str().unwrap(),
+            ],
+        );
+        let clone = base.join("clone");
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                "--branch",
+                "release",
+                served.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        // The remote's release moves on after the clone, so the fetch has something to bring.
+        run_git(&seed, &["checkout", "-q", "release"]);
+        std::fs::write(seed.join("NOTES.md"), "release fix\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "release fix"]);
+        let release_tip = run_git(&seed, &["rev-parse", "HEAD"]);
+        run_git(
+            &seed,
+            &["push", "-q", served.to_str().unwrap(), "release:release"],
+        );
+        let token = "fake-token-for-the-1994-test"; // ggignore: a made-up test value, not a secret
+        let port = serve_private_repo_1959(&served, token);
+        let url = format!("http://127.0.0.1:{port}/acme/private.git");
+        run_git(&clone, &["remote", "set-url", "origin", &url]);
+        let env = hermetic_env_1959(token);
+        let got = fetch_origin_at(&clone, &env, &format!("http://127.0.0.1:{port}/"));
+        let origin_main = git_string(
+            &clone,
+            &["rev-parse", "-q", "--verify", "refs/remotes/origin/main"],
+            &env,
+        )
+        .ok();
+        assert_eq!(
+            origin_main, None,
+            "the clone maps only release, so no origin/main appears ({got:?})"
+        );
+        assert_eq!(got, Ok(()), "the retry carries the credential");
+        assert_eq!(
+            run_git(&clone, &["rev-parse", "refs/remotes/origin/release"]),
+            release_tip,
+            "origin/release is the remote's new tip"
         );
     }
 
