@@ -2491,7 +2491,9 @@ fn github_fetch_for(
     };
     // (codex r1) The repository's own config must not steer where the credential goes: an
     // `http.*` key (a resolve override, a proxy, a CA, TLS verification) or origin's proxy set in
-    // the repository (or worktree) config, includes followed, keeps the credential out.
+    // the repository (or worktree) config, includes followed, keeps the credential out; so does a
+    // command it would run during the fetch with the header in its environment
+    // (`core.alternateRefsCommand`).
     let local = git_string(
         cwd,
         &[
@@ -2499,7 +2501,7 @@ fn github_fetch_for(
             "--show-scope",
             "--includes",
             "--get-regexp",
-            r"^(https?\.|remote\.origin\.proxy)",
+            r"^(https?\.|remote\.origin\.proxy|core\.alternaterefscommand)",
         ],
         env,
     )
@@ -4578,6 +4580,12 @@ mod tests {
     fn a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959() {
         use base64::Engine as _;
         use std::io::{Read, Write};
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959",
+        ) {
+            return;
+        }
         let base = scratch("gh-fetch-1959");
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
@@ -4786,11 +4794,14 @@ mod tests {
             &clone,
             &["config", "remote.origin.proxy", "http://127.0.0.1:9"],
         );
+        run_git(&clone, &["config", "core.alternateRefsCommand", "true"]);
         let err = github_fetch_for(&clone, &env, GITHUB_BASE)
             .err()
             .expect("a steered repository gets none");
         assert!(
-            err.contains("http.sslverify") && err.contains("remote.origin.proxy"),
+            err.contains("http.sslverify")
+                && err.contains("remote.origin.proxy")
+                && err.contains("core.alternaterefscommand"),
             "{err}"
         );
     }
