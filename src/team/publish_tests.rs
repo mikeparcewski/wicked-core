@@ -174,15 +174,15 @@ fn a_refusal_swap_never_lets_a_type_both_sides_refuse_through_1926() {
     let rig = rig("swap-gap");
     rig.refuse(&["p1.held", "p1.a"]);
     let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+    use std::sync::atomic::AtomicU32;
+    let reads = std::sync::Arc::new(AtomicU32::new(0));
     let reader = std::thread::spawn({
         let c = rig.conn();
         c.busy_timeout(Duration::ZERO).unwrap();
         let stop = stop.clone();
-        let started = started.clone();
+        let reads = reads.clone();
         move || {
-            started.wait();
-            let (mut read, mut unguarded) = (0u32, 0u32);
+            let mut unguarded = 0u32;
             while !stop.load(Ordering::SeqCst) {
                 let n: rusqlite::Result<i64> = c.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'p1_refuse'",
@@ -191,10 +191,12 @@ fn a_refusal_swap_never_lets_a_type_both_sides_refuse_through_1926() {
                 );
                 match n {
                     Ok(0) => {
-                        read += 1;
                         unguarded += 1;
+                        reads.fetch_add(1, Ordering::SeqCst);
                     }
-                    Ok(_) => read += 1,
+                    Ok(_) => {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
                     // The swap holds the lock: busy (or locked) is the one expected miss.
                     Err(rusqlite::Error::SqliteFailure(e, _))
                         if matches!(
@@ -204,22 +206,34 @@ fn a_refusal_swap_never_lets_a_type_both_sides_refuse_through_1926() {
                     Err(e) => panic!("the reader failed: {e}"),
                 }
             }
-            (read, unguarded)
+            unguarded
         }
     });
-    started.wait();
+    // (codex r1+r2 on #1990) Each swap waits for the reader to have read since the last one, so
+    // the reader really watches the swaps, however the threads are scheduled (bounded: a reader
+    // that stops reading fails the test below, never hangs it).
+    let progressed = |since: u32| {
+        let t0 = std::time::Instant::now();
+        while reads.load(Ordering::SeqCst) <= since && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        reads.load(Ordering::SeqCst) > since
+    };
+    let mut watched = 0u32;
     for i in 0..400 {
+        let since = reads.load(Ordering::SeqCst);
         rig.refuse(if i % 2 == 0 {
             &["p1.held", "p1.b"]
         } else {
             &["p1.held", "p1.a"]
         });
+        if progressed(since) {
+            watched += 1;
+        }
     }
     stop.store(true, Ordering::SeqCst);
-    let (read, unguarded) = reader.join().unwrap();
-    // (codex r1 on #1990) The reader really watched the swaps: a reader that never read, or only
-    // ever hit the lock, would pass vacuously.
-    assert!(read > 0, "the reader read the schema during the swaps");
+    let unguarded = reader.join().unwrap();
+    assert_eq!(watched, 400, "the reader read beside every swap");
     assert_eq!(
         unguarded, 0,
         "the bus was seen with no refusal while it was swapped"

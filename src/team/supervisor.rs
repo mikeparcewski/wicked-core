@@ -255,6 +255,11 @@ impl ActorCouncil {
             Vec::new(),
             deadline,
         );
+        // (codex r2 on #1990) The ask may have run the budget out (a slow engine): no council
+        // starts that its caller can no longer wait for (the slot is released at once).
+        if Instant::now() >= deadline {
+            return CouncilOutcome::NotConvened(not_convened::NOT_STARTED.into());
+        }
         let clis = if !stood.is_empty() {
             stood.into_iter().map(|s| s.record).collect()
         } else if clis.is_empty() {

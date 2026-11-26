@@ -469,7 +469,13 @@ fn host_floor_ballot(record: &crate::AgenticCli) -> Result<crate::AgenticCli, St
     use wicked_apps_core::spawn::SeatCli;
     let binary = crate::execute_wrapped::template_binary(&record.headless_invocation);
     let cli = SeatCli::from_binary(&binary);
-    crate::execute_wrapped::host_stand_in_admits(&record.headless_invocation, cli)?;
+    // (codex r2 on #1990) Every trusted token the ballot launches with: the template AND the trust
+    // flags appended after it (a resume selector there selects a session as surely).
+    let launched = std::iter::once(record.headless_invocation.clone())
+        .chain(record.trust_flags.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::execute_wrapped::host_stand_in_admits(&launched, cli)?;
     let flag = match cli {
         SeatCli::Claude => "--no-session-persistence",
         SeatCli::Pi => "--no-session",
@@ -529,6 +535,14 @@ mod reserve_team_tests {
         assert!(
             host_floor_ballot(&resumes).is_err(),
             "a resume selector is refused"
+        );
+        let resumes_by_flag = crate::AgenticCli {
+            trust_flags: vec!["--resume".into(), "builder-session".into()],
+            ..seat("claude")
+        };
+        assert!(
+            host_floor_ballot(&resumes_by_flag).is_err(),
+            "a resume selector in the trust flags is refused too"
         );
         assert!(
             host_floor_ballot(&seat("copilot")).is_err(),

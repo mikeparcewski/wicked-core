@@ -3743,6 +3743,55 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// codex r2 on #1990: the council's stand-in ask can run the budget out on a slow engine. Then no
+/// council starts: the outcome is `NotConvened`, the engine is never handed a council its caller
+/// stopped waiting for, and the host slot is free at once.
+#[test]
+fn a_stand_in_ask_that_spends_the_budget_starts_no_council_1972() {
+    let path = slot_path("ask-late");
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let engine = std::thread::spawn(move || {
+        let mut convened = false;
+        while let Ok(cmd) = rx.recv_timeout(Duration::from_secs(2)) {
+            match cmd {
+                crate::command::Command::ReserveStandIns { reply, .. } => {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = reply.send(Vec::new());
+                }
+                crate::command::Command::ConveneDecision { .. } => convened = true,
+                _ => {}
+            }
+        }
+        convened
+    });
+    let out = council.convene_from(
+        vec![
+            builtin_seat("claude"),
+            builtin_seat("codex"),
+            builtin_seat("pi"),
+        ],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_millis(300),
+        &mut |_: &[String]| {},
+    );
+    assert!(
+        matches!(&out, CouncilOutcome::NotConvened(w) if w == not_convened::NOT_STARTED),
+        "{out:?}"
+    );
+    assert!(
+        crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+        "the slot is free"
+    );
+    drop(council);
+    assert!(!engine.join().unwrap(), "no council reached the engine");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// core#1822 (T-R16): the engine reports the ballots starting before the ruling. A council whose
 /// ballots started and then ran past the budget is `TimedOut`, after `on_convened` heard its seats;
 /// one the engine never started within the budget is `NotConvened`, and `on_convened` never ran.

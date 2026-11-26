@@ -5524,9 +5524,10 @@ fn council_has_real_voter(
     contained: bool,
     ord: Option<u32>,
 ) -> bool {
+    // (codex r2 on #1990) Only a record that may vote at all: a work-only seat is no voter.
     let voters: Vec<crate::AgenticCli> = voters
         .into_iter()
-        .filter(|c| !wicked_apps_core::spawn::seat_id::is_stand_in(&c.key))
+        .filter(|c| !wicked_apps_core::spawn::seat_id::is_stand_in(&c.key) && c.enabled_for_council)
         .collect();
     session.is_some()
         && !voters.is_empty()
@@ -48078,6 +48079,21 @@ mod council_ballot_tests {
         assert!(council_has_real_voter(
             Some(&two),
             registry.clone(),
+            false,
+            Some(1)
+        ));
+        // (codex r2 on #1990) A helper that works but never votes is no real voter.
+        let work_only: Vec<crate::AgenticCli> = registry
+            .iter()
+            .cloned()
+            .map(|c| crate::AgenticCli {
+                enabled_for_council: false,
+                ..c
+            })
+            .collect();
+        assert!(!council_has_real_voter(
+            Some(&two),
+            work_only,
             false,
             Some(1)
         ));
