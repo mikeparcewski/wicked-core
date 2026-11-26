@@ -4569,8 +4569,9 @@ fn judge_rows(
         let dead = pool.dead.lock().unwrap();
         input.seats.iter().all(|s| dead.contains(s)) && stand_in.is_some_and(|k| !dead.contains(k))
     };
+    // (core#1958) A process rule at review is not asked again alone here either: it never blocks.
     let last: Vec<Batch> = (0..pending.len())
-        .filter(|i| !answered.contains_key(i) && !held.contains(i))
+        .filter(|i| !answered.contains_key(i) && !held.contains(i) && !reported(*i))
         .map(|i| (vec![i], None))
         .collect();
     if stand_in.is_some() && !last.is_empty() && !pool.stopped() && lost_all() {
