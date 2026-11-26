@@ -4059,8 +4059,9 @@ fn stand_in_judge_keys<'a>(
     keys
 }
 
-/// (core#1944) The stand-in a rule check ran on: the `~` key among the seats it drew (it draws one
-/// only when no real seat is left, `cli_runner::rule_judge_stand_in`), when the check made a judge
+/// (core#1944) The stand-in a rule check ran on: the `~` key among the seats it drew (its whole
+/// rotation when no real seat is left; core#1949, beside real seats only once it was asked, after
+/// every one of them was lost: `rule_check::check` names it then), when the check made a judge
 /// call at all (with every rule settled by fact, cache or skip, it was offered and never asked).
 /// Never read off a row, whose judge may be a cached verdict's from an earlier attempt.
 fn rule_stand_in(rc: &crate::rule_check::RuleCheckReport) -> Option<&str> {
