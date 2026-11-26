@@ -593,31 +593,55 @@ pub fn independence_of(roles: &[RoleRecord]) -> Option<String> {
     )
 }
 
-/// (core#1997) Whether a TEAM role stood in on this record: a council that seated a stand-in voter
-/// (its dispute's own `independence` says `stand_in` or `mixed`), or a monitor seated on a
-/// stand-in binding key. Those roles never reach the `roles` records, so a receipt's top-level
-/// independence reads them here. Counted once seated (conservative: never reads independent).
-pub fn team_stood_in(
+/// (core#1997) Who decided a record's TEAM roles, as a receipt reads independence: each council's
+/// own dispute `independence`, and each monitor (`stand_in` on a stand-in binding key, else
+/// `independent`), merged ([`merge_independence`]). Those roles never reach the `roles` records.
+/// `None` when no team role recorded either. A seated stand-in counts (conservative).
+pub fn team_independence(
     councils: &[crate::team::Dispute],
     monitors: &[crate::team::LedgerMonitor],
-) -> bool {
-    councils.iter().any(|d| {
-        matches!(
-            d.independence.as_deref(),
-            Some(INDEPENDENCE_STAND_IN | INDEPENDENCE_MIXED)
-        )
-    }) || monitors
+) -> Option<String> {
+    councils
         .iter()
-        .any(|m| wicked_apps_core::spawn::seat_id::is_stand_in(&m.seat))
+        .filter_map(|d| d.independence.clone())
+        .chain(monitors.iter().map(|m| {
+            if wicked_apps_core::spawn::seat_id::is_stand_in(&m.seat) {
+                INDEPENDENCE_STAND_IN.to_string()
+            } else {
+                INDEPENDENT.to_string()
+            }
+        }))
+        .fold(None, |acc, x| merge_independence(acc, Some(x)))
 }
 
-/// (core#1997) A receipt's independence with its team roles folded in: once a team stand-in took
-/// part, it is never `independent` (nor unset); an all-stand-in record stays `stand_in`.
-pub fn with_team_stand_ins(roles: Option<String>, team_stood: bool) -> Option<String> {
-    if !team_stood || roles.as_deref() == Some(INDEPENDENCE_STAND_IN) {
-        return roles;
+/// (core#1997) Two independence readings of one record merged: unset yields to the other, equal
+/// stays, anything else is `mixed`.
+pub fn merge_independence(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (None, b) => b,
+        (a, None) => a,
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => Some(INDEPENDENCE_MIXED.to_string()),
     }
-    Some(INDEPENDENCE_MIXED.to_string())
+}
+
+/// (core#1997) Whether a team stand-in took part: the team's reading is `stand_in` or `mixed`.
+pub fn stood_in(independence: Option<&str>) -> bool {
+    matches!(
+        independence,
+        Some(INDEPENDENCE_STAND_IN | INDEPENDENCE_MIXED)
+    )
+}
+
+/// (core#1997) A receipt's independence with its team roles folded in, ONLY once a team stand-in
+/// took part (an all-real team leaves the role reading as it was): merged, so a real team member
+/// beside all-stand-in roles reads `mixed`, and stand-ins throughout read `stand_in`.
+pub fn with_team(roles: Option<String>, team: Option<String>) -> Option<String> {
+    if stood_in(team.as_deref()) {
+        merge_independence(roles, team)
+    } else {
+        roles
+    }
 }
 
 impl Default for RunAssurance {
@@ -913,6 +937,53 @@ impl AssuranceReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#1997: team roles fold into a receipt's independence only once a stand-in took part,
+    /// and a real team member beside all-stand-in roles reads `mixed`, never `stand_in`.
+    #[test]
+    fn team_roles_fold_into_independence_1997() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(with_team(s(INDEPENDENT), s(INDEPENDENT)), s(INDEPENDENT));
+        assert_eq!(
+            with_team(None, s(INDEPENDENT)),
+            None,
+            "an all-real team adds nothing"
+        );
+        assert_eq!(
+            with_team(s(INDEPENDENT), s(INDEPENDENCE_STAND_IN)),
+            s(INDEPENDENCE_MIXED)
+        );
+        assert_eq!(
+            with_team(None, s(INDEPENDENCE_STAND_IN)),
+            s(INDEPENDENCE_STAND_IN)
+        );
+        assert_eq!(
+            with_team(s(INDEPENDENCE_STAND_IN), s(INDEPENDENCE_STAND_IN)),
+            s(INDEPENDENCE_STAND_IN)
+        );
+        assert_eq!(
+            with_team(s(INDEPENDENCE_STAND_IN), s(INDEPENDENCE_MIXED)),
+            s(INDEPENDENCE_MIXED),
+            "a real council voter beside stand-in roles"
+        );
+        let monitor = |seat: &str| crate::team::LedgerMonitor {
+            monitor_id: "m1".into(),
+            seat: seat.into(),
+            batches: 1,
+            status: crate::team::MonitorStatus::Completed,
+            error: None,
+        };
+        assert_eq!(team_independence(&[], &[]), None);
+        assert_eq!(team_independence(&[], &[monitor("claude")]), s(INDEPENDENT));
+        assert_eq!(
+            team_independence(&[], &[monitor("claude~1")]),
+            s(INDEPENDENCE_STAND_IN)
+        );
+        assert_eq!(
+            team_independence(&[], &[monitor("claude"), monitor("codex~1")]),
+            s(INDEPENDENCE_MIXED)
+        );
+    }
 
     /// (core#1864) A role nobody filled carries a state the DES enum names (`answered|failed|
     /// seated`): `failed`, with `filled: none`.

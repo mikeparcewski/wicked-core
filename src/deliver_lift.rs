@@ -1571,23 +1571,18 @@ pub(crate) fn delivery_receipt(
                 roles.push(role.clone());
             }
         }
-        // (core#1997) A team stand-in any gate counted, or a council a member-step review
-        // convened after its gate, took part too: the delivery is never more independent than a
-        // gate it carries, and its legacy projection says so as the gate's does.
-        let team_stood = crate::assurance::team_stood_in(&r.councils, &[])
-            || units.iter().filter_map(|u| u.assurance.as_ref()).any(|g| {
-                matches!(
-                    g.independence.as_deref(),
-                    Some(
-                        crate::assurance::INDEPENDENCE_STAND_IN
-                            | crate::assurance::INDEPENDENCE_MIXED
-                    )
-                )
-            });
-        r.independence = crate::assurance::with_team_stand_ins(
-            crate::assurance::independence_of(&roles),
-            team_stood,
-        );
+        // (core#1997) The run's team roles count too, read from their own records (never from a
+        // gate's reading alone, which a gate cut before this fold does not carry): every council
+        // the gates and member-step reviews recorded, and every monitor on a unit's ledger.
+        let monitors: Vec<crate::team::LedgerMonitor> = units
+            .iter()
+            .filter_map(|u| u.team.as_ref().and_then(|t| t.ledger.as_ref()))
+            .flat_map(|l| l.monitors.iter().cloned())
+            .collect();
+        let team = crate::assurance::team_independence(&r.councils, &monitors);
+        let team_stood = crate::assurance::stood_in(team.as_deref());
+        r.independence =
+            crate::assurance::with_team(crate::assurance::independence_of(&roles), team);
         if team_stood || roles.iter().any(RoleRecord::is_stand_in) {
             r.stand_in_label = session.assurance.stand_in_label.clone();
         }

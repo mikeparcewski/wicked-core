@@ -4475,8 +4475,9 @@ fn gate_receipt(
             .and_then(|t| t.ledger.as_ref())
             .map(|l| l.monitors.as_slice())
             .unwrap_or_default();
-        let team_stood = a::team_stood_in(&r.councils, monitors);
-        r.independence = a::with_team_stand_ins(a::independence_of(&roles), team_stood);
+        let team = a::team_independence(&r.councils, monitors);
+        let team_stood = a::stood_in(team.as_deref());
+        r.independence = a::with_team(a::independence_of(&roles), team);
         if team_stood || roles.iter().any(a::RoleRecord::is_stand_in) {
             r.stand_in_label = run.stand_in_label.clone();
             r.project_stand_ins(&run.stand_in_label.clone().unwrap_or_default());
@@ -8267,6 +8268,25 @@ mod guarded_read_step_tests {
             assert_eq!(gate.evaluator, None);
             assert_eq!(gate.judge, None);
         }
+        // A gate cut before the team was read (it says independent) still delivers mixed: the
+        // delivery reads the unit's own ledger, never the gate's reading alone.
+        let old_gate = super::gate_receipt(&store, "r", &teamed(vec![], vec![]), &run, 1, facts());
+        let mut carried = teamed(
+            vec![crate::team::LedgerMonitor {
+                monitor_id: "m1".into(),
+                seat: "sj-claude~1".into(),
+                batches: 1,
+                status: crate::team::MonitorStatus::Completed,
+                error: None,
+            }],
+            vec![],
+        );
+        carried.assurance = Some(old_gate);
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[carried]);
+        assert_eq!(
+            delivery.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENCE_MIXED)
+        );
     }
 
     /// T-R5 (the receipt, DES-STANDIN-001 §5.1): a stand-in judge's PASS is never `ran` for the

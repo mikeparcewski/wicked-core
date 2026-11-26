@@ -3784,7 +3784,13 @@ fn a_stand_in_ask_that_spends_the_budget_starts_no_council_1972() {
         "{out:?}"
     );
     assert!(
-        crate::cli_runner::HostCouncilLock::acquire_until(&path, Instant::now()).is_ok(),
+        // A short wait, never zero: a test child forked elsewhere in this process can hold the
+        // descriptor for an instant before its exec closes it.
+        crate::cli_runner::HostCouncilLock::acquire_until(
+            &path,
+            Instant::now() + Duration::from_secs(2)
+        )
+        .is_ok(),
         "the slot is free"
     );
     drop(council);
