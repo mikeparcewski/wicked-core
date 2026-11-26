@@ -4961,7 +4961,7 @@ mod tests {
     /// (core#2004) A review with 60 steering-rule lines after its ITEM verdicts (the steering
     /// contract asks for every rule after the items) runs past the findings cap. Every ITEM verdict
     /// survives whole, the FAIL items first among them; the rule `N/A` lines are what is cut, and
-    /// the findings say how many and where the full output is.
+    /// the findings say how many and where the step's output is.
     #[test]
     fn every_item_verdict_survives_the_findings_cap_2004() {
         let mut raw = String::from(
@@ -5018,10 +5018,13 @@ mod tests {
         assert!(
             v.findings.contains("steering-rule lines")
                 && v.findings
-                    .contains("the step's full output is in the run's events"),
+                    .contains("see the step's output in the run's events"),
             "the cut is named: {}",
             v.findings
         );
+        // (codex-check on cbebe96) A single output flush over 16 KB is elided in the middle
+        // (`output_throttle::FLUSH_MAX_BYTES`), so the note makes no completeness promise.
+        assert!(!v.findings.contains("full output"), "{}", v.findings);
         assert!(
             !v.findings.contains("…fig.json key"),
             "no line starts mid-sentence: {}",
