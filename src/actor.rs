@@ -36500,6 +36500,57 @@ mod request_changes_tests {
             "{e}"
         );
     }
+
+    /// core#1962 W6: the gate of a floor the machine stopped (no check ran for want of disk)
+    /// says "Approve to retry the step once that is fixed (its checks run again)", but the
+    /// approve re-dispatched the step's seat. A creator with nothing left to change then failed
+    /// the substance floor ("changed nothing") and spent a power round. A plain approve now
+    /// re-runs only the checks, on the work already there; a note is for the seat, so an approve
+    /// with one still runs the step again.
+    #[test]
+    fn approving_a_disk_refused_floor_reruns_only_its_checks_1962() {
+        let run_id = format!("disk-refused-retry-{}", std::process::id());
+        let rerun_of = |store: &dyn GraphStore| {
+            crate::domain::session_units(store, &run_id).unwrap()[3]
+                .repo_checks
+                .as_ref()
+                .and_then(|r| r.requested_rerun.clone())
+        };
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        answer(
+            &mut store,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
+        .0
+        .expect("approve retries");
+        let rerun = rerun_of(&store)
+            .expect("the checks re-run on the work already there; the seat does not run again");
+        assert_eq!(rerun.mode.as_wire(), "retry", "{rerun:?}");
+        assert!(rerun.fix.is_none() && rerun.waive.is_empty(), "{rerun:?}");
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        answer(
+            &mut store,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("use the cached dependencies".into()),
+                amend_scope: Default::default(),
+            },
+        )
+        .0
+        .expect("approve with a note retries");
+        assert!(
+            rerun_of(&store).is_none(),
+            "a note is for the seat: the step runs again"
+        );
+    }
 }
 
 /// crew#311 / core#297 §2 — the CODE-EVIDENCE floor: a governed `executes_code` CREATOR phase of
