@@ -127,10 +127,7 @@ fn tmp_path(name: &str) -> PathBuf {
 }
 
 fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "wicked-core-standin-judge-{name}-{}",
-        std::process::id()
-    ));
+    let d = tmp_path(name);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
