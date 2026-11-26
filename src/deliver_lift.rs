@@ -1617,9 +1617,23 @@ pub(crate) fn delivery_receipt(
                 roles.push(role.clone());
             }
         }
-        r.independence = crate::assurance::independence_of(&roles);
-        if roles.iter().any(RoleRecord::is_stand_in) {
+        // (core#1997) The run's team roles count too, read from their own records (never from a
+        // gate's reading alone, which a gate cut before this fold does not carry): every council
+        // the gates and member-step reviews recorded, and every monitor on a unit's ledger.
+        let monitors: Vec<crate::team::LedgerMonitor> = units
+            .iter()
+            .filter_map(|u| u.team.as_ref().and_then(|t| t.ledger.as_ref()))
+            .flat_map(|l| l.monitors.iter().cloned())
+            .collect();
+        let team = crate::assurance::team_independence(&r.councils, &monitors);
+        let team_stood = crate::assurance::stood_in(team.as_deref());
+        r.independence =
+            crate::assurance::with_team(crate::assurance::independence_of(&roles), team);
+        if team_stood || roles.iter().any(RoleRecord::is_stand_in) {
             r.stand_in_label = session.assurance.stand_in_label.clone();
+        }
+        if team_stood {
+            r.project_stand_ins(&session.assurance.stand_in_label.clone().unwrap_or_default());
         }
         r.roles = Some(roles);
     }

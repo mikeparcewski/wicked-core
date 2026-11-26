@@ -570,6 +570,33 @@ fn a_rule_check_on_the_run_judge_stand_in_is_recorded_and_its_verdicts_stand() {
     assert_eq!(receipt.rules[0].status, RuleStatus::Kept);
 }
 
+/// core#1985: the stand-in a rule check ran on (no semantic judge answered as it) is recorded on the
+/// run as the rule check's, never as a second judge: crew's delivery line lists the run's bindings
+/// by role ("Stood in: reviewer, judge, judge" before the fix).
+#[test]
+fn a_rule_check_stand_in_is_recorded_as_the_rule_check_not_a_judge_1985() {
+    let mut kept = row("K", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:1");
+    kept.judge = Some("a~1".into());
+    let rc = RuleCheckReport {
+        rows: vec![kept],
+        seats: vec!["a~1".into()],
+        calls: 1,
+        ..Default::default()
+    };
+    let (_, _, _, session) = fold_on("rc-standin-role", Some(rc), None, true);
+    let b = session
+        .assurance
+        .stand_ins
+        .iter()
+        .find(|b| b.key == "a~1")
+        .expect("the binding is on the run's record");
+    assert_eq!(b.role, crate::standin::Role::RuleJudge);
+    assert!(
+        crate::standin::label(b, b.display()).contains("stood in for the rule check"),
+        "{b:?}"
+    );
+}
+
 /// (core#1944) Fail closed: a rule check that ran on a stand-in the run never offered this unit
 /// (`a~7`) keeps none of its verdicts. The KEPT it reported is unchecked and the gate holds; no
 /// binding and no role are recorded for it.

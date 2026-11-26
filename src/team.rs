@@ -582,6 +582,33 @@ pub struct Dispute {
     /// step ended before its turn"). Absent on every row recorded before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// (core#1972, DES-STANDIN-001 §5.1) Who decided, as a receipt reads it: `independent` (real
+    /// seats only), `stand_in` (stand-ins only), `mixed`. Absent when nobody sat, and on every row
+    /// recorded before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independence: Option<String>,
+}
+
+/// (core#1972) A council's [`Dispute::independence`] from the seats that sat: a stand-in key (the
+/// engine's reserved grammar, minted only by the engine) is a stand-in, any other key a real seat.
+pub fn council_independence(seats: &[String]) -> Option<String> {
+    if seats.is_empty() {
+        return None;
+    }
+    let stood = seats
+        .iter()
+        .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
+        .count();
+    Some(
+        if stood == 0 {
+            crate::assurance::INDEPENDENT
+        } else if stood == seats.len() {
+            crate::assurance::INDEPENDENCE_STAND_IN
+        } else {
+            crate::assurance::INDEPENDENCE_MIXED
+        }
+        .to_string(),
+    )
 }
 
 /// One finding in the ledger (DES §7 `teamLedger.findings[]`). S2 fills everything it owns;

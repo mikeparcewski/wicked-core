@@ -503,18 +503,17 @@ fn reviewer_pool<'a>(
 /// (DES-STANDIN-001 §3.2, T-R11) The credentials a stand-in QE reviewer may run on: every seat the
 /// reviewer's absolute admission keeps (not benched, not launch-excluded, admitting the QE skill),
 /// by its credential, the QE executor's first. Only the author fence made them short, and a
-/// stand-in is never a real reviewer. Empty unless the run is stand-in-aware and not reduced, and
-/// on an Apps publish (its QE stand-in path is C3b's).
+/// stand-in is never a real reviewer. Empty unless the run is stand-in-aware and not reduced.
+/// (core#1974) An Apps publish included: its one seat that built none of the turns (the launch
+/// exclusion already benched every builder) stands in for its QE reviewer, and the produce
+/// backstop takes that PASS only as this unit's recorded stand-in (`apps::publish_consent_refusal`).
 pub(crate) fn stand_in_bases(
     session: &AgentSession,
     units: &[WorkUnit],
     unit: &WorkUnit,
 ) -> Vec<String> {
     use wicked_apps_core::spawn::seat_id;
-    if !crate::standin::active(&session.assurance)
-        || session.assurance.reduced()
-        || crate::apps::is_publish(session)
-    {
+    if !crate::standin::active(&session.assurance) || session.assurance.reduced() {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();

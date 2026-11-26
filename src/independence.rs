@@ -1349,7 +1349,10 @@ mod tests {
         );
         assert!(role(&p, "rule_judge").conditional);
         assert_eq!(role(&p, "council").short_by, 3);
-        assert_eq!(p.reason.as_deref(), Some("only Claude Code was signed in"));
+        assert_eq!(
+            p.reason.as_deref(),
+            Some("only Claude Code was picked for this job")
+        );
         assert_eq!(
             p.reason_data,
             Some(ShortReason::OnlyOneHelper {

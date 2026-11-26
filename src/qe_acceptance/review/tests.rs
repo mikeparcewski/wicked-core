@@ -2268,9 +2268,9 @@ fn seats_of(c: &[QeReviewerSeat]) -> Vec<String> {
     c.iter().map(|c| c.seat.clone()).collect()
 }
 
-/// T-R11 controls: no stand-in without consent, on an unaware run, on a reduced run, on an Apps
-/// publish (C3b's), or when the only seat is benched or launch-excluded (a stand-in never makes up
-/// for a credential that cannot run).
+/// T-R11 controls: no stand-in without consent, on an unaware run, on a reduced run, or when the
+/// only seat is benched or launch-excluded (a stand-in never makes up for a credential that cannot
+/// run). (core#1974) An Apps publish stands in like any run.
 #[test]
 fn t_r11_no_stand_in_reviewer_without_consent_awareness_or_a_usable_base() {
     let ledger = Path::new("/l/.wicked-qe");
@@ -2304,8 +2304,11 @@ fn t_r11_no_stand_in_reviewer_without_consent_awareness_or_a_usable_base() {
     publish.assurance.apps = Some(crate::apps::AppsContract {
         preset: crate::apps::APPS_PUBLISH.into(),
     });
-    assert!(none(&publish), "Apps publish (C3b)");
-    assert!(stand_in_bases(&publish, &units, &u).is_empty());
+    assert!(!none(&publish), "an Apps publish stands in (core#1974)");
+    assert_eq!(
+        stand_in_bases(&publish, &units, &u),
+        vec!["claude".to_string()]
+    );
 }
 
 /// T-R11 (§3.8): the hold. No consent, no reviewer seat (or every one failed as a seat), and a

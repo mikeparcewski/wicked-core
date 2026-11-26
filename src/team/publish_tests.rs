@@ -58,10 +58,13 @@ impl Rig {
             let list: Vec<String> = types.iter().map(|t| format!("'{t}'")).collect();
             format!("NEW.event_type IN ({})", list.join(","))
         };
+        // (core#1926) One transaction: the swap never leaves the bus without a refusal, so a
+        // publisher retry cannot land a fact both the old and the new refusal hold.
         self.conn()
             .execute_batch(&format!(
-                "DROP TRIGGER IF EXISTS p1_refuse; CREATE TRIGGER p1_refuse BEFORE INSERT ON \
-                 events WHEN {when} BEGIN SELECT RAISE(ABORT, 'p1 test: bus refuses'); END;"
+                "BEGIN IMMEDIATE; DROP TRIGGER IF EXISTS p1_refuse; CREATE TRIGGER p1_refuse \
+                 BEFORE INSERT ON events WHEN {when} BEGIN SELECT RAISE(ABORT, 'p1 test: bus \
+                 refuses'); END; COMMIT;"
             ))
             .unwrap();
     }
@@ -160,9 +163,83 @@ fn published(o: &PublishOutcome) -> bool {
 
 // ── P1 (a): the bus is unwritable, every fact spools, and lands once when it returns ─────────────
 
-/// P1 (a) — with the bus db held EXCLUSIVE (unwritable), every team fact lands in the team
-/// outbox (the emit-outbox record plus key, run and owner); once the bus returns, a drain
-/// publishes each exactly once, and a second drain publishes nothing more.
+/// core#1926: swapping the refused types never opens a gap. `row3` of the team-gate suite swaps
+/// `plan.accepted` for `gate.opened` while the publisher retries both; a swap made of two
+/// autocommit statements let a retry land both between them (seen once on a slow Windows
+/// runner: the run then took its `gate.decided` and went on). A reader polls the bus schema, as
+/// fast as it can, while the refusal is swapped back and forth: it never sees the bus unguarded.
+#[test]
+fn a_refusal_swap_never_lets_a_type_both_sides_refuse_through_1926() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let rig = rig("swap-gap");
+    rig.refuse(&["p1.held", "p1.a"]);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    use std::sync::atomic::AtomicU32;
+    let reads = std::sync::Arc::new(AtomicU32::new(0));
+    let reader = std::thread::spawn({
+        let c = rig.conn();
+        c.busy_timeout(Duration::ZERO).unwrap();
+        let stop = stop.clone();
+        let reads = reads.clone();
+        move || {
+            let mut unguarded = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let n: rusqlite::Result<i64> = c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'p1_refuse'",
+                    [],
+                    |r| r.get(0),
+                );
+                match n {
+                    Ok(0) => {
+                        unguarded += 1;
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(_) => {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // The swap holds the lock: busy (or locked) is the one expected miss.
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if matches!(
+                            e.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) => {}
+                    Err(e) => panic!("the reader failed: {e}"),
+                }
+            }
+            unguarded
+        }
+    });
+    // (codex r1+r2 on #1990) Each swap waits for the reader to have read since the last one, so
+    // the reader really watches the swaps, however the threads are scheduled (bounded: a reader
+    // that stops reading fails the test below, never hangs it).
+    let progressed = |since: u32| {
+        let t0 = std::time::Instant::now();
+        while reads.load(Ordering::SeqCst) <= since && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        reads.load(Ordering::SeqCst) > since
+    };
+    let mut watched = 0u32;
+    for i in 0..400 {
+        let since = reads.load(Ordering::SeqCst);
+        rig.refuse(if i % 2 == 0 {
+            &["p1.held", "p1.b"]
+        } else {
+            &["p1.held", "p1.a"]
+        });
+        if progressed(since) {
+            watched += 1;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let unguarded = reader.join().unwrap();
+    assert_eq!(watched, 400, "the reader read beside every swap");
+    assert_eq!(
+        unguarded, 0,
+        "the bus was seen with no refusal while it was swapped"
+    );
+}
+
 #[test]
 fn p1_a_unwritable_bus_every_fact_spools_and_lands_once_when_the_bus_returns() {
     let rig = rig("a");
