@@ -19,7 +19,11 @@ Two release tracks share this file, newest entry first regardless of track:
   second seat run for that rule alone, before the gate could open. A process rule's row never blocks,
   so the review check no longer asks it again: it stays `unchecked` and its reason says it was not asked again.
   Change rules are still asked again alone, as before.
-
+- **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
+  (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
+  from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
+  so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
+  way; a real seat keeps its key, and the parties keep the keys.
 - **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
   binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
   binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported
