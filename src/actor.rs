@@ -3906,12 +3906,14 @@ pub(crate) fn run(
                                 }))
                         })();
                         // (core#1979) The step a broadcast to a deaf owner is held for: the first
-                        // later step that hears operator messages, read only on that path.
+                        // later step whose dispatch takes operator messages (the dispatch site's
+                        // own predicate, so a tool step, a team review and a stand-in are
+                        // skipped), read only on that path.
                         let next_hearing = |after: usize| -> anyhow::Result<Option<u32>> {
                             let mut ix = after + 1;
                             while let Some(u) = crate::domain::session_unit_at(&store, &run_id, ix)?
                             {
-                                if u.tool_cmd.is_none() {
+                                if hears_operator_messages(&u) {
                                     return Ok(Some(u.ord));
                                 }
                                 ix += 1;
@@ -13525,6 +13527,24 @@ fn dispatch_probe_job(
     })
 }
 
+/// Whether `unit`'s dispatch takes the operator messages queued for it (DES-POWER-MODE). Not a tool
+/// step (no seat reads them), not the PA's review of a member's step (DES-TEAMING-002 §8.8), not a
+/// stand-in (DES-STANDIN-001 §3.4: a stand-in hears no communications) and not a floor re-run
+/// (core#1962: it runs no seat). The dispatch site and the inject route's hold (core#1979) both
+/// ask this, so a broadcast is never held for a step that will not take it.
+fn hears_operator_messages(unit: &crate::domain::WorkUnit) -> bool {
+    unit.tool_cmd.is_none()
+        && !unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some())
+        && !crate::execute_wrapped::is_stand_in_unit(unit)
+        && !unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.requested_rerun.is_some())
+}
+
 /// [`dispatch_unit`], with the worktree reads it needs: `None` on the first pass, which starts the
 /// off-actor probe when the unit needs one and returns `Ok(true)` (the dispatch is under way);
 /// `Some` on the second pass, from [`Command::DispatchProbed`] (core#1390, [`dispatch_probe`]).
@@ -14437,12 +14457,9 @@ fn dispatch_unit_with(
     // addressed to it or to all, once, as an operator context block.
     // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
     // (core#1962) A floor re-run runs no seat (the runner hands the reviewed output on): its
-    // messages stay queued for the next seat that does.
-    let floor_rerun = unit
-        .repo_checks
-        .as_ref()
-        .is_some_and(|r| r.requested_rerun.is_some());
-    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in && !floor_rerun {
+    // messages stay queued for the next seat that does. One predicate with the inject route's
+    // hold (core#1979), [`hears_operator_messages`].
+    if hears_operator_messages(unit) {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
