@@ -320,7 +320,7 @@ fn setup_env() {
         // The J6 v3 script `domain-run` checks for (core#1955 R2-6); the launcher plays it.
         let run_py = snapshot.join("scripts").join("domain").join("run.py");
         std::fs::create_dir_all(run_py.parent().unwrap()).unwrap();
-        std::fs::write(&run_py, "# stand-in: the fixture launcher plays run.py\n").unwrap();
+        std::fs::write(run_py, "# stand-in: the fixture launcher plays run.py\n").unwrap();
         std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
         std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
         // codex is benched on a repository-bound run unless one of these says otherwise: pin both

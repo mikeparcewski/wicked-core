@@ -172,6 +172,7 @@ pub const OLD_GARDEN_REFUSAL: &str = "this wicked-garden is too old to map a dom
 /// generation the run was admitted against), not at launch.
 pub fn domain_run_step_cmd(step: &str, rest: &str) -> Vec<String> {
     // RED (core#1955): no check, the old garden's launcher answers.
+    let _ = OLD_GARDEN_REFUSAL;
     garden_domain_step_cmd(step, DOMAIN_RUN_SCRIPT, rest)
 }
 
@@ -280,7 +281,7 @@ mod tests {
         let launcher = dir.join("scripts").join("wicked-garden");
         std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
         std::fs::write(&launcher, "#!/bin/sh\necho \"launched $*\"\nexit 3\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         let run = |root: Option<&std::path::Path>| {
             let mut c = std::process::Command::new(&cmd[0]);
             c.arg(&cmd[1])
@@ -318,7 +319,7 @@ mod tests {
             err.contains(NO_GARDEN_ROOT) && !err.contains(OLD_GARDEN_REFUSAL),
             "{err}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// (J6 C1b, codex r1) A launcher's scope text parses without losing a field: a key twice, at

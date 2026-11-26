@@ -648,9 +648,10 @@ fn a_build_another_build_overtook_is_refused_and_writes_nothing() {
     let mut store = open(&f);
     let a = wicked_governance::assemble_build(&store, &f.tree, 9).unwrap();
     let (b, b_outcome) = build_and_persist(&mut store, &f.tree, 10).unwrap();
+    let b = serde_json::to_value(b).unwrap();
     assert_ne!(
         serde_json::to_value(a.model()).unwrap()["metadata"],
-        serde_json::to_value(&b).unwrap()["metadata"],
+        b["metadata"],
         "A and B differ, so a write of A shows"
     );
     let err = wicked_governance::persist_build(&mut store, a)
@@ -665,14 +666,8 @@ fn a_build_another_build_overtook_is_refused_and_writes_nothing() {
         .unwrap()
         .unwrap();
     assert_eq!(build.generation, b_outcome.generation, "no new generation");
-    assert_eq!(
-        read["metadata"],
-        serde_json::to_value(&b).unwrap()["metadata"]
-    );
-    assert_eq!(
-        read["domains"],
-        serde_json::to_value(&b).unwrap()["domains"]
-    );
+    assert_eq!(read["metadata"], b["metadata"]);
+    assert_eq!(read["domains"], b["domains"]);
 }
 
 /// F18/F13/R16: the model persists and reads back whole (lists included), and a later build with
