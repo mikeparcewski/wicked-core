@@ -331,9 +331,12 @@ pub struct PreflightContract {
     /// no review step, whose default floor convenes a judge only when the unit changes the
     /// worktree tree. The judge is conditional.
     pub planless: bool,
-    /// (core#1954) The monitors a team run's plan seats, as the launch scores it
-    /// (`monitor_target` over the band of its score, with the plan's own ask). `None` when the
-    /// score waits for the PA's scope step: the most that step can set (the top band).
+    /// (core#1954) A team run's monitor target at its launch score (`monitor_target` over the
+    /// band of `intent_score_for_run`, with the plan's own ask). The preflight reads no code graph,
+    /// so a code touch set scores as an unbound launch's does (fail-closed, the top band) where the
+    /// run, reading its repo's graph, may seat fewer. `None` when the score waits for the PA's
+    /// scope step (the preflight reports the most that step can set, the top band), and for a
+    /// launch that is not a team run.
     pub monitors: Option<u8>,
 }
 
@@ -1431,6 +1434,16 @@ mod tests {
         let asked = docs(r#","monitors":{"asked":1}"#);
         let p = preflight(&clis, &asked, contract_for(&asked, false));
         assert_eq!(role(&p, "monitor").needed, 1, "the plan's ask raises it");
+        // A code touch set with no graph to read scores fail-closed: the top band, never fewer.
+        let code = PreflightShape {
+            plan_json: Some(r#"{"steps":[{"catalog":"build"}],"touch":["src/lib.rs"]}"#.into()),
+            ..quiet.clone()
+        };
+        let p = preflight(&clis, &code, contract_for(&code, false));
+        assert_eq!(
+            role(&p, "monitor").needed,
+            usize::from(crate::team::supervisor::MAX_MONITORS)
+        );
         // A preset's score waits for the PA's scope step: the row keeps the most it can set.
         let bug = bug_shape();
         let p = preflight(&clis, &bug, contract_for(&bug, false));

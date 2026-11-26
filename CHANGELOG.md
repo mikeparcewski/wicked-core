@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The independence preflight answers only for roles the run's plan seats** (core#1954). A launch with no plan
+  and no workflow plans one unit with no review step: the preflight no longer lists a reviewer, and its judge is
+  conditional (the unit convenes one only when it changes the worktree). A team run's monitor row is sized from
+  the plan's launch score and its own ask, not always three: a plan the PA scopes keeps the top band until its
+  scope step scores it, and a zero target drops the row. `canStandIn` is true only where a stand-in sits today
+  (the reviewer, the judge, the QE reviewer, a party's place, and the rule judge on a run that is not reduced);
+  the council, rule council and monitor rows offer none.
+
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
