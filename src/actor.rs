@@ -3861,9 +3861,12 @@ pub(crate) fn run(
                         // unit's seat (or all); an unreadable owner refuses the inject (codex r1),
                         // never queues it unscoped.
                         // (core#1964) …and whether it can still hear one: a unit already
-                        // dispatched in this attempt took its messages then, and hears a new one
-                        // only between the turns of a power build. Any other is mid-turn.
-                        let owner = (|| -> anyhow::Result<Option<(u32, bool)>> {
+                        // dispatched in this attempt (whatever its last result says, a gate
+                        // retry runs it again) took its messages then, and hears a new one only
+                        // between the turns of a power build. Any other is mid-turn, and a
+                        // message for it is refused rather than queued unheard (a broadcast
+                        // too: core#1486 keeps it from every other step).
+                        let owner = (|| -> anyhow::Result<Option<(u32, bool, String)>> {
                             let Some(s) = crate::domain::get_session(&store, &run_id)? else {
                                 return Ok(None);
                             };
@@ -3872,34 +3875,40 @@ pub(crate) fn run(
                             }
                             Ok(crate::domain::session_unit_at(&store, &run_id, s.unit_ix)?
                                 .filter(|u| {
-                                    matches!(
-                                        u.status,
-                                        crate::domain::UnitStatus::Distributed
-                                            | crate::domain::UnitStatus::Pending
-                                    ) && (target_str == "all"
-                                        || u.assigned_cli.as_deref() == Some(target_str.as_str()))
+                                    let this_attempt = u.last_attempt == Some(s.attempt);
+                                    (this_attempt
+                                        || matches!(
+                                            u.status,
+                                            crate::domain::UnitStatus::Distributed
+                                                | crate::domain::UnitStatus::Pending
+                                        ))
+                                        && (target_str == "all"
+                                            || u.assigned_cli.as_deref()
+                                                == Some(target_str.as_str()))
                                 })
                                 .map(|u| {
                                     let turns = s
                                         .power
                                         .as_ref()
                                         .is_some_and(|p| p.on && p.orchestrator.ord == Some(u.ord));
-                                    (u.ord, u.last_attempt == Some(s.attempt) && !turns)
+                                    (
+                                        u.ord,
+                                        u.last_attempt == Some(s.attempt) && !turns,
+                                        u.assigned_cli.clone().unwrap_or_else(|| "its seat".into()),
+                                    )
                                 }))
                         })();
                         let for_ord = match owner {
-                            Ok(Some((ord, true))) if target_str != "all" => {
+                            Ok(Some((ord, true, cli))) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
-                                    "step {ord} ({target_str}) is in the middle of its turn and \
-                                     reads no message until it ends, so this one would not reach \
-                                     it; it was not sent. Steer the step at its gate instead (a \
-                                     note, or request changes)"
+                                    "step {ord} ({cli}) is already working on this attempt and \
+                                     reads no new message until it is dispatched again, so this \
+                                     one would not reach it; it was not sent. Steer the step at \
+                                     its gate instead (a note, or request changes)"
                                 )));
                                 continue;
                             }
-                            // A broadcast steers the run: the next step hears it.
-                            Ok(Some((_, true))) => None,
-                            Ok(o) => o.map(|(ord, _)| ord),
+                            Ok(o) => o.map(|(ord, _, _)| ord),
                             Err(e) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "run {run_id}: could not tell which step is running ({e}); \
@@ -14366,7 +14375,13 @@ fn dispatch_unit_with(
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
     // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
-    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
+    // (core#1962) A floor re-run runs no seat (the runner hands the reviewed output on): its
+    // messages stay queued for the next seat that does.
+    let floor_rerun = unit
+        .repo_checks
+        .as_ref()
+        .is_some_and(|r| r.requested_rerun.is_some());
+    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in && !floor_rerun {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -36590,6 +36605,34 @@ mod request_changes_tests {
             .expect("the checks re-run on the work already there; the seat does not run again");
         assert_eq!(rerun.mode.as_wire(), "retry", "{rerun:?}");
         assert!(rerun.fix.is_none() && rerun.waive.is_empty(), "{rerun:?}");
+        // No seat runs, so the re-run takes no operator message: it waits for one that does.
+        crate::power::queue_operator_message(&run_id, "all", "keep it small", None);
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        dispatch_unit(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &run_id,
+            3,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .expect("the checks-only re-run dispatches");
+        let kept: Vec<String> = crate::power::take_operator_messages(&run_id, "claude", 4)
+            .into_iter()
+            .map(|m| m.message)
+            .collect();
+        crate::power::forget_run(&run_id);
+        assert_eq!(
+            kept,
+            vec!["keep it small".to_string()],
+            "the message is not spent"
+        );
 
         let mut store = open_store(Some(":memory:")).unwrap();
         seed_disk_refused_verify(&mut store, &run_id);
@@ -36606,6 +36649,34 @@ mod request_changes_tests {
         assert!(
             rerun_of(&store).is_none(),
             "a note is for the seat: the step runs again"
+        );
+    }
+
+    /// core#1962 (review): a power build whose checks the disk stopped spends no hand-off round
+    /// and records no failed hand-off step: nothing about the work failed, and the send-back it
+    /// queued was refused anyway (only a retry answers that gate).
+    #[test]
+    fn a_disk_refused_power_build_spends_no_hand_off_round_1962() {
+        let mut s = crate::actor::sessions_detail_fold_tests::session("pw-disk");
+        let mut power = crate::power::PowerState::launched(true, 0);
+        power.orchestrator.ord = Some(2);
+        s.power = Some(power);
+        let mut build = WorkUnit::pending("pw-disk:build", "pw-disk", 2, "build");
+        build.role = PhaseRole::Creator;
+        deny_by_floor(&mut build, disk_refused_floor());
+        assert!(floor_not_run(&build).is_some());
+        let reason = build.denial_reason.clone().unwrap();
+        let class = denial_class(build.denial.as_ref(), false);
+        assert_eq!(class, "floor_failed");
+        let mut sink = crate::event_log::EventSink::default();
+        assert_eq!(
+            super::power_gate::auto_send_back(&mut sink, &mut s, &build, class, &reason),
+            None,
+            "no send-back"
+        );
+        assert!(
+            s.power.as_ref().unwrap().handoff.is_none(),
+            "no round spent and no failed hand-off step"
         );
     }
 }
@@ -39882,12 +39953,12 @@ mod live_output_stream_tests {
     /// for the next step. A step not yet dispatched, and a power build between its turns, still
     /// hear theirs.
     #[test]
-    fn a_message_to_a_step_mid_turn_is_refused_or_kept_for_the_next_step_1964() {
+    fn a_message_to_a_step_mid_turn_is_refused_not_queued_unheard_1964() {
         use crate::command::InjectTarget;
         use crate::domain::{put_nodes, UnitStatus, WorkUnit};
         use wicked_apps_core::open_store;
 
-        let seed = |tag: &str, dispatched: bool, power_build: Option<u32>| {
+        let seed = |tag: &str, dispatched: bool, power_build: Option<u32>, status: UnitStatus| {
             let run_id = format!("inject-1964-{tag}-{}", uuid::Uuid::new_v4());
             let dir = std::env::temp_dir().join(&run_id);
             std::fs::create_dir_all(&dir).unwrap();
@@ -39904,7 +39975,7 @@ mod live_output_stream_tests {
                     session.power = Some(power);
                 }
                 let mut first = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "review");
-                first.status = UnitStatus::Distributed;
+                first.status = status;
                 first.assigned_cli = Some("codex".into());
                 if dispatched {
                     first.last_attempt = Some(1);
@@ -39933,7 +40004,7 @@ mod live_output_stream_tests {
         };
 
         // The reported shape: the review step's one turn is running.
-        let (run, core) = seed("mid-turn", true, None);
+        let (run, core) = seed("mid-turn", true, None, UnitStatus::Distributed);
         let refused = core.inject_worker_message(&run, "check the README too", codex());
         let (running, next) = (heard(&run, 1), heard(&run, 2));
         let err = refused
@@ -39947,20 +40018,26 @@ mod live_output_stream_tests {
             running.is_empty() && next.is_empty(),
             "a refused message is not queued"
         );
-        // A broadcast steers the run: the next step hears it.
-        core.inject_worker_message(&run, "keep it small", InjectTarget::All)
-            .expect("a broadcast is kept for the next step");
-        assert_eq!(heard(&run, 2), vec!["keep it small".to_string()]);
+        // A broadcast is that step's too (core#1486): refused, never handed to another step.
+        let refused = core.inject_worker_message(&run, "keep it small", InjectTarget::All);
+        assert!(refused.is_err(), "a broadcast mid-turn is refused too");
+        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
+
+        // A step a gate retry runs again keeps its last result's status: still mid-turn.
+        let (run, core) = seed("gate-retry", true, None, UnitStatus::Rejected);
+        let refused = core.inject_worker_message(&run, "check the README too", codex());
+        assert!(refused.is_err(), "a retried step mid-turn is refused");
+        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
 
         // Not dispatched yet: the step hears it when it is.
-        let (run, core) = seed("pending", false, None);
+        let (run, core) = seed("pending", false, None, UnitStatus::Distributed);
         core.inject_worker_message(&run, "check the README too", codex())
             .expect("queued for the step's dispatch");
         assert!(heard(&run, 2).is_empty(), "it is that step's, not the next");
         assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
 
         // A power build hears it at its next turn.
-        let (run, core) = seed("power-build", true, Some(1));
+        let (run, core) = seed("power-build", true, Some(1), UnitStatus::Distributed);
         core.inject_worker_message(&run, "check the README too", codex())
             .expect("queued for the build's next turn");
         assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);

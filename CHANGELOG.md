@@ -17,13 +17,17 @@ Two release tracks share this file, newest entry first regardless of track:
 - **Retrying a step whose checks the disk stopped re-runs only the checks** (core#1962). The gate of a floor the
   machine stopped (no check ran for want of disk) says approving re-runs the checks, but the approve re-ran the
   step's seat. A creator with nothing left to change then failed the substance floor ("changed nothing") and
-  spent a power round. A plain approve now re-runs the same checks on the work already there (`retry`); an
-  approve with a note still runs the step again.
+  spent a power round. A plain approve now re-runs the same checks on the work already there (`retry`, a new
+  `FloorRerunMode`: an engine older than this one cannot read a unit that holds it, so do not roll back across a
+  run with one); an approve with a note still runs the step again. A power build's disk refusal spends no
+  hand-off round either, and a checks-only re-run leaves queued operator messages for the next seat that runs.
 - **A message to a step in the middle of its turn is refused instead of silently dropped** (core#1964). On a run with
   no live terminal, a message to the seat of the step running now was queued for that step. A step takes its
   messages when it is dispatched and, unless it is a power build between turns, reads none while its turn runs, so
-  the message never arrived while the inject answered OK. Such a message is now refused with the reason (crew's
-  route answers 409); a broadcast steers the run and is kept for the next step.
+  the message never arrived while the inject answered OK. Such a message, a broadcast included (core#1486 keeps a
+  step's messages from every other step), is now refused with the reason (crew's route answers 409), and so is one
+  to a step a gate retry is running again. A step not yet dispatched, and a power build between its turns, still
+  hear theirs.
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
