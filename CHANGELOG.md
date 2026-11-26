@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
+  (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
+  from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
+  so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
+  way; a real seat keeps its key, and the parties keep the keys.
+
 - **core-ts 0.15.51** — 2026-11-26 — patch release on the train-15 cut 14212d70, carrying 10 PRs since 0.15.50: #1939, #1942, #1943, #1915, #1922, #1941, #1947, #1948, #1960, #1950.
   The entries below were written from each PR's changelog entry (the PR title or body where it had none).
 
