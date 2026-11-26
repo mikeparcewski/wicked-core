@@ -32574,8 +32574,35 @@ mod request_changes_tests {
     }
 
     /// core#1522: judge registry reads leave the worker home untouched; sign-in still prepares it.
+    ///
+    /// (core#2000) The check runs in a child process of this test binary that runs this test alone.
+    /// `HOME` and `WICKED_WORKER_HOME` are process-wide, and `ENV_LOCK` only holds off the tests that
+    /// take it: any other test that resolves a seat root meanwhile (a seat spawn, a sign-in roster
+    /// read) runs `ensure_dirs` and creates its seat directory in this test's home, which failed the
+    /// "must not create" check on ubuntu CI. In the child nothing else runs.
     #[test]
     fn judge_registry_reads_do_not_prepare_seat_directories() {
+        const CHILD: &str = "WICKED_TEST_JUDGE_REGISTRY_CHILD_2000";
+        const NAME: &str =
+            "actor::request_changes_tests::judge_registry_reads_do_not_prepare_seat_directories";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.hardened().env(CHILD, "1").args([
+                "--exact",
+                NAME,
+                "--test-threads=1",
+                "--nocapture",
+            ]);
+            let out = crate::k8s::run_bounded(child, None, std::time::Duration::from_secs(120));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.ok() && stdout.contains("1 passed"),
+                "the isolated run failed or did not run the test ({:?}):\n{stdout}\n{}",
+                out.code,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
