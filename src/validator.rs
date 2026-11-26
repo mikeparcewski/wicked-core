@@ -4165,7 +4165,7 @@ fn cap_findings(trimmed: &str) -> (String, bool) {
     .collect();
     let note = (!parts.is_empty()).then(|| {
         format!(
-            "… {} not shown here; the step's full output is in the run's events",
+            "… {} not shown here; see the step's output in the run's events",
             parts.join(" and ")
         )
     });
