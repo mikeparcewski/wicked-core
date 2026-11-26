@@ -1664,13 +1664,20 @@ fn stamp_judge_ids(report: &mut crate::rule_check::RuleCheckReport, pool: &[crat
         .iter_mut()
         .filter(|r| r.how == crate::rule_check::RuleHow::Judge)
     {
-        r.judge_ids = r
-            .judge
-            .as_deref()
-            .and_then(|j| pool.iter().find(|c| c.key == j))
+        // (core#1949) POL-2101's record part's judge, when another seat, ruled too.
+        let mut ids: Vec<String> = Vec::new();
+        for c in r
+            .judges()
+            .filter_map(|j| pool.iter().find(|c| c.key == j))
             .filter(|c| launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)))
-            .map(record_identities)
-            .unwrap_or_default();
+        {
+            for id in record_identities(c) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        r.judge_ids = ids;
     }
 }
 
@@ -3162,7 +3169,7 @@ impl JudgeExclusions {
             return false;
         };
         (!r.judge_ids.is_empty() || registry.iter().any(|c| c.key == j))
-            && self.seat_ok(j, &r.judge_ids, registry)
+            && r.judges().all(|k| self.seat_ok(k, &r.judge_ids, registry))
             && r.council.as_ref().is_none_or(|c| {
                 // (codex r3) A voter the registry no longer names cannot be shown eligible.
                 c.votes.iter().all(|v| {

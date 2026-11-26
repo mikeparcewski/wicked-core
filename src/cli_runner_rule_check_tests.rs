@@ -3498,3 +3498,104 @@ fn a_real_record_sharing_the_stand_ins_key_never_judges_as_it() {
         );
     }
 }
+
+/// (core#1949, codex r1) Two real rule judges, each refused for calling the work's provider: the
+/// first in the batch, the second only when the re-ask's answer is read, after the rule was
+/// scheduled. The rule left still goes to the judge stand-in, and the first seat's BROKEN stands.
+#[test]
+fn a_refusal_found_in_the_re_ask_still_falls_back_to_the_judge_stand_in() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("two-shared");
+    let pool = vec![seat("claude"), seat("codex"), seat("pi")];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: Vec::new(),
+        shares: vec!["codex".into(), "pi".into()],
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    let first_stand_in = calls.iter().position(|(w, _, _)| w == "claude~2");
+    assert!(
+        calls[..first_stand_in.unwrap_or(calls.len())]
+            .iter()
+            .any(|(w, _, _)| w == "pi"),
+        "both real seats first: {calls:?}"
+    );
+    let row = |id: &str| report.rows.iter().find(|r| r.rule_id == id).unwrap();
+    assert_eq!(row("R2").status, crate::rule_check::RuleStatus::Broken);
+    assert_ne!(
+        row("R2").judge.as_deref(),
+        Some("claude~2"),
+        "{:?}",
+        row("R2")
+    );
+    assert_eq!(
+        row("R1").status,
+        crate::rule_check::RuleStatus::Kept,
+        "{:?}",
+        row("R1")
+    );
+    assert_eq!(row("R1").judge.as_deref(), Some("claude~2"));
+}
+
+/// (core#1949 N2, codex r1) A record keyed like the stand-in that IS admissible as a real judge
+/// (it runs another binary) leaves no room for the stand-in: it judges as itself, on its own
+/// invocation, with no preface, and its approvals are refused for calling the work's provider
+/// like any real seat's.
+#[test]
+fn an_admitted_real_record_keyed_like_the_stand_in_gets_no_waiver() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("tilde-admitted");
+    let mut clash = seat("gemini");
+    clash.key = offer.key.clone();
+    let pool = vec![seat("claude"), seat("codex"), clash];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: vec!["codex".into()],
+        shares: Vec::new(),
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    assert!(calls.iter().any(|(w, _, _)| w == "claude~2"), "{calls:?}");
+    for (who, invocation, prompt) in calls.iter().filter(|(w, _, _)| w == "claude~2") {
+        assert_eq!(invocation, "gemini -p {PROMPT}", "{who}: its own record");
+        assert!(
+            !prompt.starts_with(&crate::standin::preface(None)),
+            "{prompt}"
+        );
+    }
+    let r1 = report.rows.iter().find(|r| r.rule_id == "R1").unwrap();
+    assert_eq!(
+        r1.status,
+        crate::rule_check::RuleStatus::Unchecked,
+        "{r1:?}"
+    );
+    assert!(
+        r1.reason.contains("observed calling the work's provider"),
+        "{r1:?}"
+    );
+}

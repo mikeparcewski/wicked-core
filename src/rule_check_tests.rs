@@ -6126,3 +6126,34 @@ fn core_1278_a_part_holds_only_the_files_the_diff_headers_place_in_it() {
     let texts: Vec<String> = parts.into_iter().map(|(t, _)| t).collect();
     assert_eq!(texts, diff_parts(&diff, cap), "the same parts");
 }
+
+/// (core#1949, codex r1) POL-2101's two parts ruled by different seats (the change by a real
+/// judge, the record part by the judge stand-in once the real one was lost): the combined row
+/// names both, so the stand-in is disclosed and a council seats neither.
+#[test]
+fn a_split_pol_2101_row_names_both_of_its_judges() {
+    let part = |judge: &str, cite: &str| RuleVerdict {
+        rule_id: "POL-2101".into(),
+        status: RuleStatus::Kept,
+        how: RuleHow::Judge,
+        reason: cite.into(),
+        cite: Some(cite.into()),
+        judge: Some(judge.into()),
+        evidence_complete: Some(true),
+        ..Default::default()
+    };
+    let row = combine_record(
+        part("codex", "src/a.rs:2 a test"),
+        part("claude~2", "record 1 ran the tests"),
+    );
+    assert_eq!(row.status, RuleStatus::Kept);
+    assert_eq!(row.judge.as_deref(), Some("codex"));
+    assert_eq!(row.record_judge.as_deref(), Some("claude~2"));
+    assert_eq!(row.judges().collect::<Vec<_>>(), ["codex", "claude~2"]);
+    // One seat ruling both parts names it once.
+    let one = combine_record(
+        part("codex", "src/a.rs:2 a test"),
+        part("codex", "record 1 ran the tests"),
+    );
+    assert_eq!(one.record_judge, None);
+}
