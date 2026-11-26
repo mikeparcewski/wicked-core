@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An unanswered process rule is not asked again alone** (core#1958). A one-line README change's rule check
+  took 704 s. The first round's process call left a process rule (RVWL-*) unanswered, and the check launched a
+  second seat run for that rule alone, before the gate could open. A process rule's row never blocks,
+  so the review check no longer asks it again: it stays `unchecked` and its reason says it was not asked again.
+  Change rules are still asked again alone, as before.
+
 - **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
   binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
   binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported
