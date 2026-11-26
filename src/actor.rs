@@ -3751,7 +3751,14 @@ pub(crate) fn run(
                     );
                     Vec::new()
                 });
-                let _ = reply.send(seated);
+                if let Err(e) = stand_in_gate::reply_or_abandon(&mut store, &run_id, seated, &reply)
+                {
+                    eprintln!(
+                        "wicked-core: run {run_id}: an abandoned {} stand-in reservation could \
+                         not be marked failed: {e:#}",
+                        role.as_str()
+                    );
+                }
             }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
             // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
