@@ -3864,9 +3864,15 @@ pub(crate) fn run(
                         // dispatched in this attempt (whatever its last result says, a gate
                         // retry runs it again) took its messages then, and hears a new one only
                         // between the turns of a power build. Any other is mid-turn, and a
-                        // message for it is refused rather than queued unheard (a broadcast
-                        // too: core#1486 keeps it from every other step).
-                        let owner = (|| -> anyhow::Result<Option<(u32, bool, String)>> {
+                        // message for its seat is refused rather than queued unheard.
+                        // (core#1979) A broadcast to such a step (crew's working-document "Next"
+                        // note) is held instead for the next step that hears operator messages
+                        // (a seat step, not a tool step): scoped to that step, so neither the
+                        // owner (a gate retry) nor any other step takes it. The owner can no
+                        // longer hear it, so it is not the owner's message (core#1486). With no
+                        // such later step, it is refused.
+                        type Owner = (u32, bool, String, usize);
+                        let owner = (|| -> anyhow::Result<Option<Owner>> {
                             let Some(s) = crate::domain::get_session(&store, &run_id)? else {
                                 return Ok(None);
                             };
@@ -3895,11 +3901,49 @@ pub(crate) fn run(
                                         u.ord,
                                         u.last_attempt == Some(s.attempt) && !turns,
                                         u.assigned_cli.clone().unwrap_or_else(|| "its seat".into()),
+                                        s.unit_ix,
                                     )
                                 }))
                         })();
+                        // (core#1979) The step a broadcast to a deaf owner is held for: the first
+                        // later step whose dispatch takes operator messages (the dispatch site's
+                        // own predicate, so a tool step, a team review and a stand-in are
+                        // skipped), read only on that path.
+                        let next_hearing = |after: usize| -> anyhow::Result<Option<u32>> {
+                            let mut ix = after + 1;
+                            while let Some(u) = crate::domain::session_unit_at(&store, &run_id, ix)?
+                            {
+                                if hears_operator_messages(&u) {
+                                    return Ok(Some(u.ord));
+                                }
+                                ix += 1;
+                            }
+                            Ok(None)
+                        };
                         let for_ord = match owner {
-                            Ok(Some((ord, true, cli))) => {
+                            Ok(Some((ord, true, cli, ix))) if target_str == "all" => {
+                                match next_hearing(ix) {
+                                    Ok(Some(next)) => Some(next),
+                                    Ok(None) => {
+                                        let _ = reply.send(Err(anyhow::anyhow!(
+                                            "step {ord} ({cli}) is already working on this \
+                                             attempt and no later step reads operator messages, \
+                                             so no later step would hear this one; it was not \
+                                             sent. Steer the step at its gate instead (a note, or \
+                                             request changes)"
+                                        )));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(anyhow::anyhow!(
+                                            "run {run_id}: could not tell which step comes after \
+                                             step {ord} ({e}); the message was not queued"
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Some((ord, true, cli, _))) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "step {ord} ({cli}) is already working on this attempt and \
                                      reads no new message until it is dispatched again, so this \
@@ -3908,7 +3952,7 @@ pub(crate) fn run(
                                 )));
                                 continue;
                             }
-                            Ok(o) => o.map(|(ord, _, _)| ord),
+                            Ok(o) => o.map(|(ord, ..)| ord),
                             Err(e) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "run {run_id}: could not tell which step is running ({e}); \
@@ -5468,6 +5512,9 @@ fn council_context_primed(
 /// transition goes through here.
 fn run_terminal(store: &dyn GraphStore, run_id: &str, status: crate::team::events::PathStatus) {
     crate::run_context::forget(run_id);
+    // (core#1979) A message still queued (a broadcast held for a step that never ran) goes with the
+    // run: a relaunch that reuses its id never hears it.
+    crate::power::forget_messages(run_id);
     team_gate::run_ended(store, run_id, status);
 }
 
@@ -13480,6 +13527,24 @@ fn dispatch_probe_job(
     })
 }
 
+/// Whether `unit`'s dispatch takes the operator messages queued for it (DES-POWER-MODE). Not a tool
+/// step (no seat reads them), not the PA's review of a member's step (DES-TEAMING-002 §8.8), not a
+/// stand-in (DES-STANDIN-001 §3.4: a stand-in hears no communications) and not a floor re-run
+/// (core#1962: it runs no seat). The dispatch site and the inject route's hold (core#1979) both
+/// ask this, so a broadcast is never held for a step that will not take it.
+fn hears_operator_messages(unit: &crate::domain::WorkUnit) -> bool {
+    unit.tool_cmd.is_none()
+        && !unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some())
+        && !crate::execute_wrapped::is_stand_in_unit(unit)
+        && !unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.requested_rerun.is_some())
+}
+
 /// [`dispatch_unit`], with the worktree reads it needs: `None` on the first pass, which starts the
 /// off-actor probe when the unit needs one and returns `Ok(true)` (the dispatch is under way);
 /// `Some` on the second pass, from [`Command::DispatchProbed`] (core#1390, [`dispatch_probe`]).
@@ -14392,12 +14457,9 @@ fn dispatch_unit_with(
     // addressed to it or to all, once, as an operator context block.
     // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
     // (core#1962) A floor re-run runs no seat (the runner hands the reviewed output on): its
-    // messages stay queued for the next seat that does.
-    let floor_rerun = unit
-        .repo_checks
-        .as_ref()
-        .is_some_and(|r| r.requested_rerun.is_some());
-    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in && !floor_rerun {
+    // messages stay queued for the next seat that does. One predicate with the inject route's
+    // hold (core#1979), [`hears_operator_messages`].
+    if hears_operator_messages(unit) {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -40045,10 +40107,10 @@ mod live_output_stream_tests {
             running.is_empty() && next.is_empty(),
             "a refused message is not queued"
         );
-        // A broadcast is that step's too (core#1486): refused, never handed to another step.
-        let refused = core.inject_worker_message(&run, "keep it small", InjectTarget::All);
-        assert!(refused.is_err(), "a broadcast mid-turn is refused too");
-        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
+        // A broadcast is held for the next step instead (core#1979, its own test).
+        core.inject_worker_message(&run, "keep it small", InjectTarget::All)
+            .expect("held for the next step");
+        assert_eq!(heard(&run, 2), vec!["keep it small".to_string()]);
 
         // A step a gate retry runs again keeps its last result's status: still mid-turn.
         let (run, core) = seed("gate-retry", true, None, UnitStatus::Rejected);
@@ -40068,6 +40130,131 @@ mod live_output_stream_tests {
         core.inject_worker_message(&run, "check the README too", codex())
             .expect("queued for the build's next turn");
         assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
+    }
+
+    /// core#1979 (the core half of crew#1942): a broadcast sent while the step that owns it is
+    /// mid-turn (crew's working-document "Next" note) is held for the next step that reads
+    /// operator messages (a seat step, not a tool step), not refused: the running step cannot
+    /// hear it, and the note is meant to steer what comes next. It is that step's alone (not the
+    /// owner's on a gate retry). With no such later step it is refused, with the reason. A
+    /// message for the running step's own seat is still refused (core#1964). A held message goes
+    /// with the run when it ends.
+    #[test]
+    fn a_broadcast_to_a_step_mid_turn_is_held_for_the_next_step_1979() {
+        use crate::command::InjectTarget;
+        use crate::domain::{put_nodes, UnitStatus, WorkUnit};
+        use wicked_apps_core::open_store;
+
+        // `kinds`: one letter per step, `s` a seat step, `t` a tool step, `i` a stand-in seat step
+        // (`claude~1`); `at`: the cursor's step (mid-turn).
+        let seed = |tag: &str, kinds: &str, at: usize| {
+            let run_id = format!("inject-1979-{tag}-{}", uuid::Uuid::new_v4());
+            let dir = std::env::temp_dir().join(&run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("estate.db");
+            {
+                let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+                let mut session = super::sessions_detail_fold_tests::session(&run_id);
+                session.status = SessionStatus::Executing;
+                session.unit_ix = at;
+                session.attempt = 1;
+                let mut nodes = vec![session.to_node()];
+                for (i, kind) in kinds.chars().enumerate() {
+                    let ord = i as u32 + 1;
+                    let mut u = WorkUnit::pending(format!("{run_id}:u{ord}"), &run_id, ord, "step");
+                    u.assigned_cli = Some(if kind == 'i' { "claude~1" } else { "codex" }.into());
+                    if kind == 't' {
+                        u.tool_cmd = Some(vec!["true".into()]);
+                    }
+                    if i <= at {
+                        u.status = UnitStatus::Distributed;
+                        u.last_attempt = Some(1);
+                    }
+                    nodes.push(u.to_node());
+                }
+                put_nodes(&mut store, &nodes).unwrap();
+            } // Release the seed writer before starting the actor.
+            let core = crate::Core::spawn_with_engine(
+                db.to_str().unwrap().to_string(),
+                Arc::new(StubDispatcher),
+                Arc::new(NoopRunner),
+            );
+            (run_id, core, db)
+        };
+        let heard = |run: &str, ord: u32| -> Vec<String> {
+            crate::power::take_operator_messages(run, "codex", ord)
+                .into_iter()
+                .map(|m| m.message)
+                .collect()
+        };
+        let note = "next: keep it small";
+
+        let (run, core, _) = seed("next", "ss", 0);
+        core.inject_worker_message(&run, note, InjectTarget::All)
+            .expect("held for the next step, not refused");
+        assert!(
+            heard(&run, 1).is_empty(),
+            "never the owner's, even on a gate retry"
+        );
+        assert_eq!(
+            heard(&run, 2),
+            vec![note.to_string()],
+            "the next step hears it"
+        );
+        // The running step's own seat still cannot be reached mid-turn (core#1964).
+        let refused =
+            core.inject_worker_message(&run, "check the README", InjectTarget::Cli("codex".into()));
+        assert!(
+            refused.is_err(),
+            "a message for the running seat is refused"
+        );
+        assert!(heard(&run, 2).is_empty(), "a refused message is not queued");
+
+        // A tool step reads no operator message: held for the seat step after it.
+        let (run, core, _) = seed("over-tool", "sts", 0);
+        core.inject_worker_message(&run, note, InjectTarget::All)
+            .expect("held for step 3");
+        assert!(heard(&run, 2).is_empty(), "a tool step never takes it");
+        assert_eq!(heard(&run, 3), vec![note.to_string()]);
+
+        // A stand-in hears no operator message (DES-STANDIN-001 §3.4): on a one-helper run
+        // (build on a seat, review on its stand-in) the note is held for the seat step after it.
+        let (run, core, _) = seed("over-stand-in", "sis", 0);
+        core.inject_worker_message(&run, note, InjectTarget::All)
+            .expect("held for step 3");
+        assert!(heard(&run, 2).is_empty(), "a stand-in never takes it");
+        assert_eq!(heard(&run, 3), vec![note.to_string()]);
+
+        // The last step mid-turn, or only tool or stand-in steps after it: no later step would
+        // hear it.
+        for (tag, kinds, at) in [
+            ("last", "ss", 1),
+            ("tools-only", "st", 0),
+            ("stand-in-only", "si", 0),
+        ] {
+            let (run, core, _) = seed(tag, kinds, at);
+            let err = core
+                .inject_worker_message(&run, note, InjectTarget::All)
+                .expect_err("no later step hears it")
+                .to_string();
+            assert!(err.contains("no later step"), "{tag}: {err}");
+            assert!((1..=3).all(|o| heard(&run, o).is_empty()), "{tag}");
+        }
+
+        // A held message goes with the run when it ends: a relaunch that reuses the id never
+        // hears it.
+        let (run, core, db) = seed("ended", "ss", 0);
+        core.inject_worker_message(&run, note, InjectTarget::All)
+            .expect("held");
+        // The run's end, on a scratch store of its own (never a second writer on the actor's).
+        let scratch = db.with_file_name("ended-scratch.db");
+        let store = open_store(Some(scratch.to_str().unwrap())).unwrap();
+        super::run_terminal(&store, &run, crate::team::events::PathStatus::Cancelled);
+        drop(core);
+        assert!(
+            heard(&run, 2).is_empty(),
+            "the ended run's held note is gone"
+        );
     }
 
     #[test]
