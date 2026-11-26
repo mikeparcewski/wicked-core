@@ -3644,8 +3644,12 @@ pub(crate) fn run(
                 let session = crate::domain::get_session(&store, &req.session_id)
                     .ok()
                     .flatten();
-                let clis =
-                    council_roster(session.as_ref(), clis, in_process_governance().is_some());
+                let clis = council_roster(
+                    session.as_ref(),
+                    clis,
+                    in_process_governance().is_some(),
+                    Some(req.ord),
+                );
                 // (program context-block-core) The council's topic carries the run's block.
                 let context_tx = council_context_primed(session.as_ref(), &self_tx);
                 // The system setting (size, stagger) and a fresh seed, read per council.
@@ -3660,6 +3664,15 @@ pub(crate) fn run(
                     &runner,
                     crate::container_floor::container_mode(),
                     Some(&req.session_id),
+                );
+                // (core#1972, DES-STANDIN-001 §3.4-§3.5) A stand-in voter's every ballot opens with
+                // the stand-in preface and its lens; a real seat's ballot is unchanged.
+                let disp = crate::decision::StandInBallots::wrap(
+                    disp,
+                    session
+                        .as_ref()
+                        .map_or(&[][..], |s| &s.assurance.stand_ins[..]),
+                    &clis,
                 );
                 let op_home = operational_home.clone();
                 // (core#1822) The convener hears `Convened` when the ballots start (the council
@@ -3694,6 +3707,50 @@ pub(crate) fn run(
                     );
                 });
             }
+            // (DES-STANDIN-001 §3.2) Reserve a team role's stand-ins on the single writer.
+            Command::ReserveStandIns {
+                run_id,
+                role,
+                need,
+                scope,
+                voters,
+                bases,
+                reply,
+            } => {
+                // (codex r1 on #1990) A council's caller sees only the registry: whether a real
+                // seat is left is the run's question, narrowed as the council narrows it.
+                let real_left = role == crate::standin::Role::Council
+                    && council_has_real_voter(
+                        crate::domain::get_session(&store, &run_id)
+                            .ok()
+                            .flatten()
+                            .as_ref(),
+                        voters,
+                        in_process_governance().is_some(),
+                        scope.ord,
+                    );
+                let seated = if real_left {
+                    Ok(Vec::new())
+                } else {
+                    stand_in_gate::reserve_team(
+                        &mut store,
+                        &mut subscribers,
+                        &run_id,
+                        role,
+                        need,
+                        scope,
+                        &bases,
+                    )
+                }
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "wicked-core: run {run_id}: no {} stand-ins reserved: {e:#}",
+                        role.as_str()
+                    );
+                    Vec::new()
+                });
+                let _ = reply.send(seated);
+            }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
             // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
             Command::ReserveRuleCouncil { run_id, ord, reply } => {
@@ -3714,8 +3771,12 @@ pub(crate) fn run(
                 let session = crate::domain::get_session(&store, &req.session_id)
                     .ok()
                     .flatten();
-                let clis =
-                    council_roster(session.as_ref(), clis, in_process_governance().is_some());
+                let clis = council_roster(
+                    session.as_ref(),
+                    clis,
+                    in_process_governance().is_some(),
+                    Some(req.ord),
+                );
                 // (program context-block-core) The topic carries the run's block (its ballot budget
                 // grows by the block's bytes in `decision::convene_decision_with`).
                 let context_tx = council_context_primed(session.as_ref(), &self_tx);
@@ -5379,6 +5440,7 @@ fn council_roster(
     session: Option<&crate::domain::AgentSession>,
     clis: Vec<crate::AgenticCli>,
     contained: bool,
+    ord: Option<u32>,
 ) -> Vec<crate::AgenticCli> {
     let Some(session) = session else {
         return clis
@@ -5396,12 +5458,47 @@ fn council_roster(
         .filter(|k| !run_bench.iter().any(|b| &b.cli == *k))
         .cloned()
         .collect();
+    // (core#1972, DES-STANDIN-001 §3.2) A stand-in voter the run reserved for its council is no
+    // roster seat: it skips the roster-membership filter, and sits only while its base credential
+    // is not benched. A `~` key the run never reserved as a council voter never sits.
+    let (stood, clis): (Vec<crate::AgenticCli>, Vec<crate::AgenticCli>) = clis
+        .into_iter()
+        .partition(|c| wicked_apps_core::spawn::seat_id::is_stand_in(&c.key));
+    let stood: Vec<crate::AgenticCli> = stood
+        .into_iter()
+        .filter(|c| {
+            // (codex r1 on #1990) Reserved for THIS council's unit: a binding scoped to another
+            // unit (or to none) never sits here.
+            crate::standin::binding_for(&session.assurance, Some(c.key.as_str())).is_some_and(|b| {
+                b.role == crate::standin::Role::Council && ord.is_some() && b.ord == ord
+            }) && !session.assurance.reduced()
+                && !run_bench
+                    .iter()
+                    .any(|b| b.cli == wicked_apps_core::spawn::seat_id::credential(&c.key))
+        })
+        .collect();
+    // The launch bench (the host floor, the codex worktree bench) judges a stand-in by its base:
+    // a voter on a benched base's credential stays out exactly as the base would.
+    let judged: Vec<crate::AgenticCli> = clis
+        .iter()
+        .cloned()
+        .chain(stood.iter().map(|c| crate::AgenticCli {
+            key: wicked_apps_core::spawn::seat_id::credential(&c.key).to_string(),
+            ..c.clone()
+        }))
+        .collect();
     let ballot_bench = crate::domain::ungoverned_bench(&crate::distribute::launch_benched(
-        &clis,
+        &judged,
         session.repo_ref.is_some(),
         contained,
     ));
-    clis.into_iter()
+    let stood = stood.into_iter().filter(|c| {
+        !ballot_bench
+            .iter()
+            .any(|b| b.cli == wicked_apps_core::spawn::seat_id::credential(&c.key))
+    });
+    let real: Vec<crate::AgenticCli> = clis
+        .into_iter()
         .filter(|c| !run_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| !ballot_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| {
@@ -5413,7 +5510,28 @@ fn council_roster(
                     .iter()
                     .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
         })
-        .collect()
+        .collect();
+    real.into_iter().chain(stood).collect()
+}
+
+/// (core#1972, codex r1 on #1990) Whether a real seat among `voters` (a council's non-party
+/// candidates, as its caller resolved them from the registry) sits on this run's council, as
+/// [`council_roster`] narrows it: the run's roster, its benches, the launch bench. No voter, or no
+/// run, is no real seat.
+fn council_has_real_voter(
+    session: Option<&crate::domain::AgentSession>,
+    voters: Vec<crate::AgenticCli>,
+    contained: bool,
+    ord: Option<u32>,
+) -> bool {
+    // (codex r2 on #1990) Only a record that may vote at all: a work-only seat is no voter.
+    let voters: Vec<crate::AgenticCli> = voters
+        .into_iter()
+        .filter(|c| !wicked_apps_core::spawn::seat_id::is_stand_in(&c.key) && c.enabled_for_council)
+        .collect();
+    session.is_some()
+        && !voters.is_empty()
+        && !council_roster(session, voters, contained, ord).is_empty()
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.6) Charge one rule council to `run_id`'s unit `ord`, durably:
@@ -47933,6 +48051,7 @@ mod council_ballot_tests {
                 Some(session),
                 vec![seat("claude"), seat("codex")],
                 contained,
+                None,
             )
             .into_iter()
             .map(|c| c.key)
@@ -47947,6 +48066,193 @@ mod council_ballot_tests {
             ..bound_run()
         };
         assert_eq!(keys("host", &unbound, true), vec!["claude", "codex"]);
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// codex r1 on #1990: whether a team council needs stand-ins is the run's question. Handed the
+    /// whole registry minus the party (what the supervisor sees), a one-helper run has no real
+    /// voter, so the engine reserves; a run with a second helper has one, so it does not.
+    #[test]
+    fn a_one_helper_runs_council_has_no_real_voter_in_the_registry_1972() {
+        let registry: Vec<crate::AgenticCli> = wicked_council::registry::builtin()
+            .into_iter()
+            .filter(|c| c.key != "claude" && (c.enabled_for_council || c.seat_eligible_for_work))
+            .collect();
+        assert!(!registry.is_empty());
+        let one = AgentSession {
+            repo_ref: None,
+            clis: vec!["claude".into()],
+            ..bound_run()
+        };
+        assert!(!council_has_real_voter(
+            Some(&one),
+            registry.clone(),
+            false,
+            Some(1)
+        ));
+        let two = AgentSession {
+            repo_ref: None,
+            clis: vec!["claude".into(), "codex".into()],
+            ..bound_run()
+        };
+        assert!(council_has_real_voter(
+            Some(&two),
+            registry.clone(),
+            false,
+            Some(1)
+        ));
+        // (codex r2 on #1990) A helper that works but never votes is no real voter.
+        let work_only: Vec<crate::AgenticCli> = registry
+            .iter()
+            .cloned()
+            .map(|c| crate::AgenticCli {
+                enabled_for_council: false,
+                ..c
+            })
+            .collect();
+        assert!(!council_has_real_voter(
+            Some(&two),
+            work_only,
+            false,
+            Some(1)
+        ));
+        assert!(
+            !council_has_real_voter(Some(&two), Vec::new(), false, Some(1)),
+            "no candidate"
+        );
+        assert!(
+            !council_has_real_voter(None, registry, false, Some(1)),
+            "no run"
+        );
+    }
+
+    /// core#1972: a team council's stand-in voter is no roster seat. A record the run reserved as
+    /// a council stand-in sits beside the real seats; a `~` key the run never reserved (or one
+    /// reserved for another role) never sits, nor one whose base is benched, nor on a run whose
+    /// consent is gone.
+    #[test]
+    fn a_reserved_council_stand_in_sits_and_no_other_stand_in_key_does_1972() {
+        let mut run = AgentSession {
+            repo_ref: None,
+            clis: vec!["claude".into()],
+            ..bound_run()
+        };
+        run.assurance = crate::standin::LaunchStandIn {
+            aware: true,
+            parties: Vec::new(),
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+        }
+        .apply(run.assurance);
+        let bound = |key: &str, role: crate::standin::Role| crate::standin::StandInBinding {
+            key: key.into(),
+            base: "claude".into(),
+            role,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: Some(1),
+            attempt: None,
+            subject: None,
+            evidence: None,
+            invocation: "i".into(),
+            reason: crate::standin::Reason::OnlyOneHelper {
+                cli: "Claude Code".into(),
+            },
+            state: crate::standin::STATE_SEATED.into(),
+            display: None,
+        };
+        run.assurance.stand_ins = vec![
+            bound("claude~1", crate::standin::Role::Council),
+            bound("claude~2", crate::standin::Role::Judge),
+        ];
+        // A stand-in record is its base's record under the stand-in key, as reserve_team mints it.
+        let stand_in = |key: &str| crate::AgenticCli {
+            key: key.into(),
+            ..seat("claude")
+        };
+        let clis = vec![
+            stand_in("claude~1"),
+            stand_in("claude~2"),
+            stand_in("claude~9"),
+        ];
+        let keys = |s: &AgentSession| {
+            council_roster(Some(s), clis.clone(), true, Some(1))
+                .into_iter()
+                .map(|c| c.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&run), vec!["claude~1"]);
+        // (codex r1 on #1990) A council binding reserved for unit 1 never sits on unit 2's council.
+        assert!(
+            council_roster(Some(&run), clis.clone(), true, Some(2)).is_empty(),
+            "another unit's council binding"
+        );
+        let mut benched = run.clone();
+        benched.benched_seats.push(crate::domain::BenchedSeat {
+            cli: "claude".into(),
+            reason: "quota_exhausted".into(),
+            source: "worker".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        });
+        assert!(keys(&benched).is_empty(), "its base is benched");
+        let mut unasked = run.clone();
+        unasked.assurance.stand_in = None;
+        assert!(keys(&unasked).is_empty(), "no consent, no stand-in voter");
+
+        // The launch bench judges a stand-in by its base: on a bound run's host floor the codex
+        // worktree bench keeps a codex stand-in out of the council as it keeps codex out.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        let mut on_codex = AgentSession {
+            clis: vec!["codex".into()],
+            ..bound_run()
+        };
+        on_codex.assurance = run.assurance.clone();
+        on_codex.assurance.stand_ins = vec![crate::standin::StandInBinding {
+            base: "codex".into(),
+            ..bound("codex~1", crate::standin::Role::Council)
+        }];
+        let codex_voter = crate::AgenticCli {
+            key: "codex~1".into(),
+            ..seat("codex")
+        };
+        let sat = |floor: &str, contained: bool| {
+            std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, floor);
+            council_roster(
+                Some(&on_codex),
+                vec![codex_voter.clone()],
+                contained,
+                Some(1),
+            )
+            .into_iter()
+            .map(|c| c.key)
+            .collect::<Vec<_>>()
+        };
+        assert!(sat("host", true).is_empty(), "its base is worktree-benched");
+        assert_eq!(sat("container", true), vec!["codex~1"]);
         for (k, v) in [
             ("WICKED_CODEX_WORKTREE_OK", prev.0),
             (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
@@ -47989,7 +48295,7 @@ mod council_ballot_tests {
         assert_eq!(run.benched_seats.len(), 1, "{:?}", run.benched_seats);
         assert!(run.benched_seats[0].governed_only);
         let keys = |s: &AgentSession| {
-            council_roster(Some(s), clis.clone(), true)
+            council_roster(Some(s), clis.clone(), true, None)
                 .into_iter()
                 .map(|c| c.key)
                 .collect::<Vec<_>>()

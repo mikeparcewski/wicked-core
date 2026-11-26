@@ -332,6 +332,10 @@ pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
     Some(worker_claude_config_dir())
 }
 
+/// (core#1881, core#1996) Claude Code's switch that turns its auto-memory off, reads and writes
+/// alike: a stand-in claude runs with it, on the unit path and on the ballot path.
+pub const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
 /// Whether `bin` names claude: judged on the file STEM so `claude`, `/usr/local/bin/claude`,
 /// `claude.exe` and `claude.cmd` all resolve, and `claude-code-wrapper` does not. THE carrier test
 /// every path applies — the wrapped runner to its template's first token

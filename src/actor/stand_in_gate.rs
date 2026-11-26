@@ -311,3 +311,436 @@ fn reroute(
     crate::domain::put_nodes(store, &changed)?;
     Ok(())
 }
+
+/// (DES-STANDIN-001 §3.2, core#1972, core#1973) `Command::ReserveStandIns`: reserve `need`
+/// stand-ins for a team `role` (a council, the monitors) on the run's own seats, on the single
+/// writer. Each is a fresh binding with its lens by position, persisted on the run's contract and
+/// announced (`StandInSeated`) before the reply, so two reservations never mint one key. Empty
+/// unless the run is stand-in-aware, consented and not reduced, and one of its seats can stand in:
+/// not benched, not launch-excluded, with a record the role can run (a council voter is enabled for
+/// the council). The caller asks only when no real seat is left.
+pub(crate) fn reserve_team(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    role: crate::standin::Role,
+    need: usize,
+    scope: crate::standin::BindingScope,
+    only: &[String],
+) -> anyhow::Result<Vec<crate::standin::SeatedStandIn>> {
+    use crate::standin as si;
+    use wicked_apps_core::spawn::seat_id;
+    let Some(mut session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(Vec::new());
+    };
+    let run = &session.assurance;
+    if need == 0 || !si::active(run) || run.stand_in.is_none() || run.reduced() {
+        return Ok(Vec::new());
+    }
+    if matches!(
+        session.status,
+        SessionStatus::Cancelled | SessionStatus::Failed | SessionStatus::Completed
+    ) {
+        return Ok(Vec::new());
+    }
+    let registry = crate::registry_roster();
+    let launch = super::launch_roster(&session)?;
+    let roster: Vec<crate::AgenticCli> = if launch.is_empty() {
+        session
+            .clis
+            .iter()
+            .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
+            .collect()
+    } else {
+        launch
+    };
+    let mut bases: Vec<String> = Vec::new();
+    for k in &session.clis {
+        if seat_id::is_stand_in(k) {
+            continue;
+        }
+        let c = seat_id::credential(k).to_string();
+        let benched = session
+            .benched_seats
+            .iter()
+            .any(|b| seat_id::credential(&b.cli) == c);
+        let excluded = session
+            .exclude_seats
+            .iter()
+            .any(|e| e == &c || e.as_str() == seat_id::family(&c));
+        let runnable =
+            si::base_record(&roster, &registry, &si::binding_key(&c, 1)).is_some_and(|r| {
+                !r.headless_invocation.trim().is_empty()
+                    && (role != si::Role::Council || r.enabled_for_council)
+            });
+        // (codex r1 on #1990) Only a base the caller's host admits for the role, when it names
+        // them: a monitor stand-in on a base the host refuses would leave the pool short.
+        let admitted = only.is_empty() || only.iter().any(|o| seat_id::credential(o) == c);
+        // (codex r1 on #1990) A council ballot on the host floor runs in its base's home: only a
+        // base whose template can be kept out of its builder's sessions stands in there.
+        let fresh = role != si::Role::Council
+            || crate::container_floor::container_mode()
+            || si::base_record(&roster, &registry, &si::binding_key(&c, 1))
+                .is_some_and(|r| host_floor_ballot(r).is_ok());
+        if !benched && !excluded && runnable && admitted && fresh && !bases.contains(&c) {
+            bases.push(c);
+        }
+    }
+    let Some(first) = bases.first().cloned() else {
+        return Ok(Vec::new());
+    };
+    let reason = si::reason_from_run(&roster, &session.clis, &session.benched_seats, &first);
+    // (codex r1 on #1990) A judge dispatched with a stand-in offer holds that slot unrecorded
+    // until it answers (`standin::judge_offer` mints it at dispatch, `judge_answered` records it):
+    // the slot a unit in flight may hold on its base is never a team role's.
+    let in_flight: Vec<String> = crate::domain::session_units(store, run_id)?
+        .iter()
+        .filter(|u| u.status == crate::domain::UnitStatus::Distributed)
+        .filter_map(|u| u.assigned_cli.as_deref())
+        .map(|k| seat_id::credential(k).to_string())
+        .collect();
+    let taken = si::with_judge_slots_held(&run.stand_ins, &in_flight);
+    let minted = match si::fill(si::FillRequest {
+        role,
+        need,
+        real: Vec::new(),
+        bases,
+        builder_model: None,
+        consent: run.stand_in.as_ref(),
+        reason,
+        scope,
+        taken: &taken,
+    }) {
+        si::Fill::Seats { stand_ins, .. } => stand_ins,
+        si::Fill::NeedConsent(_) | si::Fill::NoUsableBase(..) => return Ok(Vec::new()),
+    };
+    let mut seated = Vec::new();
+    for (i, mut b) in minted.into_iter().enumerate() {
+        let Some(mut record) = si::base_record(&roster, &registry, &b.key).cloned() else {
+            continue;
+        };
+        record.key = b.key.clone();
+        if role == si::Role::Council && !crate::container_floor::container_mode() {
+            let Ok(fresh) = host_floor_ballot(&record) else {
+                continue;
+            };
+            record = fresh;
+        }
+        b.lens = Some(si::lens_at(i).to_string());
+        let display = si::display_name(&roster, &b.base);
+        b.display = Some(display.clone());
+        let label = si::label(&b, &display);
+        seated.push(si::SeatedStandIn {
+            binding: b,
+            record,
+            label,
+        });
+    }
+    for s in &seated {
+        session.assurance.stand_ins.push(s.binding.clone());
+        si::note_label(&mut session.assurance, &s.binding, s.binding.display());
+    }
+    if seated.is_empty() {
+        return Ok(seated);
+    }
+    crate::domain::put_node(store, session.to_node())?;
+    for s in &seated {
+        super::emit(
+            subscribers,
+            CoreEvent::StandInSeated {
+                session: run_id.to_string(),
+                ord: s.binding.ord,
+                label: s.label.clone(),
+                binding: s.binding.clone(),
+            },
+        );
+    }
+    Ok(seated)
+}
+
+/// (DES-STANDIN-001 §3.4, codex r1 on #1990) A council stand-in's ballot record on the HOST
+/// floor: the ballot runs in its base's home, so the template must never select a session of its
+/// own and must run on a CLI whose own switch keeps it out of the base's sessions
+/// (`execute_wrapped::host_stand_in_admits`, the check a host-floor stand-in unit passes); that
+/// switch rides the ballot's trust flags (appended after the template, as every ballot's are):
+/// claude `--no-session-persistence`, pi `--no-session`, codex `--ephemeral`. The governed unit
+/// path also turns claude's auto-memory off; a ballot has no environment hook for it (filed).
+fn host_floor_ballot(record: &crate::AgenticCli) -> Result<crate::AgenticCli, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    let binary = crate::execute_wrapped::template_binary(&record.headless_invocation);
+    let cli = SeatCli::from_binary(&binary);
+    // (codex r2 on #1990) Every trusted token the ballot launches with: the template AND the trust
+    // flags appended after it (a resume selector there selects a session as surely).
+    let launched = std::iter::once(record.headless_invocation.clone())
+        .chain(record.trust_flags.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::execute_wrapped::host_stand_in_admits(&launched, cli)?;
+    let flag = match cli {
+        SeatCli::Claude => "--no-session-persistence",
+        SeatCli::Pi => "--no-session",
+        SeatCli::Codex => "--ephemeral",
+        other => return Err(format!("no host-floor ballot switch for {other:?}")),
+    };
+    let mut out = record.clone();
+    let spelled = record
+        .headless_invocation
+        .split_whitespace()
+        .chain(record.trust_flags.iter().map(String::as_str))
+        .any(|t| t == flag);
+    if !spelled {
+        out.trust_flags.push(flag.to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod reserve_team_tests {
+    //! (core#1972, core#1973) `Command::ReserveStandIns` on the single writer.
+    use super::*;
+    use crate::standin::{self as si, Role};
+
+    /// codex r1 on #1990: a council ballot on the host floor takes only a template that never
+    /// resumes a session, on a CLI with a switch that keeps it out of its base's sessions, and the
+    /// ballot carries that switch.
+    #[test]
+    fn a_host_floor_council_stand_in_ballot_starts_fresh_1972() {
+        let seat = |key: &str| {
+            wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == key)
+                .unwrap()
+        };
+        let claude = host_floor_ballot(&seat("claude")).unwrap();
+        assert!(claude
+            .trust_flags
+            .iter()
+            .any(|f| f == "--no-session-persistence"));
+        let pi = host_floor_ballot(&seat("pi")).unwrap();
+        assert!(pi.trust_flags.iter().any(|f| f == "--no-session"));
+        let twice = host_floor_ballot(&claude).unwrap();
+        assert_eq!(
+            twice
+                .trust_flags
+                .iter()
+                .filter(|f| *f == "--no-session-persistence")
+                .count(),
+            1,
+            "never spelled twice"
+        );
+        let resumes = crate::AgenticCli {
+            headless_invocation: format!("{} --continue", seat("claude").headless_invocation),
+            ..seat("claude")
+        };
+        assert!(
+            host_floor_ballot(&resumes).is_err(),
+            "a resume selector is refused"
+        );
+        let resumes_by_flag = crate::AgenticCli {
+            trust_flags: vec!["--resume".into(), "builder-session".into()],
+            ..seat("claude")
+        };
+        assert!(
+            host_floor_ballot(&resumes_by_flag).is_err(),
+            "a resume selector in the trust flags is refused too"
+        );
+        assert!(
+            host_floor_ballot(&seat("copilot")).is_err(),
+            "no host-floor switch"
+        );
+    }
+
+    fn run(clis: &[&str], consent: bool) -> AgentSession {
+        let mut s = crate::actor::sessions_detail_fold_tests::session("r-team");
+        s.clis = clis.iter().map(|c| c.to_string()).collect();
+        s.status = SessionStatus::Executing;
+        s.assurance = si::LaunchStandIn {
+            aware: true,
+            parties: Vec::new(),
+            consent: consent.then(|| si::StandInConsent {
+                scope: si::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+        }
+        .apply(s.assurance);
+        s
+    }
+
+    fn reserve(
+        s: &AgentSession,
+        role: Role,
+        need: usize,
+    ) -> (Vec<si::SeatedStandIn>, AgentSession, Vec<CoreEvent>) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = crate::event_log::EventSink::default();
+        sink.push(tx);
+        let scope = si::BindingScope {
+            ord: Some(3),
+            attempt: Some(1),
+            ..Default::default()
+        };
+        let seated = reserve_team(&mut store, &mut sink, &s.id, role, need, scope, &[]).unwrap();
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        (seated, after, rx.try_iter().collect())
+    }
+
+    /// A council of three on a one-CLI consented run: three fresh bindings on the one seat, each
+    /// with its own lens by position, on the base's record re-keyed to the binding; persisted on
+    /// the run's contract and announced before the reply. A second reservation never reuses a slot.
+    #[test]
+    fn a_team_council_reserves_fresh_stand_ins_with_a_lens_each_1972() {
+        let (seated, after, events) = reserve(&run(&["claude"], true), Role::Council, 3);
+        let keys: Vec<&str> = seated.iter().map(|s| s.binding.key.as_str()).collect();
+        assert_eq!(keys, ["claude~1", "claude~2", "claude~3"]);
+        let lenses: Vec<Option<&str>> = seated.iter().map(|s| s.binding.lens.as_deref()).collect();
+        assert_eq!(
+            lenses,
+            [
+                Some("correctness"),
+                Some("security and safety"),
+                Some("user impact")
+            ]
+        );
+        for s in &seated {
+            assert_eq!(s.binding.role, Role::Council);
+            assert_eq!(s.record.key, s.binding.key);
+            assert_eq!((s.binding.ord, s.binding.attempt), (Some(3), Some(1)));
+            assert!(s.label.contains("stood in for the council"), "{}", s.label);
+            assert!(
+                s.label.contains("only Claude Code was picked for this job"),
+                "{}",
+                s.label
+            );
+        }
+        assert_eq!(
+            after.assurance.stand_ins.len(),
+            3,
+            "persisted before the reply"
+        );
+        let announced = events
+            .iter()
+            .filter(|e| matches!(e, CoreEvent::StandInSeated { .. }))
+            .count();
+        assert_eq!(announced, 3);
+        // The next reservation takes the next slots.
+        let (next, _, _) = reserve(&after, Role::Monitor, 1);
+        assert_eq!(next[0].binding.key, "claude~4");
+        assert_eq!(next[0].binding.lens.as_deref(), Some("correctness"));
+    }
+
+    /// codex r1 on #1990: a unit in flight on the base may hold a judge offer unrecorded (the
+    /// next slot): a team reservation never takes it, and the judge that answers on it is still
+    /// recorded once the team's bindings moved the next slot on. A base the caller's host does not
+    /// admit is never reserved on.
+    #[test]
+    fn a_team_reservation_never_takes_an_in_flight_judges_slot_1972() {
+        let s = run(&["claude", "codex"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let mut unit = WorkUnit::pending(format!("{}:u1", s.id), &s.id, 1, "build");
+        unit.status = crate::domain::UnitStatus::Distributed;
+        unit.assigned_cli = Some("claude".into());
+        crate::domain::put_node(&mut store, unit.to_node()).unwrap();
+        // The judge's offer, minted at dispatch on the run as it is now: claude~1, unrecorded.
+        let offer = si::judge_offer(&s.assurance, &unit, 1, &[], &s.clis, &[]).unwrap();
+        assert_eq!(offer.key, "claude~1");
+        let mut sink = crate::event_log::EventSink::default();
+        let scope = si::BindingScope {
+            ord: Some(1),
+            attempt: Some(1),
+            ..Default::default()
+        };
+        let only = vec!["claude".to_string()];
+        let seated =
+            reserve_team(&mut store, &mut sink, &s.id, Role::Monitor, 1, scope, &only).unwrap();
+        let keys: Vec<&str> = seated.iter().map(|x| x.binding.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["claude~2"],
+            "the in-flight judge's slot is held back"
+        );
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        let answered = si::judge_answered(
+            &after.assurance,
+            &unit,
+            1,
+            &[],
+            &after.clis,
+            &[],
+            "claude~1",
+        )
+        .expect("the judge's own slot still stands");
+        assert_eq!((answered.key.as_str(), answered.slot), ("claude~1", 1));
+        assert!(
+            si::judge_answered(
+                &after.assurance,
+                &unit,
+                1,
+                &[],
+                &after.clis,
+                &[],
+                "claude~2"
+            )
+            .is_none(),
+            "the monitor's recorded key is never the judge's"
+        );
+        // Only the bases the caller's host admits: codex alone was asked for.
+        let codex_only = vec!["codex".to_string()];
+        let seated = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            si::BindingScope::default(),
+            &codex_only,
+        )
+        .unwrap();
+        assert!(!seated.is_empty(), "codex can stand in");
+        assert!(
+            seated.iter().all(|x| x.binding.base == "codex"),
+            "{seated:?}"
+        );
+    }
+
+    /// No consent, an unaware run, a reduced run, a benched base or no seat at all: nothing is
+    /// reserved and nothing is written.
+    #[test]
+    fn no_team_stand_in_without_consent_awareness_or_a_usable_base_1972() {
+        for (why, s) in [
+            ("no consent", run(&["claude"], false)),
+            ("unaware", {
+                let mut s = run(&["claude"], true);
+                s.assurance.stand_in_aware = false;
+                s
+            }),
+            ("reduced", {
+                let mut s = run(&["claude"], true);
+                s.assurance.mode = crate::assurance::MODE_REDUCED.into();
+                s
+            }),
+            ("benched", {
+                let mut s = run(&["claude"], true);
+                s.benched_seats.push(crate::domain::BenchedSeat {
+                    cli: "claude".into(),
+                    reason: "quota_exhausted".into(),
+                    source: "worker".into(),
+                    governed_only: false,
+                    benched_until: None,
+                    strikes: 1,
+                    replaced: None,
+                });
+                s
+            }),
+            ("no seat", run(&[], true)),
+        ] {
+            let (seated, after, _) = reserve(&s, Role::Council, 3);
+            assert!(seated.is_empty(), "{why}");
+            assert!(after.assurance.stand_ins.is_empty(), "{why}");
+        }
+    }
+}
