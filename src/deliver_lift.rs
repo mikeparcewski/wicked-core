@@ -384,18 +384,40 @@ fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
     fetch_origin_at(cwd, env, GITHUB_BASE)
 }
 
-fn fetch_origin_at(cwd: &Path, env: &[(&str, &Path)], _github: &str) -> Result<(), String> {
+fn fetch_origin_at(cwd: &Path, env: &[(&str, &Path)], github: &str) -> Result<(), String> {
     // crew#933: an Azure DevOps origin is fetched with the daemon's own credential, as the deliver
     // script does, rather than failing for want of a credential helper and skipping the lift.
     let ado = ado_fetch_for(cwd, env)
         .map_err(|e| format!("could not mint the Azure DevOps credential for the fetch: {e}"))?;
-    fetch_origin_with(cwd, env, ado.as_ref())
+    if ado.is_some() {
+        return fetch_origin_with(cwd, env, ado.as_ref());
+    }
+    // (core#1959) A GitHub origin the plain fetch could not read (a private repo, no git
+    // credential helper) is fetched once more with the credential the deliver script pushes with,
+    // so the run's base and the lift see the remote's tip. The plain fetch goes first: a setup that
+    // reads origin today is never changed. A fetch that ran out of time is not tried again.
+    let started = Instant::now();
+    let Err(first) = fetch_origin_with(cwd, env, None) else {
+        return Ok(());
+    };
+    if started.elapsed() >= FETCH_TIMEOUT {
+        return Err(first);
+    }
+    match github_fetch_for(cwd, env, github) {
+        Ok(None) => Err(first),
+        Ok(Some(gh)) => fetch_origin_with(cwd, env, Some(&gh)).map_err(|e| {
+            format!("{first}; fetched again with the GitHub credential the deliver step uses: {e}")
+        }),
+        Err(why) => Err(format!(
+            "{first}; not fetched again with a GitHub credential: {why}"
+        )),
+    }
 }
 
 fn fetch_origin_with(
     cwd: &Path,
     env: &[(&str, &Path)],
-    ado: Option<&AdoFetch>,
+    auth: Option<&AuthFetch>,
 ) -> Result<(), String> {
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
@@ -407,7 +429,7 @@ fn fetch_origin_with(
         "-c",
         "http.lowSpeedTime=30",
     ]);
-    match ado {
+    match auth {
         Some(a) => {
             let scheme = a.url.split_once("://").map(|(s, _)| s).unwrap_or("https");
             cmd.args([
@@ -2405,15 +2427,141 @@ fn pat_header(pat: &str) -> String {
     )
 }
 
-/// How an Azure DevOps origin is fetched: the canonical URL and the minted header.
-struct AdoFetch {
+/// How an origin is fetched with a daemon credential (an Azure DevOps origin, or a GitHub one
+/// whose plain fetch failed, core#1959): the canonical URL and the header.
+struct AuthFetch {
     url: String,
     header: String,
 }
 
+/// The most a `gh auth token` read may take (crew's own gh probe allows 4 s).
+const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// (core#1959) A GitHub origin's `owner/repo` URL under `base` (`https://github.com/`; a test's
+/// local server), from what `git remote get-url origin` prints (any `insteadOf` already applied):
+/// userinfo dropped, the host compared without case, exactly two path segments of
+/// `[A-Za-z0-9._-]` (no `..`). `None` for anything else, so no other host gets the credential.
+fn github_canonical_url(raw: &str, base: &str) -> Option<String> {
+    let (scheme, rest) = raw.trim().split_once("://")?;
+    let (bscheme, bhost) = base.trim_end_matches('/').split_once("://")?;
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit('@').next()?;
+    if !scheme.eq_ignore_ascii_case(bscheme) || !host.eq_ignore_ascii_case(bhost) {
+        return None;
+    }
+    let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let ok = |s: &&str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    (segs.len() == 2 && segs.iter().all(ok))
+        .then(|| format!("{bscheme}://{bhost}/{}/{}", segs[0], segs[1]))
+}
+
+/// A variable as the child would see it: `env`'s override, else the daemon's; blank = unset.
+fn env_of(env: &[(&str, &Path)], name: &str) -> Option<String> {
+    match env.iter().find(|(k, _)| *k == name) {
+        Some((_, v)) => Some(v.to_string_lossy().trim().to_string()).filter(|v| !v.is_empty()),
+        None => env_nonempty(name),
+    }
+}
+
+/// (core#1959) The credential crew's deliver script uses for github.com: an exported `GH_TOKEN`,
+/// else `gh auth token --hostname github.com` (for `GH_ACCOUNT` when it is set), read bounded with
+/// no stdin. `Ok(None)`: `origin` is not a GitHub repository under `base`. `Err`: it is, and there
+/// is no credential (said in the fetch's note).
+fn github_fetch_for(
+    cwd: &Path,
+    env: &[(&str, &Path)],
+    base: &str,
+) -> Result<Option<AuthFetch>, String> {
+    let Ok(raw) = git_string(cwd, &["remote", "get-url", "origin"], env) else {
+        return Ok(None);
+    };
+    let Some(url) = github_canonical_url(&raw, base) else {
+        return Ok(None);
+    };
+    let token = match env_of(env, "GH_TOKEN") {
+        Some(t) => t,
+        None => gh_token(env)?,
+    };
+    use base64::Engine as _;
+    let header = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    );
+    Ok(Some(AuthFetch { url, header }))
+}
+
+/// `gh auth token --hostname github.com [--user $GH_ACCOUNT]`, as the deliver script reads it.
+fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
+    let account = env_of(env, "GH_ACCOUNT");
+    let who = account
+        .as_deref()
+        .map(|a| format!(" as {a}"))
+        .unwrap_or_default();
+    // spawn-audit: hardened — gh reads its own login; GH_TOKEN/GITHUB_TOKEN dropped (crew's
+    // ghChildEnv), the token rides stdout only.
+    let mut cmd = Command::new("gh");
+    cmd.hardened()
+        .args(["auth", "token", "--hostname", "github.com"])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
+    if let Some(a) = &account {
+        cmd.args(["--user", a]);
+    }
+    for (k, v) in env
+        .iter()
+        .filter(|(k, _)| !matches!(*k, "GH_TOKEN" | "GITHUB_TOKEN"))
+    {
+        cmd.env(k, v);
+    }
+    let mut child = match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("no GH_TOKEN is exported and gh is not installed".into());
+        }
+        Err(e) => return Err(format!("could not run gh to read its token: {e}")),
+    };
+    let deadline = Instant::now() + GH_TOKEN_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "gh did not answer for its token within {}s",
+                    GH_TOKEN_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut out);
+    }
+    let token = out.trim();
+    if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {
+        return Err(format!(
+            "no GH_TOKEN is exported and gh holds no token for github.com{who}"
+        ));
+    }
+    Ok(token.to_string())
+}
+
 /// `Some` when `origin` is an Azure DevOps remote AND the daemon holds a credential for it;
 /// `Err` when it does but minting failed (disclosed by the caller like a failed fetch).
-fn ado_fetch_for(cwd: &Path, env: &[(&str, &Path)]) -> Result<Option<AdoFetch>, String> {
+fn ado_fetch_for(cwd: &Path, env: &[(&str, &Path)]) -> Result<Option<AuthFetch>, String> {
     let Ok(raw) = git_string(cwd, &["remote", "get-url", "origin"], env) else {
         return Ok(None);
     };
@@ -2421,7 +2569,7 @@ fn ado_fetch_for(cwd: &Path, env: &[(&str, &Path)]) -> Result<Option<AdoFetch>, 
         return Ok(None);
     };
     match ado_auth_header("https://login.microsoftonline.com")? {
-        Some(header) => Ok(Some(AdoFetch { url, header })),
+        Some(header) => Ok(Some(AuthFetch { url, header })),
         None => Ok(None),
     }
 }
@@ -2657,7 +2805,7 @@ mod tests {
             &dir,
             &["config", "http.extraHeader", "Authorization: Basic AMBIENT"],
         );
-        let ado = AdoFetch {
+        let ado = AuthFetch {
             url: format!("http://127.0.0.1:{port}/org/p/_git/repo"),
             header: "Basic MINTED".to_string(),
         };
@@ -4481,6 +4629,91 @@ mod tests {
             tip,
             "origin/main is the remote's tip"
         );
+    }
+
+    /// (core#1959) Only an `owner/repo` URL on the GitHub base gets the credential: no other host,
+    /// scheme, path shape or dot segment.
+    #[test]
+    fn github_canonical_url_takes_owner_repo_on_the_base_only_1959() {
+        let gh = "https://github.com/";
+        let ok = |raw: &str| github_canonical_url(raw, gh);
+        assert_eq!(
+            ok("https://github.com/acme/private.git"),
+            Some("https://github.com/acme/private.git".into())
+        );
+        assert_eq!(
+            ok("https://someone@GitHub.com/acme/private/"),
+            Some("https://github.com/acme/private".into())
+        );
+        for raw in [
+            "git@github.com:acme/private.git",
+            "ssh://git@github.com/acme/private.git",
+            "http://github.com/acme/private.git",
+            "https://github.com.evil.example/acme/private.git",
+            "https://evil.example/github.com/acme/private.git",
+            "https://github.com/acme/private/extra",
+            "https://github.com/acme",
+            "https://github.com/../private",
+            "https://github.com/acme/.git",
+            "https://github.com/acme/pri vate",
+            "/srv/git/private.git",
+        ] {
+            assert_eq!(ok(raw), None, "{raw}");
+        }
+    }
+
+    /// (core#1959) With no exported GH_TOKEN, gh's own login is read, as the deliver script reads
+    /// it: for GH_ACCOUNT when it is set, with GH_TOKEN/GITHUB_TOKEN kept from gh. No gh token: the
+    /// reason, naming the account.
+    #[cfg(unix)]
+    #[test]
+    fn the_gh_login_is_read_for_gh_account_when_no_gh_token_is_exported_1959() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("gh-token-1959");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\n[ -z \"$GH_TOKEN$GITHUB_TOKEN\" ] || exit 3\n\
+             [ \"$*\" = \"auth token --hostname github.com --user acct\" ] || exit 1\n\
+             echo fake-gh-login-token\n", // ggignore: a made-up test value, not a secret
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let with = |account: &str| {
+            gh_token(&[
+                ("PATH", Path::new(&path)),
+                ("GH_ACCOUNT", Path::new(account)),
+                ("GH_TOKEN", Path::new("")),
+                ("GITHUB_TOKEN", Path::new("set-but-not-for-gh")),
+            ])
+        };
+        assert_eq!(with("acct"), Ok("fake-gh-login-token".into()));
+        let err = with("other").unwrap_err();
+        assert!(
+            err.contains("gh holds no token for github.com as other"),
+            "{err}"
+        );
+    }
+
+    /// (core#1959) A failing origin that is not on GitHub is not fetched again: its own error stands.
+    #[test]
+    fn a_failed_fetch_off_github_is_not_retried_1959() {
+        let base = scratch("off-github-1959");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main", "."]);
+        let gone = base.join("no-such-origin.git");
+        run_git(&clone, &["remote", "add", "origin", gone.to_str().unwrap()]);
+        let err = fetch_origin_at(&clone, &[], GITHUB_BASE).unwrap_err();
+        assert!(err.starts_with("`git fetch origin` failed"), "{err}");
+        assert!(!err.contains("GitHub"), "{err}");
     }
 }
 

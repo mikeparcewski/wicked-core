@@ -33,7 +33,8 @@
 //!   The answers count only inside a `BEGIN VERDICTS <nonce>` block whose nonce is fresh per call, so
 //!   a `RULE` line written into the change (and echoed by a judge) is never a verdict; a KEPT must
 //!   cite a changed file. The whole prompt stays under one argv argument ([`PROMPT_BUDGET`]).
-//!   A change too big for one call is judged in parts, each in its own call ([`diff_parts`]); a rule
+//!   A change too big for one call is judged in parts, each in its own call ([`diff_parts`]; the
+//!   parts after the first at once, on the seat that answered it, core#1958); a rule
 //!   no part broke but the parts could not decide alone is asked again on the whole diff of the
 //!   changed files they named for it, together in one call ([`part_scope`], core#1278 item 4).
 //! * **Machine checks (S3).** A rule carrying `obligations: ["check:test-fails-on-base"]` is checked
@@ -397,8 +398,8 @@ pub struct RuleCheckReport {
     /// Judge calls made (batches + single re-asks).
     #[serde(default)]
     pub calls: u32,
-    /// Rounds of calls: the batch rounds plus the rounds of single re-asks, including serial part
-    /// calls in each round.
+    /// Rounds of calls: the batch rounds plus the rounds of single re-asks, including the rounds
+    /// of later-part calls in each round (core#1958: up to [`MAX_PARALLEL`] parts at once).
     #[serde(default)]
     pub waves: u32,
     #[serde(default)]
@@ -4743,7 +4744,8 @@ struct Round {
     answered: Answered,
     why: BTreeMap<usize, String>,
     left: BTreeMap<usize, Retry>,
-    /// The most later-part calls attempted by any batch in this round.
+    /// The most rounds of later-part calls made by any batch in this round (core#1958: the later
+    /// parts of a batch are asked up to [`MAX_PARALLEL`] at once).
     serial_parts: u32,
 }
 
@@ -4756,11 +4758,36 @@ struct Pool {
     stop: std::sync::atomic::AtomicBool,
     /// (core#1949) The judge's stand-in ([`RuleJudge::stand_in`]) was asked.
     stood_in: std::sync::atomic::AtomicBool,
+    /// (core#1958) The judge calls in flight, never more than [`MAX_PARALLEL`] across the whole
+    /// check (a batch's first call and its later parts alike).
+    in_flight: Mutex<usize>,
+    freed: std::sync::Condvar,
 }
 
 impl Pool {
     fn stopped(&self) -> bool {
         self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `judge.ask(seat, prompt)` in one of the check's [`MAX_PARALLEL`] call slots: it waits for a
+    /// free one, and frees it when the call returns (or panics).
+    fn ask(&self, judge: &dyn RuleJudge, seat: &str, prompt: &str) -> JudgeAnswer {
+        struct Slot<'a>(&'a Pool);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                *self.0.in_flight.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                self.0.freed.notify_one();
+            }
+        }
+        {
+            let mut n = self.in_flight.lock().unwrap();
+            while *n >= MAX_PARALLEL {
+                n = self.freed.wait(n).unwrap();
+            }
+            *n += 1;
+        }
+        let _slot = Slot(self);
+        judge.ask(seat, prompt)
     }
 }
 
@@ -4998,7 +5025,7 @@ fn run_pool(
                         pool.stood_in
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    match judge.ask(seat, &text) {
+                    match pool.ask(judge, seat, &text) {
                         JudgeAnswer::Answered(out) => {
                             got = Some((seat.clone(), out));
                             break;
@@ -5033,6 +5060,13 @@ fn run_pool(
                 // (core#1474) The other parts go to the seat that answered the first, so one judge
                 // read the whole change. A part it cannot answer ends the batch like a timeout:
                 // its rules are asked again alone on another seat.
+                // (core#1958) They are asked at once, up to MAX_PARALLEL a round (each is its own
+                // one-shot call, as the first is), in the check's shared call slots
+                // ([`Pool::ask`]: never more than MAX_PARALLEL calls in flight in all), so a
+                // worker whose batch is in parts no longer leaves the slots other batches freed
+                // idle while it asks its parts one by one. The answers are read in part order,
+                // exactly as one after another: the first part left unanswered ends the read, and
+                // no part after it counts. A round with a part left unanswered is the last asked.
                 let mut later: Vec<String> = Vec::new();
                 // (codex on #1514 v2) A part that could not be answered after earlier parts were:
                 // what they found that holds (a BROKEN, a holding miss) is kept, marked cut (the
@@ -5048,16 +5082,44 @@ fn run_pool(
                                 || p.misses.values().any(Miss::holds)
                         })
                     };
-                    for k in 1..total_parts.min(MAX_PARTS) {
-                        let dead = pool.dead.lock().unwrap().contains(seat);
-                        let answer = if pool.stopped() || dead {
-                            None
-                        } else {
-                            pool.calls
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rest: Vec<usize> = (1..total_parts.min(MAX_PARTS)).collect();
+                    let mut asked: Vec<Option<JudgeAnswer>> = Vec::new();
+                    for round in rest.chunks(MAX_PARALLEL) {
+                        let answers: Vec<Option<JudgeAnswer>> = std::thread::scope(|ps| {
+                            let part_text = &part_text;
+                            let calls: Vec<_> = round
+                                .iter()
+                                .map(|&k| {
+                                    ps.spawn(move || {
+                                        let dead = pool.dead.lock().unwrap().contains(seat);
+                                        if pool.stopped() || dead {
+                                            return None;
+                                        }
+                                        pool.calls
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        Some(pool.ask(judge, seat, &part_text(k)))
+                                    })
+                                })
+                                .collect();
+                            calls
+                                .into_iter()
+                                .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                                .collect()
+                        });
+                        if answers.iter().any(Option::is_some) {
                             batch_serial_parts += 1;
-                            Some(judge.ask(seat, &part_text(k)))
-                        };
+                        }
+                        let last = answers
+                            .iter()
+                            .any(|a| !matches!(a, Some(JudgeAnswer::Answered(_))));
+                        asked.extend(answers);
+                        if last {
+                            break;
+                        }
+                    }
+                    let mut asked = asked.into_iter();
+                    for k in 1..total_parts.min(MAX_PARTS) {
+                        let answer = asked.next().flatten();
                         let w = match answer {
                             Some(JudgeAnswer::Answered(out)) => {
                                 later.push(out);
