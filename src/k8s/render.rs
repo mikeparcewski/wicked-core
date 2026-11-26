@@ -394,9 +394,10 @@ pub(crate) struct SeatPod {
     /// [`VIEW_SOURCE`], and an init container copies it into an emptyDir at the tree's own
     /// path: the unit's writes land in that throwaway view and go with the pod.
     pub(crate) view: Option<PathBuf>,
-    /// PARITY B14: the run's `node_modules` cache claim, mounted read-only at
-    /// `<tree>/node_modules` (`(claim, tree)`), filled once per run by a fill pod.
-    pub(crate) deps: Option<(String, PathBuf)>,
+    /// PARITY B14: the run's `node_modules` cache claims, each mounted read-only at
+    /// `<package dir>/node_modules` (`(claim, package dir)`: the tree's root, and core#1970 each
+    /// subfolder package of it), filled once per run by a fill pod.
+    pub(crate) deps: Vec<(String, PathBuf)>,
 }
 
 /// Where a read-only unit's replica tree is mounted read-only (the view's source).
@@ -564,24 +565,30 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
             {"name": "replica", "persistentVolumeClaim": {"claimName": REPLICA_PVC}},
         ],
     });
-    if let Some((claim, tree)) = &s.deps {
-        let at = tree.join("node_modules");
+    for (k, (claim, pkg)) in s.deps.iter().enumerate() {
+        let at = pkg.join("node_modules");
+        // The first claim keeps the names it always had (`deps`, `nmw<i>`).
+        let (dep, nmw) = if k == 0 {
+            ("deps".to_string(), "nmw".to_string())
+        } else {
+            (format!("deps{k}"), format!("nmw{k}-"))
+        };
         if let Some(m) = spec
             .pointer_mut("/containers/0/volumeMounts")
             .and_then(Value::as_array_mut)
         {
-            m.push(json!({"name": "deps", "mountPath": at.to_string_lossy(), "readOnly": true}));
+            m.push(json!({"name": dep, "mountPath": at.to_string_lossy(), "readOnly": true}));
             // The tool caches inside it are the pod's own and writable (core#1424: Vite bundles
             // its config into node_modules/.vite-temp), over the read-only claim.
             for (i, d) in NM_WRITABLE.iter().enumerate() {
-                m.push(json!({"name": format!("nmw{i}"),
+                m.push(json!({"name": format!("{nmw}{i}"),
                     "mountPath": at.join(d).to_string_lossy()}));
             }
         }
-        extra_volumes.push(json!({"name": "deps",
+        extra_volumes.push(json!({"name": dep,
             "persistentVolumeClaim": {"claimName": claim, "readOnly": true}}));
         for i in 0..NM_WRITABLE.len() {
-            extra_volumes.push(json!({"name": format!("nmw{i}"),
+            extra_volumes.push(json!({"name": format!("{nmw}{i}"),
                 "emptyDir": {"medium": "Memory", "sizeLimit": NM_WRITABLE_SIZE}}));
         }
     }

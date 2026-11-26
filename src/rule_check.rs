@@ -28,7 +28,8 @@
 //!   at once; a batch grows past 8 only when 8 would need more than [`MAX_WAVES`] rounds (the DES
 //!   speed rule: 100 rules in two rounds). Answers are `RULE <id>: KEPT|BROKEN|N/A — <cite>` lines
 //!   ([`parse_rule_lines`]); a rule a batch did not answer (or answered twice, differently, or
-//!   without a cite) is asked again alone, and still unanswered it is **unchecked**.
+//!   without a cite) is asked again alone, and still unanswered it is **unchecked**. A process
+//!   rule (it never blocks) is not asked again: unanswered in its call it is unchecked (core#1958).
 //!   The answers count only inside a `BEGIN VERDICTS <nonce>` block whose nonce is fresh per call, so
 //!   a `RULE` line written into the change (and echoed by a judge) is never a verdict; a KEPT must
 //!   cite a changed file. The whole prompt stays under one argv argument ([`PROMPT_BUDGET`]).
@@ -4509,12 +4510,29 @@ fn judge_rows(
     let (mut answered, mut why) = (round.answered, round.why);
     // (F20, F22) Each rule left unanswered is asked alone, on a seat other than the one whose answer
     // did not count (or that ran out of time) when another is live. A miss that carried a BROKEN
-    // is not asked again: no other seat may answer it away (deny-dominates).
-    let missing: Vec<Batch> = (0..pending.len())
+    // is not asked again: no other seat may answer it away (deny-dominates). (core#1958) Nor is a
+    // process rule at review: its row never blocks (Q6), so a second seat launch for it alone only
+    // delays the gate. It stays unchecked and says why. (The subject comes from the same
+    // `PackKind::Process` overlay that sets the row's `blocking: false` at review, in `check`.)
+    let reported = |i: usize| {
+        input.stage == CheckStage::Review && pending[i].subject == EvidenceSubject::Process
+    };
+    let unasked: Vec<usize> = (0..pending.len())
         .filter(|i| !answered.contains_key(i))
         .filter(|i| !round.left.get(i).is_some_and(|l| l.holds))
+        .collect();
+    let missing: Vec<Batch> = unasked
+        .iter()
+        .copied()
+        .filter(|i| !reported(*i))
         .map(|i| (vec![i], round.left.get(&i).cloned()))
         .collect();
+    for i in unasked.into_iter().filter(|i| reported(*i)) {
+        let w = why
+            .entry(i)
+            .or_insert_with(|| "the judge did not answer for it".into());
+        w.push_str(" (a process rule is not asked again alone: it never blocks)");
+    }
     // A miss that carried a BROKEN, in any round: never asked again.
     let mut held: BTreeSet<usize> = round
         .left

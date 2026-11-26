@@ -3127,6 +3127,40 @@ fn a_process_kept_that_quotes_nothing_is_unchecked() {
     assert!(r.hold().is_none());
 }
 
+/// core#1958 W6: a one-line README change's rule check took 705 s, in two rounds of seat
+/// launches. The second round only re-asked, alone, a process rule the first left unanswered,
+/// and a process rule never blocks: its unchecked row is all that round could change. It is not
+/// asked again; its row says so. A change rule the judge leaves out is still asked alone.
+#[test]
+fn an_unanswered_process_rule_is_not_asked_again_alone_1958() {
+    let judge = PackJudge::with(&[("R000", "N/A — no source changed")], &[], &[]);
+    let r = run_packs(
+        &[pack("RVWL-1003"), rule("R001", "every change has a test")],
+        &change(),
+        &judge,
+        None,
+        Some(ENGINE),
+        Some(&[]),
+        None,
+        &[],
+    );
+    assert_eq!(
+        judge.of(Asked::Process).len(),
+        1,
+        "one process call, no lone re-ask"
+    );
+    let row = row_of(&r, "RVWL-1003");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("not asked again alone"),
+        "{}",
+        row.reason
+    );
+    assert_eq!(row.blocking, Some(false), "a process rule never holds");
+    // Control: the change rule the judge left out is asked alone, as before.
+    assert_eq!(judge.of(Asked::Change).len(), 2, "batch, then alone");
+}
+
 /// (crew#1394) A run where no agent wrote code before the gate (qe-author-tests with its author a
 /// Tool, as crew's e2e runs it) and so no judge seat can be drawn (the work's creators are not
 /// known): POL-2101 is N/A by fact and nothing holds. Control: the same seatless check with an

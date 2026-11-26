@@ -2668,8 +2668,9 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) deadline: Duration,
     /// `seat`, or `judge` for an engine-internal session.
     pub(crate) role: &'a str,
-    /// The run's read-only `node_modules` claim for the tree (B14), when one was filled.
-    pub(crate) deps: Option<&'a str>,
+    /// The run's read-only `node_modules` claims for the tree (B14), `(package dir, claim)`: the
+    /// root's (`""`) and, core#1970, each subfolder package's. Empty when none was filled.
+    pub(crate) deps: &'a [(String, String)],
     /// (core#1463) The settled optional read roots (canonical): left out when over the caps.
     pub(crate) optional: &'a [PathBuf],
 }
@@ -3347,12 +3348,9 @@ fn arm_physical(
             .filter(|m| checkout.is_some() && m.rw && m.path != s.tree && m.path.is_dir())
             .map(|m| m.path.clone()),
     );
-    if s.deps.is_some() {
-        reset_dirs.extend(
-            render::NM_WRITABLE
-                .iter()
-                .map(|d| s.tree.join("node_modules").join(d)),
-        );
+    for (dir, _) in s.deps {
+        let nm = package_dir(s.tree, dir).join("node_modules");
+        reset_dirs.extend(render::NM_WRITABLE.iter().map(|d| nm.join(d)));
     }
     reset_dirs.sort();
     reset_dirs.dedup();
@@ -3402,7 +3400,11 @@ fn arm_physical(
         deadline_secs: secs,
         scope: scope.clone(),
         view: s.view.then(|| s.tree.to_path_buf()),
-        deps: s.deps.map(|c| (c.to_string(), s.tree.to_path_buf())),
+        deps: s
+            .deps
+            .iter()
+            .map(|(d, c)| (c.clone(), package_dir(s.tree, d)))
+            .collect(),
     };
     let mut doc = render::seat_sandbox(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     let mut expected_sandbox = doc["spec"].clone();
@@ -3481,8 +3483,8 @@ fn arm_physical(
         unit_label.clone_from(&p.unit);
     }
     let mut reset_mounts: Vec<PathBuf> = pod_mounts.iter().map(|m| m.path.clone()).collect();
-    if s.deps.is_some() {
-        reset_mounts.push(s.tree.join("node_modules"));
+    for (dir, _) in s.deps {
+        reset_mounts.push(package_dir(s.tree, dir).join("node_modules"));
     }
     // One arm at a time copies into a namespace's replica (review r7 #7): the stale-pod check and
     // the copy-in see the same pods.
@@ -3512,8 +3514,8 @@ fn arm_physical(
         true,
         checkout.is_some(),
     )?;
-    if s.deps.is_some() {
-        let tree = replica_of(scope.as_deref(), s.tree)
+    for (dir, _) in s.deps {
+        let tree = replica_of(scope.as_deref(), &package_dir(s.tree, dir))
             .map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
         let r = codec(kube, &ns, &["deps", &tree], None, CALL);
         if !r.ok() {
@@ -3573,7 +3575,7 @@ fn arm_physical(
             .collect(),
         unit_label: unit_label.clone(),
         settled: Mutex::new(false),
-        deps: s.deps.is_some(),
+        deps: !s.deps.is_empty(),
         warm: Mutex::new(None),
         claude_record: Mutex::new(None),
     });
@@ -3593,8 +3595,12 @@ fn arm_physical(
         }
     }
     let mut guard = Guard(Some(id.clone()), None);
-    guard.1 = crate::checks_container::dependency_mounts(kube, &ns, s.deps)
-        .map_err(|e| (classify_apply(&e), e))?;
+    guard.1 = crate::checks_container::dependency_mounts(
+        kube,
+        &ns,
+        s.deps.iter().map(|(_, c)| c.as_str()),
+    )
+    .map_err(|e| (classify_apply(&e), e))?;
     if !reused {
         kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
     }
@@ -3691,8 +3697,9 @@ fn arm_physical(
     super::clock::mark("deny_check");
     // The nested workspace node_modules the fill archived (B14): unpacked into the seat's tree
     // before its CLI starts. Ignored by git, so never written back.
-    if s.deps.is_some() {
-        let script = nested_unpack_script(s.tree);
+    if !s.deps.is_empty() {
+        let dirs: Vec<String> = s.deps.iter().map(|(d, _)| d.clone()).collect();
+        let script = nested_unpack_script(s.tree, &dirs);
         let r = kube.call(
             Some(&ns),
             &[
@@ -3721,7 +3728,7 @@ fn arm_physical(
             ));
         }
     }
-    if s.deps.is_some() {
+    if !s.deps.is_empty() {
         super::clock::mark("deps_unpack");
     }
     if let Some(c) = checkout.as_ref() {
@@ -5220,16 +5227,52 @@ pub(crate) fn in_node_modules(rel: &str) -> bool {
 }
 
 /// The in-pod script that unpacks the fill's nested `node_modules` archive into `tree` (pure).
-pub(crate) fn nested_unpack_script(tree: &Path) -> String {
-    let t = format!("'{}'", tree.to_string_lossy().replace('\'', "'\\''"));
+pub(crate) fn nested_unpack_script(tree: &Path, dirs: &[String]) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let t = q(&tree.to_string_lossy());
     // Every nested node_modules already in the tree goes first (review r1: an ignored one the
     // replica kept from an earlier seat could carry a planted `.bin` shim), as `npm ci` empties
-    // them; the root one is the read-only claim and is left alone.
+    // them; the mounted ones (core#1970: the root's and each subfolder package's) are the
+    // read-only claims and are left alone.
+    let keep: String = dirs
+        .iter()
+        .map(|d| {
+            let nm = if d.is_empty() {
+                "./node_modules".to_string()
+            } else {
+                format!("./{d}/node_modules")
+            };
+            format!("-path {} -prune -o ", q(&nm))
+        })
+        .collect();
+    // Then each claim's archive of its package's nested (workspace) node_modules, in its own dir,
+    // the root's first. No two overlap: a subfolder package is never a member of the root's
+    // workspaces, nor inside another subfolder package
+    // ([`crate::checks_container::seat_package_dirs`]).
+    let unpack: String = dirs
+        .iter()
+        .map(|d| {
+            let at = if d.is_empty() { ".".to_string() } else { format!("./{d}") };
+            format!(
+                "a={at}/node_modules/{n}; if [ -f \"$a\" ]; then (cd {at} && $F tar -x -f node_modules/{n}); fi; ",
+                at = q(&at),
+                n = crate::checks_container::NESTED_TAR
+            )
+        })
+        .collect();
     format!(
-        "set -e; cd {t}; F=/floor/busybox; $F find . -path ./node_modules -prune -o -name node_modules -prune -exec $F rm -rf {{}} \\; ; [ -z \"$($F find . -path ./node_modules -prune -o -name node_modules -print)\" ] || {{ echo 'wicked-seat: an earlier node_modules could not be removed' >&2; exit 1; }}; \
-         a=./node_modules/{n}; [ -f \"$a\" ] || exit 0; $F tar -x -f \"$a\"",
-        n = crate::checks_container::NESTED_TAR
+        "set -e; cd {t}; F=/floor/busybox; $F find . {keep}-name node_modules -prune -exec $F rm -rf {{}} \\; ; [ -z \"$($F find . {keep}-name node_modules -print)\" ] || {{ echo 'wicked-seat: an earlier node_modules could not be removed' >&2; exit 1; }}; \
+         {unpack}true"
     )
+}
+
+/// (core#1970) A package dir of `tree` (`""` = the root), as a path.
+pub(crate) fn package_dir(tree: &Path, dir: &str) -> PathBuf {
+    if dir.is_empty() {
+        tree.to_path_buf()
+    } else {
+        tree.join(dir)
+    }
 }
 
 /// The `bundle` base that says the host tree has no commit: the pod codec answers nothing when
