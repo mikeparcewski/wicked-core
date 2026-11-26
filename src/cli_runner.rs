@@ -1664,13 +1664,18 @@ fn stamp_judge_ids(report: &mut crate::rule_check::RuleCheckReport, pool: &[crat
         .iter_mut()
         .filter(|r| r.how == crate::rule_check::RuleHow::Judge)
     {
-        // (core#1949) POL-2101's record part's judge, when another seat, ruled too.
-        let mut ids: Vec<String> = Vec::new();
-        for c in r
+        // (core#1949) POL-2101's record part's judge, when another seat, ruled too. Every judge's
+        // identity is established, or none is recorded (a council then refuses: identity_unknown).
+        let records: Option<Vec<&crate::AgenticCli>> = r
             .judges()
-            .filter_map(|j| pool.iter().find(|c| c.key == j))
-            .filter(|c| launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)))
-        {
+            .map(|j| {
+                pool.iter().find(|c| c.key == j).filter(|c| {
+                    launches_its_own_binary(c, &invocation_identity(&c.headless_invocation))
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = Vec::new();
+        for c in records.unwrap_or_default() {
             for id in record_identities(c) {
                 if !ids.contains(&id) {
                     ids.push(id);
@@ -1846,6 +1851,16 @@ fn settle_rule_disputes(
             )
         };
         let hold = |why: String| hold_with(why, Vec::new());
+        // (core#1949) POL-2101's two parts ruled by two seats (the record part by the judge
+        // stand-in once the change's judge was lost): no council is drawn for it, and it holds.
+        if row.record_judge.is_some() {
+            report.rows[i] = hold(
+                "identity_unknown: the rule's change and its step records were judged by two \
+                 different helpers, so no council can be shown independent of both"
+                    .into(),
+            );
+            continue;
+        }
         let Some(ctx) = council else {
             report.rows[i] = hold("error: this path convenes no rule council".into());
             continue;

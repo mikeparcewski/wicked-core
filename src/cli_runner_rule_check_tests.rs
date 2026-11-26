@@ -3599,3 +3599,28 @@ fn an_admitted_real_record_keyed_like_the_stand_in_gets_no_waiver() {
         "{r1:?}"
     );
 }
+
+/// (core#1949, codex delta) A split POL-2101 row's identities are its judges' together, or none
+/// when either judge's launch cannot be established: one verified judge never vouches for the
+/// other, so a council refuses such a row (`identity_unknown`).
+#[test]
+fn a_split_rows_judge_ids_are_every_judges_or_none() {
+    let row = |record: &str| crate::rule_check::RuleVerdict {
+        rule_id: "POL-2101".into(),
+        how: crate::rule_check::RuleHow::Judge,
+        judge: Some("codex".into()),
+        record_judge: Some(record.into()),
+        ..Default::default()
+    };
+    let mut rc = crate::rule_check::RuleCheckReport {
+        rows: vec![row("pi"), row("ghost")],
+        ..Default::default()
+    };
+    stamp_judge_ids(&mut rc, &[seat("codex"), seat("pi")]);
+    let both = &rc.rows[0].judge_ids;
+    assert!(
+        both.iter().any(|i| i == "codex") && both.iter().any(|i| i == "pi"),
+        "{both:?}"
+    );
+    assert!(rc.rows[1].judge_ids.is_empty(), "{:?}", rc.rows[1]);
+}
