@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An app's worktree may name its own files by absolute path, and `cd` inside itself, again** (core#1956). The
+  estate fence's raw-SQLite arm still refused two spellings from an app's worktree under `WICKED_HOME/apps`:
+  an absolute path to a file of the worktree (`python3 <worktree>/check.py`), and a `cd` inside the worktree
+  followed by a `..` word (`cd queries && python3 -c 'open("../apps.json")'`), which was judged from every
+  directory the line could reach, the worktree root included. An absolute occurrence of the home that spells a
+  file of the tree (no `..` after it, no link out of the tree or into another store) is now the tree's
+  business, and a plain `&&` list that starts with plain `cd` moves is judged from where those moves lead. Every
+  other line keeps the whole-line judgement, and every existing deny still denies.
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
