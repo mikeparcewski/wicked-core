@@ -18,12 +18,15 @@ Two release tracks share this file, newest entry first regardless of track:
   read-only `node_modules` claim, from the root's lockfile. A run that built a new package in a subfolder
   (`notes/`, with its own `package.json` and lockfile) left its seats resolving the root's dependencies, so QE's
   harness crashed on a version the subfolder had not locked, while the floor, which installs per package, passed.
-  The seats now get a claim for the root and for each subfolder package with its own npm lockfile that the
-  root's workspaces do not hold (at most 8, the rest named). Each is filled as the floor fills that package and
-  mounted read-only at its own `node_modules`. The set is read again at every unit, so a package a step adds is
-  filled before the next seat. A tree with no root package is no longer "not node" when a subfolder package
-  has a lockfile. A tree with no npm lockfile at all is still skipped before any snapshot. Host (non-pod) seats
-  still install the root only.
+  The seats now get a claim for the root and for each subfolder package with its own npm lockfile (not pnpm or
+  yarn) that the root's workspaces do not hold. A package inside another such package is left to that package's
+  install, a dir spelled with a glob or quote character is left out, and past 8 packages the rest are named on
+  the stream. Each claim is filled as the floor fills that package and mounted read-only at its own
+  `node_modules`. A package's own `.gitignore` counts for its `node_modules`. The set is read again at every unit,
+  so a package a step adds is filled before the next seat. A tree whose only npm package is in a subfolder is no
+  longer "not node". A package whose install fails makes the result a failure, and the claims that did fill are
+  still mounted. A tree with no subfolder npm lockfile ends at its root before any snapshot, as before. Host
+  (non-pod) seats still install the root only.
 
 - **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
   (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct

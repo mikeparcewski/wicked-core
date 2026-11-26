@@ -3108,7 +3108,15 @@ impl Filler<'_> {
 /// of every tree whose run claims [`provision_seat_node_modules`] filled, read by the seat arm
 /// ([`seat_claims`]) to mount each read-only at `<tree>/<dir>/node_modules` (core#1970: the root's
 /// and each subfolder package's).
-static SEAT_NM: Mutex<Vec<(String, PathBuf, Vec<(String, String)>)>> = Mutex::new(Vec::new());
+static SEAT_NM: Mutex<Vec<SeatClaims>> = Mutex::new(Vec::new());
+
+/// One tree's claims in [`SEAT_NM`].
+struct SeatClaims {
+    run_id: String,
+    tree: PathBuf,
+    /// `(package dir, claim)`, the root's dir `""` first.
+    claims: Vec<(String, String)>,
+}
 
 /// The run's `node_modules` claims for `tree`, `(package dir, claim)` with the root's dir `""`
 /// first, as this unit's provisioning filled them (none when it filled none).
@@ -3119,8 +3127,8 @@ pub(crate) fn seat_claims(run_id: &str, tree: &Path) -> Vec<(String, String)> {
         .ok()
         .and_then(|m| {
             m.iter()
-                .find(|(r, t, _)| r == run_id && *t == tree)
-                .map(|(_, _, c)| c.clone())
+                .find(|c| c.run_id == run_id && c.tree == tree)
+                .map(|c| c.claims.clone())
         })
         .unwrap_or_default()
 }
@@ -3128,9 +3136,13 @@ pub(crate) fn seat_claims(run_id: &str, tree: &Path) -> Vec<(String, String)> {
 fn remember_seat_claims(run_id: &str, tree: &Path, claims: Vec<(String, String)>) {
     let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
     if let Ok(mut m) = SEAT_NM.lock() {
-        m.retain(|(r, t, _)| !(r == run_id && *t == tree));
+        m.retain(|c| !(c.run_id == run_id && c.tree == tree));
         if !claims.is_empty() {
-            m.push((run_id.to_string(), tree, claims));
+            m.push(SeatClaims {
+                run_id: run_id.to_string(),
+                tree,
+                claims,
+            });
         }
     }
 }
@@ -3249,9 +3261,7 @@ fn seat_package(
 ) -> Result<Result<SeatPackage, String>, String> {
     let has = |f: &str| entries.iter().any(|e| e.path == rel_in(dir, f));
     if dir.is_empty() && (has("pnpm-lock.yaml") || has("yarn.lock")) {
-        return Ok(Err(
-            "the repository uses pnpm or yarn; the engine installs npm lockfiles only".into(),
-        ));
+        return Ok(Err(PNPM_OR_YARN.into()));
     }
     // npm's own choice of lockfile, as the floor makes it (review r1): a shrinkwrap wins.
     let Some(lock) = ["npm-shrinkwrap.json", "package-lock.json"]
@@ -3315,11 +3325,17 @@ pub(crate) fn seat_node_modules(
         return Ok(SeatTree { packages, left_out });
     }
     // The engine's node_modules never ride the write-back (review r1): only where the
-    // repository ignores them, at the root and nested.
-    let probe = [
-        "node_modules/.wicked".to_string(),
-        "a/node_modules/.wicked".to_string(),
-    ];
+    // repository ignores them, at each package's root and nested (core#1970: a subfolder
+    // package's own `.gitignore` counts).
+    let probe: Vec<String> = ready
+        .iter()
+        .flat_map(|p| {
+            [
+                rel_in(&p.dir, "node_modules/.wicked"),
+                rel_in(&p.dir, "a/node_modules/.wicked"),
+            ]
+        })
+        .collect();
     if crate::k8s::seat::host_ignored(tree, &probe)?.len() != probe.len() {
         return Ok(whole(
             "the repository does not ignore node_modules (the seat's would be written back)".into(),
@@ -3441,16 +3457,11 @@ fn fill_seat_package(
     }
 }
 
-/// (core#1406) The native addons the tree `tree` (a snapshot) declares in its root
+/// (core#1406) The native addons the tree `tree` (a snapshot) declares for the package at `dir`
+/// (`""` = the root; core#1970, a subfolder package's own, as the floor reads it) in its
 /// `.wicked/checks.json`, read from the blob as the floor reads its tree: validated against the
 /// floor's allowlist, so the names are the engine's own spelling; a config that does not parse is
 /// an error, never "none".
-pub(crate) fn declared_native_in(git_dir: &Path, tree: &str) -> Result<Vec<&'static str>, String> {
-    declared_native_at(git_dir, tree, "")
-}
-
-/// [`declared_native_in`] for the package at `dir` (core#1970): its own `.wicked/checks.json`, as
-/// the floor reads a subfolder package's.
 fn declared_native_at(git_dir: &Path, tree: &str, dir: &str) -> Result<Vec<&'static str>, String> {
     match read_blob(git_dir, tree, &rel_in(dir, crate::repo_checks::CONFIG_PATH)) {
         Some(raw) => crate::repo_checks::native_rebuild_in(&String::from_utf8_lossy(&raw)),
@@ -3636,16 +3647,27 @@ pub(crate) fn provision_seat_node_modules(
 ) -> crate::seat_deps::Provisioned {
     use crate::seat_deps::Provisioned;
     remember_seat_claims(run_id, tree, Vec::new());
+    let root_package =
+        std::fs::symlink_metadata(tree.join("package.json")).is_ok_and(|m| m.is_file());
+    let root_other = tree.join("pnpm-lock.yaml").exists() || tree.join("yarn.lock").exists();
     let Some(git_dir) = git_dir else {
-        if !std::fs::symlink_metadata(tree.join("package.json")).is_ok_and(|m| m.is_file()) {
+        return if !root_package {
+            Provisioned::NotNode
+        } else if root_other {
+            Provisioned::Skipped(PNPM_OR_YARN.into())
+        } else {
+            Provisioned::Skipped("the unit carries no pinned git dir to read the tree from".into())
+        };
+    };
+    // (core#1970) Before the snapshot (a full re-hash): a tree with no subfolder npm lockfile
+    // ends here as it always did, at its root.
+    if !subfolder_npm_lockfile(tree, git_dir) {
+        if !root_package {
             return Provisioned::NotNode;
         }
-        return Provisioned::Skipped(
-            "the unit carries no pinned git dir to read the tree from".into(),
-        );
-    };
-    if !may_hold_npm(tree, git_dir) {
-        return Provisioned::NotNode;
+        if root_other {
+            return Provisioned::Skipped(PNPM_OR_YARN.into());
+        }
     }
     let started = Instant::now();
     match seat_node_modules(run_id, tree, git_dir) {
@@ -3660,14 +3682,14 @@ pub(crate) fn provision_seat_node_modules(
     }
 }
 
-/// (core#1970) Whether `tree` may hold an npm package at all, read cheaply before the snapshot
-/// (a full re-hash, which a tree with no npm package never pays): a root `package.json`, or any
-/// npm lockfile git lists, tracked or new and not ignored. A git error answers yes (the snapshot
-/// decides).
-fn may_hold_npm(tree: &Path, git_dir: &Path) -> bool {
-    if std::fs::symlink_metadata(tree.join("package.json")).is_ok_and(|m| m.is_file()) {
-        return true;
-    }
+/// The reason a root pnpm or yarn repository's seats get no engine install.
+const PNPM_OR_YARN: &str =
+    "the repository uses pnpm or yarn; the engine installs npm lockfiles only";
+
+/// (core#1970) Whether git lists an npm lockfile below the root of `tree` (tracked, or new and
+/// not ignored), outside any `node_modules` and the engine scratch: read cheaply, before the
+/// snapshot. A git error answers yes (the snapshot decides).
+fn subfolder_npm_lockfile(tree: &Path, git_dir: &Path) -> bool {
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", tree)];
     crate::worktree_guard::git(
         tree,
@@ -3683,7 +3705,18 @@ fn may_hold_npm(tree: &Path, git_dir: &Path) -> bool {
         ],
         &env,
     )
-    .map(|out| !out.is_empty())
+    .map(|out| {
+        let scratch = format!("{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR);
+        out.split(|b| *b == 0)
+            .map(String::from_utf8_lossy)
+            .any(|p| {
+                p.contains('/')
+                    && !p.starts_with(&scratch)
+                    && !p
+                        .split('/')
+                        .any(|seg| seg.eq_ignore_ascii_case("node_modules"))
+            })
+    })
     .unwrap_or(true)
 }
 
@@ -3760,6 +3793,13 @@ pub(crate) fn seat_provisioned(
             },
             Vec::new(),
         );
+    }
+    // A package whose install failed is said as a failure, whatever else was filled (round 1):
+    // the claims that were filled are still mounted, as a failed root install leaves the seat
+    // to run (as before).
+    if failed {
+        problems.extend(parts);
+        return (Provisioned::Failed(problems.join("; ")), claims);
     }
     if !claims[0].0.is_empty() {
         parts.insert(0, "linux pods".into());

@@ -2412,7 +2412,10 @@ fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
     git(&["commit", "-qm", "none"]);
     let gd = root.join(".git");
     let none = git(&["rev-parse", "HEAD^{tree}"]);
-    assert_eq!(declared_native_in(&gd, &none).unwrap(), Vec::<&str>::new());
+    assert_eq!(
+        declared_native_at(&gd, &none, "").unwrap(),
+        Vec::<&str>::new()
+    );
     std::fs::write(
         root.join(crate::repo_checks::CONFIG_PATH),
         r#"{"native_rebuild":["better-sqlite3"]}"#,
@@ -2422,7 +2425,7 @@ fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
     git(&["commit", "-qm", "declares"]);
     let declares = git(&["rev-parse", "HEAD^{tree}"]);
     assert_eq!(
-        declared_native_in(&gd, &declares).unwrap(),
+        declared_native_at(&gd, &declares, "").unwrap(),
         ["better-sqlite3"]
     );
     // The worktree's own edit is not the snapshot's.
@@ -2432,13 +2435,13 @@ fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
     )
     .unwrap();
     assert_eq!(
-        declared_native_in(&gd, &declares).unwrap(),
+        declared_native_at(&gd, &declares, "").unwrap(),
         ["better-sqlite3"]
     );
     git(&["add", "-A"]);
     git(&["commit", "-qm", "bad"]);
     let bad = git(&["rev-parse", "HEAD^{tree}"]);
-    assert!(declared_native_in(&gd, &bad)
+    assert!(declared_native_at(&gd, &bad, "")
         .unwrap_err()
         .contains("leftpad"));
     let _ = std::fs::remove_dir_all(&root);
@@ -2634,13 +2637,13 @@ fn a_seat_trees_fills_read_as_one_provisioning_1970() {
         Provisioned::AlreadyFor("linux pods, the run's read-only cache wfloor-nm-r".into())
     );
     assert_eq!(c, vec![(String::new(), "wfloor-nm-r".to_string())]);
-    // The root's claim reused, notes' filled now, another package's install failed.
+    // The root's claim reused, notes' filled now, another package not filled, one left out.
     let (p, c) = seat_provisioned(
         SeatTree {
             packages: vec![
                 (String::new(), claim("wfloor-nm-r", true)),
                 ("notes".into(), claim("wfloor-nm-n", false)),
-                ("tools".into(), SeatNm::Failed("E404".into())),
+                ("tools".into(), SeatNm::Skip("no package-lock.json".into())),
             ],
             left_out: vec!["more".into()],
         },
@@ -2660,7 +2663,7 @@ fn a_seat_trees_fills_read_as_one_provisioning_1970() {
         "{platform}"
     );
     assert!(
-        platform.contains("tools/ install failed (E404)"),
+        platform.contains("tools/ not filled (no package-lock.json)"),
         "{platform}"
     );
     assert!(
@@ -2674,6 +2677,27 @@ fn a_seat_trees_fills_read_as_one_provisioning_1970() {
             ("notes".to_string(), "wfloor-nm-n".to_string()),
         ]
     );
+    // (round 1) A failed install is a failure whatever else was filled: the root's here, and
+    // notes' claim is still mounted.
+    let (p, c) = seat_provisioned(
+        SeatTree {
+            packages: vec![
+                (String::new(), SeatNm::Failed("E404".into())),
+                ("notes".into(), claim("wfloor-nm-n", true)),
+            ],
+            left_out: Vec::new(),
+        },
+        0,
+    );
+    let Provisioned::Failed(why) = &p else {
+        panic!("the root's install failed: {p:?}");
+    };
+    assert!(
+        why.starts_with("the root package install failed (E404); "),
+        "{why}"
+    );
+    assert!(why.contains("notes/node_modules"), "{why}");
+    assert_eq!(c, vec![("notes".to_string(), "wfloor-nm-n".to_string())]);
     // Only a subfolder package: it is still the seats' install.
     let (p, c) = seat_provisioned(
         SeatTree {
@@ -2691,10 +2715,96 @@ fn a_seat_trees_fills_read_as_one_provisioning_1970() {
         )
     );
     assert_eq!(c.len(), 1);
-    // Each package's claim is its own: the root's lock pins one version, notes' another.
-    let (tag, inputs) = ("wicked-checks-floor:abc", b"in".as_slice());
-    assert_ne!(
-        seat_nm_volume(tag, "", br#"{"api":"1.9.1"}"#, inputs, &[]),
-        seat_nm_volume(tag, "notes", br#"{"api":"1.10.0"}"#, inputs, &[])
+    // Each package's claim is its own, even on the same lockfile bytes, and it is the floor's
+    // own claim for that dir.
+    let (tag, lock, inputs) = (
+        "wicked-checks-floor:abc",
+        b"lock".as_slice(),
+        b"in".as_slice(),
     );
+    assert_ne!(
+        seat_nm_volume(tag, "", lock, inputs, &[]),
+        seat_nm_volume(tag, "notes", lock, inputs, &[])
+    );
+    assert_eq!(
+        seat_nm_volume(tag, "notes", lock, inputs, &[]),
+        nm_volume(tag, "notes", lock, inputs, &[])
+    );
+}
+
+/// core#1970 round 1: the cheap read before the snapshot, and a subfolder package's own ignore.
+/// A pnpm root with no subfolder npm lockfile is skipped as before; a lockfile in the engine
+/// scratch is no package; a subfolder package whose own `.gitignore` ignores its node_modules
+/// passes the ignore check (here the next check refuses: a force-tracked file under one).
+#[cfg(unix)]
+#[test]
+fn the_seat_precheck_and_a_packages_own_ignore_1970() {
+    use crate::seat_deps::Provisioned;
+    let repo = |files: &[(&str, &str)], forced: &[&str]| {
+        let root = std::env::temp_dir().join(format!("seat-pre-{}", uuid::Uuid::new_v4()));
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let git = |args: &[&str]| {
+            // spawn-audit: test-only — builds the fixture repository.
+            let o = std::process::Command::new("git")
+                .hardened()
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        for f in forced {
+            git(&["add", "-f", f]);
+        }
+        git(&["commit", "-qm", "base"]);
+        root
+    };
+    let lock = r#"{"lockfileVersion":3,"packages":{}}"#;
+    let pnpm = repo(
+        &[("package.json", r#"{"name":"p"}"#), ("pnpm-lock.yaml", "")],
+        &[],
+    );
+    assert_eq!(
+        provision_seat_node_modules("run-pre", &pnpm, Some(&pnpm.join(".git"))),
+        Provisioned::Skipped(PNPM_OR_YARN.into())
+    );
+    let scratch = repo(
+        &[
+            ("Cargo.toml", "[package]\n"),
+            ("tmp/x/package.json", r#"{"name":"x"}"#),
+            ("tmp/x/package-lock.json", lock),
+        ],
+        &[],
+    );
+    assert_eq!(
+        provision_seat_node_modules("run-pre", &scratch, Some(&scratch.join(".git"))),
+        Provisioned::NotNode
+    );
+    let own = repo(
+        &[
+            ("Cargo.toml", "[package]\n"),
+            ("notes/.gitignore", "node_modules/\n"),
+            ("notes/package.json", r#"{"name":"notes"}"#),
+            ("notes/package-lock.json", lock),
+            ("notes/node_modules/x/kept.js", "x"),
+        ],
+        &["notes/node_modules/x/kept.js"],
+    );
+    match provision_seat_node_modules("run-pre", &own, Some(&own.join(".git"))) {
+        Provisioned::Skipped(why) => assert!(
+            why.contains("tracks files under a node_modules"),
+            "notes' own ignore passed the ignore check: {why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    for r in [pnpm, scratch, own] {
+        let _ = std::fs::remove_dir_all(r);
+    }
 }
