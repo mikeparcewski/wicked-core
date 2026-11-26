@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A rule judge lost at run time falls back to the judge stand-in** (core#1949). On a consented stand-in-aware
+  run, the steering-rule check took the run's judge stand-in only when no real seat was admitted. A real seat
+  that failed as a seat, or whose KEPT was refused for calling the work's provider, left its rules unchecked.
+  The stand-in now judges those rules once every real seat of the check is lost. It is never part of the
+  rotation or the council pool, and a BROKEN a real seat reached stands. A seat record keyed like the stand-in
+  (only an operator's `clis.toml` can name one) no longer answers as it, nor gets its provider waiver.
+
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text

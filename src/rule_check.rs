@@ -1236,6 +1236,13 @@ pub trait RuleJudge: Sync {
     fn approval_failure(&self, _seat: &str) -> Option<String> {
         None
     }
+
+    /// (core#1949, DES-STANDIN-001 §3.6) The run's judge stand-in when it is not the rotation
+    /// itself: asked only once every seat of the check has failed as a seat or been refused, never
+    /// part of the rotation. `None`: no fallback.
+    fn stand_in(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The rules a check reads, the evidence, and the seats it may draw.
@@ -4334,6 +4341,16 @@ pub fn check(
     }
     report.calls = pool.calls.load(std::sync::atomic::Ordering::Relaxed);
     report.refused = pool.dead.lock().unwrap().iter().cloned().collect();
+    // (core#1949) A stand-in the check fell back to is one of its seats (the fold records it from
+    // there); one never asked is not.
+    if let Some(s) = judge
+        .stand_in()
+        .filter(|_| pool.stood_in.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        if !report.seats.iter().any(|x| x == s) {
+            report.seats.push(s.to_string());
+        }
+    }
     // The match's reading order, every rule once.
     report.rows = matches
         .iter()
@@ -4663,6 +4680,8 @@ struct Pool {
     calls: std::sync::atomic::AtomicU32,
     dead: Mutex<BTreeSet<String>>,
     stop: std::sync::atomic::AtomicBool,
+    /// (core#1949) The judge's stand-in ([`RuleJudge::stand_in`]) was asked.
+    stood_in: std::sync::atomic::AtomicBool,
 }
 
 impl Pool {
@@ -4689,6 +4708,11 @@ fn run_pool(
     let why: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
     let left: Mutex<BTreeMap<usize, Retry>> = Mutex::new(BTreeMap::new());
     let serial_parts = std::sync::atomic::AtomicU32::new(0);
+    // (core#1949) The judge's stand-in as a fallback: only when it is not the rotation itself.
+    let stand_in: Option<String> = judge
+        .stand_in()
+        .filter(|k| !input.seats.iter().any(|s| s == k))
+        .map(str::to_string);
     let paths: Vec<&str> = match input.stage {
         // (pi s6) At review a KEPT always cites a changed path: with none known, nothing can be
         // cited (a one-byte sentinel matches no cite), never "no requirement".
@@ -4879,7 +4903,14 @@ fn run_pool(
                 }
                 let mut failures: Vec<String> = Vec::new();
                 let mut got: Option<(String, String)> = None;
-                for seat in order {
+                // (core#1949) The judge's stand-in comes after the rotation, and only once every
+                // seat of it is lost (failed as a seat, or refused): never in the rotation.
+                let lost = || {
+                    let dead = pool.dead.lock().unwrap();
+                    input.seats.iter().all(|s| dead.contains(s))
+                };
+                let fallback = std::iter::once_with(|| stand_in.as_ref().filter(|_| lost()));
+                for seat in order.into_iter().chain(fallback.flatten()) {
                     if pool.dead.lock().unwrap().contains(seat) {
                         continue;
                     }
@@ -4888,6 +4919,10 @@ fn run_pool(
                     }
                     pool.calls
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if stand_in.as_ref() == Some(seat) {
+                        pool.stood_in
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     match judge.ask(seat, &text) {
                         JudgeAnswer::Answered(out) => {
                             got = Some((seat.clone(), out));
