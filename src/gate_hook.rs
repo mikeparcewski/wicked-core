@@ -6412,6 +6412,8 @@ fn token_names_graph_store(
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
     own_tree: Option<&std::path::Path>,
+    // The word is an interpreter's inline program (`python3 -c <word>`), see [`spells_own_tree`].
+    inline_code: bool,
 ) -> bool {
     if ESTATE_STORE_PIN_ENV.iter().any(|k| tok.contains(k)) {
         return true;
@@ -6438,7 +6440,9 @@ fn token_names_graph_store(
         };
         let mut exempt = 0;
         for (n, at) in path_occurrences(r, &g_text).enumerate() {
-            if n >= OWN_TREE_OCCURRENCES || !spells_own_tree(r, at, tree, graph_store, home) {
+            if n >= OWN_TREE_OCCURRENCES
+                || !spells_own_tree(r, at, inline_code, tree, graph_store, home)
+            {
                 return true;
             }
             exempt += 1;
@@ -6459,10 +6463,10 @@ fn token_names_graph_store(
 /// name boundary (`<tree>-old` is a sibling), then a run of the same plain characters with no
 /// `..` component, that is either
 /// * the WHOLE word (`python3 <tree>/check.py`): the path itself; or
-/// * a quoted literal in program text (`require("<tree>/x")`): a quote opens it, right after the
+/// * a quoted literal in an interpreter's inline program (`node -e 'require("<tree>/x")'`, the
+///   word right after its inline-code flag, `inline_code`): a quote opens it, right after the
 ///   word's start, a blank, `(`, `,`, `=` or `[`, and the same quote closes it, followed by the
-///   end, `)`, `,`, `]` or `;`. The whole rest of the word, read as one path, is judged too (a
-///   file name may hold a quote).
+///   end, `)`, `,`, `]` or `;`. The whole rest of the word, read as one path, is judged too.
 ///
 /// Anything else (a prefix such as `p=` before the tree, a quote, glob, `?`, `%`, `:` or blank in
 /// the name, a blank after it, which an inner shell line may continue) could make the program
@@ -6472,6 +6476,7 @@ fn token_names_graph_store(
 fn spells_own_tree(
     reading: &str,
     at: usize,
+    inline_code: bool,
     tree: &std::path::Path,
     graph_store: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
@@ -6495,6 +6500,9 @@ fn spells_own_tree(
         }
         vec![format!("{spelled}{run}")]
     } else {
+        if !inline_code {
+            return false;
+        }
         let mut before = reading[..at].chars().rev();
         let Some(q) = before.next().filter(|c| matches!(c, '"' | '\'')) else {
             return false;
@@ -6671,10 +6679,22 @@ fn opens_graph_store(
     home: Option<&std::path::Path>,
     own_tree: Option<&std::path::Path>,
 ) -> bool {
+    // (core#1956) A word is an interpreter's inline program only right after its inline-code
+    // flag: a quoted literal there is the string the program opens, while anywhere else a quote
+    // is part of a file name.
+    let client =
+        SQLITE_CLIENTS.contains(&base.trim_end_matches(".exe").to_ascii_lowercase().as_str());
     is_sqlite_capable_program(base)
-        && words
-            .iter()
-            .any(|t| token_names_graph_store(t, graph_store, cwd_bases, home, own_tree))
+        && words.iter().enumerate().any(|(i, t)| {
+            let inline_code = !client
+                && i.checked_sub(1).is_some_and(|p| {
+                    matches!(
+                        strip_one_quote_layer(words[p]),
+                        "-c" | "-e" | "-E" | "-p" | "--eval" | "--print" | "eval"
+                    )
+                });
+            token_names_graph_store(t, graph_store, cwd_bases, home, own_tree, inline_code)
+        })
 }
 
 /// The directories a relative token in a sqlite-capable segment could resolve against (issue #645
@@ -6758,8 +6778,9 @@ fn segment_cwd_bases(
 /// shell or a program, start a shell or another program from text, or re-read code: the
 /// builtins (`cd`, `pushd`, `popd`, `.`, `eval`, `source`, `trap`, `alias`, `shopt`, `builtin`,
 /// `command`, `function`, `exec…`), the shells, startup and lookup variables (`BASH_ENV`, `ENV`,
-/// `CDPATH`, `OLDPWD`), wrappers that take a directory (`env`, `sudo`, `find`, a short-option
-/// cluster holding `C` or `D` such as `ruby -Cback`, `--chdir`, `--directory`, `--prefix`,
+/// `CDPATH`, `OLDPWD`), a sqlite client (it reads commands that move it: `.read`, `-init`),
+/// wrappers that take a directory (`env`, `sudo`, `find`, a short-option cluster holding `C`, `D`
+/// or `X` such as `ruby -Cback`, `--chdir`, `--directory`, `--prefix`,
 /// `--cwd`, `--wd`, …) and the interpreters' own moves and
 /// launches (`chdir`, `system`, `popen`, `spawn…`, `subprocess`, `child_process`). A path or a
 /// program assembled at run time is outside this literal scan, as everywhere in it.
@@ -6866,13 +6887,16 @@ fn sqlite_cd_narrowing(command: &str, home: Option<&std::path::Path>) -> Option<
                 .filter(|c| !(c.is_whitespace() || matches!(c, '\'' | '"' | '+')))
                 .collect();
             // `.` sources a file into this shell; a short-option cluster may carry a directory
-            // (`ruby -Cback`, `sudo -Dx`).
+            // (`ruby -Cback`, `ruby -Xback`, `sudo -Dx`).
             let dot = r.trim() == ".";
             let dir_option =
-                r.starts_with('-') && !r.starts_with("--") && r[1..].contains(['C', 'D']);
+                r.starts_with('-') && !r.starts_with("--") && r[1..].contains(['C', 'D', 'X']);
+            // A sqlite client reads commands that move it (`.read` a file holding `.cd`, `-init`).
+            let client = SQLITE_CLIENTS.contains(&program_basename(&r));
             if r.contains([OPAQUE_EXPANSION, '\\', '`', '$'])
                 || dot
                 || dir_option
+                || client
                 || banned(&r)
                 || banned(&joined)
             {
@@ -19880,6 +19904,12 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
             format!("sqlite3 p={tree}/memory.db 'DELETE FROM memories'"),
             "cd queries && . ./move.rc && sqlite3 ../memory.db".to_string(),
             "cd queries && ruby -Cback -e 'SQLite3::Database.new(\"../memory.db\").execute(\"x\")'"
+                .to_string(),
+            // Round 4 (codex): a quoted name outside inline code, `ruby -X`, a sqlite client.
+            format!("sqlite3 'p=\"{tree}/probe.db\"' 'CREATE TABLE t(x)'"),
+            "cd queries && ruby -Xback -e 'SQLite3::Database.new(\"../memory.db\").execute(\"x\")'"
+                .to_string(),
+            "cd queries && sqlite3 -cmd '.read ../move.sql' :memory: \"ATTACH '../memory.db' AS v\""
                 .to_string(),
         ] {
             let hit = super::classify_estate_command(

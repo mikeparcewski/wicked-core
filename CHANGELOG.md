@@ -19,8 +19,9 @@ Two release tracks share this file, newest entry first regardless of track:
   an absolute path to a file of the worktree (`python3 <worktree>/check.py`), and a `cd` inside the worktree
   followed by a `..` word (`cd queries && python3 -c 'open("../apps.json")'`), which was judged from every
   directory the line could reach, the worktree root included. An absolute occurrence of the home that spells
-  exactly one file of the tree (the tree, then plain path characters with no `..`, ending the word or closed by
-  a quote; no link out of the tree or into another store) is now the tree's business, and a line
+  exactly one file of the tree (the tree, then plain path characters with no `..`, as the whole word or as a
+  quoted literal in an interpreter's inline program; no link out of the tree or into another store) is now the
+  tree's business, and a line
   `cd <plain dir> && …` whose later words cannot move the shell or the program is judged from where that `cd`
   leads. Every other spelling and line is judged as before, and every existing deny still denies. Known limit:
   a `CDPATH` the seat's shell inherits can send a bare `cd <dir>` elsewhere.
