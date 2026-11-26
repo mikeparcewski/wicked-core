@@ -1483,8 +1483,10 @@ pub struct QueuedMessage {
     pub message: String,
     /// (core#1486, ledger 2026-11-16 10:48Z) The unit that was EXECUTING when the message was
     /// queued: it is that unit's, heard by its next turn or its next dispatch, never by another
-    /// unit's (a steer sent to a QE step was delivered to the builder after it). `None` = queued
-    /// between units: the next unit hears it.
+    /// unit's (a steer sent to a QE step was delivered to the builder after it). (core#1979) A
+    /// broadcast sent while that unit is mid-turn (it can no longer hear one) is scoped instead to
+    /// the next unit that reads operator messages. `None` = queued between units: the next unit
+    /// hears it.
     pub for_ord: Option<u32>,
 }
 
@@ -1550,12 +1552,18 @@ pub fn full_suite_required(run_id: &str) -> bool {
         .contains(run_id)
 }
 
-/// Drop a finished run's queue.
-pub fn forget_run(run_id: &str) {
+/// (core#1979) Drop every operator message still queued for `run_id`: the run ended, and none may
+/// reach a later run that reuses its id.
+pub fn forget_messages(run_id: &str) {
     queue()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(run_id);
+}
+
+/// Drop a finished run's queue.
+pub fn forget_run(run_id: &str) {
+    forget_messages(run_id);
     // A worker waiting at a pause of an ended run stops waiting.
     answer_pause(run_id, PauseDecision::Stop);
     set_full_suite(run_id, false);
