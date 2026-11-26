@@ -14,46 +14,72 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **A rule judge lost at run time falls back to the judge stand-in** (core#1949). On a consented stand-in-aware
-  run, the steering-rule check took the run's judge stand-in only when no real seat was admitted. A real seat
-  that failed as a seat, or whose KEPT was refused for calling the work's provider, left its rules unchecked.
-  The stand-in now judges those rules once every real seat of the check is lost. It is never part of the
-  rotation or the council pool, and a BROKEN a real seat reached stands. A seat record keyed like the stand-in
-  (only an operator's `clis.toml` can name one) no longer answers as it, nor gets its provider waiver.
+- **The independence preflight answers only for roles the run's plan seats** (core#1954). A launch with no plan
+  and no workflow plans one unit with no review step: the preflight no longer lists a reviewer, and its judge is
+  conditional (the unit convenes one only when it changes the worktree). A team run's monitor row is sized from
+  the plan's launch score and its own ask, not always three: a plan the PA scopes keeps the top band until its
+  scope step scores it, and a zero target drops the row. `canStandIn` is true only where a stand-in sits today
+  (the reviewer, the judge, the QE reviewer, a party's place, and the rule judge on a run that is not reduced);
+  the council, rule council and monitor rows offer none.
 - **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
   (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
   from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
   so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
   way; a real seat keeps its key, and the parties keep the keys.
-- **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
-  binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
-  binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported
-  who stood in. The post-fold write now keeps the fold's bindings, in reservation order, and its label, the same
-  way it keeps the fold's benches and floor overrides.
-- **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
-  repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
-  estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
-  (`.`, `f.name`) resolved from the worktree into `WICKED_HOME`, so crew's own taught apps self-check
-  (`python3 -c '...' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -`) was refused as
-  a raw SQLite open of the graph and no Apps build landed. For a store location that holds the unit's own
-  worktree, a relative word now names the store only when it resolves inside that location and outside the
-  worktree (same normalize and symlink chain as the boundary). Still refused: the pin variables, every absolute
-  spelling (the literal arm is unchanged), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
-  link in the tree to a store.
 
-- **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
-  unset, `on` or `1` now enables pre-existing-failure exclusion: a head red only on tests its red base also
-  fails passes with "N pre-existing excluded: …", when the base's build guide is usable and verified by every
-  required probe. `off` or `0` turns it off (and so does any other value, as before): a red base then escalates
-  as `base_red_unseparated`. The four exclusion-only fixes the switch waited for shipped in #1766.
+- **core-ts 0.15.51** — 2026-11-26 — patch release on the train-15 cut 14212d70, carrying 10 PRs since 0.15.50: #1939, #1942, #1943, #1915, #1922, #1941, #1947, #1948, #1960, #1950.
+  The entries below were written from each PR's changelog entry (the PR title or body where it had none).
 
-- **The stand-in gate's hold reads as a person's sentence** (core#1930 F7). On a stand-in-aware run with no
-  consent, a judge or a QE reviewer that no helper could be holds the run at `stand_in_needed`, and the gate
-  prompt shows the hold's reason as written. That reason began "the run requires QE acceptance (qe_acceptance)
-  and no helper …" (and "the run requires a judge (judge) …"): a lowercase sentence start and an engine token.
-  It now reads "The job needs a QE review of its evidence, and no helper that did not build the work can do it:
-  …" and "The job needs a judge, and no helper that did not build the work can be it: …". A QE hold an engine
-  already wrote in the old words stays the QE layer's (a run waiting at its gate across an upgrade).
+  - **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
+    binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
+    binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported
+    who stood in. The post-fold write now keeps the fold's bindings, in reservation order, and its label, the same
+    way it keeps the fold's benches and floor overrides.
+  - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
+    repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
+    estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
+    (`.`, `f.name`) resolved from the worktree into `WICKED_HOME`, so crew's own taught apps self-check
+    (`python3 -c '...' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -`) was refused as
+    a raw SQLite open of the graph and no Apps build landed. For a store location that holds the unit's own
+    worktree, a relative word now names the store only when it resolves inside that location and outside the
+    worktree (same normalize and symlink chain as the boundary). Still refused: the pin variables, every absolute
+    spelling (the literal arm is unchanged), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
+    link in the tree to a store.
+
+  - **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
+    unset, `on` or `1` now enables pre-existing-failure exclusion: a head red only on tests its red base also
+    fails passes with "N pre-existing excluded: …", when the base's build guide is usable and verified by every
+    required probe. `off` or `0` turns it off (and so does any other value, as before): a red base then escalates
+    as `base_red_unseparated`. The four exclusion-only fixes the switch waited for shipped in #1766.
+
+  - **The stand-in gate's hold reads as a person's sentence** (core#1930 F7). On a stand-in-aware run with no
+    consent, a judge or a QE reviewer that no helper could be holds the run at `stand_in_needed`, and the gate
+    prompt shows the hold's reason as written. That reason began "the run requires QE acceptance (qe_acceptance)
+    and no helper …" (and "the run requires a judge (judge) …"): a lowercase sentence start and an engine token.
+    It now reads "The job needs a QE review of its evidence, and no helper that did not build the work can do it:
+    …" and "The job needs a judge, and no helper that did not build the work can be it: …". A QE hold an engine
+    already wrote in the old words stays the QE layer's (a run waiting at its gate across an upgrade).
+  - **A review judge reads the lines a finding cites, and an unclosed verdict gets one confirm** (core#1945). A
+    judge call had no tree: its evidence carried only `git status` and `git log --stat`, so a finding that cited
+    `src/math.js:6` handed the judge nothing to read, and a reply that opened a verdict and never closed it was
+    denied for good (run f1d5b8e9 could not finish its review step). The judge's evidence now carries each
+    `path:line` the work cites, read beneath the worktree root (relative paths only, no links, redacted, at most 12
+    cites and 6 KiB). A well-formed `PASS` with no closing line gets one confirm call to the same seat: `PASS`
+    closes it, anything else fails closed; an unclosed `REJECT` stays a REJECT.
+  - **The rule check takes the run's judge stand-in when no real seat is left** (core#1944). On a run whose person
+    agreed to stand-ins, the review step's steering-rule check used to find "no signed-in judge seat distinct from
+    the work's creators" and leave every rule unchecked. It now uses the same judge stand-in the actor offers the
+    unit (one binding, never counted as a second helper), runs it on its base's record with the stand-in preface,
+    and names the binding key on its rows. It fills only a shortage of distinct seats; councils still draw real
+    seats only.
+  - **J6 v3 core: the two-step `domain-extraction` preset with its scope, and domain model 1.2.0 with rulings**
+    (C1b + C2). The preset becomes two host steps (`domain-run` runs garden's `scripts/domain/run.py` with the run's
+    scope; `domain-graph` builds the model), and the old extract loop is deleted. `LaunchSpec.scope` is checked at
+    launch: a `domain-extraction` launch without one, a scope on another workflow, and a malformed scope are refused.
+    The builder writes the 1.2.0 model from garden's v3 rows, and `Core.domainRuling` records a person's Confirm or
+    Reject and rebuilds it. (#1922)
+  - Maintenance: the platform lockfile entries re-stamped for the published 0.15.50 (#1943); CI re-pins the selftest
+    to wicked-ci main (#1942); core's readers tested on a store written by estate's codegraph (#1939).
 
 - **core-ts 0.15.50** — 2026-11-25 — patch release on the train-14 cut 0059bfc3, carrying 22 PRs since 0.15.49: #1890, #1895, #1899, #1898, #1900, #1896, #1897, #1901, #1894, #1908, #1911, #1910, #1917, #1918, #1923, #1907, #1914, #1929, #1931, #1932, #1934, #1935.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
