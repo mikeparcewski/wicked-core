@@ -4059,8 +4059,9 @@ fn stand_in_judge_keys<'a>(
     keys
 }
 
-/// (core#1944) The stand-in a rule check ran on: the `~` key among the seats it drew (it draws one
-/// only when no real seat is left, `cli_runner::rule_judge_stand_in`), when the check made a judge
+/// (core#1944) The stand-in a rule check ran on: the `~` key among the seats it drew (its whole
+/// rotation when no real seat is left; core#1949, beside real seats only once it was asked, after
+/// every one of them was lost: `rule_check::check` names it then), when the check made a judge
 /// call at all (with every rule settled by fact, cache or skip, it was offered and never asked).
 /// Never read off a row, whose judge may be a cached verdict's from an earlier attempt.
 fn rule_stand_in(rc: &crate::rule_check::RuleCheckReport) -> Option<&str> {
@@ -4079,13 +4080,13 @@ fn rule_stand_in(rc: &crate::rule_check::RuleCheckReport) -> Option<&str> {
 fn rule_stand_in_ruled(rc: &crate::rule_check::RuleCheckReport, key: &str) -> bool {
     rc.rows
         .iter()
-        .any(|r| r.how != crate::rule_check::RuleHow::Cache && r.judge.as_deref() == Some(key))
+        .any(|r| r.how != crate::rule_check::RuleHow::Cache && r.judges().any(|j| j == key))
 }
 
 /// (core#1944) The `~` keys the report's rows name, each once, in row order.
 fn stand_in_row_keys(rc: &crate::rule_check::RuleCheckReport) -> Vec<&str> {
     let mut keys: Vec<&str> = Vec::new();
-    for k in rc.rows.iter().filter_map(|r| r.judge.as_deref()) {
+    for k in rc.rows.iter().flat_map(|r| r.judges()) {
         if wicked_apps_core::spawn::seat_id::is_stand_in(k) && !keys.contains(&k) {
             keys.push(k);
         }
@@ -4109,9 +4110,9 @@ fn drop_unrecorded_stand_ins(
 ) {
     for r in rc.rows.iter_mut() {
         let Some(key) = r
-            .judge
-            .clone()
-            .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k) && !valid(k))
+            .judges()
+            .find(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k) && !valid(k))
+            .map(str::to_string)
         else {
             continue;
         };
@@ -4120,6 +4121,7 @@ fn drop_unrecorded_stand_ins(
         r.origin = None;
         r.cite = None;
         r.judge = None;
+        r.record_judge = None;
         r.judge_ids = Vec::new();
         r.council = None;
         r.reason = format!(
@@ -8569,6 +8571,28 @@ mod guarded_read_step_tests {
             ..Default::default()
         };
         assert!(super::stand_in_judge_keys(None, Some(&real)).is_empty());
+        // (core#1949) POL-2101's record part ruled by the stand-in once the change's real judge
+        // was lost: the stand-in took part in the row, so the fold records it, and a run that does
+        // not hold it voids the row.
+        let split = crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                record_judge: Some("claude~3".into()),
+                status: crate::rule_check::RuleStatus::Kept,
+                ..row(Some("codex"))
+            }],
+            seats: vec!["codex".into(), "claude~3".into()],
+            calls: 2,
+            ..Default::default()
+        };
+        assert!(super::rule_stand_in_ruled(&split, "claude~3"));
+        assert_eq!(super::stand_in_row_keys(&split), ["claude~3"]);
+        let mut voided = split.clone();
+        super::drop_unrecorded_stand_ins(&mut voided, &|_| false);
+        assert_eq!(
+            voided.rows[0].status,
+            crate::rule_check::RuleStatus::Unchecked
+        );
+        assert_eq!(voided.rows[0].record_judge, None);
         let verdict = crate::validator::AgentVerdict {
             pass: true,
             reasoning: "ok".into(),

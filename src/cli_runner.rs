@@ -1056,19 +1056,28 @@ struct SeatRuleJudge<'a> {
     runner: &'a dyn StepRunner,
     parent_run_id: Option<&'a str>,
     creator_providers: &'a [crate::observed_provider::Provider],
-    /// (DES-STANDIN-001 §3.6, core#1944) The judge stand-in's key, when the check took it: its
-    /// prompt opens with the stand-in preface, and the provider-sharing approval rule does not
-    /// apply to it (a stand-in shares its base's provider by definition and is stamped as one).
-    stand_in: Option<&'a str>,
+    /// (DES-STANDIN-001 §3.6, core#1944, core#1949) The judge stand-in's own record, when the
+    /// check has one (the whole rotation, or its fallback once every real seat is lost): its prompt
+    /// opens with the stand-in preface, and the provider-sharing approval rule does not apply to it
+    /// (a stand-in shares its base's provider by definition and is stamped as one).
+    stand_in: Option<&'a crate::AgenticCli>,
+}
+
+impl SeatRuleJudge<'_> {
+    fn is_stand_in(&self, seat: &str) -> bool {
+        self.stand_in.is_some_and(|c| c.key == seat)
+    }
 }
 
 impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
+        // (N2, coord round 2 on #1948) The stand-in's own record before the pool's: a record keyed
+        // like it (only an operator's `clis.toml` can name one) never answers as it.
+        if let Some(c) = self.stand_in.filter(|c| c.key == seat) {
+            let prompt = format!("{}\n\n{prompt}", crate::standin::preface(None));
+            return crate::validator::run_rule_judge(&prompt, c, self.runner, self.parent_run_id);
+        }
         match self.seats.iter().find(|c| c.key == seat) {
-            Some(c) if self.stand_in == Some(seat) => {
-                let prompt = format!("{}\n\n{prompt}", crate::standin::preface(None));
-                crate::validator::run_rule_judge(&prompt, c, self.runner, self.parent_run_id)
-            }
             Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner, self.parent_run_id),
             None => {
                 crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
@@ -1077,7 +1086,7 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     }
 
     fn approval_failure(&self, seat: &str) -> Option<String> {
-        if self.stand_in == Some(seat) {
+        if self.is_stand_in(seat) {
             return None;
         }
         let observed = crate::observed_provider::observed_this_thread(seat);
@@ -1088,6 +1097,10 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
             self.creator_providers,
         )
         .map(|why| format!("observed calling the work's provider: {why}"))
+    }
+
+    fn stand_in(&self) -> Option<&str> {
+        self.stand_in.map(|c| c.key.as_str())
     }
 }
 
@@ -1178,8 +1191,9 @@ pub(crate) fn rule_judge_seats(
     }
 }
 
-/// (DES-STANDIN-001 §3.6, T-R9, core#1944) The rule judge's stand-in: with no real seat left
-/// (`no_real_seat`), the judge stand-in the run's actor offered this unit
+/// (DES-STANDIN-001 §3.6, T-R9, core#1944, core#1949) The rule judge's stand-in: when it may
+/// stand in (`may_stand_in`: the work's provenance is known), the judge stand-in the run's actor
+/// offered this unit
 /// ([`crate::standin::judge_offer`]: consented, stand-in-aware, not reduced, base not benched)
 /// judges the rules, as the same binding, so it is one helper whichever check it does. Its record
 /// is its base's, keyed by the binding: the base's exact invocation, and its identities for
@@ -1188,12 +1202,12 @@ pub(crate) fn rule_judge_seats(
 /// excluded from this unit (a stand-in fills a shortage, never the person's exclusion).
 fn rule_judge_stand_in(
     offer: Option<&crate::standin::StandInBinding>,
-    no_real_seat: bool,
+    may_stand_in: bool,
     exclude_seats: &[String],
     pool: &[crate::AgenticCli],
     registry: &[crate::AgenticCli],
 ) -> Option<crate::AgenticCli> {
-    let b = offer.filter(|_| no_real_seat)?;
+    let b = offer.filter(|_| may_stand_in)?;
     let base = crate::standin::base_record(pool, registry, &b.key)?;
     if base.headless_invocation.trim().is_empty() || !base.seat_eligible_for_work {
         return None;
@@ -1827,13 +1841,25 @@ fn stamp_judge_ids(report: &mut crate::rule_check::RuleCheckReport, pool: &[crat
         .iter_mut()
         .filter(|r| r.how == crate::rule_check::RuleHow::Judge)
     {
-        r.judge_ids = r
-            .judge
-            .as_deref()
-            .and_then(|j| pool.iter().find(|c| c.key == j))
-            .filter(|c| launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)))
-            .map(record_identities)
-            .unwrap_or_default();
+        // (core#1949) POL-2101's record part's judge, when another seat, ruled too. Every judge's
+        // identity is established, or none is recorded (a council then refuses: identity_unknown).
+        let records: Option<Vec<&crate::AgenticCli>> = r
+            .judges()
+            .map(|j| {
+                pool.iter().find(|c| c.key == j).filter(|c| {
+                    launches_its_own_binary(c, &invocation_identity(&c.headless_invocation))
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = Vec::new();
+        for c in records.unwrap_or_default() {
+            for id in record_identities(c) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        r.judge_ids = ids;
     }
 }
 
@@ -2002,6 +2028,16 @@ fn settle_rule_disputes(
             )
         };
         let hold = |why: String| hold_with(why, Vec::new());
+        // (core#1949) POL-2101's two parts ruled by two seats (the record part by the judge
+        // stand-in once the change's judge was lost): no council is drawn for it, and it holds.
+        if row.record_judge.is_some() {
+            report.rows[i] = hold(
+                "identity_unknown: the rule's change and its step records were judged by two \
+                 different helpers, so no council can be shown independent of both"
+                    .into(),
+            );
+            continue;
+        }
         let Some(ctx) = council else {
             report.rows[i] = hold("error: this path convenes no rule council".into());
             continue;
@@ -2784,23 +2820,35 @@ fn run_rule_check_with(
         no_agent_creator,
     );
     // (DES-STANDIN-001 §3.6, T-R9, core#1944) No real seat is left: the run's judge stand-in
-    // judges the rules, labelled as one. Never beside a real seat, and never a council voter.
-    // Only a shortage of distinct seats: when the work's authorship is not known, a stand-in fixes
-    // nothing and the rules hold on that, as before (as `JudgeExclusions` reads provenance).
+    // judges the rules, labelled as one. (core#1949) With real seats, it is their fallback: asked
+    // only once every one of them has failed as a seat or been refused at run time, never in the
+    // rotation. Never a council voter. Only a shortage of distinct seats: when the work's
+    // authorship is not known, a stand-in fixes nothing and the rules hold on that, as before (as
+    // `JudgeExclusions` reads provenance).
     let provenance_known = no_agent_creator || (!creators.is_empty() && creator_bins.is_some());
     let stand_in_seat = rule_judge_stand_in(
         stand_in,
-        seats.is_empty() && provenance_known,
+        provenance_known,
         &input.unit.exclude_seats,
         pool,
         registry,
-    );
+    )
+    // (N2) A real seat already keyed like the stand-in leaves no room for it: that seat judges
+    // as itself, with no stand-in's waiver.
+    .filter(|c| !seats.contains(&c.key));
+    let stand_in_alone = stand_in_seat.is_some() && seats.is_empty();
     let (seats, no_seat) = match &stand_in_seat {
-        Some(c) => (vec![c.key.clone()], None),
-        None => (seats, no_seat),
+        Some(c) if stand_in_alone => (vec![c.key.clone()], None),
+        _ => (seats, no_seat),
     };
+    // The stand-in first, so its identities stamp the rows it ruled whatever the pool holds.
     let judge_seats: std::borrow::Cow<'_, [crate::AgenticCli]> = match &stand_in_seat {
-        Some(c) => std::borrow::Cow::Owned(pool.iter().cloned().chain([c.clone()]).collect()),
+        Some(c) => std::borrow::Cow::Owned(
+            [c.clone()]
+                .into_iter()
+                .chain(pool.iter().cloned())
+                .collect(),
+        ),
         None => std::borrow::Cow::Borrowed(pool),
     };
     // (codex r1, r2) A cached judicial verdict (the unit's own last rows, or a council ruling from
@@ -2883,10 +2931,14 @@ fn run_rule_check_with(
                 Some(b) => {
                     let mut as_rule_judge = b.clone();
                     as_rule_judge.role = crate::standin::Role::RuleJudge;
-                    format!(
-                        " ({})",
-                        crate::standin::label(&as_rule_judge, as_rule_judge.display())
-                    )
+                    let label = crate::standin::label(&as_rule_judge, as_rule_judge.display());
+                    if stand_in_alone {
+                        format!(" ({label})")
+                    } else {
+                        // (core#1969 R2 F1) Not asked yet, so no label ("stood in"): present tense and
+                        // comma-free, since studio splits the judges on commas (`floorLine.ts` RULE_JUDGES).
+                        format!(" ({} stands in if every one is lost)", b.key)
+                    }
                 }
                 None => String::new(),
             }
@@ -2904,7 +2956,7 @@ fn run_rule_check_with(
         runner,
         parent_run_id: Some(&input.run_id),
         creator_providers: &creator_providers,
-        stand_in: stand_in_seat.as_ref().map(|c| c.key.as_str()),
+        stand_in: stand_in_seat.as_ref(),
     };
     let mut report = with_floor_heartbeat(
         emit_delta,
@@ -3311,7 +3363,7 @@ impl JudgeExclusions {
             return false;
         };
         (!r.judge_ids.is_empty() || registry.iter().any(|c| c.key == j))
-            && self.seat_ok(j, &r.judge_ids, registry)
+            && r.judges().all(|k| self.seat_ok(k, &r.judge_ids, registry))
             && r.council.as_ref().is_none_or(|c| {
                 // (codex r3) A voter the registry no longer names cannot be shown eligible.
                 c.votes.iter().all(|v| {

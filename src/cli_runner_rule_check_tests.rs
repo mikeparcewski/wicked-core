@@ -3250,3 +3250,394 @@ fn a_judge_stand_in_that_fails_leaves_the_rules_unchecked() {
     }
     assert!(report.hold().is_some());
 }
+
+/// (core#1949) Answers as a rule judge per seat: `fails` seats fail as seats; every other seat
+/// answers R1 KEPT and R2 BROKEN, recorded calling `provider` (the work's, for a seat in `shares`
+/// and for the stand-in, whose base's provider it is). Records who was asked, on what, and what.
+struct LostSeatRunner {
+    asked: Mutex<Vec<(String, String, String)>>,
+    provider: String,
+    fails: Vec<String>,
+    shares: Vec<String>,
+}
+
+impl StepRunner for LostSeatRunner {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let who = input.unit.assigned_cli.clone().unwrap_or_default();
+        self.asked.lock().unwrap().push((
+            who.clone(),
+            input.unit.assigned_invocation.clone().unwrap_or_default(),
+            input.unit.description.clone(),
+        ));
+        let failed = self.fails.contains(&who);
+        if !failed {
+            let shares =
+                self.shares.contains(&who) || wicked_apps_core::spawn::seat_id::is_stand_in(&who);
+            let called = if shares {
+                self.provider.clone()
+            } else {
+                format!("own-{who}:443")
+            };
+            crate::observed_provider::record_receipt(&who, Some(vec![called]));
+        }
+        let output = if failed {
+            "not signed in".to_string()
+        } else if input.unit.description.contains("BEGIN VERDICTS ") {
+            let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+            format!(
+                "BEGIN VERDICTS {nonce}\nRULE R1: KEPT — src/a.rs:2 typed signature\n\
+                 RULE R2: BROKEN — src/a.rs:2 no test\nEND VERDICTS {nonce}"
+            )
+        } else {
+            "VERDICT: PASS\nPASS".to_string()
+        };
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output,
+            status: if failed {
+                StepStatus::Failed
+            } else {
+                StepStatus::Ok
+            },
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// The rule-judge calls `runner` saw, as (seat, invocation, prompt).
+fn rule_calls(runner: &LostSeatRunner) -> Vec<(String, String, String)> {
+    runner
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, p)| p.contains("BEGIN VERDICTS "))
+        .cloned()
+        .collect()
+}
+
+/// (core#1949) The one real rule judge (Codex) fails as a seat at run time. On a consented
+/// stand-in-aware run the rules are then judged by the unit's judge stand-in, after the real seat
+/// and never before it. Red: both rules `unchecked` ("no judge answered").
+#[test]
+fn a_rule_judge_lost_at_run_time_falls_back_to_the_judge_stand_in() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("lost-seat");
+    let pool = vec![seat("claude"), seat("codex")];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: vec!["codex".into()],
+        shares: Vec::new(),
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    assert_eq!(
+        calls.first().map(|c| c.0.as_str()),
+        Some("codex"),
+        "the real seat first: {calls:?}"
+    );
+    assert!(calls.iter().all(|(who, _, _)| who != "claude"), "{calls:?}");
+    for (who, invocation, prompt) in calls.iter().filter(|(w, _, _)| w == "claude~2") {
+        assert_eq!(
+            invocation, "claude -p {PROMPT}",
+            "{who}: its base's invocation"
+        );
+        assert!(
+            prompt.starts_with(&crate::standin::preface(None)),
+            "{prompt}"
+        );
+    }
+    let row = |id: &str| report.rows.iter().find(|r| r.rule_id == id).unwrap();
+    assert_eq!(
+        row("R1").status,
+        crate::rule_check::RuleStatus::Kept,
+        "{:?}",
+        row("R1")
+    );
+    assert_eq!(row("R2").status, crate::rule_check::RuleStatus::Broken);
+    for id in ["R1", "R2"] {
+        assert_eq!(row(id).judge.as_deref(), Some("claude~2"), "{:?}", row(id));
+    }
+    assert!(
+        report.seats.iter().any(|s| s == "claude~2"),
+        "the fold reads the stand-in off the seats: {report:?}"
+    );
+}
+
+/// (core#1949) The one real rule judge answers through the work's provider: its KEPT is refused
+/// (`approval_failure`) and its BROKEN stands. The refused rule is then judged by the judge
+/// stand-in, whose shared provider is no reason to refuse it. Red: R1 stays `unchecked`.
+#[test]
+fn a_refused_approval_falls_back_to_the_judge_stand_in_and_broken_stands() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("shared-seat");
+    let pool = vec![seat("claude"), seat("codex")];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: Vec::new(),
+        shares: vec!["codex".into()],
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let row = |id: &str| report.rows.iter().find(|r| r.rule_id == id).unwrap();
+    assert_eq!(row("R2").status, crate::rule_check::RuleStatus::Broken);
+    assert_eq!(
+        row("R2").judge.as_deref(),
+        Some("codex"),
+        "the real seat's BROKEN stands: {:?}",
+        row("R2")
+    );
+    assert_eq!(
+        row("R1").status,
+        crate::rule_check::RuleStatus::Kept,
+        "{:?}",
+        row("R1")
+    );
+    assert_eq!(
+        row("R1").judge.as_deref(),
+        Some("claude~2"),
+        "{:?}",
+        row("R1")
+    );
+}
+
+/// (core#1949) A real rule judge that answers keeps the check: the stand-in is never asked and
+/// never named among its seats. (core#1969 R2 F1) The judges note names the offered stand-in as a
+/// fallback, in the present tense and without a comma (studio splits the judges on commas).
+#[test]
+fn a_working_real_rule_judge_never_calls_the_stand_in() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("real-seat");
+    let pool = vec![seat("claude"), seat("codex")];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: Vec::new(),
+        shares: Vec::new(),
+    };
+    let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&notes);
+    let sink = move |n: &str| seen.lock().unwrap().push(n.to_string());
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &sink,
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    assert!(rule_calls(&runner).iter().all(|(who, _, _)| who == "codex"));
+    assert_eq!(report.seats, ["codex"]);
+    let notes = notes.lock().unwrap().clone();
+    let judges = notes
+        .iter()
+        .find_map(|n| {
+            n.split_once("in force; judges: ")
+                .map(|(_, j)| j.to_string())
+        })
+        .unwrap_or_else(|| panic!("no judges note: {notes:?}"));
+    assert_eq!(
+        judges.lines().next().unwrap(),
+        format!("codex ({} stands in if every one is lost)", offer.key)
+    );
+}
+
+/// (core#1949 N2) Only an operator's `clis.toml` can name a seat with the reserved `~`: a record
+/// keyed like the stand-in is not the stand-in. It is excluded as a judge (it runs the creator's
+/// binary), and the stand-in the run offered judges on its base's own invocation, never the
+/// record's. Red: the pool's record answers under the stand-in's key, with the stand-in's waiver.
+#[test]
+fn a_real_record_sharing_the_stand_ins_key_never_judges_as_it() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("tilde-record");
+    let mut clash = seat("claude");
+    clash.key = offer.key.clone();
+    clash.headless_invocation = "claude --operator-record -p {PROMPT}".into();
+    let pool = vec![seat("claude"), clash];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: Vec::new(),
+        shares: Vec::new(),
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    assert!(!calls.is_empty(), "{report:?}");
+    for (who, invocation, _) in &calls {
+        assert_eq!(who, "claude~2");
+        assert_eq!(
+            invocation, "claude -p {PROMPT}",
+            "the stand-in's base, never the record"
+        );
+    }
+}
+
+/// (core#1949, codex r1) Two real rule judges, each refused for calling the work's provider: the
+/// first in the batch, the second only when the re-ask's answer is read, after the rule was
+/// scheduled. The rule left still goes to the judge stand-in, and the first seat's BROKEN stands.
+#[test]
+fn a_refusal_found_in_the_re_ask_still_falls_back_to_the_judge_stand_in() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("two-shared");
+    let pool = vec![seat("claude"), seat("codex"), seat("pi")];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: Vec::new(),
+        shares: vec!["codex".into(), "pi".into()],
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    let first_stand_in = calls.iter().position(|(w, _, _)| w == "claude~2");
+    assert!(
+        calls[..first_stand_in.unwrap_or(calls.len())]
+            .iter()
+            .any(|(w, _, _)| w == "pi"),
+        "both real seats first: {calls:?}"
+    );
+    let row = |id: &str| report.rows.iter().find(|r| r.rule_id == id).unwrap();
+    assert_eq!(row("R2").status, crate::rule_check::RuleStatus::Broken);
+    assert_ne!(
+        row("R2").judge.as_deref(),
+        Some("claude~2"),
+        "{:?}",
+        row("R2")
+    );
+    assert_eq!(
+        row("R1").status,
+        crate::rule_check::RuleStatus::Kept,
+        "{:?}",
+        row("R1")
+    );
+    assert_eq!(row("R1").judge.as_deref(), Some("claude~2"));
+}
+
+/// (core#1949 N2, codex r1) A record keyed like the stand-in that IS admissible as a real judge
+/// leaves no room for the stand-in: it judges as itself, on its own invocation, with no preface,
+/// and its approvals are refused for calling the work's provider like any real seat's. (A record
+/// in the stand-in base's family is a creator's instance whenever the base built the work, so it
+/// is never admitted; here the work's creator is another CLI, the only way to admit one.)
+#[test]
+fn an_admitted_real_record_keyed_like_the_stand_in_gets_no_waiver() {
+    crate::observed_provider::take_receipts();
+    let (input, offer, provider, _repo) = one_cli_consented_review("tilde-admitted");
+    let mut clash = seat("gemini");
+    clash.key = offer.key.clone();
+    let pool = vec![seat("claude"), seat("codex"), clash];
+    let runner = LostSeatRunner {
+        asked: Mutex::new(Vec::new()),
+        provider,
+        fails: vec!["claude".into()],
+        shares: Vec::new(),
+    };
+    let report = run_rule_check_standing_in(
+        &input,
+        &["codex".to_string()],
+        Some(&["codex".to_string()][..]),
+        &pool,
+        &pool,
+        &runner,
+        &|_| {},
+        &offer,
+    )
+    .expect("a report");
+    crate::observed_provider::take_receipts();
+    let calls = rule_calls(&runner);
+    assert!(calls.iter().any(|(w, _, _)| w == "claude~2"), "{calls:?}");
+    for (who, invocation, prompt) in calls.iter().filter(|(w, _, _)| w == "claude~2") {
+        assert_eq!(invocation, "gemini -p {PROMPT}", "{who}: its own record");
+        assert!(
+            !prompt.starts_with(&crate::standin::preface(None)),
+            "{prompt}"
+        );
+    }
+    let r1 = report.rows.iter().find(|r| r.rule_id == "R1").unwrap();
+    assert_eq!(
+        r1.status,
+        crate::rule_check::RuleStatus::Unchecked,
+        "{r1:?}"
+    );
+    assert!(
+        r1.reason.contains("observed calling the work's provider"),
+        "{r1:?}"
+    );
+}
+
+/// (core#1949, codex delta) A split POL-2101 row's identities are its judges' together, or none
+/// when either judge's launch cannot be established: one verified judge never vouches for the
+/// other, so a council refuses such a row (`identity_unknown`).
+#[test]
+fn a_split_rows_judge_ids_are_every_judges_or_none() {
+    let row = |record: &str| crate::rule_check::RuleVerdict {
+        rule_id: "POL-2101".into(),
+        how: crate::rule_check::RuleHow::Judge,
+        judge: Some("codex".into()),
+        record_judge: Some(record.into()),
+        ..Default::default()
+    };
+    let mut rc = crate::rule_check::RuleCheckReport {
+        rows: vec![row("pi"), row("ghost")],
+        ..Default::default()
+    };
+    stamp_judge_ids(&mut rc, &[seat("codex"), seat("pi")]);
+    let both = &rc.rows[0].judge_ids;
+    assert!(
+        both.iter().any(|i| i == "codex") && both.iter().any(|i| i == "pi"),
+        "{both:?}"
+    );
+    assert!(rc.rows[1].judge_ids.is_empty(), "{:?}", rc.rows[1]);
+}

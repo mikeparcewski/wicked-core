@@ -3161,6 +3161,96 @@ fn an_unanswered_process_rule_is_not_asked_again_alone_1958() {
     assert_eq!(judge.of(Asked::Change).len(), 2, "batch, then alone");
 }
 
+/// A [`PackJudge`] on one real seat whose approvals are refused (it calls the work's provider), with
+/// a judge stand-in (`claude~1`) that is not refused; every call is kept as (seat, subject).
+struct RefusedWithStandIn {
+    inner: PackJudge,
+    calls: Mutex<Vec<(String, Asked)>>,
+}
+
+impl RuleJudge for RefusedWithStandIn {
+    fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((seat.to_string(), asked_kind(prompt)));
+        self.inner.ask(seat, prompt)
+    }
+
+    fn approval_failure(&self, seat: &str) -> Option<String> {
+        (seat != "claude~1").then(|| "it calls the work's provider".to_string())
+    }
+
+    fn stand_in(&self) -> Option<&str> {
+        Some("claude~1")
+    }
+}
+
+/// (core#1969 x core#1958) The judge stand-in's last round (core#1949) asks each rule left alone,
+/// so it skips a process rule at review the same way the re-ask does (#1976): it never blocks. The
+/// one real seat answers and is refused, the change rule goes to the stand-in, and the process
+/// rule is asked once (round 1), never again alone. Red without the skip: two process calls.
+#[test]
+fn the_stand_in_round_never_asks_a_process_rule_alone_1958() {
+    let rules = [pack("RVWL-1003"), rule("R001", "every change has a test")];
+    let c = change();
+    let f = job_facts(&mcp_steps(), None, None, &c);
+    let judge = RefusedWithStandIn {
+        inner: PackJudge::with(&[("R001", "N/A — no source changed")], &[], &[]),
+        calls: Mutex::new(Vec::new()),
+    };
+    let seats = vec!["codex".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &rules,
+            facts: &f,
+            change: &c,
+            floor: Some("repo checks passed; test: passed"),
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: Some(ENGINE),
+            creator_records: Some(&[]),
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    let calls = judge.calls.lock().unwrap().clone();
+    let process: Vec<&str> = calls
+        .iter()
+        .filter(|(_, k)| *k == Asked::Process)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    assert_eq!(
+        process.len(),
+        1,
+        "one process call, never alone: {process:?}"
+    );
+    let r1 = row_of(&r, "R001");
+    assert_eq!(r1.status, RuleStatus::NotApplicable, "{r1:?}");
+    assert_eq!(r1.judge.as_deref(), Some("claude~1"), "{r1:?}");
+    let row = row_of(&r, "RVWL-1003");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("not asked again alone"),
+        "{}",
+        row.reason
+    );
+}
+
 /// (crew#1394) A run where no agent wrote code before the gate (qe-author-tests with its author a
 /// Tool, as crew's e2e runs it) and so no judge seat can be drawn (the work's creators are not
 /// known): POL-2101 is N/A by fact and nothing holds. Control: the same seatless check with an
@@ -6159,4 +6249,35 @@ fn core_1278_a_part_holds_only_the_files_the_diff_headers_place_in_it() {
     }
     let texts: Vec<String> = parts.into_iter().map(|(t, _)| t).collect();
     assert_eq!(texts, diff_parts(&diff, cap), "the same parts");
+}
+
+/// (core#1949, codex r1) POL-2101's two parts ruled by different seats (the change by a real
+/// judge, the record part by the judge stand-in once the real one was lost): the combined row
+/// names both, so the stand-in is disclosed and a council seats neither.
+#[test]
+fn a_split_pol_2101_row_names_both_of_its_judges() {
+    let part = |judge: &str, cite: &str| RuleVerdict {
+        rule_id: "POL-2101".into(),
+        status: RuleStatus::Kept,
+        how: RuleHow::Judge,
+        reason: cite.into(),
+        cite: Some(cite.into()),
+        judge: Some(judge.into()),
+        evidence_complete: Some(true),
+        ..Default::default()
+    };
+    let row = combine_record(
+        part("codex", "src/a.rs:2 a test"),
+        part("claude~2", "record 1 ran the tests"),
+    );
+    assert_eq!(row.status, RuleStatus::Kept);
+    assert_eq!(row.judge.as_deref(), Some("codex"));
+    assert_eq!(row.record_judge.as_deref(), Some("claude~2"));
+    assert_eq!(row.judges().collect::<Vec<_>>(), ["codex", "claude~2"]);
+    // One seat ruling both parts names it once.
+    let one = combine_record(
+        part("codex", "src/a.rs:2 a test"),
+        part("codex", "record 1 ran the tests"),
+    );
+    assert_eq!(one.record_judge, None);
 }

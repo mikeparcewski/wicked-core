@@ -290,6 +290,11 @@ pub struct RuleVerdict {
     /// The seat that ruled (on a cache row, the seat that ruled first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<String>,
+    /// (core#1949) On POL-2101's combined row: the seat that ruled the record part, when it is not
+    /// `judge` (the change part's). Both took part in the verdict: a council seats neither, and a
+    /// stand-in on either part is disclosed and recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_judge: Option<String>,
     /// SHA-256 (64 hex) of the rule's judged content (statement, criteria, obligations, facets).
     #[serde(default)]
     pub rule_key: String,
@@ -439,6 +444,14 @@ fn is_zero(n: &u32) -> bool {
 }
 
 impl RuleVerdict {
+    /// (core#1949) Every seat that ruled a part of this row: its judge, then its record part's.
+    pub fn judges(&self) -> impl Iterator<Item = &str> {
+        self.judge
+            .as_deref()
+            .into_iter()
+            .chain(self.record_judge.as_deref())
+    }
+
     /// (Part B, Q6) A process rule's row: reported with its party, never a deny, a hold or a
     /// dispute.
     pub fn reported_only(&self) -> bool {
@@ -1235,6 +1248,14 @@ pub trait RuleJudge: Sync {
 
     /// (core#1288) A launch may disqualify approving answers while its BROKEN findings stand.
     fn approval_failure(&self, _seat: &str) -> Option<String> {
+        None
+    }
+
+    /// (core#1949, DES-STANDIN-001 §3.6) The run's judge stand-in, if the judge has one. When it
+    /// is not itself the check's rotation (`CheckInput::seats`), the check asks it only once every
+    /// seat of the rotation has failed as a seat or been refused, never in the rotation. `None`:
+    /// no stand-in.
+    fn stand_in(&self) -> Option<&str> {
         None
     }
 }
@@ -3632,12 +3653,17 @@ fn combine_record(sub: RuleVerdict, rec: RuleVerdict) -> RuleVerdict {
             ..sub
         };
     }
+    let judge = sub.judge.clone().or_else(|| rec.judge.clone());
+    // (core#1949) A record part another seat ruled (a stand-in, once the change's judge was lost)
+    // took part too.
+    let record_judge = rec.judge.clone().filter(|r| judge.as_ref() != Some(r));
     let ruled = |status: RuleStatus, cite: Option<String>| RuleVerdict {
         status,
         how: RuleHow::Judge,
         reason: format!("{change}; {records}"),
         cite,
-        judge: sub.judge.clone().or_else(|| rec.judge.clone()),
+        judge: judge.clone(),
+        record_judge: record_judge.clone(),
         origin: Some(RuleOrigin::Judge),
         evidence_complete: whole,
         record_unsettled,
@@ -4002,9 +4028,8 @@ pub fn check(
                 .map(|(_, r)| r)
                 .filter(|r| matches!(r.status, RuleStatus::Kept | RuleStatus::NotApplicable))
                 .filter(|r| {
-                    r.judge
-                        .as_deref()
-                        .is_none_or(|seat| judge.approval_failure(seat).is_none())
+                    r.judges()
+                        .all(|seat| judge.approval_failure(seat).is_none())
                 })
                 .and_then(reuse)
             {
@@ -4335,6 +4360,16 @@ pub fn check(
     }
     report.calls = pool.calls.load(std::sync::atomic::Ordering::Relaxed);
     report.refused = pool.dead.lock().unwrap().iter().cloned().collect();
+    // (core#1949) A stand-in the check fell back to is one of its seats (the fold records it from
+    // there); one never asked is not.
+    if let Some(s) = judge
+        .stand_in()
+        .filter(|_| pool.stood_in.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        if !report.seats.iter().any(|x| x == s) {
+            report.seats.push(s.to_string());
+        }
+    }
     // The match's reading order, every rule once.
     report.rows = matches
         .iter()
@@ -4498,18 +4533,56 @@ fn judge_rows(
             .or_insert_with(|| "the judge did not answer for it".into());
         w.push_str(" (a process rule is not asked again alone: it never blocks)");
     }
+    // A miss that carried a BROKEN, in any round: never asked again.
+    let mut held: BTreeSet<usize> = round
+        .left
+        .iter()
+        .filter(|(_, l)| l.holds)
+        .map(|(i, _)| *i)
+        .collect();
     if !missing.is_empty() && !pool.stopped() {
         let par = missing.len().min(MAX_PARALLEL);
         report.waves += missing.len().div_ceil(par) as u32;
         let again = run_pool(pending, missing, first, par, input, judge, pool);
         report.waves += again.serial_parts;
         answered.extend(again.answered);
+        held.extend(again.left.iter().filter(|(_, l)| l.holds).map(|(i, _)| *i));
         // Both rounds' reasons stand: the first names its seat (or the failed seats), the re-ask
         // its own.
         for (k, v) in again.why {
             match why.get_mut(&k) {
                 Some(w) if *w != v => *w = format!("{w}; asked alone, {v}"),
                 Some(w) => w.push_str(" (the same when asked alone)"),
+                None => {
+                    why.insert(k, v);
+                }
+            }
+        }
+    }
+    // (core#1949) A refusal is found only when an answer is read, so the re-ask can lose the last
+    // real seat after its rules were scheduled: the rules left go once more, to the judge's
+    // stand-in alone (`run_pool` asks it only now that every real seat is lost).
+    let stand_in = judge
+        .stand_in()
+        .filter(|k| !input.seats.iter().any(|s| s == k));
+    let lost_all = || {
+        let dead = pool.dead.lock().unwrap();
+        input.seats.iter().all(|s| dead.contains(s)) && stand_in.is_some_and(|k| !dead.contains(k))
+    };
+    // (core#1958) A process rule at review is not asked again alone here either: it never blocks.
+    let last: Vec<Batch> = (0..pending.len())
+        .filter(|i| !answered.contains_key(i) && !held.contains(i) && !reported(*i))
+        .map(|i| (vec![i], None))
+        .collect();
+    if stand_in.is_some() && !last.is_empty() && !pool.stopped() && lost_all() {
+        let par = last.len().min(MAX_PARALLEL);
+        report.waves += last.len().div_ceil(par) as u32;
+        let more = run_pool(pending, last, first, par, input, judge, pool);
+        report.waves += more.serial_parts;
+        answered.extend(more.answered);
+        for (k, v) in more.why {
+            match why.get_mut(&k) {
+                Some(w) => *w = format!("{w}; then the judge's stand-in: {v}"),
                 None => {
                     why.insert(k, v);
                 }
@@ -4681,6 +4754,8 @@ struct Pool {
     calls: std::sync::atomic::AtomicU32,
     dead: Mutex<BTreeSet<String>>,
     stop: std::sync::atomic::AtomicBool,
+    /// (core#1949) The judge's stand-in ([`RuleJudge::stand_in`]) was asked.
+    stood_in: std::sync::atomic::AtomicBool,
 }
 
 impl Pool {
@@ -4707,6 +4782,11 @@ fn run_pool(
     let why: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
     let left: Mutex<BTreeMap<usize, Retry>> = Mutex::new(BTreeMap::new());
     let serial_parts = std::sync::atomic::AtomicU32::new(0);
+    // (core#1949) The judge's stand-in as a fallback: only when it is not the rotation itself.
+    let stand_in: Option<String> = judge
+        .stand_in()
+        .filter(|k| !input.seats.iter().any(|s| s == k))
+        .map(str::to_string);
     let paths: Vec<&str> = match input.stage {
         // (pi s6) At review a KEPT always cites a changed path: with none known, nothing can be
         // cited (a one-byte sentinel matches no cite), never "no requirement".
@@ -4884,7 +4964,8 @@ fn run_pool(
                     continue;
                 }
                 let n = input.seats.len();
-                // The rotation, with a retry's seat moved last: only `input.seats` are ever asked.
+                // The rotation, with a retry's seat moved last: only `input.seats` are asked in
+                // it (the judge's stand-in comes after it, below, never in it).
                 let mut order: Vec<&String> = (0..n)
                     .map(|k| &input.seats[(offset + bix + k) % n])
                     .collect();
@@ -4897,7 +4978,14 @@ fn run_pool(
                 }
                 let mut failures: Vec<String> = Vec::new();
                 let mut got: Option<(String, String)> = None;
-                for seat in order {
+                // (core#1949) The judge's stand-in comes after the rotation, and only once every
+                // seat of it is lost (failed as a seat, or refused): never in the rotation.
+                let lost = || {
+                    let dead = pool.dead.lock().unwrap();
+                    input.seats.iter().all(|s| dead.contains(s))
+                };
+                let fallback = std::iter::once_with(|| stand_in.as_ref().filter(|_| lost()));
+                for seat in order.into_iter().chain(fallback.flatten()) {
                     if pool.dead.lock().unwrap().contains(seat) {
                         continue;
                     }
@@ -4906,6 +4994,10 @@ fn run_pool(
                     }
                     pool.calls
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if stand_in.as_ref() == Some(seat) {
+                        pool.stood_in
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     match judge.ask(seat, &text) {
                         JudgeAnswer::Answered(out) => {
                             got = Some((seat.clone(), out));
