@@ -319,6 +319,7 @@ fn reroute(
 /// unless the run is stand-in-aware, consented and not reduced, and one of its seats can stand in:
 /// not benched, not launch-excluded, with a record the role can run (a council voter is enabled for
 /// the council). The caller asks only when no real seat is left.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_team(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
