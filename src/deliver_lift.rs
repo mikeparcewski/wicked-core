@@ -381,7 +381,8 @@ pub(crate) fn fetch_origin(cwd: &Path) -> Result<(), String> {
 const GITHUB_BASE: &str = "https://github.com/";
 
 /// The fetch refspec the credentialed fetch uses (an explicit URL fetches no configured mapping).
-/// The GitHub retry runs only where `remote.origin.fetch` is exactly this (core#1959).
+/// A credentialed fetch (the GitHub retry, core#1959; the Azure DevOps fetch, core#1994) runs only
+/// where `remote.origin.fetch` is exactly this ([`origin_fetch_is_default`]).
 const ORIGIN_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
@@ -2485,6 +2486,23 @@ fn env_of(env: &[(&str, &Path)], name: &str) -> Option<String> {
     }
 }
 
+/// Whether origin's `remote.origin.fetch`, in every scope (includes followed), is exactly
+/// [`ORIGIN_REFSPEC`]: the one mapping the credentialed fetch (an explicit URL with that refspec)
+/// keeps. A credentialed fetch runs only then (core#1959, core#1994); any other mapping, or none,
+/// gets the plain `git fetch origin`, or no retry.
+fn origin_fetch_is_default(cwd: &Path, env: &[(&str, &Path)]) -> bool {
+    git_string(
+        cwd,
+        &["config", "--includes", "--get-all", "remote.origin.fetch"],
+        env,
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .collect::<Vec<_>>()
+        == [ORIGIN_REFSPEC]
+}
+
 /// (core#1959) The credential crew's deliver script uses for github.com: an exported `GH_TOKEN`,
 /// else `gh auth token --hostname github.com` (for `GH_ACCOUNT` when it is set), read bounded with
 /// no stdin. `Ok(None)`: `origin` is not a GitHub repository under `base`. `Err`: it is, and there
@@ -2523,17 +2541,9 @@ fn github_fetch_for(
         .filter(|(scope, _)| matches!(*scope, "local" | "worktree"))
         .filter_map(|(_, kv)| kv.split_whitespace().next())
         .collect();
-    // (codex-check on cc29697) The retry fetches with [`ORIGIN_REFSPEC`], not origin's configured
-    // mapping: so it runs only when the mapping, in every scope, is exactly that one refspec. Any
-    // other (`release` onto `origin/main`, say) could give the run a different base; that fetch
-    // fails loudly, as it did before the retry.
-    let mapping = git_string(
-        cwd,
-        &["config", "--includes", "--get-all", "remote.origin.fetch"],
-        env,
-    )
-    .unwrap_or_default();
-    if mapping.lines().map(str::trim).collect::<Vec<_>>() != [ORIGIN_REFSPEC] {
+    // (codex-check on cc29697) Any other mapping (`release` onto `origin/main`, say) could give the
+    // run a different base; that fetch fails loudly, as it did before the retry.
+    if !origin_fetch_is_default(cwd, env) {
         steered.push("remote.origin.fetch");
     }
     if !steered.is_empty() {
@@ -2644,6 +2654,12 @@ fn ado_fetch_for(cwd: &Path, env: &[(&str, &Path)]) -> Result<Option<AuthFetch>,
     let Some(url) = ado_canonical_url(&raw) else {
         return Ok(None);
     };
+    // (core#1994) An origin that maps `remote.origin.fetch` otherwise gets the plain fetch, with its
+    // own mapping: never a different base. It works where git has a credential for it, and fails
+    // loudly where it has none.
+    if !origin_fetch_is_default(cwd, env) {
+        return Ok(None);
+    }
     match ado_auth_header("https://login.microsoftonline.com")? {
         Some(header) => Ok(Some(AuthFetch { url, header })),
         None => Ok(None),
