@@ -3864,15 +3864,22 @@ pub(crate) fn run(
                         // dispatched in this attempt (whatever its last result says, a gate
                         // retry runs it again) took its messages then, and hears a new one only
                         // between the turns of a power build. Any other is mid-turn, and a
-                        // message for it is refused rather than queued unheard (a broadcast
-                        // too: core#1486 keeps it from every other step).
-                        let owner = (|| -> anyhow::Result<Option<(u32, bool, String)>> {
+                        // message for its seat is refused rather than queued unheard.
+                        // (core#1979) A broadcast to such a step (crew's working-document "Next"
+                        // note) is held for the next step dispatched instead: the step it was
+                        // owned by can no longer hear it, so no step takes a message meant for
+                        // another (core#1486). With no later step, it is refused.
+                        type Owner = (u32, bool, String, bool);
+                        let owner = (|| -> anyhow::Result<Option<Owner>> {
                             let Some(s) = crate::domain::get_session(&store, &run_id)? else {
                                 return Ok(None);
                             };
                             if s.status != SessionStatus::Executing {
                                 return Ok(None);
                             }
+                            let later =
+                                crate::domain::session_unit_at(&store, &run_id, s.unit_ix + 1)?
+                                    .is_some();
                             Ok(crate::domain::session_unit_at(&store, &run_id, s.unit_ix)?
                                 .filter(|u| {
                                     let this_attempt = u.last_attempt == Some(s.attempt);
@@ -3895,11 +3902,22 @@ pub(crate) fn run(
                                         u.ord,
                                         u.last_attempt == Some(s.attempt) && !turns,
                                         u.assigned_cli.clone().unwrap_or_else(|| "its seat".into()),
+                                        later,
                                     )
                                 }))
                         })();
                         let for_ord = match owner {
-                            Ok(Some((ord, true, cli))) => {
+                            Ok(Some((_, true, _, true))) if target_str == "all" => None,
+                            Ok(Some((ord, true, cli, false))) if target_str == "all" => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "step {ord} ({cli}) is the last step and is already working \
+                                     on this attempt, so no later step would hear this message; \
+                                     it was not sent. Steer the step at its gate instead (a note, \
+                                     or request changes)"
+                                )));
+                                continue;
+                            }
+                            Ok(Some((ord, true, cli, _))) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "step {ord} ({cli}) is already working on this attempt and \
                                      reads no new message until it is dispatched again, so this \
@@ -3908,7 +3926,7 @@ pub(crate) fn run(
                                 )));
                                 continue;
                             }
-                            Ok(o) => o.map(|(ord, _, _)| ord),
+                            Ok(o) => o.map(|(ord, ..)| ord),
                             Err(e) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "run {run_id}: could not tell which step is running ({e}); \
@@ -40045,10 +40063,10 @@ mod live_output_stream_tests {
             running.is_empty() && next.is_empty(),
             "a refused message is not queued"
         );
-        // A broadcast is that step's too (core#1486): refused, never handed to another step.
-        let refused = core.inject_worker_message(&run, "keep it small", InjectTarget::All);
-        assert!(refused.is_err(), "a broadcast mid-turn is refused too");
-        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
+        // A broadcast is held for the next step instead (core#1979, its own test).
+        core.inject_worker_message(&run, "keep it small", InjectTarget::All)
+            .expect("held for the next step");
+        assert_eq!(heard(&run, 2), vec!["keep it small".to_string()]);
 
         // A step a gate retry runs again keeps its last result's status: still mid-turn.
         let (run, core) = seed("gate-retry", true, None, UnitStatus::Rejected);
