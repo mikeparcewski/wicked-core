@@ -1686,22 +1686,37 @@ pub(crate) fn apply_and_finish_unit(
         .unwrap_or_default();
     // (DES-STANDIN-001 §3.6) A stand-in judge answered: its binding joins the run's record here, on
     // the single writer, before the receipt reads it, and is announced. Only the key the actor
-    // offered this unit is recorded (`standin::judge_answered`).
-    if let Some(key) = agent_verdict
-        .and_then(|v| v.judge_cli.as_deref())
-        .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
-    {
+    // offered this unit is recorded (`standin::judge_answered`). (core#1944) The rule check's
+    // stand-in is the same offer; seated for the rules alone and ruling none, it took part and
+    // `failed`, so its slot is spent all the same.
+    let keys = stand_in_judge_keys(agent_verdict, evidence.rule_check.as_ref());
+    // (core#1944) The stand-in key this fold confirmed as the unit's own offer, if any.
+    let mut confirmed: Option<String> = None;
+    if !keys.is_empty() {
         let roster = crate::registry_roster();
         if let Some(mut s) = crate::domain::get_session(&*store, session_id)? {
-            if let Some(b) = crate::standin::judge_answered(
-                &s.assurance,
-                unit,
-                attempt,
-                &roster,
-                &s.clis,
-                &s.benched_seats,
-                key,
-            ) {
+            if let Some((key, mut b)) = keys.iter().find_map(|k| {
+                crate::standin::judge_answered(
+                    &s.assurance,
+                    unit,
+                    attempt,
+                    &roster,
+                    &s.clis,
+                    &s.benched_seats,
+                    k,
+                )
+                .map(|b| (*k, b))
+            }) {
+                let semantic = agent_verdict.and_then(|v| v.judge_cli.as_deref()) == Some(key);
+                if !semantic
+                    && !evidence
+                        .rule_check
+                        .as_ref()
+                        .is_some_and(|rc| rule_stand_in_ruled(rc, key))
+                {
+                    b.state = crate::standin::STATE_FAILED.to_string();
+                }
+                confirmed = Some(key.to_string());
                 let display = b.display().to_string();
                 s.assurance.stand_ins.push(b.clone());
                 crate::standin::note_label(&mut s.assurance, &b, &display);
@@ -1716,6 +1731,34 @@ pub(crate) fn apply_and_finish_unit(
             }
         }
     }
+    // (core#1944) Fail closed: no rule verdict counts on a stand-in the run's record does not hold.
+    // The stand-in this check ran on counts only as the offer this fold just confirmed; one a row
+    // carries from an earlier check only as a binding the run recorded. Every other row a `~` key
+    // ruled is unchecked, so the gate holds on it as on any rule nobody could rule.
+    let demoted: crate::workflow::UnitEvidence;
+    let evidence = match evidence.rule_check.as_ref() {
+        Some(rc) => {
+            let current = rule_stand_in(rc);
+            let valid = |k: &str| {
+                if Some(k) == current {
+                    confirmed.as_deref() == Some(k)
+                } else {
+                    crate::standin::binding_for(&assurance, Some(k)).is_some()
+                }
+            };
+            if unrecorded_stand_in_rows(rc, &valid) {
+                let mut e = evidence.clone();
+                if let Some(rc) = e.rule_check.as_mut() {
+                    drop_unrecorded_stand_ins(rc, &valid);
+                }
+                demoted = e;
+                &demoted
+            } else {
+                evidence
+            }
+        }
+        None => evidence,
+    };
     // (DES-STANDIN-001 §3.6, §3.8) On a stand-in-aware run with no consent, the missing judge is
     // the `stand_in_needed` hold (grant a stand-in, sign a helper in and retry, or reject), never
     // the reduced offer.
@@ -3995,6 +4038,97 @@ struct GateFacts<'a> {
     qe: Option<&'a crate::domain::QeReview>,
 }
 
+/// (DES-STANDIN-001 §3.6, core#1944) The stand-in keys this unit's judges ran on, for the fold to
+/// record: the semantic judge's, then the rule check's ([`rule_stand_in`]), each once. Both take
+/// the one judge offer the actor made the unit ([`crate::standin::judge_offer`]); the fold records
+/// the first that IS that offer ([`crate::standin::judge_answered`]).
+fn stand_in_judge_keys<'a>(
+    agent_verdict: Option<&'a crate::validator::AgentVerdict>,
+    rules: Option<&'a crate::rule_check::RuleCheckReport>,
+) -> Vec<&'a str> {
+    let mut keys: Vec<&str> = agent_verdict
+        .and_then(|v| v.judge_cli.as_deref())
+        .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
+        .into_iter()
+        .collect();
+    if let Some(k) = rules.and_then(rule_stand_in) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// (core#1944) The stand-in a rule check ran on: the `~` key among the seats it drew (it draws one
+/// only when no real seat is left, `cli_runner::rule_judge_stand_in`), when the check made a judge
+/// call at all (with every rule settled by fact, cache or skip, it was offered and never asked).
+/// Never read off a row, whose judge may be a cached verdict's from an earlier attempt.
+fn rule_stand_in(rc: &crate::rule_check::RuleCheckReport) -> Option<&str> {
+    if rc.calls == 0 {
+        return None;
+    }
+    rc.seats
+        .iter()
+        .map(String::as_str)
+        .find(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k))
+}
+
+/// (core#1944) Whether the rule check's stand-in `key` ruled any rule this attempt: a row it
+/// answered names it (a judge row, or the machine verdict an answer it gave became), never a
+/// cached one.
+fn rule_stand_in_ruled(rc: &crate::rule_check::RuleCheckReport, key: &str) -> bool {
+    rc.rows
+        .iter()
+        .any(|r| r.how != crate::rule_check::RuleHow::Cache && r.judge.as_deref() == Some(key))
+}
+
+/// (core#1944) The `~` keys the report's rows name, each once, in row order.
+fn stand_in_row_keys(rc: &crate::rule_check::RuleCheckReport) -> Vec<&str> {
+    let mut keys: Vec<&str> = Vec::new();
+    for k in rc.rows.iter().filter_map(|r| r.judge.as_deref()) {
+        if wicked_apps_core::spawn::seat_id::is_stand_in(k) && !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// (core#1944) Whether a row names a stand-in `valid` refuses.
+fn unrecorded_stand_in_rows(
+    rc: &crate::rule_check::RuleCheckReport,
+    valid: &dyn Fn(&str) -> bool,
+) -> bool {
+    stand_in_row_keys(rc).into_iter().any(|k| !valid(k))
+}
+
+/// (core#1944) Every row a stand-in `valid` refuses ruled, unchecked: the run's record does not
+/// hold that stand-in, so nothing it said counts.
+fn drop_unrecorded_stand_ins(
+    rc: &mut crate::rule_check::RuleCheckReport,
+    valid: &dyn Fn(&str) -> bool,
+) {
+    for r in rc.rows.iter_mut() {
+        let Some(key) = r
+            .judge
+            .clone()
+            .filter(|k| wicked_apps_core::spawn::seat_id::is_stand_in(k) && !valid(k))
+        else {
+            continue;
+        };
+        r.status = crate::rule_check::RuleStatus::Unchecked;
+        r.how = crate::rule_check::RuleHow::None;
+        r.origin = None;
+        r.cite = None;
+        r.judge = None;
+        r.judge_ids = Vec::new();
+        r.council = None;
+        r.reason = format!(
+            "the stand-in `{key}` that ruled it is not on the run's record, so its verdict does \
+             not count"
+        );
+    }
+}
+
 /// (core#1799) Why the engine's judge did not run at `unit`'s gate, as the receipt says it: the
 /// skip reason and its words. The judge reviews a bound seat's change to the tree (or a report
 /// under a cited-findings rubric), so a gate without one says which of those it lacked —
@@ -4336,6 +4470,38 @@ fn gate_receipt(
     // (DES-RULE-CHECK-001 S2) Every rule in force with its verdict; deny-dominates reads them.
     if let Some(rc) = f.rules {
         r.rules = rc.rows.clone();
+        // (DES-STANDIN-001 §3.6, core#1944) Rules the run's judge stand-in ruled: the canonical
+        // `rule_judge` role, filled by that stand-in (the same binding, so one helper). A `~` key
+        // the run never recorded claims nothing.
+        if let Some(roles) = roles.as_mut() {
+            // This check's own stand-in, at this gate, answered or failed.
+            let current = rule_stand_in(rc);
+            if let Some(b) = current.and_then(|k| crate::standin::binding_for(run, Some(k))) {
+                let mut answered = b.clone();
+                answered.role = crate::standin::Role::RuleJudge;
+                answered.state = if rule_stand_in_ruled(rc, &b.key) {
+                    crate::standin::STATE_ANSWERED
+                } else {
+                    crate::standin::STATE_FAILED
+                }
+                .to_string();
+                answered.ord = Some(unit.ord);
+                answered.attempt = Some(attempt);
+                roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+            }
+            // A verdict this gate reused from a recorded stand-in still rests on it: disclosed
+            // where and when that stand-in answered, never as having run here.
+            for b in stand_in_row_keys(rc)
+                .into_iter()
+                .filter(|k| Some(*k) != current)
+                .filter_map(|k| crate::standin::binding_for(run, Some(k)))
+            {
+                let mut answered = b.clone();
+                answered.role = crate::standin::Role::RuleJudge;
+                answered.state = crate::standin::STATE_ANSWERED.to_string();
+                roles.push(a::RoleRecord::stand_in(&answered, answered.display()));
+            }
+        }
         match (&rc.note, rc.rows.is_empty()) {
             (Some(why), true) => r.skip(
                 crate::rule_check::INSTRUMENT,
@@ -8281,6 +8447,154 @@ mod guarded_read_step_tests {
             .expect("canonical")
             .iter()
             .any(|r| r.role == "judge" && r.filled == crate::assurance::FILLED_NONE));
+    }
+
+    /// (core#1944) The rule check's judge stand-in on the receipt: a row the run's own judge
+    /// stand-in ruled is the canonical `rule_judge` role, filled by that stand-in and labelled "stood
+    /// in for the rule check". A `~` key the run never recorded adds no role (fail closed).
+    #[test]
+    fn a_rule_check_by_the_judge_stand_in_is_a_stand_in_rule_judge_on_the_receipt() {
+        use wicked_apps_core::ToNode;
+        let build = unit(1, StageKind::Build, PhaseRole::Creator, "rj-claude");
+        let mut review = unit(2, StageKind::Review, PhaseRole::Evaluator, "rj-claude");
+        review.assigned_cli = Some("rj-claude".into());
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_nodes(&mut store, &[build.to_node(), review.to_node()]).unwrap();
+        let mut run = crate::standin::LaunchStandIn {
+            aware: true,
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(crate::assurance::RunAssurance::default());
+        let b = crate::standin::judge_answered(&run, &review, 1, &[], &[], &[], "rj-claude~1")
+            .expect("the run's own offer");
+        run.stand_ins.push(b);
+        let rules = |judge: &str| crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                rule_id: "POL-2101".into(),
+                status: crate::rule_check::RuleStatus::Kept,
+                how: crate::rule_check::RuleHow::Judge,
+                reason: "kept".into(),
+                judge: Some(judge.into()),
+                ..Default::default()
+            }],
+            seats: vec![judge.into()],
+            calls: 1,
+            ..Default::default()
+        };
+        let facts = |rules| super::GateFacts {
+            own_observed: Some(&[]),
+            pinned: None,
+            checks: None,
+            checks_waived: None,
+            judge: None,
+            judge_skipped: None,
+            judge_not_due: (crate::assurance::SKIP_NOT_APPLICABLE, String::new()),
+            rules,
+            eval_ran: false,
+            eval_error: None,
+            qe: None,
+            tree: None,
+        };
+        let report = rules("rj-claude~1");
+        let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&report)));
+        let roles = receipt.roles.expect("an aware run's receipt is canonical");
+        let rj = roles
+            .iter()
+            .find(|r| r.role == "rule_judge")
+            .expect("the rule judge's role");
+        assert_eq!(rj.filled, crate::assurance::FILLED_STAND_IN);
+        assert_eq!(rj.seat.as_deref(), Some("rj-claude~1"));
+        let label = &rj.stand_in.as_ref().expect("the stand-in's stamp").label;
+        assert!(label.contains("stood in for the rule check"), "{label}");
+        assert_eq!(receipt.rules.len(), 1);
+        // A key the run never recorded is no stand-in: no role is claimed for it.
+        let forged = rules("rj-claude~9");
+        let receipt = super::gate_receipt(&store, "r", &review, &run, 1, facts(Some(&forged)));
+        assert!(!receipt
+            .roles
+            .expect("canonical")
+            .iter()
+            .any(|r| r.role == "rule_judge" && r.filled == crate::assurance::FILLED_STAND_IN));
+    }
+
+    /// (core#1944) The fold records the judge stand-in the rule check ran on, read from the seats it
+    /// drew (never a row's judge, which may be a cached verdict's from an earlier attempt); the
+    /// semantic judge's own stand-in key comes first (both take the one offer).
+    #[test]
+    fn the_fold_records_the_judge_stand_in_the_rule_check_took() {
+        let row = |judge: Option<&str>| crate::rule_check::RuleVerdict {
+            rule_id: "R1".into(),
+            how: crate::rule_check::RuleHow::Judge,
+            judge: judge.map(str::to_string),
+            ..Default::default()
+        };
+        // A cached row ruled by an earlier attempt's stand-in, and this attempt's on `claude~3`.
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![row(Some("claude~2")), row(Some("claude~3"))],
+            seats: vec!["claude~3".into()],
+            calls: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::stand_in_judge_keys(None, Some(&report)),
+            ["claude~3"]
+        );
+        // Seated, and it ruled nothing: still the key (it took part, and failed).
+        let failed = crate::rule_check::RuleCheckReport {
+            seats: vec!["claude~3".into()],
+            calls: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::stand_in_judge_keys(None, Some(&failed)),
+            ["claude~3"]
+        );
+        assert!(!super::rule_stand_in_ruled(&failed, "claude~3"));
+        // Offered and never asked (every rule settled by fact, cache or skip): not a participant.
+        let unasked = crate::rule_check::RuleCheckReport {
+            seats: vec!["claude~3".into()],
+            ..Default::default()
+        };
+        assert!(super::stand_in_judge_keys(None, Some(&unasked)).is_empty());
+        assert!(super::rule_stand_in_ruled(&report, "claude~3"));
+        let real = crate::rule_check::RuleCheckReport {
+            rows: vec![row(Some("codex")), row(Some("claude~2"))],
+            seats: vec!["codex".into()],
+            ..Default::default()
+        };
+        assert!(super::stand_in_judge_keys(None, Some(&real)).is_empty());
+        let verdict = crate::validator::AgentVerdict {
+            pass: true,
+            reasoning: "ok".into(),
+            judge_cli: Some("claude~2".into()),
+            judge_distinct: Some(false),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        assert_eq!(
+            super::stand_in_judge_keys(Some(&verdict), Some(&real)),
+            ["claude~2"]
+        );
+        // Both, each once, the semantic judge's first: the fold records the one that is the offer.
+        assert_eq!(
+            super::stand_in_judge_keys(Some(&verdict), Some(&report)),
+            ["claude~2", "claude~3"]
+        );
+        let same = crate::rule_check::RuleCheckReport {
+            seats: vec!["claude~2".into()],
+            calls: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::stand_in_judge_keys(Some(&verdict), Some(&same)),
+            ["claude~2"]
+        );
     }
 
     #[test]

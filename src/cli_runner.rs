@@ -872,17 +872,26 @@ pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool
             .is_some_and(|g| !g.db_path.trim().is_empty())
 }
 
-/// The production judge of the rule check: one headless call on a roster seat.
+/// The production judge of the rule check: one headless call on a roster seat, or on the run's
+/// judge stand-in ([`rule_judge_stand_in`]).
 struct SeatRuleJudge<'a> {
     seats: &'a [crate::AgenticCli],
     runner: &'a dyn StepRunner,
     parent_run_id: Option<&'a str>,
     creator_providers: &'a [crate::observed_provider::Provider],
+    /// (DES-STANDIN-001 §3.6, core#1944) The judge stand-in's key, when the check took it: its
+    /// prompt opens with the stand-in preface, and the provider-sharing approval rule does not
+    /// apply to it (a stand-in shares its base's provider by definition and is stamped as one).
+    stand_in: Option<&'a str>,
 }
 
 impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
         match self.seats.iter().find(|c| c.key == seat) {
+            Some(c) if self.stand_in == Some(seat) => {
+                let prompt = format!("{}\n\n{prompt}", crate::standin::preface(None));
+                crate::validator::run_rule_judge(&prompt, c, self.runner, self.parent_run_id)
+            }
             Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner, self.parent_run_id),
             None => {
                 crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
@@ -891,6 +900,9 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     }
 
     fn approval_failure(&self, seat: &str) -> Option<String> {
+        if self.stand_in == Some(seat) {
+            return None;
+        }
         let observed = crate::observed_provider::observed_this_thread(seat);
         crate::observed_provider::shares_identity(
             seat,
@@ -987,6 +999,39 @@ pub(crate) fn rule_judge_seats(
             (keys, why)
         }
     }
+}
+
+/// (DES-STANDIN-001 §3.6, T-R9, core#1944) The rule judge's stand-in: with no real seat left
+/// (`no_real_seat`), the judge stand-in the run's actor offered this unit
+/// ([`crate::standin::judge_offer`]: consented, stand-in-aware, not reduced, base not benched)
+/// judges the rules, as the same binding, so it is one helper whichever check it does. Its record
+/// is its base's, keyed by the binding: the base's exact invocation, and its identities for
+/// `judge_ids`, so a council never seats the base on a row it ruled. `None` when there is no offer,
+/// or its base has no record, launches nothing, is not eligible for work, or is a seat the launch
+/// excluded from this unit (a stand-in fills a shortage, never the person's exclusion).
+fn rule_judge_stand_in(
+    offer: Option<&crate::standin::StandInBinding>,
+    no_real_seat: bool,
+    exclude_seats: &[String],
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+) -> Option<crate::AgenticCli> {
+    let b = offer.filter(|_| no_real_seat)?;
+    let base = crate::standin::base_record(pool, registry, &b.key)?;
+    if base.headless_invocation.trim().is_empty() || !base.seat_eligible_for_work {
+        return None;
+    }
+    let excluded = excluded_identities(exclude_seats, registry);
+    if exclude_seats
+        .iter()
+        .any(|k| wicked_apps_core::spawn::seat_id::credential(k) == b.base)
+        || record_identities(base).iter().any(|i| excluded.contains(i))
+    {
+        return None;
+    }
+    let mut seat = base.clone();
+    seat.key = b.key.clone();
+    Some(seat)
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.3) Every identity the `exclude_seats` keys may execute: each one's
@@ -2104,6 +2149,7 @@ pub(crate) fn delivery_rule_check(
         runner: &*ctx.runner,
         parent_run_id: Some(&ctx.run_id),
         creator_providers: &ctx.creator_providers,
+        stand_in: None,
     };
     let report = crate::rule_check::check(
         &crate::rule_check::CheckInput {
@@ -2386,6 +2432,36 @@ fn run_rule_check(
         emit_delta,
         None,
         None,
+        None,
+    )
+}
+
+/// (core#1944, T-R9) [`run_rule_check`] on a consented stand-in-aware run: `stand_in` is the
+/// judge stand-in the run's actor offered the unit ([`crate::standin::judge_offer`]).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check_standing_in(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+    stand_in: &crate::standin::StandInBinding,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    run_rule_check_with(
+        input,
+        creators,
+        creator_bins,
+        pool,
+        registry,
+        None,
+        runner,
+        emit_delta,
+        None,
+        None,
+        Some(stand_in),
     )
 }
 
@@ -2411,6 +2487,7 @@ fn run_rule_check_with(
     emit_delta: &DeltaSink,
     settle: Option<Settle<'_>>,
     stop: Option<crate::repo_checks::FloorStop>,
+    stand_in: Option<&crate::standin::StandInBinding>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
@@ -2529,6 +2606,26 @@ fn run_rule_check_with(
         registry,
         no_agent_creator,
     );
+    // (DES-STANDIN-001 §3.6, T-R9, core#1944) No real seat is left: the run's judge stand-in
+    // judges the rules, labelled as one. Never beside a real seat, and never a council voter.
+    // Only a shortage of distinct seats: when the work's authorship is not known, a stand-in fixes
+    // nothing and the rules hold on that, as before (as `JudgeExclusions` reads provenance).
+    let provenance_known = no_agent_creator || (!creators.is_empty() && creator_bins.is_some());
+    let stand_in_seat = rule_judge_stand_in(
+        stand_in,
+        seats.is_empty() && provenance_known,
+        &input.unit.exclude_seats,
+        pool,
+        registry,
+    );
+    let (seats, no_seat) = match &stand_in_seat {
+        Some(c) => (vec![c.key.clone()], None),
+        None => (seats, no_seat),
+    };
+    let judge_seats: std::borrow::Cow<'_, [crate::AgenticCli]> = match &stand_in_seat {
+        Some(c) => std::borrow::Cow::Owned(pool.iter().cloned().chain([c.clone()]).collect()),
+        None => std::borrow::Cow::Borrowed(pool),
+    };
     // (codex r1, r2) A cached judicial verdict (the unit's own last rows, or a council ruling from
     // another gate) is reused only when fresh selection would still seat every party to it.
     let exclusions = JudgeExclusions::of(
@@ -2598,12 +2695,23 @@ fn run_rule_check_with(
     engine_note(
         emit_delta,
         &format!(
-            "rule check: {} steering rule(s) in force; judges: {}",
+            "rule check: {} steering rule(s) in force; judges: {}{}",
             rules.len(),
             if seats.is_empty() {
                 "none".to_string()
             } else {
                 seats.join(", ")
+            },
+            match stand_in.filter(|_| stand_in_seat.is_some()) {
+                Some(b) => {
+                    let mut as_rule_judge = b.clone();
+                    as_rule_judge.role = crate::standin::Role::RuleJudge;
+                    format!(
+                        " ({})",
+                        crate::standin::label(&as_rule_judge, as_rule_judge.display())
+                    )
+                }
+                None => String::new(),
             }
         ),
     );
@@ -2615,10 +2723,11 @@ fn run_rule_check_with(
         .cloned()
         .collect();
     let judge = SeatRuleJudge {
-        seats: pool,
+        seats: &judge_seats,
         runner,
         parent_run_id: Some(&input.run_id),
         creator_providers: &creator_providers,
+        stand_in: stand_in_seat.as_ref().map(|c| c.key.as_str()),
     };
     let mut report = with_floor_heartbeat(
         emit_delta,
@@ -2670,7 +2779,7 @@ fn run_rule_check_with(
             )
         },
     );
-    stamp_judge_ids(&mut report, pool);
+    stamp_judge_ids(&mut report, &judge_seats);
     if let Some(st) = settle {
         settle_rule_disputes(
             &mut report,
@@ -7150,6 +7259,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 council_pool: &eligible_run,
             }),
             stop.clone(),
+            fallback.stand_in_judge.and_then(|j| j.offer.as_ref()),
         )
     } else {
         None
