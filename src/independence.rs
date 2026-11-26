@@ -327,6 +327,14 @@ pub struct PreflightContract {
     pub rules: bool,
     /// The engine's governed units are armed (`in_process_governance`): the launch's benches.
     pub contained: bool,
+    /// (core#1954) No plan and no workflow: the run plans ONE prose unit (`plan::plan_units`) with
+    /// no review step, whose default floor convenes a judge only when the unit changes the
+    /// worktree tree. The judge is conditional.
+    pub planless: bool,
+    /// (core#1954) The monitors a team run's plan seats, as the launch scores it
+    /// (`monitor_target` over the band of its score, with the plan's own ask). `None` when the
+    /// score waits for the PA's scope step: the most that step can set (the top band).
+    pub monitors: Option<u8>,
 }
 
 /// Resolve the contract `shape` would launch under, through the launch's own code (`actor.rs`, the
@@ -360,6 +368,24 @@ pub(crate) fn preflight_contract(
         &[],
     )?;
     let team = launch.is_some();
+    let planless = launch.is_none() && shape.workflow.is_none();
+    // The monitor target the launch's plan starts at (`actor.rs`: a plan the PA scopes waits for
+    // its scope step; else `intent_score_for_run`, its band `review_scale::floor_for`). The
+    // preflight reads no code graph, so a behavioural touch set fails closed high, as an
+    // unbound launch's does.
+    let monitors = match &launch {
+        Some((plan, _)) if !crate::plan_gate::needs_pa_scope(plan) => {
+            let scored = crate::plan_gate::intent_score_for_run(plan, None, None);
+            let band =
+                crate::review_scale::floor_for(scored.assessment.score, scored.destructive).band;
+            let asked = plan.monitors.as_ref().map_or(0, |m| m.asked);
+            Some(crate::team::supervisor::monitor_target(
+                Some(band.as_str()),
+                asked,
+            ))
+        }
+        _ => None,
+    };
     let instruments = match &launch {
         Some((_, Some(preset))) => crate::preset::required_instruments(store, project, preset)?,
         Some((_, None)) => None,
@@ -390,13 +416,17 @@ pub(crate) fn preflight_contract(
             .is_empty()
     };
     Ok(PreflightContract {
-        evaluator: assurance.enforces(crate::assurance::DISTINCT_EVALUATOR)
-            || (team && !assurance.reduced()),
+        // (core#1954) The planless unit has no review step: nothing seats an evaluator.
+        evaluator: !planless
+            && (assurance.enforces(crate::assurance::DISTINCT_EVALUATOR)
+                || (team && !assurance.reduced())),
         judge: assurance.enforces(crate::assurance::JUDGE),
         qe: assurance.enforces(crate::assurance::QE_ACCEPTANCE),
         team,
         rules,
         contained: false,
+        planless,
+        monitors,
     })
 }
 
@@ -595,7 +625,6 @@ pub(crate) fn independence_preflight_in(
     };
     let work_base = workers.first().map(|c| c.key.clone());
     let qe_base = workers.iter().find(|c| qe_admits(c)).map(|c| c.key.clone());
-    let vote_base = voters.first().map(|c| c.key.clone());
 
     // (core#1847) Each role's real seats come from its gate's own admission function, called with
     // the launch's facts; the differences the launch cannot share with a gate are named in DES §8
@@ -709,6 +738,9 @@ pub(crate) fn independence_preflight_in(
             .map(|c| c.key.clone())
             .collect();
         let mut roles = Vec::new();
+        // (core#1954) `base` is the stand-in a role offers: `no_base` for a role no stand-in
+        // fills today (a council, a rule council, a monitor seat).
+        let no_base: Option<String> = None;
         let mut push = |role: &str,
                         needed: usize,
                         real: Vec<String>,
@@ -739,7 +771,7 @@ pub(crate) fn independence_preflight_in(
             push("evaluator", 1, keys(&evaluators), &work_base, false);
         }
         if contract.judge {
-            push("judge", 1, judges, &work_base, false);
+            push("judge", 1, judges, &work_base, contract.planless);
         }
         if contract.qe {
             push("qe_reviewer", 1, keys(&qe_reviewers), &qe_base, false);
@@ -803,18 +835,25 @@ pub(crate) fn independence_preflight_in(
                 }))
             })
             .unwrap_or_default();
-            push("rule_judge", 1, rule_judges, &work_base, true);
+            // (core#1944) The rule check falls back to the run's judge offer, minted only when
+            // the contract requires a judge.
+            let rule_base = if contract.judge { &work_base } else { &no_base };
+            push("rule_judge", 1, rule_judges, rule_base, true);
             push(
                 "rule_council",
                 crate::decision::RULE_COUNCIL_SIZE,
                 rule_council,
-                &vote_base,
+                &no_base,
                 true,
             );
         }
         if contract.team {
-            push("council", council_size, council, &vote_base, true);
-            let target = usize::from(crate::team::supervisor::monitor_target(None, 0));
+            push("council", council_size, council, &no_base, true);
+            let target = usize::from(
+                contract
+                    .monitors
+                    .unwrap_or_else(|| crate::team::supervisor::monitor_target(None, 0)),
+            );
             // The worker pool (`distribute::pool_seating`): an instance distinct from the creator
             // and from the run's PA; never a party.
             let pa = chosen.map(|c| c.key.as_str());
@@ -827,7 +866,9 @@ pub(crate) fn independence_preflight_in(
                 })
                 .map(|c| c.key.clone())
                 .collect();
-            push("monitor", target, monitors, &work_base, true);
+            if target > 0 {
+                push("monitor", target, monitors, &no_base, true);
+            }
         }
         if !parties.keys.is_empty() {
             push("party_excluded", 1, non_party_workers, &work_base, false);
@@ -1264,8 +1305,10 @@ mod tests {
                 team: true,
                 rules: true,
                 contained: true,
+                planless: false,
+                monitors: None,
             },
-            "a bug launch is a team run under the full contract"
+            "a bug launch is a team run under the full contract, its score pending the PA's scope"
         );
         let clis = [roster_seat("tr2", "claude")];
         let p = preflight(&clis, &shape, contract);
