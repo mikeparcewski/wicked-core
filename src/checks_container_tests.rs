@@ -2443,3 +2443,55 @@ fn a_seat_reads_its_declared_native_addons_from_the_snapshot_tree() {
         .contains("leftpad"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// core#1970: a tree whose npm package is a subfolder one (a step built `notes/`, with its own
+/// lockfile, in a repository with no root package) is a node tree for the seats: its package is
+/// seen, never "not node". This tree does not ignore node_modules, so the fill is refused before
+/// any pod starts, and the reason is the one the stream shows.
+#[cfg(unix)]
+#[test]
+fn a_subfolder_package_with_its_own_lockfile_is_provisioned_for_the_seats_1970() {
+    let root = std::env::temp_dir().join(format!("seat-subpkg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("notes/src")).unwrap();
+    let git = |args: &[&str]| {
+        // spawn-audit: test-only — builds the fixture repository.
+        let o = std::process::Command::new("git")
+            .hardened()
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("README.md"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    // The step's new package, untracked as a seat leaves it (the issue's shape: it locks its own
+    // `@opentelemetry/api`).
+    std::fs::write(
+        root.join("notes/package.json"),
+        r#"{"name":"notes","dependencies":{"@opentelemetry/api":"1.10.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("notes/package-lock.json"),
+        r#"{"name":"notes","lockfileVersion":3,"packages":{}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("notes/src/index.ts"), "export {};\n").unwrap();
+    let p = provision_seat_node_modules("run-1970", &root, Some(&root.join(".git")));
+    assert_ne!(
+        p,
+        crate::seat_deps::Provisioned::NotNode,
+        "notes/ is an npm package with a lockfile"
+    );
+    match &p {
+        crate::seat_deps::Provisioned::Skipped(why) => {
+            assert!(why.contains("does not ignore node_modules"), "{why}")
+        }
+        other => panic!("refused before any pod, with the reason: {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
