@@ -597,9 +597,10 @@ pub struct ExtractMeta {
     pub rule_groups: Vec<Value>,
     pub followups: Vec<Value>,
     pub targets: Vec<Value>,
-    /// Every emitted statement no shown sentence of a business group cites (garden#1545): one a
-    /// housekeeping group or only a withheld sentence cites, or none (an open statement, whose
-    /// follow-up names it). A requirement is a business decision; these stay readable by id (a
+    /// Every emitted statement no sentence of a business group cites, shown or withheld only
+    /// because its statements changed since (garden#1545): one a housekeeping group or only a
+    /// sentence the writer's check withheld cites, or none (an open statement, whose follow-up
+    /// names it). A requirement is a business decision; these stay readable by id (a
     /// group cites them, a follow-up's ruling names their key) without being one. Absent on a
     /// model persisted before it.
     #[serde(default)]
