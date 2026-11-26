@@ -18,10 +18,12 @@ Two release tracks share this file, newest entry first regardless of track:
   estate fence's raw-SQLite arm still refused two spellings from an app's worktree under `WICKED_HOME/apps`:
   an absolute path to a file of the worktree (`python3 <worktree>/check.py`), and a `cd` inside the worktree
   followed by a `..` word (`cd queries && python3 -c 'open("../apps.json")'`), which was judged from every
-  directory the line could reach, the worktree root included. An absolute occurrence of the home that spells a
-  file of the tree (no `..` after it, no link out of the tree or into another store) is now the tree's
-  business, and a plain `&&` list that starts with plain `cd` moves is judged from where those moves lead. Every
-  other line keeps the whole-line judgement, and every existing deny still denies.
+  directory the line could reach, the worktree root included. An absolute occurrence of the home that spells
+  exactly one file of the tree (the tree, then plain path characters with no `..`, ending the word or closed by
+  a quote; no link out of the tree or into another store) is now the tree's business, and a line
+  `cd <plain dir> && …` whose later words cannot move the shell or the program is judged from where that `cd`
+  leads. Every other spelling and line is judged as before, and every existing deny still denies. Known limit:
+  a `CDPATH` the seat's shell inherits can send a bare `cd <dir>` elsewhere.
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
@@ -30,7 +32,7 @@ Two release tracks share this file, newest entry first regardless of track:
   a raw SQLite open of the graph and no Apps build landed. For a store location that holds the unit's own
   worktree, a relative word now names the store only when it resolves inside that location and outside the
   worktree (same normalize and symlink chain as the boundary). Still refused: the pin variables, every absolute
-  spelling (the literal arm is unchanged), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
+  spelling (the literal arm is unchanged here; core#1956 later lets a file of the worktree through), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
   link in the tree to a store.
 
 - **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`
