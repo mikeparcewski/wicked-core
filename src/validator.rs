@@ -4827,6 +4827,77 @@ mod tests {
         );
     }
 
+    /// (core#2004) A review with 60 steering-rule lines after its ITEM verdicts (the steering
+    /// contract asks for every rule after the items) runs past the findings cap. Every ITEM verdict
+    /// survives whole, the FAIL items first among them; the rule `N/A` lines are what is cut, and
+    /// the findings say how many and where the full output is.
+    #[test]
+    fn every_item_verdict_survives_the_findings_cap_2004() {
+        let mut raw = String::from(
+            "Reviewed the demo.\n\
+             ITEM 1: PASS — the chapters load (chapters.json:1)\n\
+             ITEM 2: FAIL — script.md:12 skips the pre-flight checklist; chapters.json:2 omits the resets\n\
+             ITEM 3: PASS — the run of show is complete\n\
+             ITEM 4: DEFERRED — CI on the opened PR\n\
+             ITEM 5: FAIL — script.md:23 calls the rules sample data without provenance\n",
+        );
+        for n in 1..=60 {
+            raw.push_str(&format!(
+                "RULE POL-{n:03}: N/A — the rule's config.json key and background timer are not \
+                 touched by this change (none introduced)\n"
+            ));
+        }
+        raw.push_str("VERDICT: FAIL");
+        assert!(
+            raw.chars().count() > EVALUATOR_FINDINGS_CAP,
+            "the fixture is past the cap"
+        );
+        let v = parse_evaluator_verdict(&raw);
+        assert!(!v.pass && v.findings_trimmed);
+        let items = crate::review_context::parse_review_items(&v.findings);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.n, i.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "PASS"),
+                (2, "FAIL"),
+                (3, "PASS"),
+                (4, "DEFERRED"),
+                (5, "FAIL")
+            ],
+            "every ITEM verdict survives: {}",
+            v.findings
+        );
+        assert!(
+            v.findings.contains(
+                "ITEM 2: FAIL — script.md:12 skips the pre-flight checklist; chapters.json:2 omits the resets"
+            ) && v.findings.contains(
+                "ITEM 5: FAIL — script.md:23 calls the rules sample data without provenance"
+            ),
+            "the FAIL items are whole: {}",
+            v.findings
+        );
+        assert!(v.findings.ends_with("VERDICT: FAIL"), "{}", v.findings);
+        assert!(
+            v.findings.chars().count() <= EVALUATOR_FINDINGS_CAP,
+            "the items fit, so the cap holds"
+        );
+        assert!(
+            v.findings.contains("steering-rule lines")
+                && v.findings
+                    .contains("the step's full output is in the run's events"),
+            "the cut is named: {}",
+            v.findings
+        );
+        assert!(
+            !v.findings.contains("…fig.json key"),
+            "no line starts mid-sentence: {}",
+            v.findings
+        );
+    }
+
     /// DES-L1 PR-1A §7 (4): the evaluator's OWN verdict grammar (des-adjudicated §4.1) — decoration
     /// tolerated, `:` or `=` head, case-insensitive, trailing punctuation trimmed, the LAST verdict
     /// line wins, `PASS` is the only pass; every other token, a bare head and no line are NOT PASS
