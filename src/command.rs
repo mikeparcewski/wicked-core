@@ -508,6 +508,13 @@ pub(crate) enum Command {
         role: crate::standin::Role,
         need: usize,
         scope: crate::standin::BindingScope,
+        /// (codex r1 on #1990) A council's non-party candidates as its caller resolved them: the
+        /// actor reserves only when none of them sits on this run (`council_roster`, the same
+        /// narrowing the council itself applies). Empty for a monitor, or when none was left.
+        voters: Vec<wicked_council::AgenticCli>,
+        /// (codex r1 on #1990) The bases the caller's host admits for the role (a monitor's): the
+        /// reservation takes only these. Empty: any usable base.
+        bases: Vec<String>,
         reply: std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
     },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before

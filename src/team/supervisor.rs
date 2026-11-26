@@ -218,32 +218,6 @@ impl ActorCouncil {
             Err(why) => return CouncilOutcome::NoSeats(why),
         };
         let deadline = Instant::now() + budget;
-        // (core#1972, DES-STANDIN-001 T-R7) No non-party seat is left: the council sits on
-        // stand-ins the engine reserves for the run (a council's size of them, each a fresh
-        // binding with its own lens), or, with none (no consent, a reduced run), on nobody.
-        let clis = if clis.is_empty() {
-            let stood = reserve_stand_ins(
-                &self.tx,
-                &req.session_id,
-                crate::standin::Role::Council,
-                wicked_council::pick::council_size(),
-                crate::standin::BindingScope {
-                    ord: Some(req.ord),
-                    ..Default::default()
-                },
-                deadline,
-            );
-            if stood.is_empty() {
-                return CouncilOutcome::NoSeats(format!(
-                    "no council seat is left after excluding the parties [{}] by key and by \
-                     identity",
-                    excluded.join(", ")
-                ));
-            }
-            stood.into_iter().map(|s| s.record).collect()
-        } else {
-            clis
-        };
         let lock =
             match crate::cli_runner::HostCouncilLock::acquire_until(&self.lock_path, deadline) {
                 // (codex r2 on #1771) Taken only as the budget ran out: the caller can no longer
@@ -262,6 +236,35 @@ impl ActorCouncil {
                     ))
                 }
             };
+        // (core#1972, DES-STANDIN-001 T-R7; codex r1 on #1990) The engine decides, over the run:
+        // with no real seat left once the council's own narrowing runs (the run's roster, its
+        // benches, the launch bench), the council sits on stand-ins it reserves for the run (a
+        // council's size of them, each a fresh binding with its own lens). A real seat left is
+        // no reservation. Asked with the host slot held, so a council that never gets the slot
+        // never reserves; with none (no consent, a reduced run) and no candidate, nobody sits.
+        let stood = reserve_stand_ins(
+            &self.tx,
+            &req.session_id,
+            crate::standin::Role::Council,
+            wicked_council::pick::council_size(),
+            crate::standin::BindingScope {
+                ord: Some(req.ord),
+                ..Default::default()
+            },
+            clis.clone(),
+            Vec::new(),
+            deadline,
+        );
+        let clis = if !stood.is_empty() {
+            stood.into_iter().map(|s| s.record).collect()
+        } else if clis.is_empty() {
+            return CouncilOutcome::NoSeats(format!(
+                "no council seat is left after excluding the parties [{}] by key and by identity",
+                excluded.join(", ")
+            ));
+        } else {
+            clis
+        };
         let (reply, rx) = channel();
         if self
             .tx
@@ -305,13 +308,16 @@ const RESERVE_WAIT: Duration = Duration::from_secs(10);
 /// (DES-STANDIN-001 §3.2, core#1972, core#1973) Ask the engine for `need` stand-ins for `role` on
 /// `run_id` (`Command::ReserveStandIns`): the bindings it reserved and persisted, or none (the run
 /// takes no stand-ins, the engine stopped, or it did not answer by `deadline`, at most
-/// [`RESERVE_WAIT`]).
+/// [`RESERVE_WAIT`]). `voters` and `bases` ride the command as it documents them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_stand_ins(
     tx: &Sender<crate::command::Command>,
     run_id: &str,
     role: crate::standin::Role,
     need: usize,
     scope: crate::standin::BindingScope,
+    voters: Vec<wicked_council::AgenticCli>,
+    bases: Vec<String>,
     deadline: Instant,
 ) -> Vec<crate::standin::SeatedStandIn> {
     let (reply, rx) = channel();
@@ -321,6 +327,8 @@ pub(crate) fn reserve_stand_ins(
             role,
             need,
             scope,
+            voters,
+            bases,
             reply,
         })
         .is_err()
@@ -888,7 +896,7 @@ impl UnitTeam {
             || (self.ctx.repo.is_some() && self.ctx.baseline_tree.is_some());
         let mut stood: Vec<crate::standin::SeatedStandIn> = Vec::new();
         if candidates.is_empty() && watchable && host.admitted(&self.ctx.creator).is_ok() {
-            stood = self.reserve_monitors(want);
+            stood = self.reserve_monitors(want, vec![self.ctx.creator.clone()]);
         }
         // (ASK-K3b) The plan asked for a member and the roster has no seat but the PA's (or the
         // creator's): the absence is on the record with a minted identity (one signed-in seat is
@@ -926,6 +934,9 @@ impl UnitTeam {
         };
         let mut admitted = 0;
         let mut refused = 0;
+        // The seats this host admitted as members: what a short pool may stand in on (with the
+        // creator, when the host admits it too).
+        let mut admits: Vec<String> = Vec::new();
         for (i, seat) in candidates.iter().enumerate() {
             if admitted == want {
                 break;
@@ -937,12 +948,16 @@ impl UnitTeam {
                 continue;
             }
             admitted += 1;
+            admits.push(seat.clone());
             self.seat_slot(id, seat.clone(), &baseline, None);
         }
         // (core#1973) Every real seat is seated and the target is still short: the rest stand in
         // (never in place of a real seat the host refused: that refusal is disclosed as it is).
         if stood.is_empty() && admitted < want && refused == 0 && !candidates.is_empty() {
-            stood = self.reserve_monitors(want - admitted);
+            if host.admitted(&self.ctx.creator).is_ok() {
+                admits.push(self.ctx.creator.clone());
+            }
+            stood = self.reserve_monitors(want - admitted, admits);
         }
         let mut n = candidates.len();
         for s in stood {
@@ -999,7 +1014,13 @@ impl UnitTeam {
 
     /// (core#1973) `need` monitor stand-ins for this attempt, reserved by the engine; none without
     /// an engine channel (or when the run takes no stand-ins).
-    fn reserve_monitors(&self, need: usize) -> Vec<crate::standin::SeatedStandIn> {
+    /// `bases`: the seats this host admits as a member (codex r1 on #1990), so the engine never
+    /// reserves on a base the host would then refuse.
+    fn reserve_monitors(
+        &self,
+        need: usize,
+        bases: Vec<String>,
+    ) -> Vec<crate::standin::SeatedStandIn> {
         let Some(tx) = self.engine.as_ref() else {
             return Vec::new();
         };
@@ -1013,6 +1034,8 @@ impl UnitTeam {
                 attempt: Some(self.ctx.attempt),
                 ..Default::default()
             },
+            Vec::new(),
+            bases,
             Instant::now() + RESERVE_WAIT,
         )
     }

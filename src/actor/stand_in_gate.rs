@@ -326,6 +326,7 @@ pub(crate) fn reserve_team(
     role: crate::standin::Role,
     need: usize,
     scope: crate::standin::BindingScope,
+    only: &[String],
 ) -> anyhow::Result<Vec<crate::standin::SeatedStandIn>> {
     use crate::standin as si;
     use wicked_apps_core::spawn::seat_id;
@@ -372,7 +373,16 @@ pub(crate) fn reserve_team(
                 !r.headless_invocation.trim().is_empty()
                     && (role != si::Role::Council || r.enabled_for_council)
             });
-        if !benched && !excluded && runnable && !bases.contains(&c) {
+        // (codex r1 on #1990) Only a base the caller's host admits for the role, when it names
+        // them: a monitor stand-in on a base the host refuses would leave the pool short.
+        let admitted = only.is_empty() || only.iter().any(|o| seat_id::credential(o) == c);
+        // (codex r1 on #1990) A council ballot on the host floor runs in its base's home: only a
+        // base whose template can be kept out of its builder's sessions stands in there.
+        let fresh = role != si::Role::Council
+            || crate::container_floor::container_mode()
+            || si::base_record(&roster, &registry, &si::binding_key(&c, 1))
+                .is_some_and(|r| host_floor_ballot(r).is_ok());
+        if !benched && !excluded && runnable && admitted && fresh && !bases.contains(&c) {
             bases.push(c);
         }
     }
@@ -380,6 +390,16 @@ pub(crate) fn reserve_team(
         return Ok(Vec::new());
     };
     let reason = si::reason_from_run(&roster, &session.clis, &session.benched_seats, &first);
+    // (codex r1 on #1990) A judge dispatched with a stand-in offer holds that slot unrecorded
+    // until it answers (`standin::judge_offer` mints it at dispatch, `judge_answered` records it):
+    // the slot a unit in flight may hold on its base is never a team role's.
+    let in_flight: Vec<String> = crate::domain::session_units(store, run_id)?
+        .iter()
+        .filter(|u| u.status == crate::domain::UnitStatus::Distributed)
+        .filter_map(|u| u.assigned_cli.as_deref())
+        .map(|k| seat_id::credential(k).to_string())
+        .collect();
+    let taken = si::with_judge_slots_held(&run.stand_ins, &in_flight);
     let minted = match si::fill(si::FillRequest {
         role,
         need,
@@ -389,7 +409,7 @@ pub(crate) fn reserve_team(
         consent: run.stand_in.as_ref(),
         reason,
         scope,
-        taken: &run.stand_ins,
+        taken: &taken,
     }) {
         si::Fill::Seats { stand_ins, .. } => stand_ins,
         si::Fill::NeedConsent(_) | si::Fill::NoUsableBase(..) => return Ok(Vec::new()),
@@ -400,6 +420,12 @@ pub(crate) fn reserve_team(
             continue;
         };
         record.key = b.key.clone();
+        if role == si::Role::Council && !crate::container_floor::container_mode() {
+            let Ok(fresh) = host_floor_ballot(&record) else {
+                continue;
+            };
+            record = fresh;
+        }
         b.lens = Some(si::lens_at(i).to_string());
         let display = si::display_name(&roster, &b.base);
         b.display = Some(display.clone());
@@ -432,11 +458,83 @@ pub(crate) fn reserve_team(
     Ok(seated)
 }
 
+/// (DES-STANDIN-001 §3.4, codex r1 on #1990) A council stand-in's ballot record on the HOST
+/// floor: the ballot runs in its base's home, so the template must never select a session of its
+/// own and must run on a CLI whose own switch keeps it out of the base's sessions
+/// (`execute_wrapped::host_stand_in_admits`, the check a host-floor stand-in unit passes); that
+/// switch rides the ballot's trust flags (appended after the template, as every ballot's are):
+/// claude `--no-session-persistence`, pi `--no-session`, codex `--ephemeral`. The governed unit
+/// path also turns claude's auto-memory off; a ballot has no environment hook for it (filed).
+fn host_floor_ballot(record: &crate::AgenticCli) -> Result<crate::AgenticCli, String> {
+    use wicked_apps_core::spawn::SeatCli;
+    let binary = crate::execute_wrapped::template_binary(&record.headless_invocation);
+    let cli = SeatCli::from_binary(&binary);
+    crate::execute_wrapped::host_stand_in_admits(&record.headless_invocation, cli)?;
+    let flag = match cli {
+        SeatCli::Claude => "--no-session-persistence",
+        SeatCli::Pi => "--no-session",
+        SeatCli::Codex => "--ephemeral",
+        other => return Err(format!("no host-floor ballot switch for {other:?}")),
+    };
+    let mut out = record.clone();
+    let spelled = record
+        .headless_invocation
+        .split_whitespace()
+        .chain(record.trust_flags.iter().map(String::as_str))
+        .any(|t| t == flag);
+    if !spelled {
+        out.trust_flags.push(flag.to_string());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod reserve_team_tests {
     //! (core#1972, core#1973) `Command::ReserveStandIns` on the single writer.
     use super::*;
     use crate::standin::{self as si, Role};
+
+    /// codex r1 on #1990: a council ballot on the host floor takes only a template that never
+    /// resumes a session, on a CLI with a switch that keeps it out of its base's sessions, and the
+    /// ballot carries that switch.
+    #[test]
+    fn a_host_floor_council_stand_in_ballot_starts_fresh_1972() {
+        let seat = |key: &str| {
+            wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == key)
+                .unwrap()
+        };
+        let claude = host_floor_ballot(&seat("claude")).unwrap();
+        assert!(claude
+            .trust_flags
+            .iter()
+            .any(|f| f == "--no-session-persistence"));
+        let pi = host_floor_ballot(&seat("pi")).unwrap();
+        assert!(pi.trust_flags.iter().any(|f| f == "--no-session"));
+        let twice = host_floor_ballot(&claude).unwrap();
+        assert_eq!(
+            twice
+                .trust_flags
+                .iter()
+                .filter(|f| *f == "--no-session-persistence")
+                .count(),
+            1,
+            "never spelled twice"
+        );
+        let resumes = crate::AgenticCli {
+            headless_invocation: format!("{} --continue", seat("claude").headless_invocation),
+            ..seat("claude")
+        };
+        assert!(
+            host_floor_ballot(&resumes).is_err(),
+            "a resume selector is refused"
+        );
+        assert!(
+            host_floor_ballot(&seat("copilot")).is_err(),
+            "no host-floor switch"
+        );
+    }
 
     fn run(clis: &[&str], consent: bool) -> AgentSession {
         let mut s = crate::actor::sessions_detail_fold_tests::session("r-team");
@@ -471,7 +569,7 @@ mod reserve_team_tests {
             attempt: Some(1),
             ..Default::default()
         };
-        let seated = reserve_team(&mut store, &mut sink, &s.id, role, need, scope).unwrap();
+        let seated = reserve_team(&mut store, &mut sink, &s.id, role, need, scope, &[]).unwrap();
         let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
         (seated, after, rx.try_iter().collect())
     }
@@ -518,6 +616,81 @@ mod reserve_team_tests {
         let (next, _, _) = reserve(&after, Role::Monitor, 1);
         assert_eq!(next[0].binding.key, "claude~4");
         assert_eq!(next[0].binding.lens.as_deref(), Some("correctness"));
+    }
+
+    /// codex r1 on #1990: a unit in flight on the base may hold a judge offer unrecorded (the
+    /// next slot): a team reservation never takes it, and the judge that answers on it is still
+    /// recorded once the team's bindings moved the next slot on. A base the caller's host does not
+    /// admit is never reserved on.
+    #[test]
+    fn a_team_reservation_never_takes_an_in_flight_judges_slot_1972() {
+        let s = run(&["claude", "codex"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let mut unit = WorkUnit::pending(format!("{}:u1", s.id), &s.id, 1, "build");
+        unit.status = crate::domain::UnitStatus::Distributed;
+        unit.assigned_cli = Some("claude".into());
+        crate::domain::put_node(&mut store, unit.to_node()).unwrap();
+        // The judge's offer, minted at dispatch on the run as it is now: claude~1, unrecorded.
+        let offer = si::judge_offer(&s.assurance, &unit, 1, &[], &s.clis, &[]).unwrap();
+        assert_eq!(offer.key, "claude~1");
+        let mut sink = crate::event_log::EventSink::default();
+        let scope = si::BindingScope {
+            ord: Some(1),
+            attempt: Some(1),
+            ..Default::default()
+        };
+        let only = vec!["claude".to_string()];
+        let seated =
+            reserve_team(&mut store, &mut sink, &s.id, Role::Monitor, 1, scope, &only).unwrap();
+        let keys: Vec<&str> = seated.iter().map(|x| x.binding.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["claude~2"],
+            "the in-flight judge's slot is held back"
+        );
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        let answered = si::judge_answered(
+            &after.assurance,
+            &unit,
+            1,
+            &[],
+            &after.clis,
+            &[],
+            "claude~1",
+        )
+        .expect("the judge's own slot still stands");
+        assert_eq!((answered.key.as_str(), answered.slot), ("claude~1", 1));
+        assert!(
+            si::judge_answered(
+                &after.assurance,
+                &unit,
+                1,
+                &[],
+                &after.clis,
+                &[],
+                "claude~2"
+            )
+            .is_none(),
+            "the monitor's recorded key is never the judge's"
+        );
+        // Only the bases the caller's host admits: codex alone was asked for.
+        let codex_only = vec!["codex".to_string()];
+        let seated = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            si::BindingScope::default(),
+            &codex_only,
+        )
+        .unwrap();
+        assert!(!seated.is_empty(), "codex can stand in");
+        assert!(
+            seated.iter().all(|x| x.binding.base == "codex"),
+            "{seated:?}"
+        );
     }
 
     /// No consent, an unaware run, a reduced run, a benched base or no seat at all: nothing is

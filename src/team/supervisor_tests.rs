@@ -3693,8 +3693,8 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     };
     let engine = std::thread::spawn({
         let path = path.clone();
-        move || match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(crate::command::Command::ConveneDecision {
+        move || match convene_cmd(&rx) {
+            Some(crate::command::Command::ConveneDecision {
                 clis, lock, reply, ..
             }) => {
                 let busy = matches!(
@@ -3757,8 +3757,8 @@ fn core_1822_a_council_times_out_only_after_its_ballots_started() {
         };
         // The stub engine takes the command, reports the ballots starting (or not), then never
         // rules; it keeps the reply sender until the convener has given up.
-        let engine = std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(crate::command::Command::ConveneDecision { reply, lock, .. }) => {
+        let engine = std::thread::spawn(move || match convene_cmd(&rx) {
+            Some(crate::command::Command::ConveneDecision { reply, lock, .. }) => {
                 if started {
                     let _ = reply.send(crate::command::CouncilReply::Convened(vec![
                         "codex".into(),
@@ -3911,6 +3911,7 @@ fn reserved_on(
     base: &str,
     role: crate::standin::Role,
     need: usize,
+    scope: &crate::standin::BindingScope,
 ) -> Vec<crate::standin::SeatedStandIn> {
     const LENSES: [&str; 3] = ["correctness", "security and safety", "user impact"];
     (0..need)
@@ -3924,10 +3925,11 @@ fn reserved_on(
                 model: None,
                 builder_model: None,
                 lens: Some(LENSES[i % LENSES.len()].to_string()),
-                ord: Some(3),
-                attempt: Some(1),
-                subject: None,
-                evidence: None,
+                // (codex r1 on #1990) Scoped as the request asked, as `reserve_team` scopes it.
+                ord: scope.ord,
+                attempt: scope.attempt,
+                subject: scope.subject.clone(),
+                evidence: scope.evidence.clone(),
                 invocation: format!("inv-{i}"),
                 reason: crate::standin::Reason::OnlyOneHelper {
                     cli: "Claude Code".into(),
@@ -3971,10 +3973,11 @@ fn a_one_cli_team_council_sits_on_the_stand_ins_the_engine_reserved_1972() {
                         need,
                         scope,
                         reply,
+                        ..
                     } => {
                         asked.push((run_id, role, need, scope.ord));
                         let _ = reply.send(if consented {
-                            reserved_on("claude", role, need)
+                            reserved_on("claude", role, need, &scope)
                         } else {
                             Vec::new()
                         });
@@ -4033,6 +4036,24 @@ fn a_one_cli_team_council_sits_on_the_stand_ins_the_engine_reserved_1972() {
     }
 }
 
+/// The stub engine's next command past the council's stand-in ask (codex r1 on #1990: a team
+/// council asks the engine first, with the host slot held, and a run with a real seat left gets
+/// none): the ask is answered with no stand-ins.
+fn convene_cmd(
+    rx: &std::sync::mpsc::Receiver<crate::command::Command>,
+) -> Option<crate::command::Command> {
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(crate::command::Command::ReserveStandIns { reply, voters, .. }) => {
+                assert!(!voters.is_empty(), "the council hands its candidates");
+                let _ = reply.send(Vec::new());
+            }
+            Ok(cmd) => return Some(cmd),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// One `ReserveStandIns` the stub engine got: role, need, scope ord, scope attempt.
 type Reserved = (crate::standin::Role, usize, Option<u32>, Option<u32>);
 
@@ -4058,7 +4079,7 @@ fn stand_in_engine(
             {
                 asked.push((role, need, scope.ord, scope.attempt));
                 let _ = reply.send(if consented {
-                    reserved_on("claude", role, need)
+                    reserved_on("claude", role, need, &scope)
                 } else {
                     Vec::new()
                 });

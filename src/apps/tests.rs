@@ -1986,6 +1986,22 @@ fn a_consented_publish_on_one_seat_launches_and_its_qe_is_reviewed_on_a_stand_in
             ..binding.clone()
         });
     assert!(publish_consent_refusal(&judge, &[qe.clone()], t1).is_some());
+    // (codex r1 on #1990) …and the reviewer of the attempt the ruling turn ran in: a binding
+    // reserved for another attempt of this unit refuses.
+    let mut other_attempt = s.clone();
+    other_attempt
+        .assurance
+        .stand_ins
+        .push(crate::standin::StandInBinding {
+            attempt: Some(1),
+            ..binding.clone()
+        });
+    assert_eq!(
+        binding.attempt,
+        Some(0),
+        "the writer scopes it to the attempt"
+    );
+    assert!(publish_consent_refusal(&other_attempt, &[qe.clone()], t1).is_some());
     // Without consent no stand-in reviews a publish.
     let mut unasked = bound.clone();
     unasked.assurance.stand_in = None;

@@ -410,6 +410,45 @@ pub(crate) fn next_slot<'a>(
         + 1
 }
 
+/// (codex r1 on #1990) `taken` plus, for each base in `in_flight`, the next slot held back: the
+/// one a judge dispatched with a stand-in offer on that base may hold unrecorded until it answers
+/// ([`judge_offer`] mints at dispatch, [`judge_answered`] records). A team reservation counts
+/// these as taken, so a team role never takes an in-flight judge's key.
+pub(crate) fn with_judge_slots_held(
+    taken: &[StandInBinding],
+    in_flight: &[String],
+) -> Vec<StandInBinding> {
+    let mut out = taken.to_vec();
+    for base in in_flight {
+        if out
+            .iter()
+            .any(|b| b.base == *base && b.invocation.is_empty())
+        {
+            continue;
+        }
+        let slot = next_slot(out.iter(), base);
+        out.push(StandInBinding {
+            key: binding_key(base, slot),
+            base: base.clone(),
+            role: Role::Judge,
+            slot,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: None,
+            attempt: None,
+            subject: None,
+            evidence: None,
+            // Empty: held back, never a binding.
+            invocation: String::new(),
+            reason: Reason::OnlyOneHelper { cli: base.clone() },
+            state: STATE_SEATED.to_string(),
+            display: None,
+        });
+    }
+    out
+}
+
 /// `<base>~<slot>`, the reserved grammar ([`seat_id`]).
 pub(crate) fn binding_key(base: &str, slot: u32) -> String {
     format!("{base}{}{slot}", wicked_apps_core::spawn::STAND_IN_SEP)
@@ -561,8 +600,11 @@ pub(crate) fn reason_from_run(
 }
 
 /// (§3.6) The binding of a stand-in judge that ANSWERED as `key`, for the fold to record: the
-/// unit's own offer, recomputed on the single writer, when `key` is exactly that offer's key. `None` for any other key (fail closed: a `~` key the run never offered is no
-/// stand-in, and the receipt reads it as an ordinary judge seat).
+/// unit's own offer, recomputed on the single writer, when `key` is exactly that offer's key, or
+/// an earlier slot on the offer's base that no recorded binding holds (a team reservation made
+/// while the judge ran moved the next slot on, codex r1 on #1990). `None` for any other key (fail
+/// closed: a recorded or foreign `~` key is no stand-in judge, and the receipt reads it as an
+/// ordinary judge seat).
 pub(crate) fn judge_answered(
     run: &crate::assurance::RunAssurance,
     unit: &crate::domain::WorkUnit,
@@ -574,7 +616,21 @@ pub(crate) fn judge_answered(
 ) -> Option<StandInBinding> {
     let mut b = judge_offer(run, unit, attempt, roster, run_seats, benched)?;
     if b.key != key {
-        return None;
+        // (codex r1 on #1990) A team reservation recorded while this judge ran moves the next
+        // slot past its offer (the reservation held the judge's slot back,
+        // [`with_judge_slots_held`]): the judge's own earlier slot on the same base stands, as
+        // long as no recorded binding holds it.
+        let prefix = format!("{}{}", b.base, wicked_apps_core::spawn::STAND_IN_SEP);
+        let slot = key.strip_prefix(prefix.as_str())?.parse::<u32>().ok()?;
+        if slot == 0
+            || slot >= b.slot
+            || binding_key(&b.base, slot) != key
+            || run.stand_ins.iter().any(|t| t.key == key)
+        {
+            return None;
+        }
+        b.key = key.to_string();
+        b.slot = slot;
     }
     b.state = STATE_ANSWERED.to_string();
     Some(b)

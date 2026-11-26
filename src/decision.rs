@@ -898,8 +898,14 @@ impl Dispatcher for StandInBallots {
         self.inner
             .dispatch_ballot_timed(cli, &self.framed(cli, task), ctx)
     }
+    /// (codex r1 on #1990) A stand-in voter is benched when its base credential is: the bench
+    /// is on the credential that failed, and a fresh binding key must not reset it.
     fn seat_benched(&self, key: &str) -> bool {
         self.inner.seat_benched(key)
+            || (self.lenses.contains_key(key)
+                && self
+                    .inner
+                    .seat_benched(wicked_apps_core::spawn::seat_id::credential(key)))
     }
 }
 
@@ -1807,6 +1813,61 @@ mod tests {
     /// Records each ballot's seat and topic.
     struct TopicRecorder {
         seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    /// A dispatcher whose health benches exactly `benched` (as `RealDispatcher` keys it).
+    struct BenchedOn(&'static str);
+    impl Dispatcher for BenchedOn {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            None
+        }
+        fn seat_benched(&self, key: &str) -> bool {
+            key == self.0
+        }
+    }
+
+    /// codex r1 on #1990: a stand-in voter whose base credential the dispatcher benched is
+    /// benched too; a real seat and an unreserved key read the inner bench as they are.
+    #[test]
+    fn a_stand_in_voter_is_benched_with_its_base_credential_1972() {
+        let binding = crate::standin::StandInBinding {
+            key: "claude~1".into(),
+            base: "claude".into(),
+            role: crate::standin::Role::Council,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: Some("correctness".into()),
+            ord: Some(1),
+            attempt: None,
+            subject: None,
+            evidence: None,
+            invocation: "i".into(),
+            reason: crate::standin::Reason::OnlyOneHelper {
+                cli: "Claude Code".into(),
+            },
+            state: crate::standin::STATE_SEATED.into(),
+            display: None,
+        };
+        let voter = |key: &str| AgenticCli {
+            key: key.into(),
+            ..wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == "claude")
+                .unwrap()
+        };
+        let clis = vec![voter("claude~1"), voter("codex")];
+        let benched =
+            StandInBallots::wrap(Arc::new(BenchedOn("claude")), &[binding.clone()], &clis);
+        assert!(benched.seat_benched("claude~1"), "its base is benched");
+        assert!(benched.seat_benched("claude"));
+        assert!(!benched.seat_benched("codex"));
+        assert!(
+            !benched.seat_benched("claude~2"),
+            "never reserved: the inner bench as it is"
+        );
+        let healthy = StandInBallots::wrap(Arc::new(BenchedOn("pi")), &[binding], &clis);
+        assert!(!healthy.seat_benched("claude~1"));
     }
     impl Dispatcher for TopicRecorder {
         fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {

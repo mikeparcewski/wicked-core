@@ -613,7 +613,11 @@ pub(crate) fn publish_consent_refusal(
                     && !session.assurance.reduced()
                     && crate::standin::binding_for(&session.assurance, Some(a.seat.as_str()))
                         .is_some_and(|b| {
-                            b.role == crate::standin::Role::QeReviewer && b.ord == Some(qe.ord)
+                            // (codex r1 on #1990) The binding of the very turn that ruled: its
+                            // unit and the attempt it ran in (a floor re-run carries both).
+                            b.role == crate::standin::Role::QeReviewer
+                                && b.ord == Some(qe.ord)
+                                && b.attempt == Some(a.attempt)
                         }))
         });
     if !distinct {
