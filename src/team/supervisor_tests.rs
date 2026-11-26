@@ -152,9 +152,10 @@ impl FakeHost {
 }
 
 impl MonitorHost for FakeHost {
-    /// (core#1952) The built-in roster's name for its one display-named seat.
+    /// (core#1952) The built-in roster's name for its one display-named CLI, read as the ACP
+    /// host's `registry_record` reads it: the key, then its CLI's (`claude#2` is Claude Code).
     fn display_name(&self, seat: &str) -> Option<String> {
-        (seat == "claude").then(|| "Claude Code".to_string())
+        (wicked_apps_core::spawn::seat_cli_key(seat) == "claude").then(|| "Claude Code".to_string())
     }
     fn one_shot(&self) -> bool {
         self.one_shot.load(std::sync::atomic::Ordering::SeqCst)
@@ -2693,13 +2694,15 @@ fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
     );
 }
 
-/// core#1952: the words helper. A stand-in of an instance reads that instance's name (falling
-/// back to its credential key); a real seat keeps its key even when it has a display name.
+/// core#1952: the words helper. A stand-in of an instance reads its CLI's name, and its
+/// credential key when the host has none; a real seat keeps its key even when it has a display
+/// name.
 #[test]
 fn seat_words_names_stand_ins_and_keeps_real_keys_1952() {
     let host = FakeHost::new(|_, _| Ok("DONE".into()));
     assert_eq!(seat_words(&host, "claude~3"), "Claude Code, a stand-in");
-    assert_eq!(seat_words(&host, "claude#2~1"), "claude#2, a stand-in");
+    assert_eq!(seat_words(&host, "claude#2~1"), "Claude Code, a stand-in");
+    assert_eq!(seat_words(&host, "codex#2~1"), "codex#2, a stand-in");
     assert_eq!(seat_words(&host, "claude"), "claude");
     assert_eq!(seat_words(&host, "codex#2"), "codex#2");
 }

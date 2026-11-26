@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
+  (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
+  from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
+  so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
+  way; a real seat keeps its key, and the parties keep the keys.
+
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text

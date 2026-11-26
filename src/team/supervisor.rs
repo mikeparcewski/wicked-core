@@ -2959,7 +2959,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                         reason: worker,
                     },
                     CouncilPosition {
-                        by: format!("monitor {}", f.finding.seat),
+                        by: format!("monitor {}", seat_words(host, &f.finding.seat)),
                         position: "NO — the finding stands".into(),
                         reason: monitor_reason,
                     },
