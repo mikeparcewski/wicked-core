@@ -819,7 +819,8 @@ pub fn build_extract_model(
     // The business groups whose sentences cite each statement, by display index: only these make a
     // statement a requirement (garden#1545). A housekeeping group is plumbing, and a sentence the
     // writer's check withheld was never shown. A shown sentence this build withheld because its
-    // statements moved still counts, so an edit shows its requirement stale instead of hiding it.
+    // statements moved still counts, so its requirement stays: shown stale after a code change;
+    // after a statement change its sentence is withheld.
     let mut citing: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (gi, (_, g, moved)) in groups.iter().enumerate() {
         if str_of(g, "kind") != Some("business") {
