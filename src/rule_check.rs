@@ -4772,9 +4772,19 @@ impl Pool {
 
     /// `judge.ask(seat, prompt)` in one of the check's [`MAX_PARALLEL`] call slots: it waits for a
     /// free one, and frees it when the call returns (or panics). `None`: not asked, because the
-    /// check stopped or the seat failed while it waited (codex r1). A seat failure or a stop is
-    /// published the moment the call returns, whichever part order its answer is read in.
-    fn ask(&self, judge: &dyn RuleJudge, seat: &str, prompt: &str) -> Option<JudgeAnswer> {
+    /// check stopped, or (`live_seat`) the seat failed while it waited (codex r1). A seat failure
+    /// or a stop is published the moment the call returns, whichever part order reads it.
+    ///
+    /// A later part is asked with `live_seat` false (codex r2): its round was admitted in part
+    /// order while the seat was live, so a higher part failing first never keeps a lower part from
+    /// being asked (the serial read would have read it, and a BROKEN after it).
+    fn ask(
+        &self,
+        judge: &dyn RuleJudge,
+        seat: &str,
+        prompt: &str,
+        live_seat: bool,
+    ) -> Option<JudgeAnswer> {
         struct Slot<'a>(&'a Pool);
         impl Drop for Slot<'_> {
             fn drop(&mut self) {
@@ -4790,7 +4800,7 @@ impl Pool {
             *n += 1;
         }
         let _slot = Slot(self);
-        if self.stopped() || self.dead.lock().unwrap().contains(seat) {
+        if self.stopped() || (live_seat && self.dead.lock().unwrap().contains(seat)) {
             return None;
         }
         self.calls
@@ -5035,7 +5045,7 @@ fn run_pool(
                     if pool.stopped() {
                         break;
                     }
-                    let Some(answer) = pool.ask(judge, seat, &text) else {
+                    let Some(answer) = pool.ask(judge, seat, &text, true) else {
                         if pool.stopped() {
                             break;
                         }
@@ -5105,13 +5115,18 @@ fn run_pool(
                     let rest: Vec<usize> = (1..total_parts.min(MAX_PARTS)).collect();
                     let mut asked: Vec<Option<JudgeAnswer>> = Vec::new();
                     for round in rest.chunks(MAX_PARALLEL) {
+                        // A round is admitted whole, here, in part order: only while the seat is
+                        // live and the check not stopped (as the serial loop checked each part).
+                        if pool.stopped() || pool.dead.lock().unwrap().contains(seat) {
+                            break;
+                        }
                         let answers: Vec<Option<JudgeAnswer>> = std::thread::scope(|ps| {
                             let part_text = &part_text;
                             let calls: Vec<_> = round
                                 .iter()
                                 .map(|&k| {
                                     ps.spawn(move || {
-                                        let answer = pool.ask(judge, seat, &part_text(k));
+                                        let answer = pool.ask(judge, seat, &part_text(k), false);
                                         (answer, crate::observed_provider::take_receipts())
                                     })
                                 })

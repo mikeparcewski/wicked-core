@@ -432,13 +432,20 @@ fn fetch_origin_with(
     match auth {
         Some(a) => {
             let scheme = a.url.split_once("://").map(|(s, _)| s).unwrap_or("https");
+            // (codex r2) No submodule fetch and no automatic maintenance: no other git, in another
+            // repository's config, runs with the header in its environment.
             cmd.args([
                 "-c",
                 "credential.helper=",
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
                 "fetch",
                 "--quiet",
+                "--no-recurse-submodules",
             ])
             .arg(&a.url)
             .arg("+refs/heads/*:refs/remotes/origin/*")
@@ -2594,8 +2601,13 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
             }
         }
     };
+    // (pi r2) A gh that exited just inside the deadline still gets a moment for its last bytes.
     let out = rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1)),
+        )
         .map_err(|_| late())?;
     let token = out.trim();
     if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {

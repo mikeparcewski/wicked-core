@@ -4927,7 +4927,12 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
     let calls = judge.0.lock().unwrap();
     assert_eq!(r.calls, calls.len() as u32);
     // (core#1958) Each round asks its first part, then the rest up to MAX_PARALLEL at once.
-    let n = calls.len() / 2;
+    let n: usize = calls[0]
+        .1
+        .strip_prefix("PART 1 OF ")
+        .and_then(|t| t.split(' ').next())
+        .and_then(|t| t.parse().ok())
+        .expect("the part count");
     assert_eq!(calls.len(), 2 * n, "each round reads every part: {calls:?}");
     assert_eq!(
         r.waves as usize,
@@ -5287,6 +5292,76 @@ fn a_later_parts_seat_failure_is_published_past_an_earlier_timeout_1958() {
         r.rows[0]
     );
     assert_eq!(r.rows[0].judge.as_deref(), Some("pi"), "{:?}", r.rows[0]);
+}
+
+/// (core#1958, codex r2) A higher part that fails first never keeps a lower part of its round from
+/// being asked: part 3's BROKEN is read (after part 2), kept and marked cut when part 4's seat
+/// fails, as the serial read kept it.
+#[test]
+fn a_higher_parts_seat_failure_never_drops_a_lower_parts_broken_1958() {
+    struct Reversed;
+    impl RuleJudge for Reversed {
+        fn ask(&self, _seat: &str, prompt: &str) -> JudgeAnswer {
+            let line = if prompt.starts_with("PART 2 OF ") {
+                // Answers last: parts 3 and 4 are back before it.
+                std::thread::sleep(Duration::from_millis(150));
+                "N/A — not touched"
+            } else if prompt.starts_with("PART 3 OF ") {
+                "BROKEN — b.json: unsafe"
+            } else if prompt.starts_with("PART 4 OF ") {
+                return JudgeAnswer::SeatFailed("not signed in".into());
+            } else {
+                "N/A — not touched"
+            };
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: {line}\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30),
+        big_file("c.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json", "c.json"]);
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &Reversed,
+        &NoMachine,
+    );
+    assert!(r.parts >= 4, "{}", r.parts);
+    assert_eq!(r.rows[0].status, RuleStatus::Broken, "{:?}", r.rows[0]);
+    assert_eq!(r.rows[0].evidence_complete, Some(false), "{:?}", r.rows[0]);
+    assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
 }
 
 /// (codex on #1514 v2) Parts and failures never lose what was found or hide what changed:
