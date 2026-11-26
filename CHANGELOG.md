@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
+  binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
+  binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported
+  who stood in. The post-fold write now keeps the fold's bindings, in reservation order, and its label, the same
+  way it keeps the fold's benches and floor overrides.
 - **An app's worktree under `WICKED_HOME` is no longer read as the graph store** (crew#1935). crew keeps app
   repositories and their worktrees under `WICKED_HOME/apps`, and `WICKED_HOME` is one of the store locations the
   estate-command fence's raw-SQLite arm guards. Every relative path-shaped word of an interpreter's program text
