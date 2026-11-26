@@ -4772,7 +4772,11 @@ fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
         prompts.len()
     );
     assert_eq!(r.calls, prompts.len() as u32);
-    assert_eq!(r.waves, prompts.len() as u32);
+    // (core#1958) The first part, then the rest up to MAX_PARALLEL at once.
+    assert_eq!(
+        r.waves as usize,
+        1 + (prompts.len() - 1).div_ceil(MAX_PARALLEL)
+    );
     assert!(
         prompts.iter().all(|p| p.starts_with("PART ")),
         "each part is named"
@@ -4922,9 +4926,17 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
     );
     let calls = judge.0.lock().unwrap();
     assert_eq!(r.calls, calls.len() as u32);
+    // (core#1958) Each round asks its first part, then the rest up to MAX_PARALLEL at once.
+    let n: usize = calls[0]
+        .1
+        .strip_prefix("PART 1 OF ")
+        .and_then(|t| t.split(' ').next())
+        .and_then(|t| t.parse().ok())
+        .expect("the part count");
+    assert_eq!(calls.len(), 2 * n, "each round reads every part: {calls:?}");
     assert_eq!(
-        r.waves,
-        calls.len() as u32,
+        r.waves as usize,
+        2 * (1 + (n - 1).div_ceil(MAX_PARALLEL)),
         "both rounds include their parts"
     );
     assert!(
@@ -4933,6 +4945,423 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
             .any(|(s, p)| s == "pi" && p.starts_with("PART 2 ")),
         "{calls:?}"
     );
+}
+
+/// (core#1958) A change judged in parts: parts 2..N go to the seat that answered part 1 at once
+/// (at most `MAX_PARALLEL` in flight), not one after another, so a batch costs
+/// 1 + ceil((N-1)/MAX_PARALLEL) rounds of seat calls, not N. Its rules are still answered on every
+/// part, by one seat.
+#[test]
+fn parts_after_the_first_are_asked_at_once_on_the_same_seat_1958() {
+    struct Overlap {
+        seats: Mutex<Vec<String>>,
+        in_flight: AtomicU32,
+        most: AtomicU32,
+        parts: AtomicU32,
+    }
+    impl RuleJudge for Overlap {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            self.seats.lock().unwrap().push(seat.to_string());
+            let later = prompt.starts_with("PART ") && !prompt.starts_with("PART 1 OF ");
+            if let Some(rest) = prompt.strip_prefix("PART 1 OF ") {
+                let n: u32 = rest
+                    .split(' ')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .expect("the part count");
+                self.parts.store(n, Ordering::SeqCst);
+            }
+            if later {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(now, Ordering::SeqCst);
+                // Wait (bounded) for a second later part to be in flight beside this one: asked
+                // one after another, none ever is.
+                let until = Instant::now() + Duration::from_secs(3);
+                while self.most.load(Ordering::SeqCst) < 2 && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: N/A — not touched\n"));
+            }
+            if later {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    let judge = Overlap {
+        seats: Mutex::new(Vec::new()),
+        in_flight: AtomicU32::new(0),
+        most: AtomicU32::new(0),
+        parts: AtomicU32::new(0),
+    };
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    let n = judge.parts.load(Ordering::SeqCst) as usize;
+    assert!((3..=MAX_PARTS).contains(&n), "a change of {n} parts");
+    assert_eq!(
+        r.rows[0].status,
+        RuleStatus::NotApplicable,
+        "{:?}",
+        r.rows[0]
+    );
+    assert_eq!(
+        r.rows[0].evidence_complete,
+        Some(true),
+        "every part was read"
+    );
+    let seats_asked = judge.seats.lock().unwrap();
+    assert_eq!(seats_asked.len(), n, "one call per part: {seats_asked:?}");
+    assert!(
+        seats_asked.iter().all(|s| s == &seats_asked[0]),
+        "one seat reads every part: {seats_asked:?}"
+    );
+    assert!(
+        judge.most.load(Ordering::SeqCst) >= 2,
+        "the later parts are asked at once, not one after another"
+    );
+    assert_eq!(
+        r.waves as usize,
+        1 + (n - 1).div_ceil(MAX_PARALLEL),
+        "the first part, then the rest {MAX_PARALLEL} at a time"
+    );
+}
+
+/// (core#1958) Parts asked at once share the check's call slots: with several batches in parts,
+/// never more than `MAX_PARALLEL` judge calls are in flight at any moment, and every rule is still
+/// answered on every part.
+#[test]
+fn parts_at_once_never_exceed_the_checks_call_slots_1958() {
+    struct Counted {
+        in_flight: AtomicU32,
+        most: AtomicU32,
+        calls: AtomicU32,
+    }
+    impl RuleJudge for Counted {
+        fn ask(&self, _seat: &str, prompt: &str) -> JudgeAnswer {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: N/A — not touched\n"));
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    let rules: Vec<ConformanceRule> = (0..20).map(|i| rule(&format!("R{i}"), "x")).collect();
+    let judge = Counted {
+        in_flight: AtomicU32::new(0),
+        most: AtomicU32::new(0),
+        calls: AtomicU32::new(0),
+    };
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &rules,
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    assert_eq!(r.rows.len(), 20);
+    assert!(
+        r.rows
+            .iter()
+            .all(|row| row.status == RuleStatus::NotApplicable
+                && row.evidence_complete == Some(true)),
+        "{:?}",
+        r.rows
+    );
+    assert!(r.calls > 3, "several batches, each in parts: {}", r.calls);
+    assert_eq!(r.calls, judge.calls.load(Ordering::SeqCst));
+    let most = judge.most.load(Ordering::SeqCst) as usize;
+    assert!(
+        (2..=MAX_PARALLEL).contains(&most),
+        "at most {MAX_PARALLEL} calls in flight, saw {most}"
+    );
+}
+
+/// (core#1958, codex r1) A later part asked on a helper thread still counts toward the seat's
+/// independence: its launch receipt reaches the worker that reads the batch's approvals, so a seat
+/// whose later part called the work's provider does not approve (it is benched; another seat
+/// judges the rule), as when the worker ran every part itself.
+#[test]
+fn a_later_parts_provider_receipt_still_disqualifies_its_approval_1958() {
+    const SHARED: &str = "rule-1958-shared.example:443";
+    struct Sharing;
+    impl RuleJudge for Sharing {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            if seat == "codex" && prompt.starts_with("PART 2 OF ") {
+                crate::observed_provider::record_receipt(seat, Some(vec![SHARED.to_string()]));
+            }
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: N/A — not touched\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+        fn approval_failure(&self, seat: &str) -> Option<String> {
+            crate::observed_provider::observed_this_thread(seat)
+                .iter()
+                .any(|p| p == SHARED)
+                .then(|| "observed calling the work's provider".to_string())
+        }
+    }
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &Sharing,
+        &NoMachine,
+    );
+    assert_eq!(
+        r.rows[0].status,
+        RuleStatus::NotApplicable,
+        "{:?}",
+        r.rows[0]
+    );
+    assert_eq!(
+        r.rows[0].judge.as_deref(),
+        Some("pi"),
+        "codex's approval does not stand: {:?}",
+        r.rows[0]
+    );
+    assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
+}
+
+/// (core#1958, codex r1) A later part's seat failure is published when its call returns, even
+/// when an earlier part's timeout ends the read before it: the seat is benched for the check.
+#[test]
+fn a_later_parts_seat_failure_is_published_past_an_earlier_timeout_1958() {
+    struct Scripted;
+    impl RuleJudge for Scripted {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            if seat == "codex" && prompt.starts_with("PART 2 OF ") {
+                return JudgeAnswer::TimedOut("timed out".into());
+            }
+            if seat == "codex" && prompt.starts_with("PART 3 OF ") {
+                return JudgeAnswer::SeatFailed("not signed in".into());
+            }
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: N/A — not touched\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &Scripted,
+        &NoMachine,
+    );
+    assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
+    assert_eq!(
+        r.rows[0].status,
+        RuleStatus::NotApplicable,
+        "{:?}",
+        r.rows[0]
+    );
+    assert_eq!(r.rows[0].judge.as_deref(), Some("pi"), "{:?}", r.rows[0]);
+}
+
+/// (core#1958, codex r2) A higher part that fails first never keeps a lower part of its round from
+/// being asked: part 3's BROKEN is read (after part 2), kept and marked cut when part 4's seat
+/// fails, as the serial read kept it.
+#[test]
+fn a_higher_parts_seat_failure_never_drops_a_lower_parts_broken_1958() {
+    struct Reversed;
+    impl RuleJudge for Reversed {
+        fn ask(&self, _seat: &str, prompt: &str) -> JudgeAnswer {
+            let line = if prompt.starts_with("PART 2 OF ") {
+                // Answers last: parts 3 and 4 are back before it.
+                std::thread::sleep(Duration::from_millis(150));
+                "N/A — not touched"
+            } else if prompt.starts_with("PART 3 OF ") {
+                "BROKEN — b.json: unsafe"
+            } else if prompt.starts_with("PART 4 OF ") {
+                return JudgeAnswer::SeatFailed("not signed in".into());
+            } else {
+                "N/A — not touched"
+            };
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: {line}\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30),
+        big_file("c.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json", "c.json"]);
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string()];
+    let r = check(
+        &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+            same_change: &[],
+        },
+        &Reversed,
+        &NoMachine,
+    );
+    assert!(r.parts >= 4, "{}", r.parts);
+    assert_eq!(r.rows[0].status, RuleStatus::Broken, "{:?}", r.rows[0]);
+    assert_eq!(r.rows[0].evidence_complete, Some(false), "{:?}", r.rows[0]);
+    assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
 }
 
 /// (codex on #1514 v2) Parts and failures never lose what was found or hide what changed:
@@ -5027,7 +5456,15 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
             "not every part was read"
         );
         assert!(r.parts >= 4, "{}", r.parts);
-        assert_eq!(r.calls, 2, "the first part and the failed second part");
+        // (core#1958) The later parts are asked at once, so the parts asked beside the failed
+        // second one may be calls too (one admitted after a seat failure or a stop is not); none
+        // of them is read past it.
+        let beside = (r.parts as usize - 1).min(MAX_PARALLEL);
+        assert!(
+            (2..=1 + beside).contains(&(r.calls as usize)),
+            "the first part, then the failed second part and those asked with it: {}",
+            r.calls
+        );
         assert_eq!(r.waves, 2, "the failed part attempt counts too");
         if matches!(part2, JudgeAnswer::SeatFailed(_)) {
             assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);

@@ -14,18 +14,109 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **The independence preflight answers only for roles the run's plan seats** (core#1954). A launch with no plan
-  and no workflow plans one unit with no review step: the preflight no longer lists a reviewer, and its judge is
-  conditional (the unit convenes one only when it changes the worktree). A team run's monitor row is sized from
-  the plan's launch score and its own ask, not always three: a plan the PA scopes keeps the top band until its
-  scope step scores it, and a zero target drops the row. `canStandIn` is true only where a stand-in sits today
-  (the reviewer, the judge, the QE reviewer, a party's place, and the rule judge on a run that is not reduced);
-  the council, rule council and monitor rows offer none.
-- **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
-  (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
-  from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
-  so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
-  way; a real seat keeps its key, and the parties keep the keys.
+- **core-ts 0.16.0** — 2026-11-26 — minor release on the train-16 cut f413ba88, carrying 12 PRs since 0.15.51: #1968, #1966, #1967, #1963, #1978, #1976, #1984, #1983, #1969, #1951, #1982, #1987. The engine's domain CLI loses commands and flags (J6 C3, core#1951, below), so this is a minor version. It builds on wicked-estate 0.36.2 (estate#642: `memory.learn` honours its scope and tier).
+  The entries below were written from each PR's changelog entry (the PR title or body where it had none).
+
+  - **The requirements minimum is gone from the engine** (core#1924, J6 C3; phase 2 after crew#1930 and studio#1434).
+    A 1.2.0 domain model has no minimum, and the last configured minimum went with the 1.1.0 build. Removed, each
+    refused by name before anything is opened (a flag in either spelling, `--name value` or `--name=value`, exit 1;
+    a removed command, exit 2 with usage, before the engine starts):
+    - `wicked-core domain-graph --schema-version 1.1.0` (the 1.1.0 build from confidence annotations), with its
+      `--coverage <F>` and `--min-coverage-pct <N>`; `domain-graph` builds 1.2.0 only (`--schema-version 1.2.0`
+      is still accepted; with no value or given twice it is refused), and `--retire` is checked the same way.
+      Stored 1.1.0 graphs are still read.
+    - `wicked-core coverage --min-coverage-pct [N]` (its exit 3); `coverage` only reports.
+    - `wicked-core requirements-target` (the repository's own target; a stored target node stays inert) and
+      `wicked-core seed-domain-validators` (the coverage validator, its script, its criterion and its pin
+      `COVERAGE_VALIDATOR_PIN`, and the preset's plan-time seed). A stored workflow that still pins that validator
+      (`9a2c71609c3e3ced`) is refused by name at plan time.
+    - `WICKED_REQUIREMENTS_MIN_COVERAGE_PCT` and, in `wicked-governance`, `MIN_COVERAGE_ENV`,
+      `DEFAULT_MIN_COVERAGE_PCT`, `parse_min_coverage_pct`, `min_coverage_pct_from_env`, `repo_min_coverage_pct`,
+      `set_repo_min_coverage_pct` and `effective_min_coverage_pct`.
+    - `scripts/install-local.py` checks the installed binary's version only (it asked the binary for that pin).
+    The requirements read of a stored 1.1.0 graph labels it with the minimum its own build recorded, or none
+    (`ModelCoverage.min_pct` is optional in Rust; a label written into a graph always carries it, as the schema
+    requires), and its `target` is always null.
+
+  - **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
+    (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
+    from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
+    so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
+    way; a real seat keeps its key, and the parties keep the keys.
+
+  - **The independence preflight answers only for roles the run's plan seats** (core#1954). A launch with no plan
+    and no workflow plans one unit with no review step: the preflight no longer lists a reviewer, and its judge is
+    conditional (the unit convenes one only when it changes the worktree). A team run's monitor row is sized from
+    the plan's launch score and its own ask, not always three: a plan the PA scopes keeps the top band until its
+    scope step scores it, and a zero target drops the row. `canStandIn` is true only where a stand-in sits today
+    (the reviewer, the judge, the QE reviewer, a party's place, and the rule judge on a run that is not reduced);
+    the council, rule council and monitor rows offer none.
+
+  - **Retrying a step whose checks the disk stopped re-runs only the checks** (core#1962). The gate of a floor the
+    machine stopped (no check ran for want of disk) says approving re-runs the checks, but the approve re-ran the
+    step's seat. A creator with nothing left to change then failed the substance floor ("changed nothing") and
+    spent a power round. A plain approve now re-runs the same checks on the work already there (`retry`, a new
+    `FloorRerunMode`: an engine older than this one cannot read a unit that holds it, so do not roll back across a
+    run with one); an approve with a note still runs the step again. A power build's disk refusal spends no
+    hand-off round either, and a checks-only re-run leaves queued operator messages for the next seat that runs.
+
+  - **A message to a step in the middle of its turn is refused instead of silently dropped** (core#1964). On a run with
+    no live terminal, a message to the seat of the step running now was queued for that step. A step takes its
+    messages when it is dispatched and, unless it is a power build between turns, reads none while its turn runs, so
+    the message never arrived while the inject answered OK. Such a message, a broadcast included (core#1486 keeps a
+    step's messages from every other step), is now refused with the reason (crew's route answers 409), and so is one
+    to a step a gate retry is running again. A step not yet dispatched, and a power build between its turns, still
+    hear theirs.
+
+  - **An app's worktree may name its own files by absolute path, and `cd` inside itself, again** (core#1956). The
+    estate fence's raw-SQLite arm still refused two spellings from an app's worktree under `WICKED_HOME/apps`:
+    an absolute path to a file of the worktree (`python3 <worktree>/check.py`), and a `cd` inside the worktree
+    followed by a `..` word (`cd queries && python3 -c 'open("../apps.json")'`), which was judged from every
+    directory the line could reach, the worktree root included. An absolute occurrence of the home that spells
+    exactly one file of the tree (the tree, then plain path characters with no `..`, as the whole word or as a
+    quoted literal in an interpreter's inline program; no link out of the tree or into another store) is now the
+    tree's business, and a line
+    `cd <plain dir> && …` whose later words cannot move the shell or the program is judged from where that `cd`
+    leads. Every other spelling and line is judged as before, and every existing deny still denies. Known limit:
+    a `CDPATH` the seat's shell inherits can send a bare `cd <dir>` elsewhere.
+
+  - **Each npm package of a seat's tree gets its own `node_modules`** (core#1970). On pod seats the engine filled one
+    read-only `node_modules` claim, from the root's lockfile. A run that built a new package in a subfolder
+    (`notes/`, with its own `package.json` and lockfile) left its seats resolving the root's dependencies, so QE's
+    harness crashed on a version the subfolder had not locked, while the floor, which installs per package, passed.
+    The seats now get a claim for the root and for each subfolder package with its own npm lockfile (not pnpm or
+    yarn) that the root's workspaces do not hold. A package inside another such package is left to that package's
+    install, a dir spelled with a glob or quote character is left out, and past 8 packages the rest are named on
+    the stream. Each claim is filled as the floor fills that package and mounted read-only at its own
+    `node_modules`. A package's own `.gitignore` counts for its `node_modules`. The set is read again at every unit,
+    so a package a step adds is filled before the next seat. A tree whose only npm package is in a subfolder is no
+    longer "not node". A package whose install fails makes the result a failure, and the claims that did fill are
+    still mounted. A tree with no subfolder npm lockfile ends at its root before any snapshot, as before. Host
+    (non-pod) seats still install the root only.
+
+  - **An unanswered process rule is not asked again alone** (core#1958). A one-line README change's rule check
+    took 704 s. The first round's process call left a process rule (RVWL-*) unanswered, and the check launched a
+    second seat run for that rule alone, before the gate could open. A process rule's row never blocks,
+    so the review check no longer asks it again: it stays `unchecked` and its reason says it was not asked again.
+    Change rules are still asked again alone, as before.
+
+  - **A rule judge lost at run time falls back to the judge stand-in** (core#1949). On a consented stand-in-aware
+    run, the steering-rule check took the run's judge stand-in only when no real seat was admitted. A real seat
+    that failed as a seat, or whose KEPT was refused for calling the work's provider, left its rules unchecked.
+    The stand-in now judges those rules once every real seat of the check is lost. It is never part of the
+    rotation or the council pool, and a BROKEN a real seat reached stands. A seat record keyed like the stand-in
+    (only an operator's `clis.toml` can name one) no longer answers as it, nor gets its provider waiver.
+
+  - **A broadcast sent while its step is mid-turn is held for the next step** (core#1979, the core half of
+    crew#1942). Since core#1964, a broadcast to a step that is already working on this attempt (no live terminal)
+    was refused. crew's working-document "Next" notes are such broadcasts, so a note written while a step ran
+    never reached the run. The engine now holds the broadcast for the next step that reads operator messages (a
+    seat step; a tool step reads none), which takes it at dispatch with its other operator messages. It is that
+    step's alone: the running step, even when a gate retry runs it again, does not take it. With no such later step
+    it is still refused, with that reason. A message for the running step's own seat is still refused. A message
+    still queued when a run ends goes with it, so a relaunch that reuses the run's id never hears it.
+
+  - **The self-test pins wicked-ci 3ca93005** (wicked-ci#91): the advisory S04 no longer fails a valid stand-in choice whose only unfillable rows are conditional.
 
 - **core-ts 0.15.51** — 2026-11-26 — patch release on the train-15 cut 14212d70, carrying 10 PRs since 0.15.50: #1939, #1942, #1943, #1915, #1922, #1941, #1947, #1948, #1960, #1950.
   The entries below were written from each PR's changelog entry (the PR title or body where it had none).
@@ -43,7 +134,7 @@ Two release tracks share this file, newest entry first regardless of track:
     a raw SQLite open of the graph and no Apps build landed. For a store location that holds the unit's own
     worktree, a relative word now names the store only when it resolves inside that location and outside the
     worktree (same normalize and symlink chain as the boundary). Still refused: the pin variables, every absolute
-    spelling (the literal arm is unchanged), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
+    spelling (the literal arm is unchanged here; core#1956 later lets a file of the worktree through), `../../memory.db`, `cd <home> && sqlite3 memory.db`, and an existing
     link in the tree to a store.
 
   - **Floor exclusion is on by default** (core#1101 item 3, operator decision 2026-11-25). `WICKED_FLOOR_EXCLUDE`

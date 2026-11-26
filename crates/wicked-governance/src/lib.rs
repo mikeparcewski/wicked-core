@@ -121,9 +121,9 @@ pub use domain_model::{
 };
 // J6 v3: the model garden's domain-run writes, read into domain-model 1.2.0, and the rulings on it.
 pub use domain_extract::{
-    build_and_persist, build_extract_model, now_unix, statement_key, write_ruling, Accounting,
-    BuildOutcome, ExtractIndex, ExtractMeta, RulingRefusal, RulingRequest, StatementView,
-    SCHEMA_V3,
+    assemble_build, build_and_persist, build_extract_model, now_unix, persist_build, statement_key,
+    write_ruling, Accounting, AssembledBuild, BuildOutcome, ExtractIndex, ExtractMeta,
+    RulingRefusal, RulingRequest, StatementView, SCHEMA_V3,
 };
 // Corroboration of each requirement (operator ruling 2026-10-31, "validation by duplication").
 pub use corroboration::{Corroboration, CorroborationIndex, Unconfirmed, VALIDATED_MIN_SOURCES};

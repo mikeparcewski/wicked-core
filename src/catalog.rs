@@ -1288,7 +1288,7 @@ fn steering_author_preset() -> Vec<PlanStep> {
 ///   store, where crew reads it (`requirements_graph_for_repo`). No human gate: a launch with
 ///   `HumanConfirm::None` ends with no gate.
 fn domain_extraction_preset() -> Vec<PlanStep> {
-    use crate::domain_extraction::garden_domain_step_cmd;
+    use crate::domain_extraction::domain_run_step_cmd;
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
     vec![
         PlanStep {
@@ -1296,9 +1296,8 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
             id: DOMAIN_RUN_STEP.to_string(),
             gate_type: Some(None),
             executor: Some(PhaseExecutor::Tool {
-                cmd: garden_domain_step_cmd(
+                cmd: domain_run_step_cmd(
                     DOMAIN_RUN_STEP,
-                    "scripts/domain/run.py",
                     "--scope \"${WICKED_DOMAIN_SCOPE:?the engine handed this step no scope; launch domain-extraction with one}\"",
                 ),
             }),
@@ -2073,7 +2072,8 @@ chmod +x node_modules/.bin/vitest
             unreachable!()
         };
         assert!(
-            cmd[2].starts_with("exec \"${WICKED_GARDEN_ROOT:?")
+            cmd[2].starts_with("[ -f \"${WICKED_GARDEN_ROOT:?")
+                && cmd[2].contains("; exec \"${WICKED_GARDEN_ROOT:?")
                 && cmd[2].contains("/scripts/wicked-garden\" run scripts/domain/run.py ")
                 && cmd[2].contains("--db \"$1\" --repo-root \"$2\""),
             "{}",
