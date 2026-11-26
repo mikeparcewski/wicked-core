@@ -171,9 +171,12 @@ pub const OLD_GARDEN_REFUSAL: &str = "this wicked-garden is too old to map a dom
 /// such script. The check runs in the step because the garden root is resolved per Tool unit (the
 /// generation the run was admitted against), not at launch.
 pub fn domain_run_step_cmd(step: &str, rest: &str) -> Vec<String> {
-    // RED (core#1955): no check, the old garden's launcher answers.
-    let _ = OLD_GARDEN_REFUSAL;
-    garden_domain_step_cmd(step, DOMAIN_RUN_SCRIPT, rest)
+    let mut cmd = garden_domain_step_cmd(step, DOMAIN_RUN_SCRIPT, rest);
+    cmd[2] = format!(
+        "[ -f \"${{WICKED_GARDEN_ROOT:?{NO_GARDEN_ROOT}}}/{DOMAIN_RUN_SCRIPT}\" ] || {{ echo '{OLD_GARDEN_REFUSAL}' >&2; exit 1; }}; {}",
+        cmd[2]
+    );
+    cmd
 }
 
 #[cfg(test)]
