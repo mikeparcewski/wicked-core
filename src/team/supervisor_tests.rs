@@ -2662,6 +2662,28 @@ fn an_absent_reviewer_is_on_the_record_with_a_minted_key() {
     );
 }
 
+/// core#1952: on a stand-in run the step's creator is a stand-in seat (`claude~1`). The absent
+/// reviewer's error is shown to the user as the engine wrote it, so it names the seat as the
+/// stand-in wire does (its CLI, "a stand-in"), never by the reserved `<base>~N` key.
+#[test]
+fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
+    let mut h = Harness::new("absent1952");
+    h.start("claude", &["claude~1"], "20-39");
+    h.claim(3, 1, "claude~1");
+    h.fx.write("src/lib.rs", "fn a() {}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    let error = joined[0]["error"].as_str().unwrap();
+    assert!(error.contains("no seat distinct from the PA"), "{error}");
+    assert!(
+        !error.contains('~'),
+        "no stand-in key in the words: {error}"
+    );
+    assert!(error.contains("a stand-in"), "{error}");
+}
+
 fn help_scaffold(
     h: &Harness,
     floor: i64,
