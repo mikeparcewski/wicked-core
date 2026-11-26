@@ -4940,6 +4940,62 @@ mod tests {
         );
     }
 
+    /// (core#1993) A gh that leaves a child holding its stdout and exits: the token it printed is
+    /// read at once, and the child is ended with gh's process group, so no reader thread is left
+    /// blocked on the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn a_gh_child_holding_stdout_neither_delays_the_token_nor_outlives_the_read_1993() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("gh-child-1993");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pidfile = base.join("child.pid");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\necho fake-gh-token-1993\nsleep 30 &\necho $! > '{}'\nexit 0\n", // ggignore: a made-up test value, not a secret
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let started = Instant::now();
+        let got = gh_token(&[("PATH", Path::new(&path))]);
+        let took = started.elapsed();
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let alive = || {
+            !pid.is_empty()
+                && std::process::Command::new("kill")
+                    .args(["-0", &pid])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+        };
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let still_alive = alive();
+        if still_alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+        }
+        assert_eq!(got, Ok("fake-gh-token-1993".into()), "took {took:?}");
+        assert!(took < Duration::from_secs(4), "the token waited {took:?}");
+        assert!(!still_alive, "the child holding stdout outlived the read");
+    }
+
     /// (core#1959, codex r1) A repository whose own config steers HTTP (here a proxy and TLS
     /// verification off, one through an include) is not given the GitHub credential.
     #[test]
