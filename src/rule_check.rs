@@ -4477,17 +4477,22 @@ fn judge_rows(
     // did not count (or that ran out of time) when another is live. A miss that carried a BROKEN
     // is not asked again: no other seat may answer it away (deny-dominates). (core#1958) Nor is a
     // process rule at review: its row never blocks (Q6), so a second seat launch for it alone only
-    // delays the gate. It stays unchecked and says why.
+    // delays the gate. It stays unchecked and says why. (The subject comes from the same
+    // `PackKind::Process` overlay that sets the row's `blocking: false` at review, in `check`.)
     let reported = |i: usize| {
         input.stage == CheckStage::Review && pending[i].subject == EvidenceSubject::Process
     };
-    let missing: Vec<Batch> = (0..pending.len())
+    let unasked: Vec<usize> = (0..pending.len())
         .filter(|i| !answered.contains_key(i))
         .filter(|i| !round.left.get(i).is_some_and(|l| l.holds))
+        .collect();
+    let missing: Vec<Batch> = unasked
+        .iter()
+        .copied()
         .filter(|i| !reported(*i))
         .map(|i| (vec![i], round.left.get(&i).cloned()))
         .collect();
-    for i in (0..pending.len()).filter(|i| !answered.contains_key(i) && reported(*i)) {
+    for i in unasked.into_iter().filter(|i| reported(*i)) {
         let w = why
             .entry(i)
             .or_insert_with(|| "the judge did not answer for it".into());
