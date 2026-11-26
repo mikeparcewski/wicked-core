@@ -5022,6 +5022,43 @@ mod tests {
         );
     }
 
+    /// (core#2004, codex-check on 4b42c1b) ITEM lines alone past the cap: nothing is cut, so the
+    /// findings are the output whole and are not marked trimmed (no `…` without a cut). With cut
+    /// lines beside them, every ITEM line stays and the one note names the cut, even where the
+    /// note takes the findings past 4096.
+    #[test]
+    fn item_lines_alone_past_the_cap_are_not_marked_trimmed_2004() {
+        let item = |n: u32| format!("ITEM {n}: PASS — {}", "c".repeat(85));
+        let items: Vec<String> = (1..=41).map(item).collect();
+        let only_items = format!("{}\nVERDICT: PASS", items.join("\n"));
+        assert!(only_items.chars().count() > EVALUATOR_FINDINGS_CAP);
+        let v = parse_evaluator_verdict(&only_items);
+        assert!(v.pass);
+        assert_eq!(v.findings, only_items, "nothing is cut");
+        assert!(!v.findings_trimmed, "no trim, so no trim flag");
+
+        let forty = &items[..40];
+        let mut with_rules = forty.join("\n");
+        for n in 1..=20 {
+            with_rules.push_str(&format!("\nRULE POL-{n:03}: N/A — not touched"));
+        }
+        with_rules.push_str("\nVERDICT: FAIL");
+        let v = parse_evaluator_verdict(&with_rules);
+        assert!(v.findings_trimmed, "rule lines were cut");
+        assert_eq!(
+            crate::review_context::parse_review_items(&v.findings).len(),
+            40,
+            "every ITEM line stays"
+        );
+        assert!(
+            v.findings
+                .contains("… 20 steering-rule lines not shown here"),
+            "{}",
+            v.findings
+        );
+        assert!(v.findings.ends_with("VERDICT: FAIL"));
+    }
+
     /// DES-L1 PR-1A §7 (4): the evaluator's OWN verdict grammar (des-adjudicated §4.1) — decoration
     /// tolerated, `:` or `=` head, case-insensitive, trailing punctuation trimmed, the LAST verdict
     /// line wins, `PASS` is the only pass; every other token, a bare head and no line are NOT PASS
