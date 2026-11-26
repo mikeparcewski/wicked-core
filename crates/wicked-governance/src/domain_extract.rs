@@ -441,7 +441,9 @@ impl ExtractIndex {
         })
     }
 
-    /// Whether the store holds no live v3 row (retired, malformed and orphan rows are not read).
+    /// Whether the index holds no live statement, target, group or follow-up (rulings are not
+    /// checked; retired, malformed and orphan rows are never read). Not "a v3 store": that is
+    /// [`ExtractIndex::holds_v3`].
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
             && self.targets.is_empty()
