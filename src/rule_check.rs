@@ -399,7 +399,8 @@ pub struct RuleCheckReport {
     #[serde(default)]
     pub calls: u32,
     /// Rounds of calls: the batch rounds plus the rounds of single re-asks, including the rounds
-    /// of later-part calls in each round (core#1958: up to [`MAX_PARALLEL`] parts at once).
+    /// of later-part calls in each round (core#1958: up to [`MAX_PARALLEL`] parts at once), as
+    /// scheduled: a call waiting for one of the check's shared call slots can stretch a round.
     #[serde(default)]
     pub waves: u32,
     #[serde(default)]
@@ -4770,8 +4771,10 @@ impl Pool {
     }
 
     /// `judge.ask(seat, prompt)` in one of the check's [`MAX_PARALLEL`] call slots: it waits for a
-    /// free one, and frees it when the call returns (or panics).
-    fn ask(&self, judge: &dyn RuleJudge, seat: &str, prompt: &str) -> JudgeAnswer {
+    /// free one, and frees it when the call returns (or panics). `None`: not asked, because the
+    /// check stopped or the seat failed while it waited (codex r1). A seat failure or a stop is
+    /// published the moment the call returns, whichever part order its answer is read in.
+    fn ask(&self, judge: &dyn RuleJudge, seat: &str, prompt: &str) -> Option<JudgeAnswer> {
         struct Slot<'a>(&'a Pool);
         impl Drop for Slot<'_> {
             fn drop(&mut self) {
@@ -4780,14 +4783,27 @@ impl Pool {
             }
         }
         {
-            let mut n = self.in_flight.lock().unwrap();
+            let mut n = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             while *n >= MAX_PARALLEL {
-                n = self.freed.wait(n).unwrap();
+                n = self.freed.wait(n).unwrap_or_else(|e| e.into_inner());
             }
             *n += 1;
         }
         let _slot = Slot(self);
-        judge.ask(seat, prompt)
+        if self.stopped() || self.dead.lock().unwrap().contains(seat) {
+            return None;
+        }
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let answer = judge.ask(seat, prompt);
+        match &answer {
+            JudgeAnswer::SeatFailed(_) => {
+                self.dead.lock().unwrap().insert(seat.to_string());
+            }
+            JudgeAnswer::Stopped(_) => self.stop.store(true, std::sync::atomic::Ordering::SeqCst),
+            JudgeAnswer::Answered(_) | JudgeAnswer::TimedOut(_) => {}
+        }
+        Some(answer)
     }
 }
 
@@ -5019,13 +5035,17 @@ fn run_pool(
                     if pool.stopped() {
                         break;
                     }
-                    pool.calls
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(answer) = pool.ask(judge, seat, &text) else {
+                        if pool.stopped() {
+                            break;
+                        }
+                        continue;
+                    };
                     if stand_in.as_ref() == Some(seat) {
                         pool.stood_in
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    match pool.ask(judge, seat, &text) {
+                    match answer {
                         JudgeAnswer::Answered(out) => {
                             got = Some((seat.clone(), out));
                             break;
@@ -5091,19 +5111,22 @@ fn run_pool(
                                 .iter()
                                 .map(|&k| {
                                     ps.spawn(move || {
-                                        let dead = pool.dead.lock().unwrap().contains(seat);
-                                        if pool.stopped() || dead {
-                                            return None;
-                                        }
-                                        pool.calls
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        Some(pool.ask(judge, seat, &part_text(k)))
+                                        let answer = pool.ask(judge, seat, &part_text(k));
+                                        (answer, crate::observed_provider::take_receipts())
                                     })
                                 })
                                 .collect();
+                            // (codex r1) A launch's provider receipts are thread-local: each
+                            // part's are handed back to this worker, which reads the batch's
+                            // approvals (`RuleJudge::approval_failure`) as when it ran every part.
                             calls
                                 .into_iter()
-                                .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                                .map(|h| {
+                                    let (answer, receipts) =
+                                        h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                                    crate::observed_provider::restore_receipts(receipts);
+                                    answer
+                                })
                                 .collect()
                         });
                         if answers.iter().any(Option::is_some) {

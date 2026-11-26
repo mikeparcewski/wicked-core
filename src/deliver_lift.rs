@@ -464,7 +464,9 @@ fn fetch_origin_with(
             }
             cmd.env("GIT_CONFIG_COUNT", (base + entries.len()).to_string());
             // No inherited trace may record the header (GIT_TRACE_CURL logs request headers,
-            // trace2 can log config values).
+            // trace2 can log config values). (core#1959, codex r1) The trace targets are set OFF,
+            // not only unset: a trace2 target in the system or global git config is overridden
+            // only by its variable.
             for t in [
                 "GIT_TRACE",
                 "GIT_TRACE_CURL",
@@ -473,6 +475,10 @@ fn fetch_origin_with(
                 "GIT_TRACE2",
                 "GIT_TRACE2_EVENT",
                 "GIT_TRACE2_PERF",
+            ] {
+                cmd.env(t, "0");
+            }
+            for t in [
                 "GIT_TRACE2_CONFIG_PARAMS",
                 "GIT_TRACE2_ENV_VARS",
                 "GIT_CURL_VERBOSE",
@@ -2483,6 +2489,33 @@ fn github_fetch_for(
     let Some(url) = github_canonical_url(&raw, base) else {
         return Ok(None);
     };
+    // (codex r1) The repository's own config must not steer where the credential goes: an
+    // `http.*` key (a resolve override, a proxy, a CA, TLS verification) or origin's proxy set in
+    // the repository (or worktree) config, includes followed, keeps the credential out.
+    let local = git_string(
+        cwd,
+        &[
+            "config",
+            "--show-scope",
+            "--includes",
+            "--get-regexp",
+            r"^(https?\.|remote\.origin\.proxy)",
+        ],
+        env,
+    )
+    .unwrap_or_default();
+    let steered: Vec<&str> = local
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(scope, _)| matches!(*scope, "local" | "worktree"))
+        .filter_map(|(_, kv)| kv.split_whitespace().next())
+        .collect();
+    if !steered.is_empty() {
+        return Err(format!(
+            "the repository's own git config sets {}, so the credential is not sent",
+            steered.join(", ")
+        ));
+    }
     let token = match env_of(env, "GH_TOKEN") {
         Some(t) => t,
         None => gh_token(env)?,
@@ -2530,7 +2563,24 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
         }
         Err(e) => return Err(format!("could not run gh to read its token: {e}")),
     };
+    // (codex r1) The read is bounded too: a gh whose child keeps stdout open never holds the fetch.
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = String::new();
+        if let Some(s) = stdout {
+            let _ = s.take(64 * 1024).read_to_string(&mut out);
+        }
+        let _ = tx.send(out);
+    });
     let deadline = Instant::now() + GH_TOKEN_TIMEOUT;
+    let late = || {
+        format!(
+            "gh did not answer for its token within {}s",
+            GH_TOKEN_TIMEOUT.as_secs()
+        )
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -2538,18 +2588,13 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "gh did not answer for its token within {}s",
-                    GH_TOKEN_TIMEOUT.as_secs()
-                ));
+                return Err(late());
             }
         }
     };
-    let mut out = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut out);
-    }
+    let out = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| late())?;
     let token = out.trim();
     if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {
         return Err(format!(
@@ -4613,9 +4658,16 @@ mod tests {
         run_git(&clone, &["init", "-q", "-b", "main", "."]);
         let url = format!("http://127.0.0.1:{port}/acme/private.git");
         run_git(&clone, &["remote", "add", "origin", &url]);
+        // Hermetic: no system or global config, no inherited `-c` helper, no proxy (codex r1).
         let env: Vec<(&str, &Path)> = vec![
             ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
             ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                Path::new("'credential.helper=' 'core.fsmonitor=false'"),
+            ),
+            ("NO_PROXY", Path::new("127.0.0.1")),
+            ("no_proxy", Path::new("127.0.0.1")),
             ("GH_TOKEN", Path::new(token)),
         ];
         let got = fetch_origin_at(&clone, &env, &format!("http://127.0.0.1:{port}/"));
@@ -4698,6 +4750,47 @@ mod tests {
         let err = with("other").unwrap_err();
         assert!(
             err.contains("gh holds no token for github.com as other"),
+            "{err}"
+        );
+    }
+
+    /// (core#1959, codex r1) A repository whose own config steers HTTP (here a proxy and TLS
+    /// verification off, one through an include) is not given the GitHub credential.
+    #[test]
+    fn a_repository_that_steers_its_own_http_gets_no_credential_1959() {
+        let base = scratch("steered-1959");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main", "."]);
+        run_git(
+            &clone,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/private.git",
+            ],
+        );
+        let env: Vec<(&str, &Path)> = vec![
+            ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+            ("GH_TOKEN", Path::new("unused-1959")), // ggignore: a made-up test value
+        ];
+        assert!(github_fetch_for(&clone, &env, GITHUB_BASE)
+            .expect("a plain origin gets the credential")
+            .is_some());
+        let inc = base.join("steer.gitconfig");
+        std::fs::write(&inc, "[http]\n\tsslVerify = false\n").unwrap();
+        run_git(&clone, &["config", "include.path", inc.to_str().unwrap()]);
+        run_git(
+            &clone,
+            &["config", "remote.origin.proxy", "http://127.0.0.1:9"],
+        );
+        let err = github_fetch_for(&clone, &env, GITHUB_BASE)
+            .err()
+            .expect("a steered repository gets none");
+        assert!(
+            err.contains("http.sslverify") && err.contains("remote.origin.proxy"),
             "{err}"
         );
     }
