@@ -380,6 +380,10 @@ pub(crate) fn fetch_origin(cwd: &Path) -> Result<(), String> {
 /// (core#1959) The GitHub origins a failed fetch is retried on with the deliver step's credential.
 const GITHUB_BASE: &str = "https://github.com/";
 
+/// The fetch refspec the credentialed fetch uses (an explicit URL fetches no configured mapping).
+/// The GitHub retry runs only where `remote.origin.fetch` is exactly this (core#1959).
+const ORIGIN_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+
 fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
     fetch_origin_at(cwd, env, GITHUB_BASE)
 }
@@ -448,7 +452,7 @@ fn fetch_origin_with(
                 "--no-recurse-submodules",
             ])
             .arg(&a.url)
-            .arg("+refs/heads/*:refs/remotes/origin/*")
+            .arg(ORIGIN_REFSPEC)
             .env("GIT_ALLOW_PROTOCOL", scheme);
             // APPENDED after any inherited `GIT_CONFIG_*` entries (an operator's `http.proxy` or
             // `http.sslCAInfo` keeps applying), never over them.
@@ -2513,12 +2517,25 @@ fn github_fetch_for(
         env,
     )
     .unwrap_or_default();
-    let steered: Vec<&str> = local
+    let mut steered: Vec<&str> = local
         .lines()
         .filter_map(|l| l.split_once('\t'))
         .filter(|(scope, _)| matches!(*scope, "local" | "worktree"))
         .filter_map(|(_, kv)| kv.split_whitespace().next())
         .collect();
+    // (codex-check on cc29697) The retry fetches with [`ORIGIN_REFSPEC`], not origin's configured
+    // mapping: so it runs only when the mapping, in every scope, is exactly that one refspec. Any
+    // other (`release` onto `origin/main`, say) could give the run a different base; that fetch
+    // fails loudly, as it did before the retry.
+    let mapping = git_string(
+        cwd,
+        &["config", "--includes", "--get-all", "remote.origin.fetch"],
+        env,
+    )
+    .unwrap_or_default();
+    if mapping.lines().map(str::trim).collect::<Vec<_>>() != [ORIGIN_REFSPEC] {
+        steered.push("remote.origin.fetch");
+    }
     if !steered.is_empty() {
         return Err(format!(
             "the repository's own git config sets {}, so the credential is not sent",
