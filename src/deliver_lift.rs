@@ -4582,52 +4582,21 @@ mod tests {
         );
     }
 
-    /// (core#1959) A private GitHub origin on a machine with no git credential helper: the plain
-    /// fetch is refused, so the engine fetches again with the credential the deliver step uses
-    /// (here an exported `GH_TOKEN`). A local server stands in for github.com: it answers 401 to
-    /// any request without that exact Basic header, and serves the bare repo (git's dumb HTTP
-    /// protocol) to one with it. No global or system git config is read (no keychain).
+    /// (core#1959) A local server standing in for github.com: it answers 401 to any request without
+    /// the exact Basic header for `token`, and serves the bare repo `served` (git's dumb HTTP
+    /// protocol, under `/acme/private.git/`) to one with it. Returns the port.
     #[cfg(unix)]
-    #[test]
-    fn a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959() {
+    fn serve_private_repo_1959(served: &Path, token: &str) -> u16 {
         use base64::Engine as _;
         use std::io::{Read, Write};
-        if crate::test_sandbox::skip(
-            crate::test_sandbox::Need::Loopback,
-            "a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959",
-        ) {
-            return;
-        }
-        let base = scratch("gh-fetch-1959");
-        let seed = base.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        run_git(&seed, &["init", "-q", "-b", "main", "."]);
-        identity(&seed);
-        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
-        run_git(&seed, &["add", "-A"]);
-        run_git(&seed, &["commit", "-qm", "base"]);
-        let tip = run_git(&seed, &["rev-parse", "HEAD"]);
-        let served = base.join("srv").join("private.git");
-        std::fs::create_dir_all(served.parent().unwrap()).unwrap();
-        run_git(
-            &base,
-            &[
-                "clone",
-                "-q",
-                "--bare",
-                seed.to_str().unwrap(),
-                served.to_str().unwrap(),
-            ],
-        );
-        run_git(&served, &["update-server-info"]);
-        let token = "fake-token-for-the-1959-test"; // ggignore: a made-up test value, not a secret
+        run_git(served, &["update-server-info"]);
         let want = format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let root = served.clone();
+        let root = served.to_path_buf();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut c) = conn else { continue };
@@ -4673,13 +4642,14 @@ mod tests {
                 let _ = c.write_all(&resp);
             }
         });
-        let clone = base.join("clone");
-        std::fs::create_dir_all(&clone).unwrap();
-        run_git(&clone, &["init", "-q", "-b", "main", "."]);
-        let url = format!("http://127.0.0.1:{port}/acme/private.git");
-        run_git(&clone, &["remote", "add", "origin", &url]);
-        // Hermetic: no system or global config, no inherited `-c` helper, no proxy (codex r1).
-        let env: Vec<(&str, &Path)> = vec![
+        port
+    }
+
+    /// The hermetic env for the fetch tests: no system or global config, no inherited `-c` helper,
+    /// no proxy (codex r1), and `token` exported as `GH_TOKEN`.
+    #[cfg(unix)]
+    fn hermetic_env_1959(token: &str) -> Vec<(&'static str, &Path)> {
+        vec![
             ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
             ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
             (
@@ -4689,7 +4659,51 @@ mod tests {
             ("NO_PROXY", Path::new("127.0.0.1")),
             ("no_proxy", Path::new("127.0.0.1")),
             ("GH_TOKEN", Path::new(token)),
-        ];
+        ]
+    }
+
+    /// (core#1959) A private GitHub origin on a machine with no git credential helper: the plain
+    /// fetch is refused, so the engine fetches again with the credential the deliver step uses
+    /// (here an exported `GH_TOKEN`), against [`serve_private_repo_1959`]. No global or system git
+    /// config is read (no keychain).
+    #[cfg(unix)]
+    #[test]
+    fn a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959",
+        ) {
+            return;
+        }
+        let base = scratch("gh-fetch-1959");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let tip = run_git(&seed, &["rev-parse", "HEAD"]);
+        let served = base.join("srv").join("private.git");
+        std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                served.to_str().unwrap(),
+            ],
+        );
+        let token = "fake-token-for-the-1959-test"; // ggignore: a made-up test value, not a secret
+        let port = serve_private_repo_1959(&served, token);
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main", "."]);
+        let url = format!("http://127.0.0.1:{port}/acme/private.git");
+        run_git(&clone, &["remote", "add", "origin", &url]);
+        let env = hermetic_env_1959(token);
         let got = fetch_origin_at(&clone, &env, &format!("http://127.0.0.1:{port}/"));
         assert_eq!(
             got,
@@ -4701,6 +4715,76 @@ mod tests {
             tip,
             "origin/main is the remote's tip"
         );
+    }
+
+    /// (core#1959, codex-check on cc29697) A clone whose own `remote.origin.fetch` maps the remote's
+    /// `release` onto `origin/main`: the plain fetch is refused, and the retry with the credential
+    /// must not pick a different base. Fetched with a fixed `+refs/heads/*:refs/remotes/origin/*`,
+    /// origin/main would silently become the remote's `main`; a fetch that fails loudly is right.
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_origin_fetch_mapping_never_gets_a_different_base_1959() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_custom_origin_fetch_mapping_never_gets_a_different_base_1959",
+        ) {
+            return;
+        }
+        let base = scratch("gh-fetch-refspec-1959");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("README.md"), "release\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "release"]);
+        run_git(&seed, &["branch", "release"]);
+        std::fs::write(seed.join("README.md"), "main\n").unwrap();
+        run_git(&seed, &["commit", "-qam", "main moves on"]);
+        let remote_main = run_git(&seed, &["rev-parse", "main"]);
+        let served = base.join("srv").join("private.git");
+        std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                served.to_str().unwrap(),
+            ],
+        );
+        let token = "fake-token-for-the-1959-test"; // ggignore: a made-up test value, not a secret
+        let port = serve_private_repo_1959(&served, token);
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main", "."]);
+        let url = format!("http://127.0.0.1:{port}/acme/private.git");
+        run_git(&clone, &["remote", "add", "origin", &url]);
+        run_git(
+            &clone,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/release:refs/remotes/origin/main",
+            ],
+        );
+        let env = hermetic_env_1959(token);
+        let got = fetch_origin_at(&clone, &env, &format!("http://127.0.0.1:{port}/"));
+        let origin_main = git_string(
+            &clone,
+            &["rev-parse", "-q", "--verify", "refs/remotes/origin/main"],
+            &env,
+        )
+        .ok();
+        assert_ne!(
+            origin_main.as_deref(),
+            Some(remote_main.as_str()),
+            "origin/main must not become the remote's main ({got:?})"
+        );
+        let err = got.expect_err("the fetch fails loudly");
+        assert!(err.contains("remote.origin.fetch"), "{err}");
     }
 
     /// (core#1959) Only an `owner/repo` URL on the GitHub base gets the credential: no other host,
