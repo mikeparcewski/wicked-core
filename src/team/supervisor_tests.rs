@@ -2672,7 +2672,9 @@ fn an_absent_reviewer_is_on_the_record_with_a_minted_key() {
 #[test]
 fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
     let mut h = Harness::new("absent1952");
-    h.start("claude", &["claude~1"], "20-39");
+    // The launch roster as distribution writes it (no stand-in key on it); the stand-in is the
+    // step's creator, and the PA is never a member candidate.
+    h.start("claude", &["claude"], "20-39");
     h.claim(3, 1, "claude~1");
     h.fx.write("src/lib.rs", "fn a() {}\n");
     h.checkpoint(3, 1, 1, "edit");
@@ -2689,6 +2691,17 @@ fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
         error.contains("(Claude Code, a stand-in)"),
         "its CLI's display name: {error}"
     );
+}
+
+/// core#1952: the words helper. A stand-in of an instance reads that instance's name (falling
+/// back to its credential key); a real seat keeps its key even when it has a display name.
+#[test]
+fn seat_words_names_stand_ins_and_keeps_real_keys_1952() {
+    let host = FakeHost::new(|_, _| Ok("DONE".into()));
+    assert_eq!(seat_words(&host, "claude~3"), "Claude Code, a stand-in");
+    assert_eq!(seat_words(&host, "claude#2~1"), "claude#2, a stand-in");
+    assert_eq!(seat_words(&host, "claude"), "claude");
+    assert_eq!(seat_words(&host, "codex#2"), "codex#2");
 }
 
 fn help_scaffold(
