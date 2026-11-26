@@ -1174,8 +1174,9 @@ pub(super) fn apply_rerun(
                 .partition(|c| rerun.waive.iter().any(|w| w == &c.name));
             Ok((run, waived.into_iter().map(|c| c.name).collect()))
         }
-        // The fix already ran; its floor is the ordinary one, on the fixed tree.
-        FloorRerunMode::FloorFix => Ok((detected, Vec::new())),
+        // The fix already ran; its floor is the ordinary one, on the fixed tree. (core#1962) A
+        // retry of a floor the machine stopped is the ordinary floor, on the tree as it stands.
+        FloorRerunMode::FloorFix | FloorRerunMode::Retry => Ok((detected, Vec::new())),
     }
 }
 

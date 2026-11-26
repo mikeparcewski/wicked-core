@@ -11010,7 +11010,8 @@ fn denial_gate_prompt_body(
             let (verb, cause) = floor_not_run(unit).map_or(("run", ""), |f| (f.verb, f.cause));
             format!(
                 "Unit {ord}'s checks did not {verb}: {cause}. Approve to retry the step once that \
-                 is fixed (its checks run again), or reject to cancel the run{note}"
+                 is fixed (its checks run again, on the work already there), or reject to cancel \
+                 the run{note}"
             )
         }
         "floor_failed" if floor_fix_applies(unit) => format!(
@@ -20676,6 +20677,25 @@ pub(crate) fn confirm_gate_expecting(
     // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
     // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
     let mut intent_amendment: Option<String> = None;
+    // (core#1962) A plain approve at a floor the MACHINE stopped (no check ran for want of disk)
+    // re-runs the checks on the work already there, as its gate says: the seat does not run
+    // again. Re-dispatching the step sent a creator with nothing left to change, whose empty
+    // attempt then failed the substance floor and spent a power round. A note is for the seat.
+    let decision = match decision {
+        crate::workflow::HumanDecision::Approve { amend, .. }
+            if amend.as_deref().is_none_or(|a| a.trim().is_empty())
+                && !adjudication_open
+                && !floor_fix_route
+                && !team_gate::transport_gate_open(&session)
+                && !team_gate::dispute_gate_open(&session)
+                && crate::domain::session_units(store, run_id)?
+                    .get(session.unit_ix)
+                    .is_some_and(|u| floor_not_run(u).is_some()) =>
+        {
+            crate::workflow::HumanDecision::FloorRerun(crate::repo_checks::FloorRerunMode::Retry)
+        }
+        d => d,
+    };
     let (amend, amend_scope, rework): (
         Option<String>,
         crate::workflow::AmendScope,
@@ -21781,6 +21801,23 @@ fn floor_rerun_request(
     unit: &crate::domain::WorkUnit,
     mode: crate::repo_checks::FloorRerunMode,
 ) -> anyhow::Result<crate::repo_checks::FloorRerun> {
+    // (core#1962) A retry answers only a floor the machine stopped: the same checks, nothing waived.
+    if mode == crate::repo_checks::FloorRerunMode::Retry {
+        if floor_not_run(unit).is_none() {
+            anyhow::bail!(
+                "unit {}'s checks ran, so a checks-only retry would not answer its gate",
+                unit.ord
+            );
+        }
+        return Ok(crate::repo_checks::FloorRerun {
+            mode,
+            waive: Vec::new(),
+            output: crate::domain::get_unit_transcript(store, &unit.id)
+                .and_then(|t| t.output)
+                .unwrap_or_default(),
+            fix: None,
+        });
+    }
     let source = unit.denial.as_ref().map(|d| d.source.as_str());
     let report = unit
         .repo_checks
