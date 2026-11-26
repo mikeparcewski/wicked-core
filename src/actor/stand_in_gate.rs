@@ -330,7 +330,6 @@ pub(crate) fn reserve_team(
     only: &[String],
     give_up: Option<std::time::Instant>,
 ) -> anyhow::Result<Vec<crate::standin::SeatedStandIn>> {
-    let _ = give_up; // red scaffold (core#1999): not yet read
     use crate::standin as si;
     use wicked_apps_core::spawn::seat_id;
     let Some(mut session) = crate::domain::get_session(store, run_id)? else {
@@ -443,8 +442,9 @@ pub(crate) fn reserve_team(
         session.assurance.stand_ins.push(s.binding.clone());
         si::note_label(&mut session.assurance, &s.binding, s.binding.display());
     }
-    if seated.is_empty() {
-        return Ok(seated);
+    // (core#1999) The asker stopped waiting: nothing it would never run on is left seated.
+    if seated.is_empty() || give_up.is_some_and(|t| std::time::Instant::now() >= t) {
+        return Ok(Vec::new());
     }
     crate::domain::put_node(store, session.to_node())?;
     for s in &seated {
@@ -466,8 +466,8 @@ pub(crate) fn reserve_team(
 /// own and must run on a CLI whose own switch keeps it out of the base's sessions
 /// (`execute_wrapped::host_stand_in_admits`, the check a host-floor stand-in unit passes); that
 /// switch rides the ballot's trust flags (appended after the template, as every ballot's are):
-/// claude `--no-session-persistence`, pi `--no-session`, codex `--ephemeral`. The governed unit
-/// path also turns claude's auto-memory off; a ballot has no environment hook for it (filed).
+/// claude `--no-session-persistence`, pi `--no-session`, codex `--ephemeral`. A stand-in claude
+/// ballot also runs with auto-memory off, set by the dispatcher (`stand_in_ballot_env`, core#1996).
 fn host_floor_ballot(record: &crate::AgenticCli) -> Result<crate::AgenticCli, String> {
     use wicked_apps_core::spawn::SeatCli;
     let binary = crate::execute_wrapped::template_binary(&record.headless_invocation);

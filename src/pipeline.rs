@@ -4466,19 +4466,20 @@ fn gate_receipt(
             },
         });
     }
-    if let Some(roles) = roles {
-        // (core#1997) The attempt's team roles count too: a council that seated a stand-in voter,
-        // or a monitor on a stand-in binding, took part, though neither reaches `roles`.
-        let monitors = unit
-            .team
-            .as_ref()
-            .and_then(|t| t.ledger.as_ref())
-            .map(|l| l.monitors.as_slice())
-            .unwrap_or_default();
-        let team = a::team_independence(&r.councils, monitors);
-        let team_stood = a::stood_in(team.as_deref());
-        r.independence = a::with_team(a::independence_of(&roles), team);
-        if team_stood || roles.iter().any(a::RoleRecord::is_stand_in) {
+    if let Some(mut roles) = roles {
+        // (core#1997) The attempt's team roles are role records too: each council voter and each
+        // monitor its team ledger recorded.
+        if let Some(ledger) = unit.team.as_ref().and_then(|t| t.ledger.as_ref()) {
+            roles.extend(a::team_roles(
+                run,
+                unit.ord,
+                attempt,
+                &a::ledger_councils(ledger),
+                &ledger.monitors,
+            ));
+        }
+        r.independence = a::receipt_independence(&roles);
+        if roles.iter().any(a::RoleRecord::is_stand_in) {
             r.stand_in_label = run.stand_in_label.clone();
             r.project_stand_ins(&run.stand_in_label.clone().unwrap_or_default());
         }
@@ -8245,8 +8246,23 @@ mod guarded_read_step_tests {
             let delivery = crate::deliver_lift::delivery_receipt(&session, &[carried]);
             (gate, delivery)
         };
-        // All real: independent at the gate and at delivery, both checks ran.
-        let (gate, delivery) = delivered(&teamed(vec![], vec![]));
+        // All real: independent at the gate and at delivery, both checks ran. A real monitor is a
+        // record of its own and changes nothing (codex r1).
+        let (gate, delivery) = delivered(&teamed(
+            vec![crate::team::LedgerMonitor {
+                monitor_id: "m1".into(),
+                seat: "sj-codex".into(),
+                batches: 1,
+                status: crate::team::MonitorStatus::Completed,
+                error: None,
+            }],
+            vec![],
+        ));
+        for r in [&gate, &delivery] {
+            let monitor = team_records(r, "monitor");
+            assert_eq!(monitor.len(), 1, "{monitor:?}");
+            assert_eq!(monitor[0].filled, crate::assurance::FILLED_REAL);
+        }
         assert_eq!(
             gate.independence.as_deref(),
             Some(crate::assurance::INDEPENDENT)
@@ -8354,6 +8370,66 @@ mod guarded_read_step_tests {
             1,
             "the delivery records the monitor off the unit's own ledger"
         );
+        // (codex r1) A unit with no ledger left delivers the councils its gate recorded, though
+        // that gate predates team role records; a member-step council keeps the attempt its
+        // review judged.
+        let mut gate = super::gate_receipt(
+            &store,
+            "r",
+            &teamed(vec![], vec![finding.clone()]),
+            &run,
+            1,
+            facts(),
+        );
+        gate.roles.as_mut().unwrap().retain(|x| x.role != "council");
+        let mut ledgerless = review.clone();
+        ledgerless.assurance = Some(gate);
+        ledgerless.member_step = Some(crate::domain::MemberStepState {
+            reviews: vec![crate::team::StepReviewRecord {
+                step_id: "s1".into(),
+                reviewed_attempt: 0,
+                verdict: crate::team::events::StepVerdict::Rejected,
+                to: None,
+                reason: "r".into(),
+                held: Some(true),
+                member_reason: None,
+                dispute: finding.dispute.clone(),
+            }],
+            ..Default::default()
+        });
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[ledgerless]);
+        let council = team_records(&delivery, "council");
+        let on = |subject: &str| {
+            council
+                .iter()
+                .filter(|r| r.subject.as_deref() == Some(subject))
+                .map(|r| r.attempt)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on("council:0"), vec![Some(1); 3], "{council:?}");
+        assert!(on("finding:f1").is_empty(), "{council:?}");
+        assert_eq!(on("step:s1:0"), vec![Some(0); 3], "{council:?}");
+        assert_eq!(
+            delivery.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENCE_MIXED)
+        );
+        // (codex r2) A ledgerless unit whose gate already has its council records delivers each
+        // voter once, under the gate's own subject.
+        let mut ledgerless = review.clone();
+        ledgerless.assurance = Some(super::gate_receipt(
+            &store,
+            "r",
+            &teamed(vec![], vec![finding.clone()]),
+            &run,
+            1,
+            facts(),
+        ));
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[ledgerless]);
+        let council = team_records(&delivery, "council");
+        assert_eq!(council.len(), 3, "{council:?}");
+        assert!(council
+            .iter()
+            .all(|r| r.subject.as_deref() == Some("finding:f1")));
     }
 
     /// The role records a receipt keeps for one team role, in seat order.
