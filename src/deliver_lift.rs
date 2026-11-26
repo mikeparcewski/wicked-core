@@ -2827,6 +2827,67 @@ mod tests {
         assert_eq!(pat_header("pat"), "Basic OnBhdA==");
     }
 
+    /// (core#1994) An Azure DevOps origin whose own config maps `release` onto `origin/main` gets no
+    /// credentialed fetch: that fetch uses `+refs/heads/*:refs/remotes/origin/*` and would make the
+    /// remote's `main` the run's base. It gets the plain fetch, with its own mapping. A default
+    /// mapping still gets the credential.
+    #[test]
+    fn an_ado_origin_with_its_own_fetch_mapping_gets_the_plain_fetch_1994() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let names: Vec<&str> = std::iter::once(ADO_PAT_ENV)
+            .chain(ADO_SP_ENV.iter().copied())
+            .collect();
+        let prev: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for n in &names {
+            std::env::remove_var(n);
+        }
+        std::env::set_var(ADO_PAT_ENV, "fake-pat-for-the-1994-test"); // ggignore: a made-up test value, not a secret
+        let dir = scratch("ado-mapping-1994");
+        run_git(&dir, &["init", "-q", "-b", "main", "."]);
+        run_git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://dev.azure.com/org/p/_git/repo",
+            ],
+        );
+        let env: Vec<(&str, &Path)> = vec![
+            ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+        ];
+        let plain = ado_fetch_for(&dir, &env);
+        run_git(
+            &dir,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/release:refs/remotes/origin/main",
+            ],
+        );
+        let mapped = ado_fetch_for(&dir, &env);
+        for (k, v) in names.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(
+            matches!(&plain, Ok(Some(a)) if a.url == "https://dev.azure.com/org/p/_git/repo"),
+            "a default mapping still gets the credential: {:?}",
+            plain.map(|a| a.map(|a| a.url))
+        );
+        assert!(
+            matches!(mapped, Ok(None)),
+            "a custom mapping gets the plain fetch: {:?}",
+            mapped.map(|a| a.map(|a| a.url))
+        );
+    }
+
     #[test]
     fn an_ado_fetch_sends_the_minted_header_to_the_canonical_url_only_never_the_ambient_one() {
         if crate::test_sandbox::skip(
