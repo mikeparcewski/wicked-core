@@ -2214,6 +2214,17 @@ struct BuildRecord {
     retired: Vec<serde_json::Value>,
 }
 
+/// The `schema_version` of the persisted domain model (`None` when nothing is persisted, or a
+/// record from before the model's metadata rode on it).
+pub(crate) fn persisted_schema_version(store: &dyn GraphRead) -> anyhow::Result<Option<String>> {
+    Ok(read_build_record(store)?
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("schema_version"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
 /// The generation of the last committed build (0 when none): what a build that reads before it
 /// assembles its model expects to find still in place when it persists.
 pub fn build_generation(store: &dyn GraphRead) -> anyhow::Result<u64> {

@@ -118,15 +118,21 @@ pub struct Skipped {
 /// (`ts`, then write order) winning, and a `{"status": "retired"}` row retiring its key when it is
 /// the latest. A row on a node the index no longer holds (its file was removed or re-indexed
 /// without it) is an orphan and is not read, as garden's reader joins to `nodes` (store.py:234).
+///
+/// `v3_seen` is set by any row only J6 v3 writes, whatever becomes of it here (live, retired,
+/// malformed or an orphan): a row of a v3-only type, or a `business_rule` row in the v3 shape.
 fn live_rows(
     store: &dyn GraphRead,
     ty: &str,
     skipped: &mut Skipped,
     present: &mut BTreeMap<String, bool>,
+    v3_seen: &mut bool,
 ) -> anyhow::Result<BTreeMap<String, Row>> {
     let mut latest: BTreeMap<String, Row> = BTreeMap::new();
     let prefix = format!("{ty}:");
     for (seq, (sym, a)) in store.annotations_by_type(ty)?.into_iter().enumerate() {
+        // Parsed only until the first one: a large 1.1.0 store's rules are plain text.
+        *v3_seen = *v3_seen || ty != RULE_ANN || is_v3_value(&a.value);
         let here = match present.get(sym.as_str()) {
             Some(h) => *h,
             None => {
@@ -236,6 +242,10 @@ pub struct ExtractIndex {
     pub followups: BTreeMap<String, Row>,
     pub rulings: BTreeMap<String, Row>,
     pub skipped: Skipped,
+    /// (core#1955 R2-2) Whether this is a v3 store: a 1.2.0 build is persisted, or the store holds
+    /// any row only J6 v3 writes, live or not (a store whose v3 rows are all retired is still one).
+    /// `false` only for a store the old loop alone wrote, whose stored 1.1.0 graph keeps its label.
+    pub holds_v3: bool,
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -256,11 +266,15 @@ impl ExtractIndex {
     pub fn load(store: &dyn GraphRead, repo_root: Option<&Path>) -> anyhow::Result<Self> {
         let mut skipped = Skipped::default();
         let mut present = BTreeMap::new();
-        let mut rules = live_rows(store, RULE_ANN, &mut skipped, &mut present)?;
-        let target_rows = live_rows(store, TARGET_ANN, &mut skipped, &mut present)?;
-        let mut groups = live_rows(store, GROUP_ANN, &mut skipped, &mut present)?;
-        let mut followups = live_rows(store, FOLLOWUP_ANN, &mut skipped, &mut present)?;
-        let rulings = live_rows(store, RULING_ANN, &mut skipped, &mut present)?;
+        // (core#1955 R2-2) A 1.2.0 build persisted, or any row only v3 writes: a v3 store.
+        let mut v3 =
+            crate::domain_model::persisted_schema_version(store)?.as_deref() == Some(SCHEMA_V3);
+        let seen = &mut v3;
+        let mut rules = live_rows(store, RULE_ANN, &mut skipped, &mut present, seen)?;
+        let target_rows = live_rows(store, TARGET_ANN, &mut skipped, &mut present, seen)?;
+        let mut groups = live_rows(store, GROUP_ANN, &mut skipped, &mut present, seen)?;
+        let mut followups = live_rows(store, FOLLOWUP_ANN, &mut skipped, &mut present, seen)?;
+        let rulings = live_rows(store, RULING_ANN, &mut skipped, &mut present, seen)?;
         // A row missing what every reader needs is malformed: a group with no `group` object, a
         // follow-up with no `kind`.
         groups.retain(|_, r| {
@@ -423,10 +437,11 @@ impl ExtractIndex {
             followups,
             rulings,
             skipped,
+            holds_v3: v3,
         })
     }
 
-    /// Whether the store holds any v3 row at all.
+    /// Whether the store holds no live v3 row (retired, malformed and orphan rows are not read).
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
             && self.targets.is_empty()
@@ -437,16 +452,16 @@ impl ExtractIndex {
     /// For the coverage report (R22): how the `business_rule` annotation (`key`, `value`) on a node
     /// counts, by the same effective status the model shows.
     ///
-    /// An old-loop row (no `contract`) counts the 1.1.0 way only in a store with no v3 row: there
-    /// it is the stored 1.1.0 graph's own rule (core#1924 keeps those readable). Once the store
-    /// holds v3 rows the 1.2.0 model skips it (`skipped.old_loop`), so the report does too and the
-    /// two never tell different stories (core#1955 R2-2).
+    /// An old-loop row (no `contract`) counts the 1.1.0 way only in a store that is not a v3 store
+    /// ([`ExtractIndex::holds_v3`]): there it is the stored 1.1.0 graph's own rule (core#1924 keeps
+    /// those readable). In a v3 store the 1.2.0 model skips it (`skipped.old_loop`), so the report
+    /// does too and the two never tell different stories (core#1955 R2-2).
     pub fn rule_counts(&self, key: &str, value: &str) -> RuleCount {
         let v3_shaped = is_v3_value(value);
-        let not_v3 = if self.is_empty() {
-            RuleCount::Legacy
-        } else {
+        let not_v3 = if self.holds_v3 {
             RuleCount::Ignored
+        } else {
+            RuleCount::Legacy
         };
         let Some(id) = key.strip_prefix("business_rule:") else {
             return if v3_shaped {
@@ -480,9 +495,9 @@ pub enum RuleCount {
     /// A v3 statement that is open, rejected or stale: accounted, not resolved.
     Unresolved,
     /// A v3 row that is not the live one (retired, superseded or malformed), or an old-loop row in
-    /// a store that holds v3 rows: not counted at all.
+    /// a v3 store: not counted at all.
     Ignored,
-    /// Not a v3 row, in a store with no v3 row: the 1.1.0 reading (its confidence) applies.
+    /// Not a v3 row, in a store that is not a v3 store: the 1.1.0 reading (its confidence) applies.
     Legacy,
 }
 
@@ -1263,37 +1278,31 @@ mod tests {
     use super::*;
 
     /// (core#1955 R2-2) An old-loop `business_rule` row (no `contract`, either key spelling) counts
-    /// the 1.1.0 way in a store with no v3 row (a stored 1.1.0 graph's own rules; the store-level
-    /// case is `domain_model::tests::resolved_risk_split_and_mean_confidence_resolved_only`), and
-    /// is not counted once the store holds v3 rows, as the 1.2.0 model skips it. A v3 tombstone is
-    /// never counted. Fails with the old `Legacy` arms.
+    /// the 1.1.0 way in a store the old loop alone wrote (a stored 1.1.0 graph's own rules; the
+    /// store-level cases are in `tests/domain_model_v3.rs`), and is not counted in a v3 store, as
+    /// the 1.2.0 model skips it, even one with no live v3 row left. A v3 tombstone is never
+    /// counted. Fails with the old `Legacy` arms.
     #[test]
-    fn an_old_loop_rule_counts_the_old_way_only_in_a_store_with_no_v3_row() {
+    fn an_old_loop_rule_counts_the_old_way_only_outside_a_v3_store() {
         let old_loop = [
             ("r", "amount > 0".to_string()),
             ("business_rule:r", json!({"rule": "amount > 0"}).to_string()),
         ];
         let tombstone = json!({"status": RETIRED}).to_string();
-        let pure = ExtractIndex::default();
-        assert!(pure.is_empty());
+        let old = ExtractIndex::default();
+        assert!(!old.holds_v3);
         for (key, value) in &old_loop {
-            assert_eq!(pure.rule_counts(key, value), RuleCount::Legacy, "{key}");
+            assert_eq!(old.rule_counts(key, value), RuleCount::Legacy, "{key}");
         }
-        assert_eq!(pure.rule_counts("r", &tombstone), RuleCount::Ignored);
-        let mut mixed = ExtractIndex::default();
-        mixed.followups.insert(
-            "f".to_string(),
-            Row {
-                symbol: "s".to_string(),
-                value: json!({"kind": "open"}),
-                ts: 0,
-                seq: 0,
-            },
-        );
-        assert!(!mixed.is_empty());
+        assert_eq!(old.rule_counts("r", &tombstone), RuleCount::Ignored);
+        let v3 = ExtractIndex {
+            holds_v3: true,
+            ..ExtractIndex::default()
+        };
+        assert!(v3.is_empty(), "no live v3 row");
         for (key, value) in &old_loop {
-            assert_eq!(mixed.rule_counts(key, value), RuleCount::Ignored, "{key}");
+            assert_eq!(v3.rule_counts(key, value), RuleCount::Ignored, "{key}");
         }
-        assert_eq!(mixed.rule_counts("r", &tombstone), RuleCount::Ignored);
+        assert_eq!(v3.rule_counts("r", &tombstone), RuleCount::Ignored);
     }
 }
