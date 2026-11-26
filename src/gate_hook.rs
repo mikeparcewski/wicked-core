@@ -19412,6 +19412,104 @@ print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call
         let _ = std::fs::remove_dir_all(&wicked_home);
     }
 
+    /// core#1956: #1947 stopped the raw-SQLite arm reading an app's own worktree as the store for
+    /// RELATIVE words only. An app's worktree sits under `WICKED_HOME/apps`, and the home is a
+    /// store location, so two spellings still ended an Apps build with a fatal estate deny: a file
+    /// of the worktree named by its ABSOLUTE path (seats are steered to absolute paths), and a `cd`
+    /// inside the worktree with a `..` word, which was judged from every base of the command, the
+    /// worktree root included. The tree is still never a way into the home: a `..` after it, a
+    /// link out of it, a sibling tree, and every base the shell could still be standing on are
+    /// refused as before.
+    #[cfg(unix)]
+    #[test]
+    fn an_apps_worktree_names_its_own_files_by_absolute_path_and_cd_dotdot_1956() {
+        let wicked_home =
+            std::env::temp_dir().join(format!("wicked-1956-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wicked_home);
+        let wt = wicked_home.join(
+            "apps/steering-rules-project.wicked/wicked-worktrees/\
+             apps-steering-rules-project-d40721c09526",
+        );
+        std::fs::create_dir_all(wt.join("queries")).unwrap();
+        std::fs::write(wicked_home.join("memory.db"), "fixture").unwrap();
+        for f in ["check.py", "apps.json", "x.js", "queries/q.json"] {
+            std::fs::write(wt.join(f), "{}").unwrap();
+        }
+        std::os::unix::fs::symlink(wicked_home.join("memory.db"), wt.join("m.db")).unwrap();
+        let store = [wicked_home.clone()];
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let (home, tree) = (wicked_home.display(), wt.display());
+
+        // The issue's spellings, judged by the whole gate hook from the worktree.
+        for command in [
+            format!("python3 {tree}/check.py"),
+            format!("python3 -m json.tool {tree}/apps.json"),
+            format!("node -e 'require(\"{tree}/x\")'"),
+            format!("python3 {tree}/check.py && python3 -m json.tool {tree}/queries/q.json"),
+            "cd queries && python3 -c 'open(\"../apps.json\")'".to_string(),
+            "cd queries && python3 -m json.tool ../apps.json".to_string(),
+            format!("cd {tree}/queries && python3 -m json.tool ../apps.json"),
+            "sh -c 'cd queries && python3 -m json.tool ../apps.json'".to_string(),
+        ] {
+            let verdict = boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+                None,
+                true,
+                &store,
+            );
+            assert_eq!(verdict, None, "{command}");
+        }
+
+        // Still the store: judged from where the shell stands (the worktree), as the hook calls it.
+        for command in [
+            // The tree's own spelling, then out of it.
+            format!(
+                "python3 -c 'import sqlite3; sqlite3.connect(\"{tree}/../../../../memory.db\")'"
+            ),
+            format!("python3 -c 'open(\"{tree}/x /../../../../../memory.db\")'"),
+            // A link in the tree to the store, alone and followed by more words.
+            format!("sqlite3 {tree}/m.db 'DELETE FROM memories'"),
+            format!("python3 -c 'import os; os.system(\"sqlite3 {tree}/m.db .tables\")'"),
+            // A sibling tree is not this tree, and a second occurrence is judged on its own.
+            format!("python3 -m json.tool {tree}-old/apps.json"),
+            format!("python3 -c 'open(\"{tree}/apps.json\"); open(\"{home}/memory.db\")'"),
+            // Every base the shell can still stand on: a failed cd, a skipped one, a subshell, a
+            // pipeline member, a popd, a loop's next pass, a function run later, CDPATH, an inner
+            // shell's cd, and an eval's.
+            "cd nope && true; python3 -m json.tool ../apps.json".to_string(),
+            "true || cd queries && python3 -m json.tool ../apps.json".to_string(),
+            "( cd queries ) && python3 -m json.tool ../apps.json".to_string(),
+            "cd queries | true && python3 -m json.tool ../apps.json".to_string(),
+            "pushd queries && popd && python3 -m json.tool ../apps.json".to_string(),
+            "cd queries && while true; do python3 -m json.tool ../apps.json; cd ..; done"
+                .to_string(),
+            "f() { python3 -m json.tool apps.json; }; cd .. && f".to_string(),
+            format!("CDPATH={home} cd apps && python3 -m json.tool ../memory.db"),
+            "sh -c 'cd queries' && python3 -m json.tool ../apps.json".to_string(),
+            "eval cd .. && python3 -m json.tool apps.json".to_string(),
+        ] {
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                &store,
+                std::slice::from_ref(&wt),
+                None,
+                Some(wt.as_path()),
+            )
+            .unwrap_or_else(|| panic!("the home's store stays fenced: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+        let _ = std::fs::remove_dir_all(&wicked_home);
+    }
+
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
     /// judged exactly as the evidence-derived read roots are. Reads inside it pass; a WRITE into it
     /// stays a fatal escape — a read root never widens write scope; reads outside every root stay
