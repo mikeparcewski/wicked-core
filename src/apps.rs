@@ -120,6 +120,11 @@ pub(crate) struct LaunchFacts<'a> {
     pub exclude_seats: &'a [String],
     /// `WICKED_SEAT_FLOOR` as the process holds it.
     pub floor: Option<&'a str>,
+    /// (DES-STANDIN-001 §3.8) The launcher implements the stand-in choice (`standInAware`).
+    pub stand_in_aware: bool,
+    /// (core#1974) A stand-in-aware, non-reduced launch with a person's consent: a publish's QE
+    /// reviewer may be a stand-in.
+    pub stand_in: bool,
 }
 
 impl<'a> LaunchFacts<'a> {
@@ -145,6 +150,10 @@ impl<'a> LaunchFacts<'a> {
             clis: &spec.clis,
             exclude_seats: &spec.exclude_seats,
             floor,
+            stand_in_aware: spec.stand_in.aware,
+            stand_in: spec.stand_in.aware
+                && spec.stand_in.consent.is_some()
+                && !spec.reduced_assurance,
         }
     }
 }
@@ -331,11 +340,23 @@ pub(crate) fn admit(
     }
     // A publish's QE runs on one seat and its evidence is reviewed, in isolation, on another
     // (`qe_acceptance::review`); a turn's review is a seat distinct from its builder.
+    // (core#1974, DES-STANDIN-001 T-R17) With consent, a publish whose one seat built none of the
+    // turns is reviewed on a stand-in of that seat (`review::stand_in_reviewer`), disclosed as one.
+    if contract.publish() && eligible == 1 && f.stand_in {
+        return Ok(Some(contract));
+    }
     if eligible < 2 {
         return Err(refuse(if contract.publish() {
-            "a publish's QE runs on one seat that built none of the turns and is reviewed on \
-             another, and this roster has 1 such seat — add a seat"
-                .to_string()
+            format!(
+                "a publish's QE runs on one seat that built none of the turns and is reviewed on \
+                 another, and this roster has 1 such seat — add a seat{}",
+                if f.stand_in_aware {
+                    ", or use stand-ins for this job (a fresh session of that seat reviews the QE \
+                     evidence, labelled as a stand-in)"
+                } else {
+                    ""
+                }
+            )
         } else {
             format!(
                 "a turn is reviewed by a seat distinct from its builder, and this roster has \
@@ -577,15 +598,23 @@ pub(crate) fn publish_consent_refusal(
         ));
     }
     // The verdict's reviewer: the last turn that recorded one, on a seat distinct from the
-    // executor — never the executor's own seat standing in (`BASIS_EXECUTOR`).
+    // executor — never the executor's own seat standing in (`BASIS_EXECUTOR`). (core#1974) Or a
+    // stand-in this QE unit's reviewer binding names on a consented run: a disclosed stand-in
+    // review, never counted as a distinct seat's.
     let distinct = r
         .attempts
         .iter()
         .rev()
         .find(|a| a.status == "verdict")
         .is_some_and(|a| {
-            a.basis == crate::qe_acceptance::review::BASIS_DISTINCT
-                && qe.assigned_cli.as_deref() != Some(a.seat.as_str())
+            (a.basis == crate::qe_acceptance::review::BASIS_DISTINCT
+                && qe.assigned_cli.as_deref() != Some(a.seat.as_str()))
+                || (a.basis == crate::qe_acceptance::review::BASIS_STAND_IN
+                    && !session.assurance.reduced()
+                    && crate::standin::binding_for(&session.assurance, Some(a.seat.as_str()))
+                        .is_some_and(|b| {
+                            b.role == crate::standin::Role::QeReviewer && b.ord == Some(qe.ord)
+                        }))
         });
     if !distinct {
         return Some(format!(

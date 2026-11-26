@@ -503,8 +503,6 @@ pub(crate) enum Command {
     /// run's contract and announced before the reply, so two reservations never mint one key.
     /// Empty when the run cannot take stand-ins (not stand-in-aware, no consent, reduced, or no
     /// base). A team council and the team monitors ask through it when no real seat is left.
-    // The red commit's scaffold: the fix constructs it (supervisor::reserve_stand_ins).
-    #[allow(dead_code)]
     ReserveStandIns {
         run_id: String,
         role: crate::standin::Role,

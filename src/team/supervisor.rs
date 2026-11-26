@@ -217,13 +217,33 @@ impl ActorCouncil {
             Ok(clis) => clis,
             Err(why) => return CouncilOutcome::NoSeats(why),
         };
-        if clis.is_empty() {
-            return CouncilOutcome::NoSeats(format!(
-                "no council seat is left after excluding the parties [{}] by key and by identity",
-                excluded.join(", ")
-            ));
-        }
         let deadline = Instant::now() + budget;
+        // (core#1972, DES-STANDIN-001 T-R7) No non-party seat is left: the council sits on
+        // stand-ins the engine reserves for the run (a council's size of them, each a fresh
+        // binding with its own lens), or, with none (no consent, a reduced run), on nobody.
+        let clis = if clis.is_empty() {
+            let stood = reserve_stand_ins(
+                &self.tx,
+                &req.session_id,
+                crate::standin::Role::Council,
+                wicked_council::pick::council_size(),
+                crate::standin::BindingScope {
+                    ord: Some(req.ord),
+                    ..Default::default()
+                },
+                deadline,
+            );
+            if stood.is_empty() {
+                return CouncilOutcome::NoSeats(format!(
+                    "no council seat is left after excluding the parties [{}] by key and by \
+                     identity",
+                    excluded.join(", ")
+                ));
+            }
+            stood.into_iter().map(|s| s.record).collect()
+        } else {
+            clis
+        };
         let lock =
             match crate::cli_runner::HostCouncilLock::acquire_until(&self.lock_path, deadline) {
                 // (codex r2 on #1771) Taken only as the budget ran out: the caller can no longer
@@ -277,6 +297,40 @@ impl ActorCouncil {
             }
         }
     }
+}
+
+/// The longest the supervisor waits for the engine to reserve stand-ins (one write on the actor).
+const RESERVE_WAIT: Duration = Duration::from_secs(10);
+
+/// (DES-STANDIN-001 §3.2, core#1972, core#1973) Ask the engine for `need` stand-ins for `role` on
+/// `run_id` (`Command::ReserveStandIns`): the bindings it reserved and persisted, or none (the run
+/// takes no stand-ins, the engine stopped, or it did not answer by `deadline`, at most
+/// [`RESERVE_WAIT`]).
+pub(crate) fn reserve_stand_ins(
+    tx: &Sender<crate::command::Command>,
+    run_id: &str,
+    role: crate::standin::Role,
+    need: usize,
+    scope: crate::standin::BindingScope,
+    deadline: Instant,
+) -> Vec<crate::standin::SeatedStandIn> {
+    let (reply, rx) = channel();
+    if tx
+        .send(crate::command::Command::ReserveStandIns {
+            run_id: run_id.to_string(),
+            role,
+            need,
+            scope,
+            reply,
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .min(RESERVE_WAIT);
+    rx.recv_timeout(wait).unwrap_or_default()
 }
 
 /// (core#1289) The seats a team council may draw from `roster`, each party in `excluded`
@@ -518,6 +572,15 @@ struct MonitorSlot {
     pending: bool,
     last_tree: String,
     last_start: Option<Instant>,
+    /// (core#1973) A stand-in member: its lens and its stamp's words (`member.joined.reason`).
+    stand_in: Option<StandInMember>,
+}
+
+/// (core#1973, DES-STANDIN-001 T-R10) What a stand-in monitor carries beside its binding key.
+#[derive(Debug, Clone)]
+struct StandInMember {
+    lens: Option<String>,
+    label: String,
 }
 
 /// One live attempt's team state: its members, its findings and what it published.
@@ -753,9 +816,12 @@ impl UnitTeam {
             None => 1,
         };
         let key = self.key();
-        let reason = match seat {
-            Some(_) => format!("team plan monitors={}", self.ctx.plan.monitors),
-            None => "no distinct signed-in seat".to_string(),
+        // (core#1973) A stand-in member is joined under its stamp, never as an independent one.
+        let stood = i.and_then(|i| self.monitors[i].stand_in.as_ref().map(|m| m.label.clone()));
+        let reason = match (seat, stood) {
+            (Some(_), Some(label)) => label,
+            (Some(_), None) => format!("team plan monitors={}", self.ctx.plan.monitors),
+            (None, _) => "no distinct signed-in seat".to_string(),
         };
         let ev = TeamEvent {
             env: env_of(&key, seat.unwrap_or("engine"), None),
@@ -814,10 +880,20 @@ impl UnitTeam {
             .filter(|c| **c != self.ctx.creator)
             .cloned()
             .collect();
+        // (core#1973, DES-STANDIN-001 T-R10) No real seat can watch: on a consented run the engine
+        // reserves stand-ins for the slots (each a fresh binding with its lens), seated below like
+        // any member. Asked only for a unit that can be watched (a baseline, or unbound) on a host
+        // that admits the base.
+        let watchable = (self.ctx.repo.is_none() && !self.ctx.bound)
+            || (self.ctx.repo.is_some() && self.ctx.baseline_tree.is_some());
+        let mut stood: Vec<crate::standin::SeatedStandIn> = Vec::new();
+        if candidates.is_empty() && watchable && host.admitted(&self.ctx.creator).is_ok() {
+            stood = self.reserve_monitors(want);
+        }
         // (ASK-K3b) The plan asked for a member and the roster has no seat but the PA's (or the
         // creator's): the absence is on the record with a minted identity (one signed-in seat is
         // the common single-user case; the thread renders "No reviewer — only <seat> is signed in").
-        if candidates.is_empty() {
+        if candidates.is_empty() && stood.is_empty() {
             self.joined(
                 None,
                 "m1",
@@ -849,6 +925,7 @@ impl UnitTeam {
             }
         };
         let mut admitted = 0;
+        let mut refused = 0;
         for (i, seat) in candidates.iter().enumerate() {
             if admitted == want {
                 break;
@@ -856,27 +933,88 @@ impl UnitTeam {
             let id = format!("m{}", i + 1);
             if let Err(why) = host.admitted(seat) {
                 self.joined(None, &id, Some(seat), Some(why));
+                refused += 1;
                 continue;
             }
             admitted += 1;
-            let pool_key = self.pool_key(&id);
-            self.monitors.push(MonitorSlot {
-                id,
-                seat: seat.clone(),
-                pool_key,
-                state: SlotState::Pending,
-                open_seq: 0,
-                batches: 0,
-                budget_exhausted: false,
-                timed_out: false,
-                error: None,
-                in_flight: false,
-                primed: false,
-                pending: self.pending,
-                last_tree: baseline.clone(),
-                last_start: None,
-            });
+            self.seat_slot(id, seat.clone(), &baseline, None);
         }
+        // (core#1973) Every real seat is seated and the target is still short: the rest stand in
+        // (never in place of a real seat the host refused: that refusal is disclosed as it is).
+        if stood.is_empty() && admitted < want && refused == 0 && !candidates.is_empty() {
+            stood = self.reserve_monitors(want - admitted);
+        }
+        let mut n = candidates.len();
+        for s in stood {
+            if admitted == want {
+                break;
+            }
+            n += 1;
+            let id = format!("m{n}");
+            let seat = s.binding.key.clone();
+            if let Err(why) = host.admitted(&seat) {
+                self.joined(None, &id, Some(&seat), Some(why));
+                continue;
+            }
+            admitted += 1;
+            self.seat_slot(
+                id,
+                seat,
+                &baseline,
+                Some(StandInMember {
+                    lens: s.binding.lens.clone(),
+                    label: s.label,
+                }),
+            );
+        }
+    }
+
+    /// One admitted member's slot, pending its first batch.
+    fn seat_slot(
+        &mut self,
+        id: String,
+        seat: String,
+        baseline: &str,
+        stand_in: Option<StandInMember>,
+    ) {
+        let pool_key = self.pool_key(&id);
+        self.monitors.push(MonitorSlot {
+            id,
+            seat,
+            pool_key,
+            state: SlotState::Pending,
+            open_seq: 0,
+            batches: 0,
+            budget_exhausted: false,
+            timed_out: false,
+            error: None,
+            in_flight: false,
+            primed: false,
+            pending: self.pending,
+            last_tree: baseline.to_string(),
+            last_start: None,
+            stand_in,
+        });
+    }
+
+    /// (core#1973) `need` monitor stand-ins for this attempt, reserved by the engine; none without
+    /// an engine channel (or when the run takes no stand-ins).
+    fn reserve_monitors(&self, need: usize) -> Vec<crate::standin::SeatedStandIn> {
+        let Some(tx) = self.engine.as_ref() else {
+            return Vec::new();
+        };
+        reserve_stand_ins(
+            tx,
+            &self.ctx.run_id,
+            crate::standin::Role::Monitor,
+            need,
+            crate::standin::BindingScope {
+                ord: Some(self.ctx.ord),
+                attempt: Some(self.ctx.attempt),
+                ..Default::default()
+            },
+            Instant::now() + RESERVE_WAIT,
+        )
     }
 
     fn scope(&self, monitor_id: &str) -> MonitorScope {
@@ -951,7 +1089,15 @@ impl UnitTeam {
             needs_open: m.state == SlotState::Pending,
             scope: self.scope(&m.id),
             // A one-shot member remembers nothing: the header goes with every batch.
-            header: (!m.primed || self.one_shot).then(|| self.header()),
+            // (core#1973) A stand-in member's header opens with the stand-in preface and its lens.
+            header: (!m.primed || self.one_shot).then(|| match &m.stand_in {
+                Some(si) => format!(
+                    "{}\n\n{}",
+                    crate::standin::preface(si.lens.as_deref()),
+                    self.header()
+                ),
+                None => self.header(),
+            }),
             titles: self.titles.clone(),
             from_tree: m.last_tree.clone(),
             baseline_tree: self.ctx.baseline_tree.clone().unwrap_or_default(),

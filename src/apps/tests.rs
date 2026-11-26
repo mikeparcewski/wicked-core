@@ -65,6 +65,8 @@ fn facts<'a>(
         clis,
         exclude_seats: &[],
         floor: Some("container"),
+        stand_in_aware: false,
+        stand_in: false,
     }
 }
 

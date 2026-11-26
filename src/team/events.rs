@@ -1969,12 +1969,14 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
             seed: r.seed,
             reason: r.reason,
             detail: None,
+            independence: super::council_independence(&r.seats),
         },
         // A council that was drawn but reached no verdict still names who sat (codex r1).
         Verdict::NoVerdict => Dispute {
             seats: r.seats.clone(),
             seed: r.seed,
             detail: r.detail.clone(),
+            independence: super::council_independence(&r.seats),
             ..no_verdict(r.reason.unwrap_or(NoVerdictReason::Error))
         },
     }
@@ -2050,6 +2052,7 @@ pub(crate) fn no_verdict(reason: NoVerdictReason) -> Dispute {
         seed: None,
         reason: Some(reason),
         detail: None,
+        independence: None,
     }
 }
 

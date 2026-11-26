@@ -58,10 +58,13 @@ impl Rig {
             let list: Vec<String> = types.iter().map(|t| format!("'{t}'")).collect();
             format!("NEW.event_type IN ({})", list.join(","))
         };
+        // (core#1926) One transaction: the swap never leaves the bus without a refusal, so a
+        // publisher retry cannot land a fact both the old and the new refusal hold.
         self.conn()
             .execute_batch(&format!(
-                "DROP TRIGGER IF EXISTS p1_refuse; CREATE TRIGGER p1_refuse BEFORE INSERT ON \
-                 events WHEN {when} BEGIN SELECT RAISE(ABORT, 'p1 test: bus refuses'); END;"
+                "BEGIN IMMEDIATE; DROP TRIGGER IF EXISTS p1_refuse; CREATE TRIGGER p1_refuse \
+                 BEFORE INSERT ON events WHEN {when} BEGIN SELECT RAISE(ABORT, 'p1 test: bus \
+                 refuses'); END; COMMIT;"
             ))
             .unwrap();
     }

@@ -811,6 +811,98 @@ impl CouncilPick {
     }
 }
 
+/// (core#1972, DES-STANDIN-001 §3.4-§3.5) A council's dispatcher with every stand-in voter's ballot
+/// (the first and every runoff) opened by the stand-in preface and its lens, carried in the task's
+/// topic for that seat alone. A real seat's ballot, and every other call, goes through unchanged.
+pub(crate) struct StandInBallots {
+    inner: Arc<dyn Dispatcher + Send + Sync>,
+    /// Stand-in voter key → its lens.
+    lenses: std::collections::HashMap<String, Option<String>>,
+}
+
+impl StandInBallots {
+    /// `inner`, framing the voters among `clis` that are the run's recorded council stand-ins;
+    /// `inner` itself when there are none.
+    pub(crate) fn wrap(
+        inner: Arc<dyn Dispatcher + Send + Sync>,
+        bindings: &[crate::standin::StandInBinding],
+        clis: &[AgenticCli],
+    ) -> Arc<dyn Dispatcher + Send + Sync> {
+        let lenses: std::collections::HashMap<String, Option<String>> = clis
+            .iter()
+            .filter_map(|c| {
+                bindings
+                    .iter()
+                    .find(|b| b.key == c.key && b.role == crate::standin::Role::Council)
+                    .map(|b| (c.key.clone(), b.lens.clone()))
+            })
+            .collect();
+        if lenses.is_empty() {
+            return inner;
+        }
+        Arc::new(StandInBallots { inner, lenses })
+    }
+
+    fn framed<'t>(
+        &self,
+        cli: &AgenticCli,
+        task: &'t CouncilTask,
+    ) -> std::borrow::Cow<'t, CouncilTask> {
+        match self.lenses.get(&cli.key) {
+            Some(lens) => {
+                let mut t = task.clone();
+                t.topic = format!(
+                    "{}\n\n{}",
+                    crate::standin::preface(lens.as_deref()),
+                    task.topic
+                );
+                std::borrow::Cow::Owned(t)
+            }
+            None => std::borrow::Cow::Borrowed(task),
+        }
+    }
+}
+
+impl Dispatcher for StandInBallots {
+    fn dispatch(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+    ) -> Option<wicked_council::types::Vote> {
+        self.inner.dispatch(cli, &self.framed(cli, task))
+    }
+    fn dispatch_ballot(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &wicked_council::types::BallotContext,
+    ) -> Option<wicked_council::types::Vote> {
+        self.inner
+            .dispatch_ballot(cli, &self.framed(cli, task), ctx)
+    }
+    fn dispatch_ballot_detailed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &wicked_council::types::BallotContext,
+    ) -> wicked_council::types::DispatchOutcome {
+        self.inner
+            .dispatch_ballot_detailed(cli, &self.framed(cli, task), ctx)
+    }
+    fn dispatch_ballot_timed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &wicked_council::types::BallotContext,
+    ) -> wicked_council::types::TimedOutcome {
+        self.inner
+            .dispatch_ballot_timed(cli, &self.framed(cli, task), ctx)
+    }
+    fn seat_benched(&self, key: &str) -> bool {
+        self.inner.seat_benched(key)
+    }
+}
+
 /// Convene a council on ONE disputed decision and return its ruling (core#590 S5) — the single
 /// engine entry point for a council, reached through `Core::convene_decision`.
 ///
@@ -1710,6 +1802,86 @@ mod tests {
         assert_eq!(named_option("4", 3), None);
         assert_eq!(named_option("0", 3), None);
         assert_eq!(named_option("the second", 3), None);
+    }
+
+    /// Records each ballot's seat and topic.
+    struct TopicRecorder {
+        seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+    impl Dispatcher for TopicRecorder {
+        fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((cli.key.clone(), task.topic.clone()));
+            None
+        }
+    }
+
+    /// core#1972 (DES-STANDIN-001 §3.4-§3.5): a council's stand-in voter reads the stand-in preface
+    /// and its own lens first, on every ballot; a real seat's ballot is unchanged, and a `~` key
+    /// the run never reserved as a council voter is not framed as one.
+    #[test]
+    fn a_stand_in_voters_ballot_opens_with_the_preface_and_its_lens_1972() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner: Arc<dyn Dispatcher + Send + Sync> =
+            Arc::new(TopicRecorder { seen: seen.clone() });
+        let binding = crate::standin::StandInBinding {
+            key: "claude~1".into(),
+            base: "claude".into(),
+            role: crate::standin::Role::Council,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: Some("security and safety".into()),
+            ord: Some(1),
+            attempt: None,
+            subject: None,
+            evidence: None,
+            invocation: "i".into(),
+            reason: crate::standin::Reason::OnlyOneHelper {
+                cli: "Claude Code".into(),
+            },
+            state: crate::standin::STATE_SEATED.into(),
+            display: None,
+        };
+        let judge = crate::standin::StandInBinding {
+            key: "claude~2".into(),
+            role: crate::standin::Role::Judge,
+            ..binding.clone()
+        };
+        let clis = [seat("claude~1"), seat("claude~2"), seat("codex")];
+        let d = StandInBallots::wrap(inner.clone(), &[binding, judge], &clis);
+        let task = CouncilTask {
+            id: "t".into(),
+            topic: "Which position holds?".into(),
+            options: vec!["a".into(), "b".into()],
+            criteria: Vec::new(),
+            session_id: "r".into(),
+        };
+        let ctx = wicked_council::types::BallotContext::default();
+        for c in &clis {
+            let _ = d.dispatch_ballot_timed(c, &task, &ctx);
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].1,
+            format!(
+                "{}\n\nWhich position holds?",
+                crate::standin::preface(Some("security and safety"))
+            )
+        );
+        assert_eq!(
+            seen[1].1, "Which position holds?",
+            "a judge binding is no voter"
+        );
+        assert_eq!(
+            seen[2].1, "Which position holds?",
+            "a real seat is unchanged"
+        );
+        // No council stand-in among the voters: the dispatcher is the one handed in.
+        let plain = StandInBallots::wrap(inner.clone(), &[], &clis);
+        assert!(Arc::ptr_eq(&plain, &inner));
     }
 
     /// Records every seat it is asked to dispatch — what the council actually convened with.

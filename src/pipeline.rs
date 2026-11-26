@@ -1684,13 +1684,18 @@ pub(crate) fn apply_and_finish_unit(
                 .map(|b| (*k, b))
             }) {
                 let semantic = agent_verdict.and_then(|v| v.judge_cli.as_deref()) == Some(key);
-                if !semantic
-                    && !evidence
+                if !semantic {
+                    // (core#1985) Seated for the rules alone: the rule check's stand-in, recorded
+                    // as one (the delivery line lists the run's bindings by role; it read as a
+                    // second judge).
+                    b.role = crate::standin::Role::RuleJudge;
+                    if !evidence
                         .rule_check
                         .as_ref()
                         .is_some_and(|rc| rule_stand_in_ruled(rc, key))
-                {
-                    b.state = crate::standin::STATE_FAILED.to_string();
+                    {
+                        b.state = crate::standin::STATE_FAILED.to_string();
+                    }
                 }
                 confirmed = Some(key.to_string());
                 let display = b.display().to_string();

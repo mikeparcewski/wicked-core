@@ -3661,6 +3661,15 @@ pub(crate) fn run(
                     crate::container_floor::container_mode(),
                     Some(&req.session_id),
                 );
+                // (core#1972, DES-STANDIN-001 §3.4-§3.5) A stand-in voter's every ballot opens with
+                // the stand-in preface and its lens; a real seat's ballot is unchanged.
+                let disp = crate::decision::StandInBallots::wrap(
+                    disp,
+                    session
+                        .as_ref()
+                        .map_or(&[][..], |s| &s.assurance.stand_ins[..]),
+                    &clis,
+                );
                 let op_home = operational_home.clone();
                 // (core#1822) The convener hears `Convened` when the ballots start (the council
                 // worker's `requested`, relayed as `CouncilConvened`), before any ballot returns.
@@ -3695,8 +3704,29 @@ pub(crate) fn run(
                 });
             }
             // (DES-STANDIN-001 §3.2) Reserve a team role's stand-ins on the single writer.
-            Command::ReserveStandIns { reply, .. } => {
-                let _ = reply.send(Vec::new());
+            Command::ReserveStandIns {
+                run_id,
+                role,
+                need,
+                scope,
+                reply,
+            } => {
+                let seated = stand_in_gate::reserve_team(
+                    &mut store,
+                    &mut subscribers,
+                    &run_id,
+                    role,
+                    need,
+                    scope,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "wicked-core: run {run_id}: no {} stand-ins reserved: {e:#}",
+                        role.as_str()
+                    );
+                    Vec::new()
+                });
+                let _ = reply.send(seated);
             }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
             // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
@@ -5400,12 +5430,45 @@ fn council_roster(
         .filter(|k| !run_bench.iter().any(|b| &b.cli == *k))
         .cloned()
         .collect();
+    // (core#1972, DES-STANDIN-001 §3.2) A stand-in voter the run reserved for its council is no
+    // roster seat: it skips the roster-membership filter, and sits only while its base credential
+    // is not benched. A `~` key the run never reserved as a council voter never sits.
+    let (stood, clis): (Vec<crate::AgenticCli>, Vec<crate::AgenticCli>) = clis
+        .into_iter()
+        .partition(|c| wicked_apps_core::spawn::seat_id::is_stand_in(&c.key));
+    let stood: Vec<crate::AgenticCli> = stood
+        .into_iter()
+        .filter(|c| {
+            crate::standin::binding_for(&session.assurance, Some(c.key.as_str()))
+                .is_some_and(|b| b.role == crate::standin::Role::Council)
+                && !session.assurance.reduced()
+                && !run_bench
+                    .iter()
+                    .any(|b| b.cli == wicked_apps_core::spawn::seat_id::credential(&c.key))
+        })
+        .collect();
+    // The launch bench (the host floor, the codex worktree bench) judges a stand-in by its base:
+    // a voter on a benched base's credential stays out exactly as the base would.
+    let judged: Vec<crate::AgenticCli> = clis
+        .iter()
+        .cloned()
+        .chain(stood.iter().map(|c| crate::AgenticCli {
+            key: wicked_apps_core::spawn::seat_id::credential(&c.key).to_string(),
+            ..c.clone()
+        }))
+        .collect();
     let ballot_bench = crate::domain::ungoverned_bench(&crate::distribute::launch_benched(
-        &clis,
+        &judged,
         session.repo_ref.is_some(),
         contained,
     ));
-    clis.into_iter()
+    let stood = stood.into_iter().filter(|c| {
+        !ballot_bench
+            .iter()
+            .any(|b| b.cli == wicked_apps_core::spawn::seat_id::credential(&c.key))
+    });
+    let real: Vec<crate::AgenticCli> = clis
+        .into_iter()
         .filter(|c| !run_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| !ballot_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| {
@@ -5417,7 +5480,8 @@ fn council_roster(
                     .iter()
                     .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
         })
-        .collect()
+        .collect();
+    real.into_iter().chain(stood).collect()
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.6) Charge one rule council to `run_id`'s unit `ord`, durably:
@@ -47924,6 +47988,126 @@ mod council_ballot_tests {
             ..bound_run()
         };
         assert_eq!(keys("host", &unbound, true), vec!["claude", "codex"]);
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// core#1972: a team council's stand-in voter is no roster seat. A record the run reserved as
+    /// a council stand-in sits beside the real seats; a `~` key the run never reserved (or one
+    /// reserved for another role) never sits, nor one whose base is benched, nor on a run whose
+    /// consent is gone.
+    #[test]
+    fn a_reserved_council_stand_in_sits_and_no_other_stand_in_key_does_1972() {
+        let mut run = AgentSession {
+            repo_ref: None,
+            clis: vec!["claude".into()],
+            ..bound_run()
+        };
+        run.assurance = crate::standin::LaunchStandIn {
+            aware: true,
+            parties: Vec::new(),
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+        }
+        .apply(run.assurance);
+        let bound = |key: &str, role: crate::standin::Role| crate::standin::StandInBinding {
+            key: key.into(),
+            base: "claude".into(),
+            role,
+            slot: 1,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: Some(1),
+            attempt: None,
+            subject: None,
+            evidence: None,
+            invocation: "i".into(),
+            reason: crate::standin::Reason::OnlyOneHelper {
+                cli: "Claude Code".into(),
+            },
+            state: crate::standin::STATE_SEATED.into(),
+            display: None,
+        };
+        run.assurance.stand_ins = vec![
+            bound("claude~1", crate::standin::Role::Council),
+            bound("claude~2", crate::standin::Role::Judge),
+        ];
+        // A stand-in record is its base's record under the stand-in key, as reserve_team mints it.
+        let stand_in = |key: &str| crate::AgenticCli {
+            key: key.into(),
+            ..seat("claude")
+        };
+        let clis = vec![
+            stand_in("claude~1"),
+            stand_in("claude~2"),
+            stand_in("claude~9"),
+        ];
+        let keys = |s: &AgentSession| {
+            council_roster(Some(s), clis.clone(), true)
+                .into_iter()
+                .map(|c| c.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&run), vec!["claude~1"]);
+        let mut benched = run.clone();
+        benched.benched_seats.push(crate::domain::BenchedSeat {
+            cli: "claude".into(),
+            reason: "quota_exhausted".into(),
+            source: "worker".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        });
+        assert!(keys(&benched).is_empty(), "its base is benched");
+        let mut unasked = run.clone();
+        unasked.assurance.stand_in = None;
+        assert!(keys(&unasked).is_empty(), "no consent, no stand-in voter");
+
+        // The launch bench judges a stand-in by its base: on a bound run's host floor the codex
+        // worktree bench keeps a codex stand-in out of the council as it keeps codex out.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        let mut on_codex = AgentSession {
+            clis: vec!["codex".into()],
+            ..bound_run()
+        };
+        on_codex.assurance = run.assurance.clone();
+        on_codex.assurance.stand_ins = vec![crate::standin::StandInBinding {
+            base: "codex".into(),
+            ..bound("codex~1", crate::standin::Role::Council)
+        }];
+        let codex_voter = crate::AgenticCli {
+            key: "codex~1".into(),
+            ..seat("codex")
+        };
+        let sat = |floor: &str, contained: bool| {
+            std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, floor);
+            council_roster(Some(&on_codex), vec![codex_voter.clone()], contained)
+                .into_iter()
+                .map(|c| c.key)
+                .collect::<Vec<_>>()
+        };
+        assert!(sat("host", true).is_empty(), "its base is worktree-benched");
+        assert_eq!(sat("container", true), vec!["codex~1"]);
         for (k, v) in [
             ("WICKED_CODEX_WORKTREE_OK", prev.0),
             (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
