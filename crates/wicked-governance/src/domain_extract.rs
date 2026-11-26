@@ -118,15 +118,21 @@ pub struct Skipped {
 /// (`ts`, then write order) winning, and a `{"status": "retired"}` row retiring its key when it is
 /// the latest. A row on a node the index no longer holds (its file was removed or re-indexed
 /// without it) is an orphan and is not read, as garden's reader joins to `nodes` (store.py:234).
+///
+/// `v3_seen` is set by any row only J6 v3 writes, whatever becomes of it here (live, retired,
+/// malformed or an orphan): a row of a v3-only type, or a `business_rule` row in the v3 shape.
 fn live_rows(
     store: &dyn GraphRead,
     ty: &str,
     skipped: &mut Skipped,
     present: &mut BTreeMap<String, bool>,
+    v3_seen: &mut bool,
 ) -> anyhow::Result<BTreeMap<String, Row>> {
     let mut latest: BTreeMap<String, Row> = BTreeMap::new();
     let prefix = format!("{ty}:");
     for (seq, (sym, a)) in store.annotations_by_type(ty)?.into_iter().enumerate() {
+        // Parsed only until the first one: a large 1.1.0 store's rules are plain text.
+        *v3_seen = *v3_seen || ty != RULE_ANN || is_v3_value(&a.value);
         let here = match present.get(sym.as_str()) {
             Some(h) => *h,
             None => {
@@ -236,6 +242,10 @@ pub struct ExtractIndex {
     pub followups: BTreeMap<String, Row>,
     pub rulings: BTreeMap<String, Row>,
     pub skipped: Skipped,
+    /// (core#1955 R2-2) Whether this is a v3 store: a 1.2.0 build is persisted, or the store holds
+    /// any row only J6 v3 writes, live or not (a store whose v3 rows are all retired is still one).
+    /// `false` only for a store the old loop alone wrote, whose stored 1.1.0 graph keeps its label.
+    pub holds_v3: bool,
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -256,11 +266,15 @@ impl ExtractIndex {
     pub fn load(store: &dyn GraphRead, repo_root: Option<&Path>) -> anyhow::Result<Self> {
         let mut skipped = Skipped::default();
         let mut present = BTreeMap::new();
-        let mut rules = live_rows(store, RULE_ANN, &mut skipped, &mut present)?;
-        let target_rows = live_rows(store, TARGET_ANN, &mut skipped, &mut present)?;
-        let mut groups = live_rows(store, GROUP_ANN, &mut skipped, &mut present)?;
-        let mut followups = live_rows(store, FOLLOWUP_ANN, &mut skipped, &mut present)?;
-        let rulings = live_rows(store, RULING_ANN, &mut skipped, &mut present)?;
+        // (core#1955 R2-2) A 1.2.0 build persisted, or any row only v3 writes: a v3 store.
+        let mut v3 =
+            crate::domain_model::persisted_schema_version(store)?.as_deref() == Some(SCHEMA_V3);
+        let seen = &mut v3;
+        let mut rules = live_rows(store, RULE_ANN, &mut skipped, &mut present, seen)?;
+        let target_rows = live_rows(store, TARGET_ANN, &mut skipped, &mut present, seen)?;
+        let mut groups = live_rows(store, GROUP_ANN, &mut skipped, &mut present, seen)?;
+        let mut followups = live_rows(store, FOLLOWUP_ANN, &mut skipped, &mut present, seen)?;
+        let rulings = live_rows(store, RULING_ANN, &mut skipped, &mut present, seen)?;
         // A row missing what every reader needs is malformed: a group with no `group` object, a
         // follow-up with no `kind`.
         groups.retain(|_, r| {
@@ -423,10 +437,13 @@ impl ExtractIndex {
             followups,
             rulings,
             skipped,
+            holds_v3: v3,
         })
     }
 
-    /// Whether the store holds any v3 row at all.
+    /// Whether the index holds no live statement, target, group or follow-up (rulings are not
+    /// checked; retired, malformed and orphan rows are never read). Not "a v3 store": that is
+    /// [`ExtractIndex::holds_v3`].
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
             && self.targets.is_empty()
@@ -436,13 +453,23 @@ impl ExtractIndex {
 
     /// For the coverage report (R22): how the `business_rule` annotation (`key`, `value`) on a node
     /// counts, by the same effective status the model shows.
+    ///
+    /// An old-loop row (no `contract`) counts the 1.1.0 way only in a store that is not a v3 store
+    /// ([`ExtractIndex::holds_v3`]): there it is the stored 1.1.0 graph's own rule (core#1924 keeps
+    /// those readable). In a v3 store the 1.2.0 model skips it (`skipped.old_loop`), so the report
+    /// does too and the two never tell different stories (core#1955 R2-2).
     pub fn rule_counts(&self, key: &str, value: &str) -> RuleCount {
         let v3_shaped = is_v3_value(value);
+        let not_v3 = if self.holds_v3 {
+            RuleCount::Ignored
+        } else {
+            RuleCount::Legacy
+        };
         let Some(id) = key.strip_prefix("business_rule:") else {
             return if v3_shaped {
                 RuleCount::Ignored
             } else {
-                RuleCount::Legacy
+                not_v3
             };
         };
         match self.statements.get(id) {
@@ -457,7 +484,7 @@ impl ExtractIndex {
             }
             // An older copy of a key that is live elsewhere, a tombstone, or a skipped v3 row.
             _ if v3_shaped => RuleCount::Ignored,
-            _ => RuleCount::Legacy,
+            _ => not_v3,
         }
     }
 }
@@ -469,9 +496,10 @@ pub enum RuleCount {
     Resolved(f64),
     /// A v3 statement that is open, rejected or stale: accounted, not resolved.
     Unresolved,
-    /// A v3 row that is not the live one (retired, superseded or malformed): not counted at all.
+    /// A v3 row that is not the live one (retired, superseded or malformed), or an old-loop row in
+    /// a v3 store: not counted at all.
     Ignored,
-    /// Not a v3 row: the 1.1.0 reading (its confidence) applies.
+    /// Not a v3 row, in a store that is not a v3 store: the 1.1.0 reading (its confidence) applies.
     Legacy,
 }
 
@@ -1169,17 +1197,30 @@ pub struct BuildOutcome {
     pub accounting: Accounting,
 }
 
-/// Build the 1.2.0 model from the store's v3 rows, keep the ids of requirements still present,
-/// and persist it into the same store (refused, nothing written, when another build committed in
-/// between). The one build path of `domain-graph`, `domain-ruling` and core-ts.
-pub fn build_and_persist(
-    store: &mut dyn wicked_apps_core::GraphStore,
+/// A 1.2.0 model assembled from the store's v3 rows and numbered against one build generation,
+/// not yet persisted ([`assemble_build`], then [`persist_build`]).
+#[derive(Debug, Clone)]
+pub struct AssembledBuild {
+    model: crate::domain_model::DomainModel,
+    generation: u64,
+}
+
+impl AssembledBuild {
+    /// The model as it will be persisted.
+    pub fn model(&self) -> &crate::domain_model::DomainModel {
+        &self.model
+    }
+}
+
+/// Build the 1.2.0 model from the store's v3 rows and keep the ids of requirements still present.
+/// The first half of [`build_and_persist`].
+pub fn assemble_build(
+    read: &dyn GraphRead,
     repo_root: &Path,
     built_at: i64,
-) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
-    let read: &dyn GraphRead = &*store;
+) -> anyhow::Result<AssembledBuild> {
     // The generation is read BEFORE the rows: a build that commits while this one assembles its
-    // model moves it, and the persist below then refuses instead of writing the older model over it.
+    // model moves it, and the persist then refuses instead of writing the older model over it.
     let before = crate::domain_model::build_generation(read)?;
     let mut model = build_extract_model(read, repo_root, built_at)?;
     let generation = crate::domain_model::stabilize_requirement_ids_with(read, &mut model, false)?;
@@ -1187,6 +1228,16 @@ pub fn build_and_persist(
         generation == before,
         "another build of this domain model committed while this one was assembled; build again"
     );
+    Ok(AssembledBuild { model, generation })
+}
+
+/// Persist an [`assemble_build`] model into the same store: refused, nothing written, when another
+/// build committed after it was numbered. The second half of [`build_and_persist`].
+pub fn persist_build(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    build: AssembledBuild,
+) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
+    let AssembledBuild { model, generation } = build;
     let (nodes, edges) =
         crate::domain_model::persist_domain_model_expecting(store, &model, Some(generation))?;
     let outcome = BuildOutcome {
@@ -1204,10 +1255,56 @@ pub fn build_and_persist(
     Ok((model, outcome))
 }
 
+/// Build the 1.2.0 model from the store's v3 rows, keep the ids of requirements still present,
+/// and persist it into the same store (refused, nothing written, when another build committed in
+/// between). The one build path of `domain-graph`, `domain-ruling` and core-ts.
+pub fn build_and_persist(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    repo_root: &Path,
+    built_at: i64,
+) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
+    let build = assemble_build(&*store, repo_root, built_at)?;
+    persist_build(store, build)
+}
+
 /// Unix seconds now (a build's `built_at`, a ruling's `at`).
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (core#1955 R2-2) An old-loop `business_rule` row (no `contract`, either key spelling) counts
+    /// the 1.1.0 way in a store the old loop alone wrote (a stored 1.1.0 graph's own rules; the
+    /// store-level cases are in `tests/domain_model_v3.rs`), and is not counted in a v3 store, as
+    /// the 1.2.0 model skips it, even one with no live v3 row left. A v3 tombstone is never
+    /// counted. Fails with the old `Legacy` arms.
+    #[test]
+    fn an_old_loop_rule_counts_the_old_way_only_outside_a_v3_store() {
+        let old_loop = [
+            ("r", "amount > 0".to_string()),
+            ("business_rule:r", json!({"rule": "amount > 0"}).to_string()),
+        ];
+        let tombstone = json!({"status": RETIRED}).to_string();
+        let old = ExtractIndex::default();
+        assert!(!old.holds_v3);
+        for (key, value) in &old_loop {
+            assert_eq!(old.rule_counts(key, value), RuleCount::Legacy, "{key}");
+        }
+        assert_eq!(old.rule_counts("r", &tombstone), RuleCount::Ignored);
+        let v3 = ExtractIndex {
+            holds_v3: true,
+            ..ExtractIndex::default()
+        };
+        assert!(v3.is_empty(), "no live v3 row");
+        for (key, value) in &old_loop {
+            assert_eq!(v3.rule_counts(key, value), RuleCount::Ignored, "{key}");
+        }
+        assert_eq!(v3.rule_counts("r", &tombstone), RuleCount::Ignored);
+    }
 }

@@ -147,12 +147,36 @@ pub fn garden_domain_step_cmd(step: &str, script: &str, rest: &str) -> Vec<Strin
         "bash".to_string(),
         "-c".to_string(),
         format!(
-            "exec \"${{WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}}/scripts/wicked-garden\" run {script} --db \"$1\" --repo-root \"$2\" {rest}"
+            "exec \"${{WICKED_GARDEN_ROOT:?{NO_GARDEN_ROOT}}}/scripts/wicked-garden\" run {script} --db \"$1\" --repo-root \"$2\" {rest}"
         ),
         step.to_string(),
         crate::workflow::CODE_GRAPH_DB_TOKEN.to_string(),
         crate::workflow::REPO_ROOT_TOKEN.to_string(),
     ]
+}
+
+/// The refusal of a garden step handed no garden root (never a `wicked-garden` from PATH).
+const NO_GARDEN_ROOT: &str =
+    "the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH";
+
+/// garden's J6 v3 domain run, the script `domain-run` runs.
+pub const DOMAIN_RUN_SCRIPT: &str = "scripts/domain/run.py";
+
+/// (core#1955 R2-6) What `domain-run` says when the admitted garden predates J6 v3 (it has no
+/// [`DOMAIN_RUN_SCRIPT`]), instead of the launcher's missing-script error.
+pub const OLD_GARDEN_REFUSAL: &str = "this wicked-garden is too old to map a domain: upgrade it";
+
+/// The `domain-run` step: [`garden_domain_step_cmd`] for [`DOMAIN_RUN_SCRIPT`], refusing in words
+/// ([`OLD_GARDEN_REFUSAL`], exit 1) before it runs anything when the admitted garden root has no
+/// such script. The check runs in the step because the garden root is resolved per Tool unit (the
+/// generation the run was admitted against), not at launch.
+pub fn domain_run_step_cmd(step: &str, rest: &str) -> Vec<String> {
+    let mut cmd = garden_domain_step_cmd(step, DOMAIN_RUN_SCRIPT, rest);
+    cmd[2] = format!(
+        "[ -f \"${{WICKED_GARDEN_ROOT:?{NO_GARDEN_ROOT}}}/{DOMAIN_RUN_SCRIPT}\" ] || {{ echo '{OLD_GARDEN_REFUSAL}' >&2; exit 1; }}; {}",
+        cmd[2]
+    );
+    cmd
 }
 
 #[cfg(test)]
@@ -244,6 +268,64 @@ mod tests {
                 crate::workflow::REPO_ROOT_TOKEN
             ]
         );
+    }
+
+    /// (core#1955 R2-6) `domain-run` refuses in words, before it runs anything, when the admitted
+    /// garden has no `scripts/domain/run.py`. A garden with it runs it through its launcher, and no
+    /// garden root keeps the PATH refusal. Fails without the check: the old garden's launcher runs.
+    #[cfg(unix)]
+    #[test]
+    fn domain_run_refuses_an_old_garden_in_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let cmd = domain_run_step_cmd("domain-run", "--scope \"$WICKED_DOMAIN_SCOPE\"");
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-old-garden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let launcher = dir.join("scripts").join("wicked-garden");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, "#!/bin/sh\necho \"launched $*\"\nexit 3\n").unwrap();
+        std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |root: Option<&std::path::Path>| {
+            use wicked_apps_core::HardenedCommand;
+            // spawn-audit: hardened run of the shipped step command, as the Tool step runs it.
+            let mut c = std::process::Command::new(&cmd[0]);
+            c.hardened()
+                .arg(&cmd[1])
+                .arg(&cmd[2])
+                .args(["domain-run", "/db", "/repo"])
+                .env("WICKED_DOMAIN_SCOPE", "/scope.json")
+                .env_remove("WICKED_GARDEN_ROOT");
+            if let Some(r) = root {
+                c.env("WICKED_GARDEN_ROOT", r);
+            }
+            c.output().unwrap()
+        };
+        // An old garden: its launcher is there, the J6 v3 script is not.
+        let old = run(Some(&dir));
+        assert_eq!(old.status.code(), Some(1), "{old:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&old.stderr).trim(),
+            OLD_GARDEN_REFUSAL
+        );
+        assert!(old.stdout.is_empty(), "nothing ran: {old:?}");
+        // A garden with the script runs it through its own launcher.
+        std::fs::create_dir_all(dir.join("scripts").join("domain")).unwrap();
+        std::fs::write(dir.join(DOMAIN_RUN_SCRIPT), "").unwrap();
+        let new = run(Some(&dir));
+        assert_eq!(new.status.code(), Some(3), "{new:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&new.stdout).trim(),
+            "launched run scripts/domain/run.py --db /db --repo-root /repo --scope /scope.json"
+        );
+        // No garden root: the PATH refusal, not the old-garden one.
+        let none = run(None);
+        assert_ne!(none.status.code(), Some(0), "{none:?}");
+        let err = String::from_utf8_lossy(&none.stderr);
+        assert!(
+            err.contains(NO_GARDEN_ROOT) && !err.contains(OLD_GARDEN_REFUSAL),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// (J6 C1b, codex r1) A launcher's scope text parses without losing a field: a key twice, at
