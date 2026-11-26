@@ -377,7 +377,14 @@ pub(crate) fn fetch_origin(cwd: &Path) -> Result<(), String> {
     fetch_origin_env(cwd, &[])
 }
 
+/// (core#1959) The GitHub origins a failed fetch is retried on with the deliver step's credential.
+const GITHUB_BASE: &str = "https://github.com/";
+
 fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
+    fetch_origin_at(cwd, env, GITHUB_BASE)
+}
+
+fn fetch_origin_at(cwd: &Path, env: &[(&str, &Path)], _github: &str) -> Result<(), String> {
     // crew#933: an Azure DevOps origin is fetched with the daemon's own credential, as the deliver
     // script does, rather than failing for want of a credential helper and skipping the lift.
     let ado = ado_fetch_for(cwd, env)
@@ -4365,6 +4372,114 @@ mod tests {
         assert!(
             err.contains("FAILED") && !err.contains(crate::repo_checks::REGRESSION),
             "{err}"
+        );
+    }
+
+    /// (core#1959) A private GitHub origin on a machine with no git credential helper: the plain
+    /// fetch is refused, so the engine fetches again with the credential the deliver step uses
+    /// (here an exported `GH_TOKEN`). A local server stands in for github.com: it answers 401 to
+    /// any request without that exact Basic header, and serves the bare repo (git's dumb HTTP
+    /// protocol) to one with it. No global or system git config is read (no keychain).
+    #[cfg(unix)]
+    #[test]
+    fn a_github_fetch_refused_without_a_helper_uses_the_deliver_credential_1959() {
+        use base64::Engine as _;
+        use std::io::{Read, Write};
+        let base = scratch("gh-fetch-1959");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let tip = run_git(&seed, &["rev-parse", "HEAD"]);
+        let served = base.join("srv").join("private.git");
+        std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                served.to_str().unwrap(),
+            ],
+        );
+        run_git(&served, &["update-server-info"]);
+        let token = "fake-token-for-the-1959-test"; // ggignore: a made-up test value, not a secret
+        let want = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = served.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut b = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut b) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&b[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .split('?')
+                    .next()
+                    .unwrap_or("/")
+                    .to_string();
+                let authed = req.lines().any(|l| {
+                    l.split_once(':').is_some_and(|(k, v)| {
+                        k.eq_ignore_ascii_case("authorization") && v.trim() == want
+                    })
+                });
+                let file = path
+                    .strip_prefix("/acme/private.git/")
+                    .filter(|p| !p.split('/').any(|c| c == ".."))
+                    .and_then(|p| std::fs::read(root.join(p)).ok());
+                let resp = match (authed, file) {
+                    (false, _) => b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"t\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    (true, Some(body)) => {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        r.extend(body);
+                        r
+                    }
+                    (true, None) => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                };
+                let _ = c.write_all(&resp);
+            }
+        });
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main", "."]);
+        let url = format!("http://127.0.0.1:{port}/acme/private.git");
+        run_git(&clone, &["remote", "add", "origin", &url]);
+        let env: Vec<(&str, &Path)> = vec![
+            ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+            ("GH_TOKEN", Path::new(token)),
+        ];
+        let got = fetch_origin_at(&clone, &env, &format!("http://127.0.0.1:{port}/"));
+        assert_eq!(
+            got,
+            Ok(()),
+            "the second fetch carries the deliver credential"
+        );
+        assert_eq!(
+            run_git(&clone, &["rev-parse", "refs/remotes/origin/main"]),
+            tip,
+            "origin/main is the remote's tip"
         );
     }
 }
