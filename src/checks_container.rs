@@ -3212,14 +3212,14 @@ pub(crate) fn seat_package_dirs(
         .filter(|d| *d != scratch && !d.starts_with(&format!("{scratch}/")))
         // A glob or quote character would widen the seat's own `find -path` of the mount.
         .filter(|d| !d.contains(&['*', '?', '[', ']', '\\', '\''][..]))
-        .filter(|d| has(*d, "package.json"))
+        .filter(|d| has(d, "package.json"))
         .filter(|d| {
             ["npm-shrinkwrap.json", "package-lock.json"]
                 .iter()
-                .any(|f| has(*d, *f))
+                .any(|f| has(d, f))
         })
-        .filter(|d| !has(*d, "pnpm-lock.yaml") && !has(*d, "yarn.lock"))
-        .filter(|d| !covered(*d))
+        .filter(|d| !has(d, "pnpm-lock.yaml") && !has(d, "yarn.lock"))
+        .filter(|d| !covered(d))
         .collect();
     dirs.sort_unstable();
     dirs.dedup();
