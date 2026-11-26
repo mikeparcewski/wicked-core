@@ -326,6 +326,8 @@ pub(crate) fn reserve_stand_ins(
     deadline: Instant,
 ) -> Vec<crate::standin::SeatedStandIn> {
     let (reply, rx) = channel();
+    // (core#1999) The engine reserves nothing past the instant this stops waiting.
+    let give_up = deadline.min(Instant::now() + RESERVE_WAIT);
     if tx
         .send(crate::command::Command::ReserveStandIns {
             run_id: run_id.to_string(),
@@ -334,16 +336,15 @@ pub(crate) fn reserve_stand_ins(
             scope,
             voters,
             bases,
+            give_up,
             reply,
         })
         .is_err()
     {
         return Vec::new();
     }
-    let wait = deadline
-        .saturating_duration_since(Instant::now())
-        .min(RESERVE_WAIT);
-    rx.recv_timeout(wait).unwrap_or_default()
+    rx.recv_timeout(give_up.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
 }
 
 /// (core#1289) The seats a team council may draw from `roster`, each party in `excluded`
@@ -3631,7 +3632,11 @@ fn convene_one(
         // (core#1822) `council.convened` goes on the stream when the ballots start, before any
         // ballot returns: a council still voting when the unit ends reads `timeout`, and one that
         // never started reads `not_convened`.
+        // (core#1997, codex r1) The seats whose ballots started: a council that then times out
+        // or fails still names who sat, so its voters are on the receipt.
+        let mut started: Vec<String> = Vec::new();
         let mut on_convened = |seats: &[String]| {
+            started = seats.to_vec();
             u.publish(&TeamEvent {
                 env: env_of(
                     &key,
@@ -3673,10 +3678,22 @@ fn convene_one(
                 )
             }
             CouncilOutcome::NoSeats(_) => ("engine".into(), no(tev_reason::SEATS_BENCHED, None)),
-            CouncilOutcome::Failed(_) => ("engine".into(), no(tev_reason::ERROR, None)),
+            CouncilOutcome::Failed(_) => (
+                "engine".into(),
+                CouncilRuled {
+                    seats: std::mem::take(&mut started),
+                    ..no(tev_reason::ERROR, None)
+                },
+            ),
             CouncilOutcome::TimedOut => {
                 *timed_out = true;
-                ("engine".into(), no(tev_reason::TIMEOUT, None))
+                (
+                    "engine".into(),
+                    CouncilRuled {
+                        seats: std::mem::take(&mut started),
+                        ..no(tev_reason::TIMEOUT, None)
+                    },
+                )
             }
             // The budget ran out with no ballot started: `finalPass` reads `timed_out` as before;
             // only the council's reason says what happened.

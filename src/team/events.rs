@@ -1982,11 +1982,11 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
     }
 }
 
-/// The `finding_id`s whose council STARTED voting in `rows` (`council.convened`, core#1822), in
-/// the attempt the rows' terminal `step.completed` names (every row when none names one, as the
-/// fold reads them). [`synthesize_timeout`] reads it: a council that never convened did not time
-/// out.
-pub fn convened_findings(rows: &[TeamRow]) -> HashSet<String> {
+/// The `finding_id`s whose council STARTED voting in `rows` (`council.convened`, core#1822), each
+/// with the seats that sat (core#1997), in the attempt the rows' terminal `step.completed` names
+/// (every row when none names one, as the fold reads them). [`synthesize_timeout`] reads it: a
+/// council that never convened did not time out, and one that did still names who sat.
+pub fn convened_findings(rows: &[TeamRow]) -> std::collections::HashMap<String, Vec<String>> {
     let terminal = rows.iter().find_map(|r| match r.event.body {
         TeamBody::StepCompleted(_) => Some((r.event.env.ord, r.event.env.attempt)),
         _ => None,
@@ -1996,7 +1996,7 @@ pub fn convened_findings(rows: &[TeamRow]) -> HashSet<String> {
         .filter_map(|r| match &r.event.body {
             // A finding's council only (`finding:<raise_seq>`); a member step's has no finding.
             TeamBody::CouncilConvened(b) if b.subject.starts_with("finding:") => {
-                b.finding_id.clone()
+                b.finding_id.clone().map(|id| (id, b.seats.clone()))
             }
             _ => None,
         })
@@ -2012,7 +2012,10 @@ pub const NOT_CONVENED_STEP_ENDED: &str = "the step ended before its turn";
 /// the finding's council STARTED voting (`convened`, from [`convened_findings`]); a council that
 /// never convened is `not_convened` with [`NOT_CONVENED_STEP_ENDED`]. Recorded results are kept;
 /// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. `teamPause` is recomputed.
-pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &HashSet<String>) -> TeamLedger {
+pub fn synthesize_timeout(
+    mut ledger: TeamLedger,
+    convened: &std::collections::HashMap<String, Vec<String>>,
+) -> TeamLedger {
     ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
         if f.finding.severity != Severity::High || !settles_now(f) {
@@ -2029,8 +2032,14 @@ pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &HashSet<String>) ->
             });
         }
         if f.dispute.is_none() {
-            f.dispute = Some(if convened.contains(&f.finding.finding_id) {
-                no_verdict(NoVerdictReason::Timeout)
+            f.dispute = Some(if let Some(seats) = convened.get(&f.finding.finding_id) {
+                // (core#1997, codex r2) The council started: who sat stays on the record, so its
+                // voters reach the receipt's roles.
+                Dispute {
+                    seats: seats.clone(),
+                    independence: super::council_independence(seats),
+                    ..no_verdict(NoVerdictReason::Timeout)
+                }
             } else {
                 Dispute {
                     detail: Some(NOT_CONVENED_STEP_ENDED.to_string()),

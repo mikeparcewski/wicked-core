@@ -3715,6 +3715,7 @@ pub(crate) fn run(
                 scope,
                 voters,
                 bases,
+                give_up,
                 reply,
             } => {
                 // (codex r1 on #1990) A council's caller sees only the registry: whether a real
@@ -3740,6 +3741,7 @@ pub(crate) fn run(
                         need,
                         scope,
                         &bases,
+                        Some(give_up),
                     )
                 }
                 .unwrap_or_else(|e| {
