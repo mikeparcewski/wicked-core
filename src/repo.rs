@@ -385,7 +385,24 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         Some(entry) => (entry.graph_key, entry.seat_layers_off),
         None => (crate::code_graph::mint_repo_graph_key(&id), Vec::new()),
     };
-    let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
+    let (code_graph_db, mut findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
+    // (core#2001) Once, at registration: a partial clone whose recent history a seat cannot copy
+    // is warned about here, and refused at each container-floor run start. Registration still
+    // succeeds (the floor can change, and a fetch can fill the objects).
+    if let Some(gap) = git(&root_path, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|(ok, _, _)| *ok)
+        .and_then(|(_, head, _)| partial_clone_gap(Path::new(&root_path), &head))
+    {
+        findings.push(RepoFinding {
+            code: FINDING_PARTIAL_CLONE_GAP.to_string(),
+            message: format!(
+                "{gap}; a run on the container floor is refused at its start until they are: {}",
+                crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+            ),
+            path: None,
+        });
+    }
     let seat_layers = seat_layer_rows(&root_path, &seat_layers_off);
     let entry = RepoEntry {
         id,
@@ -1159,20 +1176,73 @@ fn git_run(
 /// whose recent history the engine cannot copy into a seat ([`partial_clone_gap`]).
 pub const FINDING_PARTIAL_CLONE_GAP: &str = "partial_clone_gap";
 
-/// (core#2001) Whether the checkout at `tree` is a partial clone missing objects of the last
-/// commits from `sha`. `Some` names the promisor remote, the count and the first missing object.
-pub(crate) fn partial_clone_gap(_tree: &Path, _sha: &str) -> Option<String> {
-    None
+/// (core#2001, core#1667) Whether the checkout at `tree` is a partial clone (a remote marked
+/// promisor, or `extensions.partialClone`) missing objects of the last
+/// [`crate::k8s::seat::REPLICA_DEPTH`] commits from `sha`. The engine never fetches them lazily
+/// (`GIT_NO_LAZY_FETCH`), so a seat's copy of that history cannot be made. `Some` names the
+/// promisor remote, the count and the first missing object. `None` for a complete clone, a
+/// partial clone with those objects present, or a git that cannot answer.
+pub(crate) fn partial_clone_gap(tree: &Path, sha: &str) -> Option<String> {
+    let bounded = |args: &[&str]| {
+        let mut c = crate::k8s::sync::git(tree);
+        c.args(args).env("GIT_NO_LAZY_FETCH", "1");
+        crate::k8s::run_capped(c, None, crate::k8s::seat::GIT_CALL, 64 << 20)
+    };
+    let promisor = bounded(&["config", "--get-regexp", r"^remote\..*\.promisor$"]);
+    let remote = if promisor.ok() {
+        String::from_utf8_lossy(&promisor.stdout)
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let key = fields.next()?;
+                if !fields.next()?.eq_ignore_ascii_case("true") {
+                    return None;
+                }
+                key.strip_prefix("remote.")?
+                    .strip_suffix(".promisor")
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    }
+    .or_else(|| {
+        let partial = bounded(&["config", "--get", "extensions.partialClone"]);
+        partial
+            .ok()
+            .then(|| String::from_utf8_lossy(&partial.stdout).trim().to_string())
+            .filter(|name| !name.is_empty())
+    })?;
+    let depth = crate::k8s::seat::REPLICA_DEPTH;
+    let objects = bounded(&["rev-list", "--objects", "--missing=print", "-n", depth, sha]);
+    if !objects.ok() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&objects.stdout);
+    let mut missing = stdout.lines().filter_map(|line| line.strip_prefix('?'));
+    let first = missing.next()?;
+    let count = 1 + missing.count();
+    Some(format!(
+        "the repository is a partial clone (promisor remote `{remote}`) and {count} object(s) of \
+         its last {depth} commits were never fetched (first {first})"
+    ))
 }
 
 /// (core#2001) The refusal a run start gives, before the first dispatch, when the container floor
-/// would copy a partial clone's missing history into a seat. `None` off the container floor.
+/// would copy a partial clone's missing history into a seat: the floor's remedy and the gap.
+/// `None` off the container floor, where no seat replica is made.
 pub(crate) fn partial_clone_start_refusal(
-    _root: &Path,
-    _commit: &str,
-    _container: bool,
+    root: &Path,
+    commit: &str,
+    container: bool,
 ) -> Option<String> {
-    None
+    if !container {
+        return None;
+    }
+    let gap = partial_clone_gap(root, commit)?;
+    Some(format!(
+        "the run did not start: {} ({gap})",
+        crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+    ))
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
