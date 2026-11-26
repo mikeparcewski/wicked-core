@@ -2011,6 +2011,9 @@ pub fn convened_councils(rows: &[TeamRow]) -> Convened {
                     out.findings.insert(id.clone(), b.seats.clone());
                 }
             }
+            TeamBody::CouncilConvened(b) if b.subject.starts_with("step:") => {
+                out.steps.insert(b.subject.clone(), b.seats.clone());
+            }
             _ => {}
         }
     }
@@ -2025,7 +2028,9 @@ pub const NOT_CONVENED_STEP_ENDED: &str = "the step ended before its turn";
 /// pass timed out)"}` and a no-verdict dispute. (core#1822) The dispute says `timeout` only when
 /// the finding's council STARTED voting (`convened`, from [`convened_councils`]); a council that
 /// never convened is `not_convened` with [`NOT_CONVENED_STEP_ENDED`]. Recorded results are kept;
-/// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. `teamPause` is recomputed.
+/// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. (core#2011) A member
+/// step's review whose council convened and never ruled gets the same `timeout` dispute, naming
+/// who sat. `teamPause` is recomputed.
 pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &Convened) -> TeamLedger {
     ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
@@ -2059,6 +2064,24 @@ pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &Convened) -> TeamLe
                     }
                 },
             );
+        }
+    }
+    // (core#2011) A member step's council that started and never ruled: who sat stays on the
+    // review, so its voters reach the receipt's roles. The engine pauses on it as on a review
+    // with no dispute (the member held, the council gave no verdict).
+    for r in &mut ledger.step_reviews {
+        if r.dispute.is_some() {
+            continue;
+        }
+        if let Some(seats) = convened
+            .steps
+            .get(&subject_step(&r.step_id, r.reviewed_attempt))
+        {
+            r.dispute = Some(Dispute {
+                seats: seats.clone(),
+                independence: super::council_independence(seats),
+                ..no_verdict(NoVerdictReason::Timeout)
+            });
         }
     }
     ledger.refresh_pause();

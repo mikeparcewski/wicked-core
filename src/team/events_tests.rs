@@ -1098,7 +1098,13 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     step.event.env.run_id = "f88faa2f".into();
     step.event.env.ord = Some(6);
     step.event.env.attempt = Some(3);
-    assert_eq!(convened_councils(&s.rows), Convened::default());
+    let convened = convened_councils(&s.rows);
+    assert!(convened.findings.is_empty(), "{convened:?}");
+    // (core#2011) It is a step's council, by its subject.
+    assert_eq!(
+        convened.steps,
+        std::collections::HashMap::from([(subject_step("build", 3), vec!["codex".to_string()])])
+    );
 }
 
 /// core#2011: a member-step council the final pass outlived (its ballots started, its ruling never
