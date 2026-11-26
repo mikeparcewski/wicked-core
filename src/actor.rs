@@ -40128,8 +40128,9 @@ mod live_output_stream_tests {
         use crate::domain::{put_nodes, UnitStatus, WorkUnit};
         use wicked_apps_core::open_store;
 
-        // `tools`: which of the run's steps are tool steps; `at`: the cursor's step (mid-turn).
-        let seed = |tag: &str, tools: &[bool], at: usize| {
+        // `kinds`: one letter per step, `s` a seat step, `t` a tool step, `i` a stand-in seat step
+        // (`claude~1`); `at`: the cursor's step (mid-turn).
+        let seed = |tag: &str, kinds: &str, at: usize| {
             let run_id = format!("inject-1979-{tag}-{}", uuid::Uuid::new_v4());
             let dir = std::env::temp_dir().join(&run_id);
             std::fs::create_dir_all(&dir).unwrap();
@@ -40141,11 +40142,11 @@ mod live_output_stream_tests {
                 session.unit_ix = at;
                 session.attempt = 1;
                 let mut nodes = vec![session.to_node()];
-                for (i, tool) in tools.iter().enumerate() {
+                for (i, kind) in kinds.chars().enumerate() {
                     let ord = i as u32 + 1;
                     let mut u = WorkUnit::pending(format!("{run_id}:u{ord}"), &run_id, ord, "step");
-                    u.assigned_cli = Some("codex".into());
-                    if *tool {
+                    u.assigned_cli = Some(if kind == 'i' { "claude~1" } else { "codex" }.into());
+                    if kind == 't' {
                         u.tool_cmd = Some(vec!["true".into()]);
                     }
                     if i <= at {
@@ -40171,7 +40172,7 @@ mod live_output_stream_tests {
         };
         let note = "next: keep it small";
 
-        let (run, core, _) = seed("next", &[false, false], 0);
+        let (run, core, _) = seed("next", "ss", 0);
         core.inject_worker_message(&run, note, InjectTarget::All)
             .expect("held for the next step, not refused");
         assert!(
@@ -40193,18 +40194,28 @@ mod live_output_stream_tests {
         assert!(heard(&run, 2).is_empty(), "a refused message is not queued");
 
         // A tool step reads no operator message: held for the seat step after it.
-        let (run, core, _) = seed("over-tool", &[false, true, false], 0);
+        let (run, core, _) = seed("over-tool", "sts", 0);
         core.inject_worker_message(&run, note, InjectTarget::All)
             .expect("held for step 3");
         assert!(heard(&run, 2).is_empty(), "a tool step never takes it");
         assert_eq!(heard(&run, 3), vec![note.to_string()]);
 
-        // The last step mid-turn, or only tool steps after it: no later step would hear it.
-        for (tag, tools, at) in [
-            ("last", &[false, false][..], 1),
-            ("tools-only", &[false, true][..], 0),
+        // A stand-in hears no operator message (DES-STANDIN-001 §3.4): on a one-helper run
+        // (build on a seat, review on its stand-in) the note is held for the seat step after it.
+        let (run, core, _) = seed("over-stand-in", "sis", 0);
+        core.inject_worker_message(&run, note, InjectTarget::All)
+            .expect("held for step 3");
+        assert!(heard(&run, 2).is_empty(), "a stand-in never takes it");
+        assert_eq!(heard(&run, 3), vec![note.to_string()]);
+
+        // The last step mid-turn, or only tool or stand-in steps after it: no later step would
+        // hear it.
+        for (tag, kinds, at) in [
+            ("last", "ss", 1),
+            ("tools-only", "st", 0),
+            ("stand-in-only", "si", 0),
         ] {
-            let (run, core, _) = seed(tag, tools, at);
+            let (run, core, _) = seed(tag, kinds, at);
             let err = core
                 .inject_worker_message(&run, note, InjectTarget::All)
                 .expect_err("no later step hears it")
@@ -40215,7 +40226,7 @@ mod live_output_stream_tests {
 
         // A held message goes with the run when it ends: a relaunch that reuses the id never
         // hears it.
-        let (run, core, db) = seed("ended", &[false, false], 0);
+        let (run, core, db) = seed("ended", "ss", 0);
         core.inject_worker_message(&run, note, InjectTarget::All)
             .expect("held");
         // The run's end, on a scratch store of its own (never a second writer on the actor's).
