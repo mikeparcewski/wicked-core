@@ -3486,7 +3486,7 @@ fn plain_dir(worktree: &Path, rel: &str) -> bool {
 /// Node workspace member (`dir` matches the root `package.json` `workspaces` globs, or
 /// `pnpm-workspace.yaml` `packages`, `!` exclusions honoured), or any root `Cargo.toml` (a
 /// workspace, or a crate whose members cargo builds)?
-fn root_covers(worktree: &Path, manifest: &str, dir: &str) -> bool {
+pub(crate) fn root_covers(worktree: &Path, manifest: &str, dir: &str) -> bool {
     if manifest != "package.json" {
         return worktree.join("Cargo.toml").is_file();
     }
