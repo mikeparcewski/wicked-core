@@ -208,6 +208,12 @@ pub(crate) fn take_receipts() -> Vec<LaunchReceipt> {
     RECEIPTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
+/// (core#1958) Put back receipts a helper thread took ([`take_receipts`]), so the thread that
+/// reads a batch's answers sees every launch it asked for, as when it ran them itself.
+pub(crate) fn restore_receipts(receipts: Vec<LaunchReceipt>) {
+    RECEIPTS.with(|r| r.borrow_mut().extend(receipts));
+}
+
 /// What the launches of one seat among a set of receipts were observed calling: every provider
 /// any of them was seen calling, and whether EVERY one of them was observed. A known shared
 /// provider is proven by `providers` alone; proving that two launches are independent also needs
