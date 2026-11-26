@@ -160,6 +160,51 @@ fn published(o: &PublishOutcome) -> bool {
 
 // ── P1 (a): the bus is unwritable, every fact spools, and lands once when it returns ─────────────
 
+/// core#1926: swapping the refused types never opens a gap. `row3` of the team-gate suite swaps
+/// `plan.accepted` for `gate.opened` while the publisher retries both; a swap made of two
+/// autocommit statements let a retry land both between them (seen once on a slow Windows
+/// runner: the run then took its `gate.decided` and went on). A reader polls the bus schema, as
+/// fast as it can, while the refusal is swapped back and forth: it never sees the bus unguarded.
+#[test]
+fn a_refusal_swap_never_lets_a_type_both_sides_refuse_through_1926() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let rig = rig("swap-gap");
+    rig.refuse(&["p1.held", "p1.a"]);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let reader = std::thread::spawn({
+        let c = rig.conn();
+        c.busy_timeout(Duration::ZERO).unwrap();
+        let stop = stop.clone();
+        move || {
+            let mut unguarded = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let n: rusqlite::Result<i64> = c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'p1_refuse'",
+                    [],
+                    |r| r.get(0),
+                );
+                if n == Ok(0) {
+                    unguarded += 1;
+                }
+            }
+            unguarded
+        }
+    });
+    for i in 0..400 {
+        rig.refuse(if i % 2 == 0 {
+            &["p1.held", "p1.b"]
+        } else {
+            &["p1.held", "p1.a"]
+        });
+    }
+    stop.store(true, Ordering::SeqCst);
+    let unguarded = reader.join().unwrap();
+    assert_eq!(
+        unguarded, 0,
+        "the bus was seen with no refusal while it was swapped"
+    );
+}
+
 /// P1 (a) — with the bus db held EXCLUSIVE (unwritable), every team fact lands in the team
 /// outbox (the emit-outbox record plus key, run and owner); once the bus returns, a drain
 /// publishes each exactly once, and a second drain publishes nothing more.

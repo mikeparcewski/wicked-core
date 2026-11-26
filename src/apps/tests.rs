@@ -1842,3 +1842,150 @@ fn a_run_cost_launch_that_could_not_arm_the_crew_tool_channel_is_refused() {
     };
     assert!(admit(&store, &other).unwrap().is_none());
 }
+
+// ─── Stand-ins on a publish (core#1974, DES-STANDIN-001 T-R17) ─────────────────────────────────
+
+fn job_consent() -> crate::standin::StandInConsent {
+    crate::standin::StandInConsent {
+        scope: crate::standin::SCOPE_JOB.into(),
+        by: "operator".into(),
+        at: 1,
+        via: "launch".into(),
+    }
+}
+
+/// A publish launch as the launch routes build it, on `clis`, with the stand-in facts given.
+fn publish_spec(
+    clis: Vec<crate::AgenticCli>,
+    aware: bool,
+    consent: Option<crate::standin::StandInConsent>,
+) -> crate::LaunchSpec {
+    crate::LaunchSpec {
+        scope: None,
+        base_ref: None,
+        project_id: None,
+        problem: "publish the app".into(),
+        clis,
+        entity_mode: EntityMode::Shared,
+        session_id: "r-admit".into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: Some("app-repo".into()),
+        workflow: Some(APPS_PUBLISH.into()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        optional_read_roots: Vec::new(),
+        project_graph: None,
+        plan: None,
+        deliver_step: None,
+        exclude_seats: Vec::new(),
+        evidence_root: Some("/ev".into()),
+        primary: None,
+        reduced_assurance: false,
+        stand_in: crate::standin::LaunchStandIn {
+            aware,
+            parties: Vec::new(),
+            consent,
+        },
+        power: false,
+        voice: None,
+        deliverables: Vec::new(),
+        qe_acceptance: QeOverride::Auto,
+    }
+}
+
+/// core#1974 (T-R17): on a roster with one seat that built nothing, a consented, stand-in-aware
+/// publish launches, its QE evidence is reviewed on a fresh stand-in (minted by the real writer,
+/// `qe_acceptance::review::stand_in_reviewer`), and the produce backstop takes that PASS as a
+/// disclosed stand-in review, never as a distinct seat's. Without consent the launch refusal stays
+/// and offers the stand-in choice; a launcher that is not stand-in-aware keeps today's words; no
+/// seat at all is still the typed builder refusal.
+#[test]
+fn a_consented_publish_on_one_seat_launches_and_its_qe_is_reviewed_on_a_stand_in_1974() {
+    let store = seeded();
+    let one = vec![cli("claude")];
+    let launch = |spec: &crate::LaunchSpec| {
+        admit(
+            &store,
+            &LaunchFacts {
+                crew_url: true,
+                ..LaunchFacts::of(spec, Some("container"), true)
+            },
+        )
+    };
+    let consented = publish_spec(one.clone(), true, Some(job_consent()));
+    let admitted = launch(&consented).expect("a consented one-seat publish launches");
+    assert!(admitted.is_some_and(|c| c.publish()));
+    // No consent: refused, and the words offer the stand-in choice.
+    let asked = launch(&publish_spec(one.clone(), true, None))
+        .unwrap_err()
+        .to_string();
+    assert!(asked.contains("1 such seat"), "{asked}");
+    assert!(
+        asked.contains("stand-in"),
+        "the refusal offers stand-ins: {asked}"
+    );
+    // Not stand-in-aware: today's refusal, word for word.
+    let plain = launch(&publish_spec(one.clone(), false, None))
+        .unwrap_err()
+        .to_string();
+    assert!(plain.contains("1 such seat — add a seat"), "{plain}");
+    assert!(!plain.contains("stand-in"), "{plain}");
+    // Consent never stands in for a seat the builder exclusion benched.
+    let mut built = publish_spec(one.clone(), true, Some(job_consent()));
+    built.exclude_seats = vec!["claude".into()];
+    let err = launch(&built).unwrap_err();
+    assert!(
+        err.downcast_ref::<crate::actor::NoEligibleSeat>().is_some(),
+        "{err:#}"
+    );
+
+    // Past launch: the QE reviewer is a stand-in on the one seat's credential.
+    let mut s = session("r-pub", apps_contract(APPS_PUBLISH));
+    s.clis = vec!["claude".into()];
+    s.assurance = consented.stand_in.clone().apply(s.assurance);
+    let mut qe = qe_denied_unit("r-pub", s.assurance.qe.clone());
+    qe.status = UnitStatus::Done;
+    qe.denial = None;
+    qe.assigned_cli = Some("claude".into());
+    let units = vec![qe.clone()];
+    assert!(crate::qe_acceptance::review::candidates(&s, &units, &qe).is_empty());
+    assert_eq!(
+        crate::qe_acceptance::review::stand_in_bases(&s, &units, &qe),
+        vec!["claude".to_string()]
+    );
+    let registry = wicked_council::registry::builtin();
+    let (seat, binding) =
+        crate::qe_acceptance::review::stand_in_reviewer(&s, &units, &qe, 0, &registry, &registry)
+            .expect("a publish's QE reviewer stands in");
+    assert_eq!(
+        (seat.seat.as_str(), seat.basis.as_str()),
+        ("claude~1", crate::qe_acceptance::review::BASIS_STAND_IN)
+    );
+    // The receipt as the reviewer turn writes it (`review.rs` `attempt`: the seat's key and basis).
+    qe.qe_review = Some(QeReview {
+        attempts: vec![reviewed_by(&seat.seat, &seat.basis)],
+        ..pass_review()
+    });
+    let t1 = Some("t1");
+    // A stand-in basis the run never bound is refused (no binding, no stand-in review).
+    let why = publish_consent_refusal(&s, &[qe.clone()], t1).unwrap();
+    assert!(why.contains("distinct from the QE executor"), "{why}");
+    let mut bound = s.clone();
+    bound.assurance.stand_ins.push(binding.clone());
+    assert_eq!(publish_consent_refusal(&bound, &[qe.clone()], t1), None);
+    // The binding must be this QE unit's reviewer: another role's binding on the key refuses.
+    let mut judge = s.clone();
+    judge
+        .assurance
+        .stand_ins
+        .push(crate::standin::StandInBinding {
+            role: crate::standin::Role::Judge,
+            ..binding.clone()
+        });
+    assert!(publish_consent_refusal(&judge, &[qe.clone()], t1).is_some());
+    // Without consent no stand-in reviews a publish.
+    let mut unasked = bound.clone();
+    unasked.assurance.stand_in = None;
+    assert!(publish_consent_refusal(&unasked, &[qe.clone()], t1).is_some());
+}

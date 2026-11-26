@@ -3694,6 +3694,10 @@ pub(crate) fn run(
                     );
                 });
             }
+            // (DES-STANDIN-001 §3.2) Reserve a team role's stand-ins on the single writer.
+            Command::ReserveStandIns { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
             // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
             Command::ReserveRuleCouncil { run_id, ord, reply } => {

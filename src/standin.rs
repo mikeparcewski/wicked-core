@@ -313,6 +313,17 @@ pub(crate) struct BindingScope {
     pub evidence: Option<String>,
 }
 
+/// (§3.2, core#1972, core#1973) A stand-in the actor reserved for a team role: its binding as the
+/// run's contract now holds it, the base's record re-keyed to the binding (what a ballot or a
+/// member turn runs), and its stamp's words.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // The red commit's scaffold: the fix reads every field.
+pub(crate) struct SeatedStandIn {
+    pub binding: StandInBinding,
+    pub record: crate::AgenticCli,
+    pub label: String,
+}
+
 /// (§3.2) What one role asks [`fill`] for, after its own admission gave up.
 pub(crate) struct FillRequest<'a> {
     pub role: Role,
@@ -993,6 +1004,37 @@ mod tests {
         ];
         for l in dropped {
             assert!(!packet_keeps(l), "dropped by default: {l}");
+        }
+    }
+
+    /// core#1985: the engine knows the helpers ON the run (the launch's own seats), never which
+    /// other helpers are signed in. A run that picked one helper while others were signed in was
+    /// recorded "only Claude Code was signed in", on the run page and in the pull request. The
+    /// reason says what the run's facts hold: the helpers picked for this job.
+    #[test]
+    fn a_reason_names_the_helpers_picked_for_the_job_never_who_was_signed_in_1985() {
+        let one = Reason::OnlyOneHelper {
+            cli: "Claude Code".into(),
+        };
+        assert_eq!(one.words(), "only Claude Code was picked for this job");
+        let short = Reason::HelpersShort {
+            signed_in: 2,
+            need: 2,
+            have: 1,
+        };
+        assert_eq!(
+            short.words(),
+            "2 helpers are picked for this job: 1 can check this job independently and it needs 2"
+        );
+        let all = Reason::AllParties {
+            seats: vec!["Claude Code".into(), "Codex".into()],
+        };
+        assert_eq!(
+            all.words(),
+            "every helper picked for this job (Claude Code, Codex) built or reviewed this work"
+        );
+        for r in [one, short, all] {
+            assert!(!r.words().contains("signed in"), "{}", r.words());
         }
     }
 }
