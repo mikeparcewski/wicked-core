@@ -3860,7 +3860,10 @@ pub(crate) fn run(
                         // another unit dispatched after it. Owned only when the message is for that
                         // unit's seat (or all); an unreadable owner refuses the inject (codex r1),
                         // never queues it unscoped.
-                        let owner = (|| -> anyhow::Result<Option<u32>> {
+                        // (core#1964) …and whether it can still hear one: a unit already
+                        // dispatched in this attempt took its messages then, and hears a new one
+                        // only between the turns of a power build. Any other is mid-turn.
+                        let owner = (|| -> anyhow::Result<Option<(u32, bool)>> {
                             let Some(s) = crate::domain::get_session(&store, &run_id)? else {
                                 return Ok(None);
                             };
@@ -3876,10 +3879,27 @@ pub(crate) fn run(
                                     ) && (target_str == "all"
                                         || u.assigned_cli.as_deref() == Some(target_str.as_str()))
                                 })
-                                .map(|u| u.ord))
+                                .map(|u| {
+                                    let turns = s
+                                        .power
+                                        .as_ref()
+                                        .is_some_and(|p| p.on && p.orchestrator.ord == Some(u.ord));
+                                    (u.ord, u.last_attempt == Some(s.attempt) && !turns)
+                                }))
                         })();
                         let for_ord = match owner {
-                            Ok(o) => o,
+                            Ok(Some((ord, true))) if target_str != "all" => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "step {ord} ({target_str}) is in the middle of its turn and \
+                                     reads no message until it ends, so this one would not reach \
+                                     it; it was not sent. Steer the step at its gate instead (a \
+                                     note, or request changes)"
+                                )));
+                                continue;
+                            }
+                            // A broadcast steers the run: the next step hears it.
+                            Ok(Some((_, true))) => None,
+                            Ok(o) => o.map(|(ord, _)| ord),
                             Err(e) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "run {run_id}: could not tell which step is running ({e}); \
