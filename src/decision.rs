@@ -1857,8 +1857,11 @@ mod tests {
                 .unwrap()
         };
         let clis = vec![voter("claude~1"), voter("codex")];
-        let benched =
-            StandInBallots::wrap(Arc::new(BenchedOn("claude")), &[binding.clone()], &clis);
+        let benched = StandInBallots::wrap(
+            Arc::new(BenchedOn("claude")),
+            std::slice::from_ref(&binding),
+            &clis,
+        );
         assert!(benched.seat_benched("claude~1"), "its base is benched");
         assert!(benched.seat_benched("claude"));
         assert!(!benched.seat_benched("codex"));
