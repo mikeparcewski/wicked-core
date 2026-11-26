@@ -1330,6 +1330,98 @@ mod tests {
         );
     }
 
+    /// core#1954 (1): a launch with no plan and no workflow plans ONE prose unit
+    /// (`plan::plan_units`) with no review step, so no evaluator is seated; its default floor
+    /// convenes a judge only when the unit changes the worktree tree, so the judge is conditional.
+    #[test]
+    fn a_planless_launch_has_no_reviewer_and_a_conditional_judge() {
+        let shape = PreflightShape {
+            repo_bound: true,
+            ..PreflightShape::default()
+        };
+        let contract = contract_for(&shape, false);
+        assert!(!contract.team, "no plan, no preset: not a team run");
+        let p = preflight(&[roster_seat("t1954p", "claude")], &shape, contract);
+        assert_eq!(
+            role_names(&p),
+            ["judge"],
+            "a planless launch has no review step"
+        );
+        let judge = role(&p, "judge");
+        assert!(
+            judge.conditional,
+            "the planless unit seats a judge only when it changes code"
+        );
+        assert_eq!((judge.needed, judge.short_by), (1, 1));
+        assert!(
+            judge.can_stand_in,
+            "the judge's stand-in hold still applies"
+        );
+    }
+
+    /// core#1954 (2): the monitor row is sized from the plan's score as the launch scores it
+    /// (`review_scale::floor_for` over `plan_gate::intent_score_for_run`, then `monitor_target`
+    /// with the plan's own ask), not the top band. A docs-only build lands in the lowest band: no
+    /// monitors unless the plan asks for one.
+    #[test]
+    fn the_monitor_row_is_sized_from_the_plans_score() {
+        let clis = [roster_seat("t1954m", "claude")];
+        let docs = |asked: &str| PreflightShape {
+            plan_json: Some(format!(
+                r#"{{"steps":[{{"catalog":"build"}}],"touch":["docs/a.md"]{asked}}}"#
+            )),
+            repo_bound: true,
+            council_size: Some(3),
+            ..PreflightShape::default()
+        };
+        let quiet = docs("");
+        let p = preflight(&clis, &quiet, contract_for(&quiet, false));
+        assert!(
+            !role_names(&p).contains(&"monitor"),
+            "a lowest-band plan seats no monitor: {:?}",
+            p.roles
+        );
+        let asked = docs(r#","monitors":{"asked":1}"#);
+        let p = preflight(&clis, &asked, contract_for(&asked, false));
+        assert_eq!(role(&p, "monitor").needed, 1, "the plan's ask raises it");
+        // A preset's score waits for the PA's scope step: the row keeps the most it can set.
+        let bug = bug_shape();
+        let p = preflight(&clis, &bug, contract_for(&bug, false));
+        assert_eq!(
+            role(&p, "monitor").needed,
+            usize::from(crate::team::supervisor::MAX_MONITORS)
+        );
+    }
+
+    /// core#1954 (3): a stand-in fills the evaluator, the judge, the QE reviewer, a party's place
+    /// and (core#1944) the rule judge through the run's judge offer. No stand-in sits on a council,
+    /// a rule council or a monitor seat, so those rows offer none.
+    #[test]
+    fn only_roles_a_stand_in_fills_offer_one() {
+        let shape = bug_shape();
+        let p = preflight(
+            &[roster_seat("t1954s", "claude")],
+            &shape,
+            contract_for(&shape, true),
+        );
+        for name in ["evaluator", "judge", "qe_reviewer", "rule_judge"] {
+            assert!(role(&p, name).can_stand_in, "{name}");
+        }
+        for name in ["council", "rule_council", "monitor"] {
+            let r = role(&p, name);
+            assert!(!r.can_stand_in, "{name}");
+            assert_eq!(r.stand_in_from, None, "{name}");
+        }
+        // The rule check's stand-in is the judge offer, minted only when the run requires a judge.
+        let no_judge = PreflightContract {
+            rules: true,
+            contained: true,
+            ..PreflightContract::default()
+        };
+        let p = preflight(&[roster_seat("t1954s", "claude")], &shape, no_judge);
+        assert!(!role(&p, "rule_judge").can_stand_in);
+    }
+
     /// DES §2.2: two CLIs. On the expected shape Codex reviews and judges Claude Code's work, so
     /// those roles are real; a council has no non-party voter and the monitors want more seats.
     #[test]
