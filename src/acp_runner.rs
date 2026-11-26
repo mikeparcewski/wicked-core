@@ -2130,9 +2130,9 @@ fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
     let clis = wicked_council::registry::load(user.as_deref())
         .unwrap_or_else(|_| wicked_council::registry::builtin());
     // core#591: a seat INSTANCE (`claude#2`) reads its cli's record unless the operator gave the
-    // instance one of its own — the same two-step lookup the wrapped carrier applies
+    // instance one of its own (and a stand-in reads its base's, core#1995) — the same lookup the wrapped carrier applies
     // (`execute_wrapped::resolve_invocation`), so one key never resolves two ways.
-    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+    for key in crate::execute_wrapped::registry_keys(cli_key) {
         if let Some(c) = clis.iter().find(|c| c.key == key) {
             return Some(c.clone());
         }

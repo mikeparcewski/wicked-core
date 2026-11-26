@@ -5707,7 +5707,7 @@ pub(crate) fn seat_governance_class(cli_key: &str) -> wicked_council::Governance
     let user = wicked_council::registry::default_user_path();
     let clis = wicked_council::registry::load(user.as_deref())
         .unwrap_or_else(|_| wicked_council::registry::builtin());
-    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+    for key in registry_keys(cli_key) {
         if let Some(cli) = clis.iter().find(|c| c.key == key) {
             return wicked_council::governance_class(cli);
         }
@@ -5737,6 +5737,23 @@ pub(crate) fn seat_governance_class(cli_key: &str) -> wicked_council::Governance
     wicked_council::governance_class(&unregistered)
 }
 
+/// (core#1995) THE registry lookup order for a seat key, shared by every resolver: the exact key,
+/// then its credential (a stand-in `claude#2~1` reads the `claude#2` record its reservation picked,
+/// `seat_id::credential`), then the CLI family (core#591: `claude#2` inherits `claude`). Deduped,
+/// so a plain key is looked up once.
+pub(crate) fn registry_keys(cli_key: &str) -> Vec<&str> {
+    let mut keys = vec![cli_key];
+    for k in [
+        wicked_apps_core::spawn::seat_id::credential(cli_key),
+        wicked_apps_core::spawn::seat_cli_key(cli_key),
+    ] {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 /// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
 /// Mirrors `resolve_invocation`'s two-step key lookup: exact key first, then the CLI key
 /// behind it (core#595), so `claude#2` inherits the `claude` registry record's flag.
@@ -5744,7 +5761,7 @@ pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
     let user = wicked_council::registry::default_user_path();
     let clis = wicked_council::registry::load(user.as_deref())
         .unwrap_or_else(|_| wicked_council::registry::builtin());
-    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+    for key in registry_keys(cli_key) {
         if let Some(cli) = clis.iter().find(|c| c.key == key) {
             return cli.acp.as_ref().is_some_and(|acp| acp.os_sandbox);
         }
@@ -6805,7 +6822,7 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
     if let Ok(clis) = wicked_council::registry::load(user.as_deref()) {
         // The exact key first, then the CLI behind it — an operator who registers `claude#2`
         // outright still wins over the `claude` record.
-        for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+        for key in registry_keys(cli_key) {
             if let Some(c) = clis.iter().find(|c| c.key == key) {
                 if !c.headless_invocation.trim().is_empty() {
                     return c.headless_invocation.clone();
@@ -6867,7 +6884,7 @@ pub(crate) fn seat_posture_from(cli_key: &str, user_path: Option<&Path>) -> Vec<
     // record under `"claude#2"` but inherits `"claude"`'s trust_flags. Mirrors the same
     // two-step loop `resolve_invocation` already applies to `headless_invocation`.
     if let Ok(clis) = wicked_council::registry::load(user_path) {
-        for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+        for key in registry_keys(cli_key) {
             if let Some(c) = clis.iter().find(|c| c.key == key) {
                 return c.trust_flags.clone();
             }
@@ -14599,6 +14616,54 @@ mod tests {
         assert!(
             !capped.iter().any(|f| f.contains("dangerously-bypass")),
             "the resolved governed-worker posture must never be the full bypass (crew#427)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#1995: a stand-in on an INSTANCE base (`codex#2~1`) reads its base instance's record,
+    /// never the family's, and a stand-in on a plain base reads that base. The lookup order is the
+    /// one every resolver shares ([`registry_keys`]).
+    #[test]
+    fn a_stand_in_on_an_instance_base_reads_its_base_record_1995() {
+        assert_eq!(registry_keys("codex"), vec!["codex"]);
+        assert_eq!(registry_keys("codex#2"), vec!["codex#2", "codex"]);
+        assert_eq!(registry_keys("codex~1"), vec!["codex~1", "codex"]);
+        assert_eq!(
+            registry_keys("codex#2~1"),
+            vec!["codex#2~1", "codex#2", "codex"]
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "wc-posture-standin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clis = dir.join("clis.toml");
+        std::fs::write(
+            &clis,
+            "[[cli]]\n\
+             key = \"codex\"\n\
+             display_name = \"Codex\"\n\
+             binary = \"codex\"\n\
+             headless_invocation = \"codex {PROMPT}\"\n\
+             trust_flags = [\"--sandbox\", \"workspace-write\"]\n\
+             [[cli]]\n\
+             key = \"codex#2\"\n\
+             display_name = \"Codex-2\"\n\
+             binary = \"codex\"\n\
+             headless_invocation = \"codex {PROMPT}\"\n\
+             trust_flags = [\"--sandbox\", \"read-only\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            seat_posture_from("codex#2~1", Some(&clis)),
+            vec!["--sandbox".to_string(), "read-only".to_string()],
+            "the stand-in reads codex#2's record, not codex's"
+        );
+        assert_eq!(
+            seat_posture_from("codex~1", Some(&clis)),
+            vec!["--sandbox".to_string(), "workspace-write".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

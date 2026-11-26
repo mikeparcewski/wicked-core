@@ -1571,9 +1571,28 @@ pub(crate) fn delivery_receipt(
                 roles.push(role.clone());
             }
         }
-        r.independence = crate::assurance::independence_of(&roles);
-        if roles.iter().any(RoleRecord::is_stand_in) {
+        // (core#1997) A team stand-in any gate counted, or a council a member-step review
+        // convened after its gate, took part too: the delivery is never more independent than a
+        // gate it carries, and its legacy projection says so as the gate's does.
+        let team_stood = crate::assurance::team_stood_in(&r.councils, &[])
+            || units.iter().filter_map(|u| u.assurance.as_ref()).any(|g| {
+                matches!(
+                    g.independence.as_deref(),
+                    Some(
+                        crate::assurance::INDEPENDENCE_STAND_IN
+                            | crate::assurance::INDEPENDENCE_MIXED
+                    )
+                )
+            });
+        r.independence = crate::assurance::with_team_stand_ins(
+            crate::assurance::independence_of(&roles),
+            team_stood,
+        );
+        if team_stood || roles.iter().any(RoleRecord::is_stand_in) {
             r.stand_in_label = session.assurance.stand_in_label.clone();
+        }
+        if team_stood {
+            r.project_stand_ins(&session.assurance.stand_in_label.clone().unwrap_or_default());
         }
         r.roles = Some(roles);
     }

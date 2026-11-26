@@ -593,6 +593,33 @@ pub fn independence_of(roles: &[RoleRecord]) -> Option<String> {
     )
 }
 
+/// (core#1997) Whether a TEAM role stood in on this record: a council that seated a stand-in voter
+/// (its dispute's own `independence` says `stand_in` or `mixed`), or a monitor seated on a
+/// stand-in binding key. Those roles never reach the `roles` records, so a receipt's top-level
+/// independence reads them here. Counted once seated (conservative: never reads independent).
+pub fn team_stood_in(
+    councils: &[crate::team::Dispute],
+    monitors: &[crate::team::LedgerMonitor],
+) -> bool {
+    councils.iter().any(|d| {
+        matches!(
+            d.independence.as_deref(),
+            Some(INDEPENDENCE_STAND_IN | INDEPENDENCE_MIXED)
+        )
+    }) || monitors
+        .iter()
+        .any(|m| wicked_apps_core::spawn::seat_id::is_stand_in(&m.seat))
+}
+
+/// (core#1997) A receipt's independence with its team roles folded in: once a team stand-in took
+/// part, it is never `independent` (nor unset); an all-stand-in record stays `stand_in`.
+pub fn with_team_stand_ins(roles: Option<String>, team_stood: bool) -> Option<String> {
+    if !team_stood || roles.as_deref() == Some(INDEPENDENCE_STAND_IN) {
+        return roles;
+    }
+    Some(INDEPENDENCE_MIXED.to_string())
+}
+
 impl Default for RunAssurance {
     fn default() -> Self {
         Self::new(None, false)
@@ -823,6 +850,25 @@ impl AssuranceReceipt {
         if !self.ran.iter().any(|r| r == instrument) {
             self.ran.push(instrument.to_string());
         }
+    }
+
+    /// (DES-STANDIN-001 §5.1) THE WHOLE-RECEIPT CONSERVATIVE PROJECTION: once any stand-in took
+    /// part, no reader on main may read an independent check off this receipt — neither instrument
+    /// is `ran`, both seats are null, and a stronger skip a role already has stands (`skip` keeps
+    /// the first). One spelling for the gate and the delivery (core#1997).
+    pub fn project_stand_ins(&mut self, label: &str) {
+        for (instrument, role) in [(DISTINCT_EVALUATOR, "review"), (JUDGE, "judge")] {
+            if self.ran.iter().any(|i| i == instrument) {
+                self.ran.retain(|i| i != instrument);
+                self.skip(
+                    instrument,
+                    SKIP_STAND_IN,
+                    Some(format!("{label} (the {role} itself was a real helper)")),
+                );
+            }
+        }
+        self.evaluator = None;
+        self.judge = None;
     }
 
     pub fn skip(&mut self, instrument: &str, reason: &str, detail: Option<String>) {
