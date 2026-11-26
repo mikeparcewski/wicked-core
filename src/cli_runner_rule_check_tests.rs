@@ -3551,9 +3551,10 @@ fn a_refusal_found_in_the_re_ask_still_falls_back_to_the_judge_stand_in() {
 }
 
 /// (core#1949 N2, codex r1) A record keyed like the stand-in that IS admissible as a real judge
-/// (it runs another binary) leaves no room for the stand-in: it judges as itself, on its own
-/// invocation, with no preface, and its approvals are refused for calling the work's provider
-/// like any real seat's.
+/// leaves no room for the stand-in: it judges as itself, on its own invocation, with no preface,
+/// and its approvals are refused for calling the work's provider like any real seat's. (A record
+/// in the stand-in base's family is a creator's instance whenever the base built the work, so it
+/// is never admitted; here the work's creator is another CLI, the only way to admit one.)
 #[test]
 fn an_admitted_real_record_keyed_like_the_stand_in_gets_no_waiver() {
     crate::observed_provider::take_receipts();
@@ -3564,13 +3565,13 @@ fn an_admitted_real_record_keyed_like_the_stand_in_gets_no_waiver() {
     let runner = LostSeatRunner {
         asked: Mutex::new(Vec::new()),
         provider,
-        fails: vec!["codex".into()],
+        fails: vec!["claude".into()],
         shares: Vec::new(),
     };
     let report = run_rule_check_standing_in(
         &input,
-        &["claude".to_string()],
-        Some(&["claude".to_string()][..]),
+        &["codex".to_string()],
+        Some(&["codex".to_string()][..]),
         &pool,
         &pool,
         &runner,
