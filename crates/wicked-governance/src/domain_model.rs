@@ -34,10 +34,9 @@ pub struct Metadata {
     pub migration_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// How much of the code this model maps (domain-model 1.1.0, bundle 1.2.3, optional). A graph is built once the
-    /// mapped share reaches the configured minimum ([`MIN_COVERAGE_ENV`], default
-    /// [`DEFAULT_MIN_COVERAGE_PCT`]), so a reader needs the share to read the graph honestly:
-    /// "82% of behaviours mapped".
+    /// How much of the code this model maps (domain-model 1.1.0, bundle 1.2.3, optional). A 1.1.0
+    /// graph was built once the mapped share reached its minimum (`min_pct`, kept on the label), so
+    /// a reader needs the share to read the graph honestly: "82% of behaviours mapped".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<ModelCoverage>,
     /// The build left tests, data, manifests and documents out (an extracted rule counts whatever
@@ -95,8 +94,13 @@ pub struct ModelCoverage {
     /// `floor(real * 100 / behavior_bearing)`; 100 on an empty denominator. The one number the
     /// minimum is checked against.
     pub real_pct: u8,
-    /// The minimum the build was held to.
-    pub min_pct: u8,
+    /// The minimum the build was held to. Every label a build writes, and every relabel of a stored
+    /// graph, carries it (the schema requires it there). `None` only on the requirements read's own
+    /// count when no build recorded a minimum: core#1924 removed the configured minimum (the env,
+    /// the repository target and the 1.1.0 build command), so a read names the stored build's
+    /// minimum or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_pct: Option<u8>,
     /// Behavior-bearing nodes in product code (the denominator; tests, data, manifests and
     /// documents are not in it, see [`is_product_file`]).
     pub behavior_bearing: u64,
@@ -365,8 +369,9 @@ pub struct CoverageConfig {
     /// `Other(tag)` tags that ARE behavior-bearing (coverage.py `DEFAULT_ESTATE_BEHAVIOR_KINDS`).
     pub behavior_other_tags: std::collections::BTreeSet<String>,
     pub resolve_threshold: f64,
-    /// (J6 v3) The checkout a v3 statement's freshness is judged against; `None` treats every
-    /// target as fresh (a store with no repository, such as the daemon's).
+    /// (J6 v3) The checkout a v3 statement's freshness is judged against. `None` fails closed: with
+    /// no checkout no target is fresh, so no v3 statement counts as resolved (`domain_extract.rs`,
+    /// `ExtractIndex::load`).
     pub repo_root: Option<std::path::PathBuf>,
 }
 
@@ -1182,38 +1187,6 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
     assert_front_half_coverage_min(report, 100)
 }
 
-/// The default minimum share of behavior-bearing nodes a requirements graph must map before it is
-/// built (operator ruling 2026-10-31). Adjustable per daemon: crew's
-/// `requirementsGraph.minCoveragePct` setting, exported as [`MIN_COVERAGE_ENV`].
-pub const DEFAULT_MIN_COVERAGE_PCT: u8 = 80;
-
-/// The variable carrying the configured minimum (an integer percentage, 1..=100). The daemon
-/// exports it at boot and on every settings change; `wicked-core domain-graph` and `wicked-core
-/// coverage --min-coverage-pct` read it, and the coverage validator is handed it explicitly.
-pub const MIN_COVERAGE_ENV: &str = "WICKED_REQUIREMENTS_MIN_COVERAGE_PCT";
-
-/// Parse a minimum: an integer 1..=100 (surrounding whitespace and one trailing `%` allowed).
-#[must_use]
-pub fn parse_min_coverage_pct(raw: &str) -> Option<u8> {
-    let t = raw.trim();
-    let t = t.strip_suffix('%').unwrap_or(t).trim();
-    t.parse::<u8>().ok().filter(|v| (1..=100).contains(v))
-}
-
-/// The configured minimum from [`MIN_COVERAGE_ENV`], or [`DEFAULT_MIN_COVERAGE_PCT`] when it is
-/// absent or not a valid percentage.
-///
-/// Absent (or empty) is the default. A value that is SET but not a whole percentage 1..=100 is an
-/// error, never the default: a typo'd `95.5` silently becoming 80 would approve a graph below the
-/// bar the operator set. Callers fail closed on it.
-pub fn min_coverage_pct_from_env() -> Result<u8, String> {
-    match std::env::var(MIN_COVERAGE_ENV) {
-        Ok(v) if !v.trim().is_empty() => parse_min_coverage_pct(&v)
-            .ok_or_else(|| format!("{MIN_COVERAGE_ENV}={v:?} is not a whole percentage 1..100")),
-        _ => Ok(DEFAULT_MIN_COVERAGE_PCT),
-    }
-}
-
 /// `floor(real * 100 / behavior_bearing)`, 100 on an empty denominator, where `real` is the
 /// behaviours RESOLVED to a stated, sourced business rule. Risk-flagged placeholders never count
 /// (operator decision 2026-11-01, core#1233). Floored so the number shown never rounds up past the
@@ -1532,9 +1505,13 @@ impl Default for DomainBuildOptions<'_> {
     }
 }
 
-/// [`build_domain_model`] at a configured minimum (operator ruling 2026-10-31): the graph is built
-/// once `min_coverage_pct` percent of the behavior-bearing nodes are mapped, carries that share on
+/// [`build_domain_model`] at a given minimum (operator ruling 2026-10-31): the graph is built once
+/// `min_coverage_pct` percent of the behavior-bearing nodes are mapped, carries that share on
 /// `metadata.coverage`, and every requirement carries its corroboration.
+///
+/// No command reaches this since core#1924 removed `domain-graph --schema-version 1.1.0` and every
+/// configured minimum: the CLI builds 1.2.0 only ([`crate::domain_extract`]). It stays as the writer
+/// of the 1.0.0 / 1.1.0 graphs a store may still hold, which the read paths and their tests serve.
 pub fn build_domain_model_with(
     store: &dyn GraphRead,
     coverage: &CoverageReport,
@@ -1787,7 +1764,7 @@ pub fn build_domain_model_with(
             // M5 package-dir grouping IS the schema's "functional" (capability-grouped) mode.
             migration_mode: "functional".to_string(),
             source: Some("estate-graph".to_string()),
-            coverage: rich.then(|| model_coverage(&recomputed, min_pct)),
+            coverage: rich.then(|| model_coverage(&recomputed, Some(min_pct))),
             product_only: rich.then_some(true),
             business_domains: business.into_values().collect(),
             extract: None,
@@ -2276,14 +2253,11 @@ fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
     })
 }
 
-/// (domain-graph-3) The repository's OWN coverage target, beside the build record
-/// (`requirements-graph/target`): set when the operator lowers the target for this repository at a
-/// generation's budget ask, so every reader of this store — `wicked-core coverage`, `domain-graph`
-/// and the requirements read — holds the graph to it before the daemon-wide minimum.
-/// The `NodeKind::Other` tags core writes into a store itself: the repository's coverage target
-/// ([`set_repo_min_coverage_pct`]), the build record and the persisted graph's domain and
-/// requirement nodes ([`persist_domain_model`]). Structural, and known, so the coverage
-/// classifier's unknown-kind warning skips them (core#1376).
+/// The `NodeKind::Other` tags core writes into a store itself: the build record and the persisted
+/// graph's domain and requirement nodes ([`persist_domain_model`]), plus `requirements_target`, the
+/// repository coverage target an older core wrote (core#1924 removed the target; a stored node
+/// stays inert, nothing reads it). Structural, and known, so the coverage classifier's
+/// unknown-kind warning skips them (core#1376).
 const CORE_SYNTHETIC_KINDS: [&str; 4] = [
     "requirements_target",
     "requirements_graph",
@@ -2298,68 +2272,6 @@ fn kinds_to_warn_about(
         .iter()
         .filter(|t| !CORE_SYNTHETIC_KINDS.contains(&t.as_str()))
 }
-const TARGET_ID: &str = "target";
-const TARGET_KEY: &str = "min_coverage_pct";
-
-/// The repository's own coverage target, if one is set in its store (a whole percentage 1..=100;
-/// anything else stored there is ignored, never trusted).
-pub fn repo_min_coverage_pct(store: &dyn GraphRead) -> anyhow::Result<Option<u8>> {
-    let sym = wicked_apps_core::synthetic_symbol(BUILD_SCHEME, TARGET_ID);
-    Ok(store.get_node(&sym)?.and_then(|n| {
-        n.metadata
-            .get(TARGET_KEY)
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u8::try_from(v).ok())
-            .filter(|v| (1..=100).contains(v))
-    }))
-}
-
-/// Set (`Some`) or clear (`None`) the repository's own coverage target in its store. A value
-/// outside 1..=100 is refused.
-pub fn set_repo_min_coverage_pct(
-    store: &mut dyn wicked_apps_core::GraphStore,
-    pct: Option<u8>,
-) -> anyhow::Result<()> {
-    use wicked_apps_core::{
-        synthetic_symbol, Language, Location, Node, NodeKind, Span, SYMBOL_SCHEME,
-    };
-    let file = format!("{BUILD_SCHEME}/{TARGET_ID}");
-    let Some(pct) = pct else {
-        store.begin_batch()?;
-        store.remove_file(&file)?;
-        store.commit_batch()?;
-        return Ok(());
-    };
-    if !(1..=100).contains(&pct) {
-        anyhow::bail!("a coverage target is a whole percentage 1..100, not {pct}");
-    }
-    let mut node = Node::new(
-        synthetic_symbol(BUILD_SCHEME, TARGET_ID),
-        NodeKind::Other("requirements_target".to_string()),
-        "requirements graph target".to_string(),
-        Language::new(SYMBOL_SCHEME),
-        Location::new(file, Span::ZERO),
-    );
-    node.metadata
-        .insert(TARGET_KEY.to_string(), serde_json::json!(pct));
-    store.begin_batch()?;
-    store.upsert_nodes(&[node])?;
-    store.commit_batch()?;
-    Ok(())
-}
-
-/// The minimum this store's graph is held to: the repository's own target when one is set
-/// ([`repo_min_coverage_pct`]), else the daemon-wide setting ([`min_coverage_pct_from_env`]).
-pub fn effective_min_coverage_pct(store: &dyn GraphRead) -> Result<u8, String> {
-    match repo_min_coverage_pct(store) {
-        Ok(Some(pct)) => Ok(pct),
-        Ok(None) => min_coverage_pct_from_env(),
-        Err(e) => Err(format!(
-            "the repository's coverage target could not be read: {e}"
-        )),
-    }
-}
-
 /// The highest requirement number each domain has used: the build record's marks merged with the
 /// numbers of the requirement nodes in the store (a graph persisted before the record existed
 /// carries only those).
@@ -2770,11 +2682,16 @@ pub fn load_domain_graph(
 }
 
 /// Put `coverage` on a read graph's `metadata.coverage`, replacing the build's — except on a 1.0.0
-/// document, whose schema has no such field (the caller carries the label beside the graph either way).
+/// document, whose schema has no such field (the caller carries the label beside the graph either way),
+/// and except when `coverage` names no minimum (the schema's label requires one): the graph is then
+/// served with the label its build wrote (core#1924).
 pub fn label_domain_graph(
     graph: &mut serde_json::Value,
     coverage: &ModelCoverage,
 ) -> anyhow::Result<()> {
+    if coverage.min_pct.is_none() {
+        return Ok(());
+    }
     let label = serde_json::to_value(coverage)?;
     if let Some(metadata) = graph.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         if metadata.get("schema_version").and_then(|v| v.as_str()) != Some("1.0.0") {
@@ -2900,8 +2817,8 @@ pub fn recompute_front_half_coverage_for_rows(
 }
 
 /// [`recompute_front_half_coverage_for_rows`] judged against the checkout `repo_root` (J6 v3, R22):
-/// a v3 statement whose code changed there is stale, so it never counts as resolved. `None` treats
-/// every v3 target as fresh (a store with no checkout to judge against).
+/// a v3 statement whose code changed there is stale, so it never counts as resolved. `None` fails
+/// closed: with no checkout no v3 target is fresh, so no v3 statement counts as resolved.
 pub fn recompute_front_half_coverage_for_rows_at(
     store: &dyn GraphRead,
     units: &RequirementUnits,
@@ -3181,10 +3098,11 @@ fn legacy_requirement(
     Ok(req)
 }
 
-/// The coverage label for `report` against `min_pct`, from the store's own counts — the same
-/// numbers the build and the coverage gate use (`metadata.coverage`).
+/// The coverage label for `report` against `min_pct` (the minimum a build was held to; `None` when
+/// none is recorded), from the store's own counts — the same numbers the build and the coverage gate
+/// use (`metadata.coverage`).
 #[must_use]
-pub fn model_coverage(report: &CoverageReport, min_pct: u8) -> ModelCoverage {
+pub fn model_coverage(report: &CoverageReport, min_pct: Option<u8>) -> ModelCoverage {
     ModelCoverage {
         real_pct: real_pct(report),
         min_pct,
@@ -3203,39 +3121,6 @@ mod tests {
     /// The domain graph lands IN the estate store as queryable nodes + edges — not a JSON file.
     /// Falsifiable: delete the `upsert_edges` line in production and the Contains-edge assertion
     /// fails; delete `upsert_nodes` and the node lookups fail.
-    /// domain-graph-3: the repository's own target lives in its store, beside the build record,
-    /// and comes before the daemon-wide minimum; clearing it hands the bar back; a value outside
-    /// 1..=100 is refused, and a persisted graph build never touches it.
-    #[test]
-    fn a_repositorys_own_target_is_kept_in_its_store_and_comes_first() {
-        use wicked_apps_core::SqliteStore;
-        let mut st = SqliteStore::in_memory().unwrap();
-        assert_eq!(repo_min_coverage_pct(&st).unwrap(), None);
-        set_repo_min_coverage_pct(&mut st, Some(23)).unwrap();
-        assert_eq!(repo_min_coverage_pct(&st).unwrap(), Some(23));
-        assert_eq!(effective_min_coverage_pct(&st), Ok(23));
-        assert!(set_repo_min_coverage_pct(&mut st, Some(0)).is_err());
-        assert!(set_repo_min_coverage_pct(&mut st, Some(101)).is_err());
-        assert_eq!(
-            repo_min_coverage_pct(&st).unwrap(),
-            Some(23),
-            "a refusal keeps it"
-        );
-        let model: DomainModel = serde_json::from_value(serde_json::json!({
-            "domains": {},
-            "metadata": {"schema_version": "1.0.0", "migration_mode": "functional"}
-        }))
-        .unwrap();
-        persist_domain_model(&mut st, &model).unwrap();
-        assert_eq!(
-            repo_min_coverage_pct(&st).unwrap(),
-            Some(23),
-            "a build keeps the target"
-        );
-        set_repo_min_coverage_pct(&mut st, None).unwrap();
-        assert_eq!(repo_min_coverage_pct(&st).unwrap(), None);
-    }
-
     #[test]
     fn persist_domain_model_writes_the_graph_into_the_store() {
         use wicked_apps_core::{synthetic_symbol, EdgeKind, GraphRead, NodeKind, SqliteStore};
@@ -3626,7 +3511,7 @@ mod tests {
         assert!(meets_minimum(&report(0, 0, 0), 80));
         assert_eq!(real_pct(&report(0, 0, 0)), 100);
         // The label carries the one gated number and the placeholders as their own count.
-        let label = model_coverage(&report(100, 60, 20), 80);
+        let label = model_coverage(&report(100, 60, 20), Some(80));
         assert_eq!(
             (
                 label.real_pct,
@@ -3636,12 +3521,6 @@ mod tests {
             ),
             (60, 60, 20, 20)
         );
-        // The setting's parse: whole percentages 1..=100 only.
-        assert_eq!(parse_min_coverage_pct(" 80 "), Some(80));
-        assert_eq!(parse_min_coverage_pct("75%"), Some(75));
-        for bad in ["0", "101", "eighty", "80.5", ""] {
-            assert_eq!(parse_min_coverage_pct(bad), None, "{bad}");
-        }
     }
 
     /// Operator decision 2026-11-01: tests, data, manifests and documents are not behaviour-bearing.
@@ -4508,7 +4387,7 @@ mod tests {
                 .remove("product_only");
             let old: DomainModel = serde_json::from_value(old).unwrap();
             persist_domain_model(&mut s, &old).unwrap();
-            let read = load_domain_graph(&s, Some(&model_coverage(&cov(&s), 80)))
+            let read = load_domain_graph(&s, Some(&model_coverage(&cov(&s), Some(80))))
                 .unwrap()
                 .unwrap();
             assert!(read["metadata"].get("product_only").is_none());
@@ -5023,8 +4902,11 @@ mod tests {
             );
             assert_eq!(back.domains.len(), model.domains.len());
 
-            let label = model_coverage(&cov(&s), 80);
-            assert_eq!((label.real_pct, label.min_pct, label.real), (80, 80, 4));
+            let label = model_coverage(&cov(&s), Some(80));
+            assert_eq!(
+                (label.real_pct, label.min_pct, label.real),
+                (80, Some(80), 4)
+            );
             let labelled = load_domain_graph(&s, Some(&label)).unwrap().unwrap();
             assert_eq!(labelled["metadata"]["coverage"]["real_pct"], 80);
             assert!(labelled["metadata"]["coverage"].get("mapped_pct").is_none());
@@ -5034,7 +4916,7 @@ mod tests {
             // too). The live label replaces the document's, and the build's own label is still
             // there to read, with the build's generation, so a reader can tell the rows are older.
             map(&mut s, &nodes[0], "seat-1", "extract-loop");
-            let live = model_coverage(&cov(&s), 80);
+            let live = model_coverage(&cov(&s), Some(80));
             assert_eq!(live.real, 5);
             let (mut read, build) = load_domain_graph_with_build(&s).unwrap().expect("a graph");
             assert_eq!(
@@ -5207,7 +5089,7 @@ mod tests {
             let empty = build_at(&s, 1);
             assert!(empty.domains.is_empty());
             persist_domain_model(&mut s, &empty).unwrap();
-            let label = model_coverage(&cov(&s), 80);
+            let label = model_coverage(&cov(&s), Some(80));
             let read = load_domain_graph(&s, Some(&label))
                 .unwrap()
                 .expect("built, not absent");
@@ -5217,7 +5099,7 @@ mod tests {
             map(&mut s, &n, "seat-1", "extract-loop");
             let v1 = build_domain_model(&s, &cov(&s), "1.0.0").unwrap();
             persist_domain_model(&mut s, &v1).unwrap();
-            let label = model_coverage(&cov(&s), 80);
+            let label = model_coverage(&cov(&s), Some(80));
             let read = load_domain_graph(&s, Some(&label)).unwrap().unwrap();
             assert!(read["metadata"].get("coverage").is_none(), "{read}");
             assert_eq!(read, serde_json::to_value(&v1).unwrap());

@@ -1270,12 +1270,13 @@ export declare class Core {
   /**
    * ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
    * of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
-   * recomputed from the store's own counts against the configured minimum. Resolves to a JSON
+   * recomputed from the store's own counts, naming the minimum its build recorded, if any (core#1924
+   * removed the configured one); `target` is always null. Resolves to a JSON
    * string `{ "graph": <domain-model document | null>, "coverage": {...}, "build": { generation,
    * coverage } | null, "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" |
    * "not_product" | "unindexed" } } } | null, "satisfied_by": { <domain>: { <REQ-NNN>:
    * [{ symbol, name, file, kind, confidence }] } } | null }`: `graph` is the last build (null until
-   * a build reached the minimum), `coverage` the store now, `build` the label that build persisted,
+   * a build is stored), `coverage` the store now, `build` the label that build persisted,
    * `rows` the engine's verdict on each listed row that recorded its unit (same pass as `coverage`),
    * and `satisfied_by` each listed requirement's live code links, sorted by symbol, with an empty
    * list when no target remains and null until built. An unknown `repo_ref` REJECTS. A J6 v3

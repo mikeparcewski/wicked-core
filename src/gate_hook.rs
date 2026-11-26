@@ -143,7 +143,8 @@ fn estate_store_pinned_by(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> b
 /// The store a VALIDATOR script may reach, carried under its own name.
 ///
 /// Validator scripts used to be handed `WICKED_ESTATE_DB` — the OPERATIONAL store — so that
-/// `COVERAGE_SCRIPT` could shell out to `wicked-core coverage`. Those scripts are approval-gated,
+/// the domain-extraction coverage script (removed with core#1924) could shell out to
+/// `wicked-core coverage`. Those scripts are approval-gated,
 /// denylist-screened and run with a minimal env, which is a genuinely different threat model from a
 /// worker CLI running agent-authored Bash. But all three are AUTHORIZATION controls: none of them
 /// constrain what an approved script does with the handle once it holds it, and FINDING-067 showed
@@ -158,8 +159,8 @@ pub const COVERAGE_DB_ENV: &str = "WICKED_COVERAGE_DB";
 /// The name a validator script uses to reach the engine's own CLI: `${WICKED_CORE_EXE:-wicked-core}`.
 ///
 /// Named here rather than spelled at each site because three places have to agree on it — the
-/// injection in [`crate::validator`], the shipped `COVERAGE_SCRIPT` in [`crate::domain_extraction`],
-/// and the diagnostic that fires when no binary can be located (FINDING-093). It is also read as an
+/// injection in [`crate::validator`], any approved validator script that calls the CLI, and the
+/// diagnostic that fires when no binary can be located (FINDING-093). It is also read as an
 /// operator override by `resolve_wicked_core_exe_opt`.
 pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
 

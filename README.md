@@ -17,8 +17,8 @@ and records every verdict.
 In power mode the code-writing build step runs as one agent's checkpointed turns while the engine
 re-scores the diff (other required steps can run separately); a failed review or qualifying check
 failure goes back to that agent, up to three hand-off attempts in all, and problems that need the
-operator's judgment pause for them. It also builds a repository's requirements graph and measures
-real coverage against a minimum. Underneath, a single-writer store actor owns the SQLite file, so
+operator's judgment pause for them. It also builds a repository's domain model and reports how
+much of the code is mapped (no minimum since core#1924). Underneath, a single-writer store actor owns the SQLite file, so
 the daemon, the UI and the MCP servers compose through one command API and a live event stream
 without racing on the database. Not end-user-facing: wicked-crew drives it through the
 `wicked-core-ts` bindings.
@@ -96,39 +96,30 @@ The rules a built-in carries with it:
 
 ## Requirements graph
 
-wicked-core also builds a repository's **requirements graph**: the business rules garden's
-extraction stated on the code, grouped into domains by package directory and saved into the
-repository's estate store (domain, requirement and business-rule nodes, `SatisfiedBy` edges to
-the code). crew reads it from there; nothing is written into the checkout.
-
-The graph is held to a minimum share of **real** requirements: behaviours in product code with a
-validated requirement or a business rule at or above the confidence threshold (0.75 by default).
-A placeholder (a behaviour that meets neither: a risk flag, a rule under the threshold, or an
-unvalidated requirement alone) stays in the graph and never counts. A requirement's `review` status
-is not that test: an unvalidated requirement whose rule clears the threshold still counts. What is product code is decided by file path:
-test, spec and fixture files and data, manifest and document files are left out (`not_product`),
-though a test module inside a product file still counts, and an extracted rules-engine rule outside
-test and fixture paths counts whatever its file extension. A TypeScript interface counts only when the graph shows it does something.
-Below the minimum the build fails closed and says why: "23% real requirements, minimum 80% (1362
-of 5786 behaviours; 4397 placeholders, 27 unmapped)". The mapping done so far stays in the store.
+wicked-core also builds a repository's **domain model** (schema 1.2.0): the statements, rule groups,
+targets and follow-ups garden's `domain-run` wrote, saved into the repository's estate store
+(domain, requirement and business-rule nodes, `SatisfiedBy` edges to the code). crew reads it
+from there; nothing is written into the checkout. A statement whose code changed since it was
+checked is shown stale, judged against the checkout. The model has **no minimum**: it counts
+accounted targets and open statements, and an empty run builds an empty model.
 
 Each command reads the store `--db` names, else `WICKED_COVERAGE_DB`, else `WICKED_ESTATE_DB`, else
 `./wicked-estate.db`, so point it at the repository's estate store:
 
-- `wicked-core coverage --db <store> [--min-coverage-pct [N]]` reports the share. With
-  `--min-coverage-pct` it exits 3 below the minimum (N, or with no value the minimum in force).
-- `wicked-core domain-graph --db <store>` builds and saves the graph (`--out` also writes a JSON
-  export).
-- `wicked-core requirements-target --db <store> --set N | --clear` keeps a repository's own minimum
-  in its store, ahead of the daemon-wide one (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, default 80).
+- `wicked-core domain-graph --db <store> --repo-root <checkout>` builds and saves the model
+  (`--out` also writes a JSON export).
+- `wicked-core domain-ruling` records a person's ruling on one open statement or target, then
+  rebuilds.
+- `wicked-core coverage --db <store>` reports the share of behaviours in product code that are
+  real requirements. It only reports.
 
-crew's `domain-extraction` run maps a repository page by page (a bounded loop over its own steps,
-`repeat_from`) until the minimum is reached, the operator stops it, or nothing is left to map; a
-run that ends its pages below the minimum still meets the fail-closed build. `requirements_graph_for_repo`
-(core-ts `getRequirementsGraphForRepo`) returns the graph, the live coverage label, the `build`
-record the listed graph came from, and the engine's verdict on each listed row that records its code unit (`rows`: `real`, and
-`uncounted` with the reason a row is not in the share; a row persisted before requirements recorded
-their code unit has no entry, which means unknown until a rebuild).
+core#1924 removed the 1.1.0 build from confidence annotations and every configured minimum:
+`domain-graph --schema-version 1.1.0` (with its `--coverage` and `--min-coverage-pct`),
+`coverage --min-coverage-pct`, the `requirements-target` and `seed-domain-validators` commands,
+and the `WICKED_REQUIREMENTS_MIN_COVERAGE_PCT` variable. Each removed flag and command is refused
+by name. Stored 1.1.0 graphs are still read: `requirements_graph_for_repo` (core-ts
+`getRequirementsGraphForRepo`) returns such a graph with the store's live counts, labelled with the
+minimum its own build recorded (none when it recorded none).
 
 ## Platform support
 

@@ -128,7 +128,7 @@ fn built_domain_model_validates_against_the_kept_schema() {
     wicked_governance::persist_domain_model(&mut store, &new).expect("persist");
     let label = wicked_governance::model_coverage(
         &wicked_governance::recompute_front_half_coverage(&store).unwrap(),
-        33,
+        Some(33),
     );
     let read_back = wicked_governance::load_domain_graph(&store, Some(&label))
         .unwrap()

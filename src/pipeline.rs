@@ -262,6 +262,11 @@ pub(crate) fn resolve_workflow_def(
     }
 }
 
+/// The pin of the domain-extraction coverage validator core#1924 removed (a domain model has no
+/// minimum). A store seeded before then may still hold it vaulted and approved, so a stored workflow
+/// that pins it would attach a check whose command is gone: it is refused by name at plan time.
+const RETIRED_DOMAIN_COVERAGE_PIN: &str = "9a2c71609c3e3ced";
+
 /// Attach each phase's PINNED, already-approved validator to its unit (the producer half that makes the
 /// rev0.4 dual-validator gate ENGAGE). Units are 1:1 with `def.phases` in declaration order, so this zips
 /// them and, for every phase that declares a `validator_pin`, LOADS that validator from the vault (a pure
@@ -280,8 +285,8 @@ fn attach_pinned_validators(
     // floor as authored (registration REFUSES a `verified_evidence` phase with no pin — nothing is
     // armed here), and a composed plan's pins come from the phase catalog (DES-TEAMING-002 §10,
     // seam C1): the `build`, `test`, `review` and `security_review` entries carry the evidence
-    // floor as data and `domain_coverage` the coverage pin (`catalog.rs`); a step may add a pin to
-    // an unpinned entry only, never swap or remove one (`plan::apply_step`).
+    // floor as data; a step may add a pin to an unpinned entry only, never swap or remove one
+    // (`plan::apply_step`). The domain-extraction coverage pin is retired (core#1924) and refused.
     // A phase with no pin still leaves the unit's validator `None` (ungated). Operators author
     // phase-specific criteria via `wicked-core provision-validator --criterion "..."` then
     // `wicked-core approve-validator --pin <pin>`, and put the approved pin in a def's `validator_pin`.
@@ -289,6 +294,15 @@ fn attach_pinned_validators(
         let Some(pin) = phase.validator_pin.as_deref() else {
             continue;
         };
+        if pin == RETIRED_DOMAIN_COVERAGE_PIN {
+            anyhow::bail!(
+                "workflow `{}` phase `{}` pins `{pin}`, the domain-extraction coverage validator, \
+                 which was removed with core#1924 (a domain model has no minimum): remove the \
+                 `validator_pin` from that phase",
+                def.id,
+                phase.id
+            );
+        }
         match crate::validator_vault::load_validator(store, pin)? {
             // The pin must resolve to an APPROVED validator (Lane D finding 2). An UNAPPROVED-but-vaulted
             // pin would attach and then DENY EVERY run at gate time (run_validator fails closed on an
@@ -303,9 +317,8 @@ fn attach_pinned_validators(
                 phase.id
             ),
             // Name the CLI, not just the Rust API — the UNAPPROVED arm above already does, and an
-            // operator who hits this one is strictly worse off for the inconsistency. The shipped
-            // coverage pin has a purpose-built one-liner (`seed-domain-validators`); every other pin
-            // goes through the generic author→approve pair. Both are commands the operator can run.
+            // operator who hits this one is strictly worse off for the inconsistency: a pin goes
+            // through the author→approve pair, commands the operator can run.
             None => anyhow::bail!(
                 "workflow `{}` phase `{}` pins validator `{pin}`, which is not in the vault — \
                  refusing to run the phase ungated (fail-closed). {}",
@@ -320,35 +333,17 @@ fn attach_pinned_validators(
 
 /// The operator-runnable remedy named by [`attach_pinned_validators`]'s missing-pin refusal.
 ///
-/// The shipped `domain-extraction` drop-in pins a hand-authored validator that the LLM writer path
-/// cannot reproduce (its script is deterministic, so `provision-validator` would author a *different*
-/// script and therefore a different pin). `seed-domain-validators` exists for exactly that pin and is
-/// idempotent. Pointing an operator at the generic author→approve pair for it would send them down a
-/// path that cannot produce the pin they need.
-///
-/// Every arm carries [`vault_is_per_db`], because naming a command is only half a remedy: the vault
-/// lives in whichever database the engine opened, and every one of these commands defaults to a
-/// DIFFERENT database than a long-running engine does (FINDING-066). The coverage arm is now
-/// belt-and-braces — `pre_distribute` seeds that pin on the plan path, so reaching it means the seed
-/// itself failed or the engine predates it — but the generic arm is live, and an operator who runs
+/// It carries [`vault_is_per_db`], because naming a command is only half a remedy: the vault lives
+/// in whichever database the engine opened, and every one of these commands defaults to a DIFFERENT
+/// database than a long-running engine does (FINDING-066). An operator who runs
 /// `provision-validator` in the wrong cwd hits the identical dead end.
 fn missing_pin_remedy(pin: &str) -> String {
-    if pin == crate::domain_extraction::COVERAGE_VALIDATOR_PIN {
-        format!(
-            "This is the coverage validator the shipped `domain-extraction` workflow pins, and the \
-             plan path seeds it automatically — so seeing this means the seed did not take. Run \
-             `wicked-core seed-domain-validators` to vault + approve it (idempotent, and it yields \
-             exactly this pin). {}",
-            vault_is_per_db()
-        )
-    } else {
-        format!(
-            "Author + approve it first: `wicked-core provision-validator --criterion \"...\"` then \
-             `wicked-core approve-validator --pin <unapproved pin>`, and pin the APPROVED pin \
-             (`{pin}` resolves to nothing today). {}",
-            vault_is_per_db()
-        )
-    }
+    format!(
+        "Author + approve it first: `wicked-core provision-validator --criterion \"...\"` then \
+         `wicked-core approve-validator --pin <unapproved pin>`, and pin the APPROVED pin \
+         (`{pin}` resolves to nothing today). {}",
+        vault_is_per_db()
+    )
 }
 
 /// The sentence that turns "run this command" into a remedy that actually lands.
@@ -668,7 +663,7 @@ pub(crate) fn pre_distribute(
 /// plans (DES-TEAMING-002 T3, codex round 4): the tool preflight (core#120), the base-skill intake
 /// (core#468), repo-placeholder binding, the governed unit limit and the pinned-validator attach
 /// (fail-closed on an unvaulted pin). Writes nothing of the run's: only the idempotent,
-/// content-addressed built-in floor / coverage validator seeds the attach reads. [`pre_distribute`]
+/// content-addressed built-in floor validator seed the attach reads. [`pre_distribute`]
 /// calls it, and the plan gate calls it on an edited plan BEFORE it answers the gate or touches
 /// the old units — one checker, so what was proven is what runs.
 pub(crate) fn planned_units(
@@ -754,25 +749,6 @@ pub(crate) fn planned_units(
         // built-in validators: the evidence floor and the two walkthrough pins, WT-C1). The boot-time seed stays as the loud early warning and
         // to make the floor visible in the vault before a first run; this is the invariant.
         crate::builtin_floors::seed_builtin_floors(store)?;
-        // The shipped `domain-extraction` drop-in's coverage validator is seeded HERE for the same
-        // reason, and it was NOT — which cost an operator a closed loop (FINDING-066).
-        //
-        // It is the same class of object as the floor above: hand-authored, deterministic,
-        // content-addressed, shipped with the product, and pinned by a def we ship. The only
-        // difference was where it got vaulted — the floor on the plan path, this one only via an
-        // out-of-band `wicked-core seed-domain-validators`. That difference is not survivable,
-        // because THE VAULT IS PER-DATABASE and the CLI's default database is not the engine's:
-        // crew's daemon opens `~/.wicked-crew/core.db`, the CLI falls back to a cwd-relative
-        // `wicked-estate.db`. Measured: the run failed naming this pin, the prescribed command ran
-        // and printed the matching pin, and the relaunch failed identically — the seed had landed in
-        // a database nothing reads. An error whose remedy is inert is worse than an unclear one; the
-        // operator has no signal that they are looping.
-        //
-        // Seeding it here removes the out-of-band step from the critical path entirely, so no
-        // database can be the wrong one. Same cost argument as the floor: two content-addressed
-        // `put_node`s that collapse onto themselves, and the pin is a compile-time constant.
-        // `seed-domain-validators` survives as a visibility/repair tool, not a prerequisite.
-        crate::domain_extraction::provision_and_approve_coverage_validator(store)?;
         attach_pinned_validators(store, &mut units, def)?;
         // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
     }
@@ -2929,7 +2905,7 @@ pub(crate) fn pinned_validator_denial_with_env(
         ));
     };
     match crate::validator::run_validator_reporting_with_env(v, cwd, db_path, extra_env) {
-        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion, cwd, db_path),
+        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
 }
@@ -2942,89 +2918,16 @@ pub(crate) fn pinned_validator_denial_with_env(
 ///
 /// Split out from [`pinned_validator_denial`] so the wording of each arm is directly testable without
 /// having to provoke a real 120s timeout or a real missing shell.
-/// The measurement a failed validator left behind, rendered compactly — or `None`.
-///
-/// FINDING-092: a criterion is a CONJUNCTION ("at least one behavior-bearing node, AND
-/// resolved-or-flagged coverage == 1.0 over them"), and restating it says nothing about which
-/// conjunct failed. Two runs produced byte-identical denials while measuring completely different
-/// things:
-///
-/// ```text
-/// behavior_bearing 0    coverage 1.0     <- the gate read the WRONG STORE (FINDING-091)
-/// behavior_bearing 766  coverage 0.171   <- the gate read the right one, 17% covered
-/// ```
-///
-/// The first is "your extraction produced nothing"; the second is "your extraction covered 17%".
-/// Different problems, different next actions, same message — and the CRITICAL defect behind the
-/// first hid in that ambiguity for three runs.
-///
-/// The numbers are already on disk when the denial is rendered. This reads them rather than
-/// recomputing, so the message reports what the validator ACTUALLY gated on.
-fn failing_measurement(cwd: &std::path::Path, db_path: Option<&str>) -> Option<String> {
-    // FINDING-099: this read `.wicked/domain/coverage-report.json`, a path nothing else in the
-    // system writes. It therefore never found the report, and every legitimate coverage denial was
-    // reported as "no coverage report was produced" — the floor blamed for not measuring when it
-    // had measured and the number was bad. Read the one name all four artifacts agree on.
-    let raw =
-        std::fs::read_to_string(cwd.join(crate::domain_extraction::COVERAGE_REPORT_FILE)).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
-    let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
-    // Only the fields the criterion actually turns on, led by the operator's sentence ("42% real
-    // requirements, minimum 80% (…)"). A dump of the whole report would bury the one number they need.
-    let report = wicked_governance::CoverageReport {
-        behavior_bearing: n("behavior_bearing")?,
-        resolved: n("resolved")?,
-        risk_flagged: n("risk_flagged")?,
-        unaccounted: n("unaccounted")?,
-        ..Default::default()
-    };
-    // The sentence names what actually failed: a minimum the operator mistyped, a store with
-    // nothing to map, or the real share itself.
-    // (e2e F29) The minimum the floor APPLIED: the repository's own target in the store it
-    // measured (the person may have lowered it during the run), else the daemon's setting —
-    // never the daemon's setting alone, which quoted "minimum 80%" on a 66% repository.
-    let lead = match crate::domain_extraction::applied_min_coverage(db_path).map(|(m, _)| m) {
-        Err(e) => format!("the configured minimum is invalid ({e})"),
-        Ok(_) if report.behavior_bearing == 0 => {
-            "no behaviour-bearing code in the store to map (index the repository first)".to_string()
-        }
-        Ok(min) => format!(
-            "{}; the mapping so far is kept for the next run",
-            wicked_governance::coverage_verdict(&report, min)
-        ),
-    };
-    Some(format!(
-        "{lead} — measured: behavior_bearing={}, resolved={}, risk_flagged={}, unaccounted={}, \
-         coverage={}",
-        report.behavior_bearing,
-        report.resolved,
-        report.risk_flagged,
-        report.unaccounted,
-        f("coverage")?
-    ))
-}
-
 fn denial_for_outcome(
     outcome: &crate::validator::ValidatorOutcome,
     criterion: &str,
-    cwd: &std::path::Path,
-    db_path: Option<&str>,
 ) -> Option<String> {
     use crate::validator::ValidatorOutcome as O;
     match outcome {
         O::Passed => None,
-        O::Failed => Some(match failing_measurement(cwd, db_path) {
-            // Naming the measurement is the point: without it a wrong-store read and a genuine
-            // shortfall are indistinguishable (FINDING-092).
-            Some(m) => format!("pinned validator failed: {criterion} — {m}"),
-            // No report means the script denied before producing one; say so rather than implying
-            // a measurement happened.
-            None => format!(
-                "pinned validator failed: {criterion} (no coverage report was produced, so the \
-                 criterion could not be measured — the script denied before writing one)"
-            ),
-        }),
+        // (J6 C3) The coverage report this used to quote went with the coverage validator: a domain
+        // model run has none, and no other pinned validator writes one.
+        O::Failed => Some(format!("pinned validator failed: {criterion}")),
         O::TimedOut => Some(format!(
             "pinned validator TIMED OUT before reaching a verdict (fail-closed — a phase that cannot \
              be re-verified is treated as NOT-passed, so this is a DENY, not a criterion failure). \
@@ -4629,94 +4532,24 @@ mod denial_message_tests {
     /// FINDING-050. A distinguishable enum is worth nothing if the operator still reads one sentence.
     /// Asserts the property, not the prose: a no-verdict outcome must never be phrased as the criterion
     /// having failed, must say the criterion went unevaluated, and must name its own cause.
-    /// FINDING-092: a criterion is a CONJUNCTION, so restating it cannot say which conjunct
-    /// failed. Two campaign runs produced BYTE-IDENTICAL denials while measuring completely
-    /// different things — one had read the wrong database entirely (FINDING-091), and that
-    /// CRITICAL defect hid in the ambiguity for three runs.
-    ///
-    /// The invariant is DISTINGUISHABILITY, not wording: an operator must be able to tell "your
-    /// extraction produced nothing" from "your extraction covered 17%".
-    #[test]
-    fn a_failed_denial_distinguishes_no_data_from_a_real_shortfall() {
-        fn denial_for(report: &str) -> String {
-            let dir =
-                std::env::temp_dir().join(format!("den_{}_{}", std::process::id(), report.len()));
-            // FINDING-099: this fixture used to write `.wicked/domain/coverage-report.json` — the
-            // SAME wrong path the implementation read. Test and code shared one mistake, so the
-            // test passed while the behaviour it asserted never occurred in production. Writing
-            // through the shared constant is what stops a fixture from agreeing with a defect.
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
-                report,
-            )
-            .unwrap();
-            let msg = denial_for_outcome(&O::Failed, CRITERION, &dir, None).expect("denies");
-            let _ = std::fs::remove_dir_all(&dir);
-            msg
-        }
-
-        // The two states the old message could not tell apart.
-        let wrong_store = denial_for(
-            r#"{"behavior_bearing":0,"resolved":0,"risk_flagged":0,"unaccounted":0,"coverage":1.0}"#,
-        );
-        let real_shortfall = denial_for(
-            r#"{"behavior_bearing":766,"resolved":0,"risk_flagged":131,"unaccounted":635,"coverage":0.171}"#,
-        );
-
-        assert_ne!(
-            wrong_store, real_shortfall,
-            "a nothing-measured denial and a 17%-covered denial must not read identically — this \
-             is FINDING-092, and it is how FINDING-091 stayed hidden"
-        );
-        assert!(
-            wrong_store.contains("behavior_bearing=0"),
-            "must name the measurement: {wrong_store}"
-        );
-        assert!(
-            real_shortfall.contains("behavior_bearing=766")
-                && real_shortfall.contains("coverage=0.171"),
-            "must name the measurement: {real_shortfall}"
-        );
-    }
-
     #[test]
     fn a_no_verdict_outcome_is_never_worded_as_a_criterion_failure() {
         assert_eq!(
-            denial_for_outcome(
-                &O::Passed,
-                CRITERION,
-                std::path::Path::new("/nonexistent"),
-                None
-            ),
+            denial_for_outcome(&O::Passed, CRITERION),
             None,
             "pass ⇒ no denial"
         );
 
-        let failed = denial_for_outcome(
-            &O::Failed,
-            CRITERION,
-            std::path::Path::new("/nonexistent"),
-            None,
-        )
-        .expect("denies");
+        let failed = denial_for_outcome(&O::Failed, CRITERION).expect("denies");
         assert!(
             failed.starts_with(&format!("pinned validator failed: {CRITERION}")),
             "the genuine criterion failure keeps its established wording: {failed}"
         );
 
-        let timed_out = denial_for_outcome(
-            &O::TimedOut,
-            CRITERION,
-            std::path::Path::new("/nonexistent"),
-            None,
-        )
-        .expect("denies");
+        let timed_out = denial_for_outcome(&O::TimedOut, CRITERION).expect("denies");
         let unrunnable = denial_for_outcome(
             &O::Unrunnable("No such file or directory (os error 2)".into()),
             CRITERION,
-            std::path::Path::new("/nonexistent"),
-            None,
         )
         .expect("denies");
 
@@ -4979,97 +4812,6 @@ mod resolve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── FINDING-099: the denial must name the number it measured ────────────────────────────
-    //
-    // `failing_measurement` read `.wicked/domain/coverage-report.json`, a path nothing else in this
-    // system writes. It never found the report, so every LEGITIMATE coverage denial claimed the
-    // floor "could not measure" — blaming the engine for a bad number it had measured correctly,
-    // and making the denial indistinguishable from FINDING-093's genuinely inert floor.
-
-    /// P1 rule, applied without touching the content-addressed script: the reader and the script
-    /// must agree on the filename, and this asserts BOTH artifacts rather than restating either.
-    #[test]
-    fn the_script_and_the_diagnostic_agree_on_the_report_filename() {
-        assert!(
-            crate::domain_extraction::COVERAGE_SCRIPT
-                .contains(crate::domain_extraction::COVERAGE_REPORT_FILE),
-            "the shipped coverage script does not mention {} — the diagnostic would read a file \
-             the script never produces",
-            crate::domain_extraction::COVERAGE_REPORT_FILE
-        );
-    }
-
-    /// The behaviour that actually broke. Falsified by restoring the nested path: this fails.
-    #[test]
-    fn a_failing_report_is_read_from_the_worktree_root() {
-        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        std::fs::write(
-            dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
-            r#"{"behavior_bearing":5769,"resolved":128,"risk_flagged":0,"unaccounted":5641,"coverage":0.0222}"#,
-        )
-        .expect("write report");
-
-        let m =
-            failing_measurement(&dir, None).expect("the report at the worktree root must be read");
-        assert!(m.contains("behavior_bearing=5769"), "{m}");
-        assert!(m.contains("unaccounted=5641"), "{m}");
-        assert!(m.contains("coverage=0.0222"), "{m}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (e2e F29) The denial quotes the minimum the floor APPLIED. A repository whose own target is
-    /// 66% (the person's "Lower the minimum") is measured against 66%, so a 50% share is denied as
-    /// "minimum 66%", never the daemon's 80% (no env is set here; the daemon default is 80). Fails
-    /// without the fix: the lead read `min_coverage_pct_from_env()` alone.
-    #[test]
-    fn the_denial_quotes_the_repository_target_the_floor_applied() {
-        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-target", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let db = dir.join("graph.db");
-        {
-            let mut store =
-                wicked_apps_core::open_store(Some(db.to_str().unwrap())).expect("store");
-            wicked_governance::set_repo_min_coverage_pct(&mut store, Some(66)).expect("target");
-        }
-        std::fs::write(
-            dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
-            r#"{"behavior_bearing":10,"resolved":5,"risk_flagged":5,"unaccounted":0,"coverage":1.0}"#,
-        )
-        .expect("write report");
-
-        let with_store = failing_measurement(&dir, db.to_str()).expect("measured");
-        assert!(with_store.contains("minimum 66%"), "{with_store}");
-        assert!(!with_store.contains("minimum 80%"), "{with_store}");
-        // Without a store (or with none readable) the daemon's setting is the minimum, as before.
-        let no_store = failing_measurement(&dir, None).expect("measured");
-        assert!(!no_store.contains("minimum 66%"), "{no_store}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The other half: a report ONLY at the old nested path must NOT be found, so a future edit
-    /// cannot quietly satisfy the test above by reading both locations. Reading two paths would
-    /// reintroduce the ambiguity this fix removes.
-    #[test]
-    fn the_abandoned_nested_path_is_not_consulted() {
-        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-nested", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".wicked/domain")).expect("temp dir");
-        std::fs::write(
-            dir.join(".wicked/domain").join(crate::domain_extraction::COVERAGE_REPORT_FILE),
-            r#"{"behavior_bearing":1,"resolved":1,"risk_flagged":0,"unaccounted":0,"coverage":1.0}"#,
-        )
-        .expect("write report");
-
-        assert!(
-            failing_measurement(&dir, None).is_none(),
-            "the nested path is not where anything writes; consulting it invites two spellings again"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A judge verdict with no seat attribution — the shape the fold tests need.
     fn av(pass: bool, reasoning: &str) -> crate::validator::AgentVerdict {
         crate::validator::AgentVerdict {
@@ -5276,10 +5018,7 @@ mod resolve_tests {
     /// all — an operator running `provision-validator` in the wrong cwd hits the identical dead end.
     #[test]
     fn every_missing_pin_remedy_names_the_database() {
-        for pin in [
-            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
-            "deadbeefdeadbeef",
-        ] {
+        for pin in ["deadbeefdeadbeef", "0123456789abcdef"] {
             let remedy = missing_pin_remedy(pin);
             assert!(
                 remedy.contains("--db"),
@@ -5416,6 +5155,32 @@ mod resolve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#1924: the retired domain-extraction coverage pin is refused by name at plan time, before
+    /// the vault is read, so a store that still holds it approved never attaches it.
+    #[test]
+    fn the_retired_domain_coverage_pin_is_refused_by_name() {
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-pin-retired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(
+            r#"{ "id": "old", "phases": [ { "id": "coverage", "kind": "build", "validator_pin": "9a2c71609c3e3ced" } ] }"#,
+        )
+        .unwrap();
+        def.validate().unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        let msg = attach_pinned_validators(&store, &mut units, &def)
+            .expect_err("the retired pin is refused")
+            .to_string();
+        assert!(
+            msg.contains("core#1924") && msg.contains("phase `coverage`"),
+            "{msg}"
+        );
+        assert!(units.iter().all(|u| u.validator.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_unapproved_pinned_validator_bails_at_plan_time() {
         // Lane D finding 2: a phase that pins an UNAPPROVED-but-vaulted validator must be caught at PLAN
@@ -5545,23 +5310,6 @@ mod resolve_tests {
         );
         // No prior creator before ord 1 ⇒ None (the caller falls back to the unit's own output).
         assert!(creator_output_for(&store, "s", 1).is_none());
-    }
-
-    /// A fail-closed refusal has to leave the operator with a command to run. The shipped coverage
-    /// pin has a purpose-built one, and the generic author→approve pair cannot reproduce it — so
-    /// sending them to `provision-validator` for that pin would be actively misleading.
-    #[test]
-    fn the_shipped_coverage_pin_is_pointed_at_its_own_seed_command() {
-        let remedy = missing_pin_remedy(crate::domain_extraction::COVERAGE_VALIDATOR_PIN);
-        assert!(
-            remedy.contains("wicked-core seed-domain-validators"),
-            "the shipped pin must name its purpose-built seed command: {remedy}"
-        );
-        assert!(
-            !remedy.contains("provision-validator"),
-            "the LLM writer path authors a different script and so a DIFFERENT pin — pointing at it \
-             here sends the operator somewhere that cannot produce this pin: {remedy}"
-        );
     }
 
     /// Any other unresolved pin is an operator-authored one: name the author→approve pair, and name

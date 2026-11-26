@@ -631,7 +631,7 @@ pub(crate) fn active_runs_on_repo(
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
 /// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
-/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product,
+/// "coverage": { real_pct, min_pct?, behavior_bearing, real, placeholders, unmapped, not_product,
 /// weightedPct }, where `weightedPct` is the confidence-weighted share (headline only; optional on the
 /// wire, absent from the persisted build label, and never an input to the gate),
 /// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
@@ -645,11 +645,12 @@ pub(crate) fn active_runs_on_repo(
 /// counted row gets the verdict the count used. With the build not behind the store, the rows with
 /// `real` and no `uncounted` number exactly `coverage.real`; behind it, units mapped since the build
 /// have no row yet. A requirement from a build before `code_symbol` has no entry (no claim either way);
-/// (real requirements only count toward the minimum, core#1233); the
-/// coverage is recomputed from the store's own counts at read time against the configured minimum
-/// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
-/// rebuild. `graph` is null until a build has reached the minimum; a repo registered but not
-/// indexed yet answers `{ graph: null, coverage: null }`. An unknown `repo_ref` errors.
+/// (real requirements only count, core#1233); the coverage is recomputed from the store's own
+/// counts at read time, so a run that maps more shows up without a rebuild. `min_pct` is the minimum
+/// the listed build recorded on its label, absent when none did: core#1924 removed the configured
+/// minimum, so a read names no other. `target` is always null (the repository target is gone).
+/// `graph` is null until a build is stored; a repo registered but not indexed yet answers
+/// `{ graph: null, coverage: null }`. An unknown `repo_ref` errors.
 pub fn requirements_graph_for_repo(
     daemon: &dyn GraphRead,
     daemon_db: &str,
@@ -683,16 +684,16 @@ pub fn requirements_graph_for_repo(
             "rows": null, "satisfied_by": links, "code": code, "target": null,
         }));
     }
-    // (domain-graph-3) The repository's own target first (lowered at a budget ask), else the
-    // daemon-wide minimum.
-    // Read ONCE: the minimum applied and the `target` the read reports come from the same values
-    // (codex r1: a target cleared mid-read must not pair 66 with "no target").
-    let repo_target = wicked_governance::repo_min_coverage_pct(&repo_store)?;
-    let daemon_target = wicked_governance::min_coverage_pct_from_env();
-    let min_pct = match repo_target {
-        Some(pct) => pct,
-        None => daemon_target.clone().map_err(|e| anyhow::anyhow!(e))?,
-    };
+    // core#1924: no configured minimum is left (env, repository target and the 1.1.0 build
+    // command are gone). The read names the minimum the listed build recorded on its own label, or
+    // none; a graph whose build recorded none keeps the label it was built with.
+    let min_pct = loaded
+        .as_ref()
+        .and_then(|(_, build, _, _)| build.coverage.as_ref())
+        .and_then(|c| c.get("min_pct"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u8::try_from(v).ok())
+        .filter(|v| (1..=100).contains(v));
     // The rows are the last BUILD; `coverage` is the store now. `build` says which build the rows are
     // and the label it was built at, so a reader can tell when the header counts what the list does
     // not hold (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is
@@ -728,7 +729,7 @@ pub fn requirements_graph_for_repo(
     };
     // P1/P3 (operator rulings 2026-11-06): how old the code behind the listed build is, counted
     // against the REGISTERED checkout (never the graph's recorded root, which a run's worktree index
-    // may have left pointing at a removed worktree), and which minimum is in force and why.
+    // may have left pointing at a removed worktree).
     let built_from = build
         .as_ref()
         .and_then(|b| b.code_commit.clone())
@@ -744,11 +745,10 @@ pub fn requirements_graph_for_repo(
                 .map(|c| (c, "index"))
         });
     let code = built_from.map(|(commit, basis)| code_drift(&repo.root_path, &commit, basis));
-    let target = serde_json::json!({ "repo": repo_target, "daemon": daemon_target.ok() });
     Ok(serde_json::json!({
         "graph": graph, "coverage": coverage_read, "build": build, "rows": rows,
         "satisfied_by": links, "code": code,
-        "target": target,
+        "target": null,
     }))
 }
 
@@ -3913,27 +3913,15 @@ mod tests {
         assert_eq!(current["code"]["built_from"]["basis"], "build");
         assert_eq!(current["code"]["commits_behind"], 0);
         assert!(current["code"]["built_from"]["at"].is_string());
-        assert_eq!(
-            current["target"],
-            serde_json::json!({ "repo": null, "daemon": 80 })
-        );
+        // core#1924: no repository target and no daemon minimum are left to report.
+        assert_eq!(current["target"], serde_json::Value::Null);
         // The checkout moves on two commits: the map is now two commits old.
         for i in 0..2 {
             std::fs::write(root.join("README.md"), format!("change {i}\n")).unwrap();
             assert!(git(p, &["commit", "-qam", "change"]).unwrap().0);
         }
-        // The repository's own target, lowered at a budget ask, is the one in force.
-        {
-            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
-            wicked_governance::set_repo_min_coverage_pct(&mut repo_store, Some(66)).unwrap();
-        }
         let moved = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
         assert_eq!(moved["code"]["commits_behind"], 2, "{}", moved["code"]);
-        assert_eq!(
-            moved["target"],
-            serde_json::json!({ "repo": 66, "daemon": 80 })
-        );
-        assert_eq!(moved["coverage"]["min_pct"], 66);
         // A commit the checkout does not hold: unknown, never 0.
         {
             let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
@@ -4054,7 +4042,14 @@ mod tests {
             serde_json::json!({}),
             "an empty build reads as built"
         );
-        assert_eq!(built["coverage"]["min_pct"], 80);
+        // core#1924: this build recorded no minimum and none is configured, so the read names none,
+        // and the served graph keeps the label its build wrote (none here).
+        assert!(
+            built["coverage"].get("min_pct").is_none(),
+            "{}",
+            built["coverage"]
+        );
+        assert!(built["graph"]["metadata"].get("coverage").is_none());
         assert_eq!(
             built["rows"],
             serde_json::json!({}),
@@ -4078,7 +4073,8 @@ mod tests {
             let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
             let built_at = wicked_governance::ModelCoverage {
                 real_pct: 23,
-                min_pct: 80,
+                // Not the old default: the read must name what this build recorded (core#1924).
+                min_pct: Some(66),
                 behavior_bearing: 5786,
                 real: 1362,
                 placeholders: 4397,
@@ -4106,6 +4102,10 @@ mod tests {
             "the build's own label"
         );
         assert_eq!(moved["build"]["coverage"]["real_pct"], 23);
+        assert_eq!(
+            moved["coverage"]["min_pct"], 66,
+            "the read names the minimum the listed build recorded"
+        );
         assert_eq!(
             moved["coverage"]["real"], 0,
             "the store now (nothing mapped in it)"

@@ -282,12 +282,9 @@ pub use domain::{
     RejudgeReadiness, RoutingInfo, SeatFailureMark, SessionStatus, SessionView, StageKind,
     UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
+pub use domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID;
 /// (J6 C1b) The launch's scope: the strict parse core-ts uses for `scopeJson`, and its check.
 pub use domain_extraction::{check_launch_scope, parse_scope_json};
-pub use domain_extraction::{
-    coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
-    COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID,
-};
 pub use event::{ArmPhase, BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
