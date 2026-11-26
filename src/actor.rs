@@ -3740,6 +3740,7 @@ pub(crate) fn run(
                         need,
                         scope,
                         &bases,
+                        None,
                     )
                 }
                 .unwrap_or_else(|e| {

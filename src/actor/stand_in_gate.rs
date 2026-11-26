@@ -327,7 +327,9 @@ pub(crate) fn reserve_team(
     need: usize,
     scope: crate::standin::BindingScope,
     only: &[String],
+    give_up: Option<std::time::Instant>,
 ) -> anyhow::Result<Vec<crate::standin::SeatedStandIn>> {
+    let _ = give_up; // red scaffold (core#1999): not yet read
     use crate::standin as si;
     use wicked_apps_core::spawn::seat_id;
     let Some(mut session) = crate::domain::get_session(store, run_id)? else {
@@ -583,9 +585,51 @@ mod reserve_team_tests {
             attempt: Some(1),
             ..Default::default()
         };
-        let seated = reserve_team(&mut store, &mut sink, &s.id, role, need, scope, &[]).unwrap();
+        let seated =
+            reserve_team(&mut store, &mut sink, &s.id, role, need, scope, &[], None).unwrap();
         let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
         (seated, after, rx.try_iter().collect())
+    }
+
+    /// core#1999: a reservation answered after its asker stopped waiting reserves nothing, so no
+    /// binding stays `seated` with nothing run on it; one asked in time still reserves.
+    #[test]
+    fn a_reservation_its_asker_gave_up_on_reserves_nothing_1999() {
+        let s = run(&["claude"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let gave_up = std::time::Instant::now();
+        let late = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            si::BindingScope::default(),
+            &[],
+            Some(gave_up),
+        )
+        .unwrap();
+        assert!(late.is_empty(), "{late:?}");
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        assert!(
+            after.assurance.stand_ins.is_empty(),
+            "nothing stays seated: {:?}",
+            after.assurance.stand_ins
+        );
+        let in_time = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            si::BindingScope::default(),
+            &[],
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(in_time.len(), 1);
     }
 
     /// A council of three on a one-CLI consented run: three fresh bindings on the one seat, each
@@ -655,8 +699,17 @@ mod reserve_team_tests {
             ..Default::default()
         };
         let only = vec!["claude".to_string()];
-        let seated =
-            reserve_team(&mut store, &mut sink, &s.id, Role::Monitor, 1, scope, &only).unwrap();
+        let seated = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            scope,
+            &only,
+            None,
+        )
+        .unwrap();
         let keys: Vec<&str> = seated.iter().map(|x| x.binding.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -698,6 +751,7 @@ mod reserve_team_tests {
             1,
             si::BindingScope::default(),
             &codex_only,
+            None,
         )
         .unwrap();
         assert!(!seated.is_empty(), "codex can stand in");

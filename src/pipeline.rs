@@ -8110,7 +8110,7 @@ mod guarded_read_step_tests {
         let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "sj-codex");
         let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
         crate::domain::put_nodes(&mut store, &[build.to_node(), review.to_node()]).unwrap();
-        let run = crate::standin::LaunchStandIn {
+        let mut run = crate::standin::LaunchStandIn {
             aware: true,
             consent: Some(crate::standin::StandInConsent {
                 scope: crate::standin::SCOPE_JOB.into(),
@@ -8121,6 +8121,35 @@ mod guarded_read_step_tests {
             ..Default::default()
         }
         .apply(crate::assurance::RunAssurance::default());
+        // (core#1997) The run's team bindings as the engine mints them (`standin::fill`, the call
+        // `stand_in_gate::reserve_team` makes): a council of three (`sj-claude~1..3`) and then a
+        // monitor (`sj-claude~4`) on the one base, scoped to the review unit.
+        for (role, need) in [
+            (crate::standin::Role::Council, 3),
+            (crate::standin::Role::Monitor, 1),
+        ] {
+            let crate::standin::Fill::Seats { stand_ins, .. } =
+                crate::standin::fill(crate::standin::FillRequest {
+                    role,
+                    need,
+                    real: Vec::new(),
+                    bases: vec!["sj-claude".into()],
+                    builder_model: None,
+                    consent: run.stand_in.as_ref(),
+                    reason: crate::standin::Reason::OnlyOneHelper {
+                        cli: "sj-claude".into(),
+                    },
+                    scope: crate::standin::BindingScope {
+                        ord: Some(2),
+                        ..Default::default()
+                    },
+                    taken: &run.stand_ins,
+                })
+            else {
+                panic!("the run mints its team stand-ins");
+            };
+            run.stand_ins.extend(stand_ins);
+        }
         let verdict = crate::validator::AgentVerdict {
             pass: true,
             reasoning: "ok".into(),
@@ -8236,7 +8265,7 @@ mod guarded_read_step_tests {
             teamed(
                 vec![crate::team::LedgerMonitor {
                     monitor_id: "m1".into(),
-                    seat: "sj-claude~1".into(),
+                    seat: "sj-claude~4".into(),
                     batches: 1,
                     status: crate::team::MonitorStatus::Completed,
                     error: None,
@@ -8267,6 +8296,39 @@ mod guarded_read_step_tests {
             }
             assert_eq!(gate.evaluator, None);
             assert_eq!(gate.judge, None);
+            // (core#1997) Each team role that took part is a role record of its own, at the gate
+            // and at delivery: its binding, its unit, and what it decided on.
+            let council = !u
+                .team
+                .as_ref()
+                .unwrap()
+                .ledger
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty();
+            let (role, seats, subject): (&str, &[&str], &str) = if council {
+                (
+                    "council",
+                    &["sj-claude~1", "sj-claude~2", "sj-claude~3"],
+                    "finding:f1",
+                )
+            } else {
+                ("monitor", &["sj-claude~4"], "monitor:m1")
+            };
+            for r in [&gate, &delivery] {
+                let team = team_records(r, role);
+                assert_eq!(team.len(), seats.len(), "{role}: {team:?}");
+                for (rec, seat) in team.iter().zip(seats) {
+                    assert_eq!(rec.seat.as_deref(), Some(*seat));
+                    assert_eq!(rec.filled, crate::assurance::FILLED_STAND_IN);
+                    assert_eq!(rec.state, crate::standin::STATE_ANSWERED);
+                    assert_eq!(rec.ord, Some(2));
+                    assert_eq!(rec.subject.as_deref(), Some(subject));
+                    let stamp = rec.stand_in.as_ref().expect("the binding's stamp");
+                    assert_eq!(stamp.base, "sj-claude");
+                }
+            }
         }
         // A gate cut before the team was read (it says independent) still delivers mixed: the
         // delivery reads the unit's own ledger, never the gate's reading alone.
@@ -8274,7 +8336,7 @@ mod guarded_read_step_tests {
         let mut carried = teamed(
             vec![crate::team::LedgerMonitor {
                 monitor_id: "m1".into(),
-                seat: "sj-claude~1".into(),
+                seat: "sj-claude~4".into(),
                 batches: 1,
                 status: crate::team::MonitorStatus::Completed,
                 error: None,
@@ -8287,6 +8349,26 @@ mod guarded_read_step_tests {
             delivery.independence.as_deref(),
             Some(crate::assurance::INDEPENDENCE_MIXED)
         );
+        assert_eq!(
+            team_records(&delivery, "monitor").len(),
+            1,
+            "the delivery records the monitor off the unit's own ledger"
+        );
+    }
+
+    /// The role records a receipt keeps for one team role, in seat order.
+    fn team_records<'a>(
+        r: &'a crate::assurance::AssuranceReceipt,
+        role: &str,
+    ) -> Vec<&'a crate::assurance::RoleRecord> {
+        let mut v: Vec<&crate::assurance::RoleRecord> = r
+            .roles
+            .iter()
+            .flatten()
+            .filter(|x| x.role == role)
+            .collect();
+        v.sort_by(|a, b| a.seat.cmp(&b.seat));
+        v
     }
 
     /// T-R5 (the receipt, DES-STANDIN-001 §5.1): a stand-in judge's PASS is never `ran` for the
