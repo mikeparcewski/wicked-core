@@ -2935,7 +2935,9 @@ fn run_rule_check_with(
                     if stand_in_alone {
                         format!(" ({label})")
                     } else {
-                        format!(" (if every one is lost, {}: {label})", b.key)
+                        // (core#1969 R2 F1) Not asked yet, so no label ("stood in"): present tense and
+                        // comma-free, since studio splits the judges on commas (`floorLine.ts` RULE_JUDGES).
+                        format!(" ({} stands in if every one is lost)", b.key)
                     }
                 }
                 None => String::new(),

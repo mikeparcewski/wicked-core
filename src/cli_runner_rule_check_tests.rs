@@ -3430,7 +3430,8 @@ fn a_refused_approval_falls_back_to_the_judge_stand_in_and_broken_stands() {
 }
 
 /// (core#1949) A real rule judge that answers keeps the check: the stand-in is never asked and
-/// never named among its seats.
+/// never named among its seats. (core#1969 R2 F1) The judges note names the offered stand-in as a
+/// fallback, in the present tense and without a comma (studio splits the judges on commas).
 #[test]
 fn a_working_real_rule_judge_never_calls_the_stand_in() {
     crate::observed_provider::take_receipts();
@@ -3442,6 +3443,9 @@ fn a_working_real_rule_judge_never_calls_the_stand_in() {
         fails: Vec::new(),
         shares: Vec::new(),
     };
+    let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&notes);
+    let sink = move |n: &str| seen.lock().unwrap().push(n.to_string());
     let report = run_rule_check_standing_in(
         &input,
         &["claude".to_string()],
@@ -3449,13 +3453,25 @@ fn a_working_real_rule_judge_never_calls_the_stand_in() {
         &pool,
         &pool,
         &runner,
-        &|_| {},
+        &sink,
         &offer,
     )
     .expect("a report");
     crate::observed_provider::take_receipts();
     assert!(rule_calls(&runner).iter().all(|(who, _, _)| who == "codex"));
     assert_eq!(report.seats, ["codex"]);
+    let notes = notes.lock().unwrap().clone();
+    let judges = notes
+        .iter()
+        .find_map(|n| {
+            n.split_once("in force; judges: ")
+                .map(|(_, j)| j.to_string())
+        })
+        .unwrap_or_else(|| panic!("no judges note: {notes:?}"));
+    assert_eq!(
+        judges.lines().next().unwrap(),
+        format!("codex ({} stands in if every one is lost)", offer.key)
+    );
 }
 
 /// (core#1949 N2) Only an operator's `clis.toml` can name a seat with the reserved `~`: a record
