@@ -835,9 +835,13 @@ pub(crate) fn independence_preflight_in(
                 }))
             })
             .unwrap_or_default();
-            // (core#1944) The rule check falls back to the run's judge offer, minted only when
-            // the contract requires a judge.
-            let rule_base = if contract.judge { &work_base } else { &no_base };
+            // (core#1944) The rule check falls back to the run's judge offer, which
+            // `standin::judge_offer` never mints on a reduced run (whatever its instruments).
+            let rule_base = if shape.reduced_assurance {
+                &no_base
+            } else {
+                &work_base
+            };
             push("rule_judge", 1, rule_judges, rule_base, true);
             push(
                 "rule_council",
@@ -1455,14 +1459,29 @@ mod tests {
             assert!(!r.can_stand_in, "{name}");
             assert_eq!(r.stand_in_from, None, "{name}");
         }
-        // The rule check's stand-in is the judge offer, minted only when the run requires a judge.
+        // The rule check's stand-in is the run's judge offer (`standin::judge_offer`): minted on a
+        // full run whatever its instruments, never on a reduced one.
         let no_judge = PreflightContract {
             rules: true,
             contained: true,
             ..PreflightContract::default()
         };
         let p = preflight(&[roster_seat("t1954s", "claude")], &shape, no_judge);
-        assert!(!role(&p, "rule_judge").can_stand_in);
+        assert!(
+            role(&p, "rule_judge").can_stand_in,
+            "a full run without the judge instrument still mints the offer"
+        );
+        let reduced = PreflightShape {
+            reduced_assurance: true,
+            ..bug_shape()
+        };
+        let contract = contract_for(&reduced, true);
+        assert!(contract.rules && !contract.judge, "{contract:?}");
+        let p = preflight(&[roster_seat("t1954s", "claude")], &reduced, contract);
+        assert!(
+            !role(&p, "rule_judge").can_stand_in,
+            "a reduced run mints none"
+        );
     }
 
     /// DES §2.2: two CLIs. On the expected shape Codex reviews and judges Claude Code's work, so
