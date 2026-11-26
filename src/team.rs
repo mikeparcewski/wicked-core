@@ -1121,6 +1121,11 @@ pub trait MonitorHost: Send + Sync {
     /// own bookkeeping stands (a final pass already detached from its unit included). A warm host
     /// whose sessions the supervisor closes one by one needs nothing more.
     fn close_run(&self, _run_id: &str) {}
+    /// (core#1952) The seat's display name (`Claude Code`), for words a user reads; `None` when
+    /// the host has no roster to read it from.
+    fn display_name(&self, _seat: &str) -> Option<String> {
+        None
+    }
 }
 
 // ── DES-TEAMING-001 S3 (#602): monitor→worker advice over `_session/steering` ─────────────────

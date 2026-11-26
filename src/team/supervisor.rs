@@ -115,6 +115,23 @@ pub fn monitor_target(band: Option<&str>, asked: u8) -> u8 {
         .min(MAX_MONITORS)
 }
 
+/// (core#1952) A seat as a user reads it: a stand-in (`claude~1`, DES-STANDIN-001) by its CLI's
+/// display name and "a stand-in", never by the reserved key; a real seat by its key, which names
+/// the instance (`claude#2`). For words only (errors, council labels and evidence): seating and
+/// `parties` keep the keys.
+fn seat_words(host: &dyn MonitorHost, seat: &str) -> String {
+    use wicked_apps_core::spawn::seat_id;
+    if !seat_id::is_stand_in(seat) {
+        return seat.to_string();
+    }
+    let base = seat_id::credential(seat);
+    let name = host
+        .display_name(base)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| base.to_string());
+    format!("{name}, a stand-in")
+}
+
 // ── Councils (DES-001 §6.3, DES-002 §8.10) ──────────────────────────────────────────────────────
 
 /// What one council call came to.
@@ -807,7 +824,7 @@ impl UnitTeam {
                 None,
                 Some(format!(
                     "the roster has no seat distinct from the PA ({})",
-                    self.ctx.creator
+                    seat_words(host, &self.ctx.creator)
                 )),
             );
             return;
@@ -2933,7 +2950,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     .unwrap_or_else(|| "no reply (counted as hold)".into());
                 let positions = vec![
                     CouncilPosition {
-                        by: format!("worker {}", u.ctx.creator),
+                        by: format!("worker {}", seat_words(host, &u.ctx.creator)),
                         position: if declined {
                             "YES — the refusal stands".into()
                         } else {
@@ -2942,7 +2959,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                         reason: worker,
                     },
                     CouncilPosition {
-                        by: format!("monitor {}", f.finding.seat),
+                        by: format!("monitor {}", seat_words(host, &f.finding.seat)),
                         position: "NO — the finding stands".into(),
                         reason: monitor_reason,
                     },
@@ -2997,20 +3014,23 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                             .into(),
                         positions: vec![
                             CouncilPosition {
-                                by: format!("member {member}"),
+                                by: format!("member {}", seat_words(host, &member)),
                                 position: "YES — the output counts".into(),
                                 reason: why,
                             },
                             CouncilPosition {
-                                by: format!("pa {}", job.pa),
+                                by: format!("pa {}", seat_words(host, &job.pa)),
                                 position: "NO — the rejection stands".into(),
                                 reason: r.reason.clone(),
                             },
                         ],
                         evidence: cap_utf8(
                             &format!(
-                                "Step {} (attempt {}) by {member}; the PA's rejection: {}",
-                                r.step_id, r.reviewed_attempt, r.reason
+                                "Step {} (attempt {}) by {}; the PA's rejection: {}",
+                                r.step_id,
+                                r.reviewed_attempt,
+                                seat_words(host, &member),
+                                r.reason
                             ),
                             16 * 1024,
                         ),

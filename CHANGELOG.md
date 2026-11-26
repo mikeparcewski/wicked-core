@@ -20,6 +20,11 @@ Two release tracks share this file, newest entry first regardless of track:
   The stand-in now judges those rules once every real seat of the check is lost. It is never part of the
   rotation or the council pool, and a BROKEN a real seat reached stands. A seat record keyed like the stand-in
   (only an operator's `clis.toml` can name one) no longer answers as it, nor gets its provider waiver.
+- **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
+  (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
+  from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
+  so: "(Claude Code, a stand-in)". The council positions and evidence the supervisor writes name seats the same
+  way; a real seat keeps its key, and the parties keep the keys.
 - **A stand-in run keeps every judge stand-in on its record** (core#1953). Each fold records its answered judge's
   binding on the stored session. The actor then wrote back its own copy, read before the fold, which dropped the
   binding and the stand-in label. The next gate re-minted the same slot, and the run's `standIns` under-reported

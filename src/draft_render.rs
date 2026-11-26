@@ -240,10 +240,16 @@ pub(crate) fn resolve_draft(
 }
 
 /// Open `real` by walking down from `root` one component at a time, each `openat` with `O_NOFOLLOW`
-/// on the directory just opened: no link anywhere below the root is followed, so a directory swapped
-/// for a link after [`resolve_draft`] cannot lead the read out of the root.
+/// on the directory just opened (the last component also `O_NONBLOCK`, so a FIFO cannot block the
+/// open): no link anywhere below the root is followed, so a directory swapped for a link after
+/// [`resolve_draft`] cannot lead the read out of the root. `real` must be `root` joined with a
+/// relative path of plain components; anything else is an error. Also the cited-source read
+/// (`cli_runner::cited_source_for_judge`, core#1945). The non-unix version follows links.
 #[cfg(unix)]
-fn open_beneath(root: &std::path::Path, real: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_beneath(
+    root: &std::path::Path,
+    real: &std::path::Path,
+) -> Result<std::fs::File, String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     let rel = real
@@ -305,7 +311,10 @@ fn open_beneath(root: &std::path::Path, real: &std::path::Path) -> Result<std::f
 }
 
 #[cfg(not(unix))]
-fn open_beneath(_root: &std::path::Path, real: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_beneath(
+    _root: &std::path::Path,
+    real: &std::path::Path,
+) -> Result<std::fs::File, String> {
     std::fs::File::open(real).map_err(|e| format!("the draft could not be opened: {e}"))
 }
 
