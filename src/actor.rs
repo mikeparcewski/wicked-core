@@ -35713,6 +35713,17 @@ mod request_changes_tests {
             .as_ref()
             .is_some_and(|r| r.requested_rerun.is_some());
         let rejudged = unit.requested_rejudge.is_some();
+        // (core#1962) …except a retry at a floor the machine stopped: its checks run again on the
+        // work already there (the seat ran; no check did), nothing waived and no fix.
+        let checks_retry = unit
+            .repo_checks
+            .as_ref()
+            .and_then(|r| r.requested_rerun.as_ref())
+            .is_some_and(|r| {
+                r.mode == crate::repo_checks::FloorRerunMode::Retry
+                    && r.fix.is_none()
+                    && r.waive.is_empty()
+            });
         match intent {
             "retry" | "continue" | "deliver" | "reseat_and_retry" => {
                 assert!(
@@ -35720,7 +35731,7 @@ mod request_changes_tests {
                     "{name}: `{intent}` counted unit {ord} instead of running it"
                 );
                 assert!(
-                    !floor_only && !rejudged,
+                    (!floor_only || (intent == "retry" && checks_retry)) && !rejudged,
                     "{name}: `{intent}` re-checked unit {ord}'s old output instead of running it"
                 );
             }
