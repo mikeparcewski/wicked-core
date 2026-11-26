@@ -539,7 +539,7 @@ fn seq_stays_monotonic_across_a_real_process_restart() {
     let completed = types
         .iter()
         .position(|t| *t == "sessionCompleted")
-        .expect("the run finished");
+        .unwrap_or_else(|| panic!("the run finished: {types:?}"));
     assert!(
         paused < resumed && resumed < completed,
         "pause, then approval, then completion: {types:?}"
@@ -593,8 +593,28 @@ fn seq_restart_child_approves_the_gate_in_a_fresh_process() {
         .expect("approve the gate after the restart");
     assert_eq!(status, SessionStatus::Executing);
     wait_terminal(&core, RESTART_RUN);
-    // Drain the writer before this process exits so the parent reads a complete log.
-    let _ = core.run_events(RESTART_RUN);
+    // The status can read terminal before the run's last event is in the log: the read model
+    // answers mid-command once the actor stays busy past its quiet budget (core#1390), and
+    // `finalize_run` stores `Completed`, then runs the run's terminal cleanup, then emits
+    // `sessionCompleted`. On a slow runner (Windows) this process could exit in between. So wait
+    // for the event itself before this process exits.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let terminal = ["sessionCompleted", "sessionFailed", "runCancelled"];
+    let types = loop {
+        let types: Vec<String> = core
+            .run_events(RESTART_RUN)
+            .iter()
+            .filter_map(|e| e["type"].as_str().map(str::to_string))
+            .collect();
+        if types.iter().any(|t| terminal.contains(&t.as_str())) || Instant::now() > deadline {
+            break types;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        types.iter().any(|t| t == "sessionCompleted"),
+        "the run completed: {types:?}"
+    );
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
