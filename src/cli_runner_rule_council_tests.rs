@@ -295,6 +295,7 @@ fn settle_in(
             council_pool: run_seats,
         }),
         None,
+        None,
     )
     .expect("a report")
 }

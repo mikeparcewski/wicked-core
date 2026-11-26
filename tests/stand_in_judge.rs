@@ -63,6 +63,10 @@ impl StepRunner for Seat {
             if let (Some(wd), "fix") = (&input.workdir, phase.as_str()) {
                 std::fs::write(wd.join("src/app.ts"), "fixed\n").unwrap();
             }
+            // core#1953: a second build phase changes the tree again, so its default judge runs too.
+            if let (Some(wd), "polish") = (&input.workdir, phase.as_str()) {
+                std::fs::write(wd.join("src/app.ts"), "fixed and polished\n").unwrap();
+            }
             format!("did: {phase}")
         };
         StepOutput {
@@ -115,11 +119,15 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
-fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
+fn tmp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
         "wicked-core-standin-judge-{name}-{}",
         std::process::id()
-    ));
+    ))
+}
+
+fn tmp(name: &str) -> PathBuf {
+    let d = tmp_path(name);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -537,4 +545,73 @@ fn t_r12_a_missing_judge_holds_and_a_grant_re_runs_only_the_judge() {
     assert!(judges[0].starts_with("claude~"), "{judges:?}");
     assert_eq!(fixes, 1, "the fix was never re-dispatched");
     assert_eq!(judge_role(&fix_receipt(&evs, sid))["filled"], "stand_in");
+}
+
+/// core#1953: two build phases, one CLI, consent. Each gate's default judge has no seat distinct
+/// from the creator, so a stand-in judges at both. Each fold records its judge binding on the
+/// stored session; the actor's post-fold write of its own (older) copy must keep them. Otherwise
+/// the second gate re-mints the first gate's slot and the run's record loses its judges.
+#[test]
+fn core_1953_every_judge_stand_in_stays_on_the_run_record() {
+    let name = "two-gates";
+    let rig = rig(name, "PASS", false);
+    let def = format!(
+        r#"{{"id":"{name}-two","phases":[
+        {{"id":"fix","kind":"build","gate_type":"execution","gate":"auto","executes_code":false,
+          "verified_evidence":false,"required_deliverables":[],"depends_on":[],"role":"creator",
+          "skill_ref":null,"allowed_skills":[],"validator_pin":null,"executor":{{"type":"agent"}}}},
+        {{"id":"polish","kind":"build","gate_type":"execution","gate":"auto","executes_code":false,
+          "verified_evidence":false,"required_deliverables":[],"depends_on":["fix"],"role":"creator",
+          "skill_ref":null,"allowed_skills":[],"validator_pin":null,"executor":{{"type":"agent"}}}}]}}"#
+    );
+    rig.core
+        .register_workflow(def)
+        .expect("the two-phase def registers");
+    let sid = "standin-judge-two-gates";
+    let ev = rig.core.subscribe();
+    rig.core
+        .launch_run(spec(
+            sid,
+            &rig.repo_ref,
+            &format!("{name}-two"),
+            Some(consent()),
+        ))
+        .expect("an aware launch with consent is admitted");
+    let evs = collect_until(&ev, ends(sid));
+    let (judges, fixes) = tallies(&rig);
+    assert_eq!(fixes, 2, "both phases ran: {judges:?}");
+    assert_eq!(judges.len(), 2, "a stand-in judged each gate: {judges:?}");
+    let seated: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            CoreEvent::StandInSeated {
+                session, binding, ..
+            } if session == sid => Some(binding.key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seated.len(), 2, "one standInSeated per gate: {seated:?}");
+    assert_ne!(
+        seated[0], seated[1],
+        "a new gate reserves a new slot, never the earlier gate's: {seated:?}"
+    );
+    let db = tmp_path(&format!("{name}-db")).join("estate.db");
+    let store = wicked_apps_core::open_store_ro(Some(db.to_str().unwrap())).expect("store");
+    let session = wicked_core::get_session(&store, sid)
+        .unwrap()
+        .expect("the run's session");
+    let kept: Vec<String> = session
+        .assurance
+        .stand_ins
+        .iter()
+        .map(|b| b.key.clone())
+        .collect();
+    assert_eq!(
+        kept, seated,
+        "the run's record keeps every judge binding the folds recorded, in order"
+    );
+    assert!(
+        session.assurance.stand_in_label.is_some(),
+        "the run's record keeps the stand-in label the folds recorded"
+    );
 }
