@@ -9636,6 +9636,22 @@ fn apply_step_result(
         // The fold appends (or replaces) only carried records, and nothing on this thread touched
         // the overrides since this copy was read: the stored list is the current one.
         session.assurance.floor_overrides = stored.assurance.floor_overrides;
+        // (core#1953) …and the stand-in judge binding (and label) the fold recorded on the stored
+        // contract (`pipeline.rs` `judge_answered`): a write of this copy without it would drop the
+        // binding, so the next gate re-mints its slot and the run's record loses its judges. The
+        // stored list is in reservation order. Bindings are append-only and every writer persists
+        // before this read, so the stored list holds this copy's; appending a copy-only binding is
+        // belt and braces, never a resurrection.
+        let mut stand_ins = stored.assurance.stand_ins;
+        for b in std::mem::take(&mut session.assurance.stand_ins) {
+            if !stand_ins.iter().any(|x| x.key == b.key) {
+                stand_ins.push(b);
+            }
+        }
+        session.assurance.stand_ins = stand_ins;
+        if stored.assurance.stand_in_label.is_some() {
+            session.assurance.stand_in_label = stored.assurance.stand_in_label;
+        }
     }
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
     // approved a teamed unit whose ledger does not let the run continue unattended.

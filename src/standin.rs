@@ -556,6 +556,16 @@ pub(crate) fn resolve(
     registry: &[crate::AgenticCli],
     key: &str,
 ) -> Option<String> {
+    base_record(roster, registry, key).map(|c| c.headless_invocation.clone())
+}
+
+/// The base record a binding `key` runs on, resolved as [`resolve`] reads it. `None` for a key
+/// outside the stand-in grammar or a base with no record.
+pub(crate) fn base_record<'a>(
+    roster: &'a [crate::AgenticCli],
+    registry: &'a [crate::AgenticCli],
+    key: &str,
+) -> Option<&'a crate::AgenticCli> {
     if !seat_id::is_stand_in(key) {
         return None;
     }
@@ -565,7 +575,6 @@ pub(crate) fn resolve(
         .find(|c| c.key == base)
         .or_else(|| registry.iter().find(|c| c.key == base))
         .or_else(|| registry.iter().find(|c| c.key == seat_id::family(base)))
-        .map(|c| c.headless_invocation.clone())
 }
 
 /// (§3.4) The preface every stand-in prompt opens with. Real-seat prompts never carry it.
