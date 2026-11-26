@@ -3860,7 +3860,13 @@ pub(crate) fn run(
                         // another unit dispatched after it. Owned only when the message is for that
                         // unit's seat (or all); an unreadable owner refuses the inject (codex r1),
                         // never queues it unscoped.
-                        let owner = (|| -> anyhow::Result<Option<u32>> {
+                        // (core#1964) …and whether it can still hear one: a unit already
+                        // dispatched in this attempt (whatever its last result says, a gate
+                        // retry runs it again) took its messages then, and hears a new one only
+                        // between the turns of a power build. Any other is mid-turn, and a
+                        // message for it is refused rather than queued unheard (a broadcast
+                        // too: core#1486 keeps it from every other step).
+                        let owner = (|| -> anyhow::Result<Option<(u32, bool, String)>> {
                             let Some(s) = crate::domain::get_session(&store, &run_id)? else {
                                 return Ok(None);
                             };
@@ -3869,17 +3875,40 @@ pub(crate) fn run(
                             }
                             Ok(crate::domain::session_unit_at(&store, &run_id, s.unit_ix)?
                                 .filter(|u| {
-                                    matches!(
-                                        u.status,
-                                        crate::domain::UnitStatus::Distributed
-                                            | crate::domain::UnitStatus::Pending
-                                    ) && (target_str == "all"
-                                        || u.assigned_cli.as_deref() == Some(target_str.as_str()))
+                                    let this_attempt = u.last_attempt == Some(s.attempt);
+                                    (this_attempt
+                                        || matches!(
+                                            u.status,
+                                            crate::domain::UnitStatus::Distributed
+                                                | crate::domain::UnitStatus::Pending
+                                        ))
+                                        && (target_str == "all"
+                                            || u.assigned_cli.as_deref()
+                                                == Some(target_str.as_str()))
                                 })
-                                .map(|u| u.ord))
+                                .map(|u| {
+                                    let turns = s
+                                        .power
+                                        .as_ref()
+                                        .is_some_and(|p| p.on && p.orchestrator.ord == Some(u.ord));
+                                    (
+                                        u.ord,
+                                        u.last_attempt == Some(s.attempt) && !turns,
+                                        u.assigned_cli.clone().unwrap_or_else(|| "its seat".into()),
+                                    )
+                                }))
                         })();
                         let for_ord = match owner {
-                            Ok(o) => o,
+                            Ok(Some((ord, true, cli))) => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "step {ord} ({cli}) is already working on this attempt and \
+                                     reads no new message until it is dispatched again, so this \
+                                     one would not reach it; it was not sent. Steer the step at \
+                                     its gate instead (a note, or request changes)"
+                                )));
+                                continue;
+                            }
+                            Ok(o) => o.map(|(ord, _, _)| ord),
                             Err(e) => {
                                 let _ = reply.send(Err(anyhow::anyhow!(
                                     "run {run_id}: could not tell which step is running ({e}); \
@@ -9607,6 +9636,22 @@ fn apply_step_result(
         // The fold appends (or replaces) only carried records, and nothing on this thread touched
         // the overrides since this copy was read: the stored list is the current one.
         session.assurance.floor_overrides = stored.assurance.floor_overrides;
+        // (core#1953) …and the stand-in judge binding (and label) the fold recorded on the stored
+        // contract (`pipeline.rs` `judge_answered`): a write of this copy without it would drop the
+        // binding, so the next gate re-mints its slot and the run's record loses its judges. The
+        // stored list is in reservation order. Bindings are append-only and every writer persists
+        // before this read, so the stored list holds this copy's; appending a copy-only binding is
+        // belt and braces, never a resurrection.
+        let mut stand_ins = stored.assurance.stand_ins;
+        for b in std::mem::take(&mut session.assurance.stand_ins) {
+            if !stand_ins.iter().any(|x| x.key == b.key) {
+                stand_ins.push(b);
+            }
+        }
+        session.assurance.stand_ins = stand_ins;
+        if stored.assurance.stand_in_label.is_some() {
+            session.assurance.stand_in_label = stored.assurance.stand_in_label;
+        }
     }
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
     // approved a teamed unit whose ledger does not let the run continue unattended.
@@ -10990,7 +11035,8 @@ fn denial_gate_prompt_body(
             let (verb, cause) = floor_not_run(unit).map_or(("run", ""), |f| (f.verb, f.cause));
             format!(
                 "Unit {ord}'s checks did not {verb}: {cause}. Approve to retry the step once that \
-                 is fixed (its checks run again), or reject to cancel the run{note}"
+                 is fixed (its checks run again, on the work already there), or reject to cancel \
+                 the run{note}"
             )
         }
         "floor_failed" if floor_fix_applies(unit) => format!(
@@ -14345,7 +14391,13 @@ fn dispatch_unit_with(
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
     // (DES-STANDIN-001 §3.4) A stand-in hears no communications: they stay queued for the seats.
-    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in {
+    // (core#1962) A floor re-run runs no seat (the runner hands the reviewed output on): its
+    // messages stay queued for the next seat that does.
+    let floor_rerun = unit
+        .repo_checks
+        .as_ref()
+        .is_some_and(|r| r.requested_rerun.is_some());
+    if unit.tool_cmd.is_none() && review_of.is_none() && !stand_in && !floor_rerun {
         let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
@@ -20656,6 +20708,25 @@ pub(crate) fn confirm_gate_expecting(
     // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
     // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
     let mut intent_amendment: Option<String> = None;
+    // (core#1962) A plain approve at a floor the MACHINE stopped (no check ran for want of disk)
+    // re-runs the checks on the work already there, as its gate says: the seat does not run
+    // again. Re-dispatching the step sent a creator with nothing left to change, whose empty
+    // attempt then failed the substance floor and spent a power round. A note is for the seat.
+    let decision = match decision {
+        crate::workflow::HumanDecision::Approve { amend, .. }
+            if amend.as_deref().is_none_or(|a| a.trim().is_empty())
+                && !adjudication_open
+                && !floor_fix_route
+                && !team_gate::transport_gate_open(&session)
+                && !team_gate::dispute_gate_open(&session)
+                && crate::domain::session_units(store, run_id)?
+                    .get(session.unit_ix)
+                    .is_some_and(|u| floor_not_run(u).is_some()) =>
+        {
+            crate::workflow::HumanDecision::FloorRerun(crate::repo_checks::FloorRerunMode::Retry)
+        }
+        d => d,
+    };
     let (amend, amend_scope, rework): (
         Option<String>,
         crate::workflow::AmendScope,
@@ -21761,6 +21832,23 @@ fn floor_rerun_request(
     unit: &crate::domain::WorkUnit,
     mode: crate::repo_checks::FloorRerunMode,
 ) -> anyhow::Result<crate::repo_checks::FloorRerun> {
+    // (core#1962) A retry answers only a floor the machine stopped: the same checks, nothing waived.
+    if mode == crate::repo_checks::FloorRerunMode::Retry {
+        if floor_not_run(unit).is_none() {
+            anyhow::bail!(
+                "unit {}'s checks ran, so a checks-only retry would not answer its gate",
+                unit.ord
+            );
+        }
+        return Ok(crate::repo_checks::FloorRerun {
+            mode,
+            waive: Vec::new(),
+            output: crate::domain::get_unit_transcript(store, &unit.id)
+                .and_then(|t| t.output)
+                .unwrap_or_default(),
+            fix: None,
+        });
+    }
     let source = unit.denial.as_ref().map(|d| d.source.as_str());
     let report = unit
         .repo_checks
@@ -35641,6 +35729,17 @@ mod request_changes_tests {
             .as_ref()
             .is_some_and(|r| r.requested_rerun.is_some());
         let rejudged = unit.requested_rejudge.is_some();
+        // (core#1962) …except a retry at a floor the machine stopped: its checks run again on the
+        // work already there (the seat ran; no check did), nothing waived and no fix.
+        let checks_retry = unit
+            .repo_checks
+            .as_ref()
+            .and_then(|r| r.requested_rerun.as_ref())
+            .is_some_and(|r| {
+                r.mode == crate::repo_checks::FloorRerunMode::Retry
+                    && r.fix.is_none()
+                    && r.waive.is_empty()
+            });
         match intent {
             "retry" | "continue" | "deliver" | "reseat_and_retry" => {
                 assert!(
@@ -35648,7 +35747,7 @@ mod request_changes_tests {
                     "{name}: `{intent}` counted unit {ord} instead of running it"
                 );
                 assert!(
-                    !floor_only && !rejudged,
+                    (!floor_only || (intent == "retry" && checks_retry)) && !rejudged,
                     "{name}: `{intent}` re-checked unit {ord}'s old output instead of running it"
                 );
             }
@@ -36498,6 +36597,113 @@ mod request_changes_tests {
         assert!(
             e.contains("moving the step to another seat would not help"),
             "{e}"
+        );
+    }
+
+    /// core#1962 W6: the gate of a floor the machine stopped (no check ran for want of disk)
+    /// says "Approve to retry the step once that is fixed (its checks run again)", but the
+    /// approve re-dispatched the step's seat. A creator with nothing left to change then failed
+    /// the substance floor ("changed nothing") and spent a power round. A plain approve now
+    /// re-runs only the checks, on the work already there; a note is for the seat, so an approve
+    /// with one still runs the step again.
+    #[test]
+    fn approving_a_disk_refused_floor_reruns_only_its_checks_1962() {
+        let run_id = format!("disk-refused-retry-{}", std::process::id());
+        let rerun_of = |store: &dyn GraphStore| {
+            crate::domain::session_units(store, &run_id).unwrap()[3]
+                .repo_checks
+                .as_ref()
+                .and_then(|r| r.requested_rerun.clone())
+        };
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        answer(
+            &mut store,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
+        .0
+        .expect("approve retries");
+        let rerun = rerun_of(&store)
+            .expect("the checks re-run on the work already there; the seat does not run again");
+        assert_eq!(rerun.mode.as_wire(), "retry", "{rerun:?}");
+        assert!(rerun.fix.is_none() && rerun.waive.is_empty(), "{rerun:?}");
+        // No seat runs, so the re-run takes no operator message: it waits for one that does.
+        crate::power::queue_operator_message(&run_id, "all", "keep it small", None);
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        dispatch_unit(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &run_id,
+            3,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .expect("the checks-only re-run dispatches");
+        let kept: Vec<String> = crate::power::take_operator_messages(&run_id, "claude", 4)
+            .into_iter()
+            .map(|m| m.message)
+            .collect();
+        crate::power::forget_run(&run_id);
+        assert_eq!(
+            kept,
+            vec!["keep it small".to_string()],
+            "the message is not spent"
+        );
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_disk_refused_verify(&mut store, &run_id);
+        answer(
+            &mut store,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("use the cached dependencies".into()),
+                amend_scope: Default::default(),
+            },
+        )
+        .0
+        .expect("approve with a note retries");
+        assert!(
+            rerun_of(&store).is_none(),
+            "a note is for the seat: the step runs again"
+        );
+    }
+
+    /// core#1962 (review): a power build whose checks the disk stopped spends no hand-off round
+    /// and records no failed hand-off step: nothing about the work failed, and the send-back it
+    /// queued was refused anyway (only a retry answers that gate).
+    #[test]
+    fn a_disk_refused_power_build_spends_no_hand_off_round_1962() {
+        let mut s = crate::actor::sessions_detail_fold_tests::session("pw-disk");
+        let mut power = crate::power::PowerState::launched(true, 0);
+        power.orchestrator.ord = Some(2);
+        s.power = Some(power);
+        let mut build = WorkUnit::pending("pw-disk:build", "pw-disk", 2, "build");
+        build.role = PhaseRole::Creator;
+        deny_by_floor(&mut build, disk_refused_floor());
+        assert!(floor_not_run(&build).is_some());
+        let reason = build.denial_reason.clone().unwrap();
+        let class = denial_class(build.denial.as_ref(), false);
+        assert_eq!(class, "floor_failed");
+        let mut sink = crate::event_log::EventSink::default();
+        assert_eq!(
+            super::power_gate::auto_send_back(&mut sink, &mut s, &build, class, &reason),
+            None,
+            "no send-back"
+        );
+        assert!(
+            s.power.as_ref().unwrap().handoff.is_none(),
+            "no round spent and no failed hand-off step"
         );
     }
 }
@@ -39765,6 +39971,103 @@ mod live_output_stream_tests {
             running.is_empty() && next.is_empty(),
             "no unit may inherit the message"
         );
+    }
+
+    /// core#1964 W6: a message to a step whose one turn is already running was queued for that
+    /// step, which had taken its messages when it was dispatched and hears none mid-turn, so it
+    /// was never delivered while the route answered OK and the sheet said "Sent". Such a message
+    /// is now refused (the route's 409, with the reason); a broadcast steers the run and is kept
+    /// for the next step. A step not yet dispatched, and a power build between its turns, still
+    /// hear theirs.
+    #[test]
+    fn a_message_to_a_step_mid_turn_is_refused_not_queued_unheard_1964() {
+        use crate::command::InjectTarget;
+        use crate::domain::{put_nodes, UnitStatus, WorkUnit};
+        use wicked_apps_core::open_store;
+
+        let seed = |tag: &str, dispatched: bool, power_build: Option<u32>, status: UnitStatus| {
+            let run_id = format!("inject-1964-{tag}-{}", uuid::Uuid::new_v4());
+            let dir = std::env::temp_dir().join(&run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("estate.db");
+            {
+                let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+                let mut session = super::sessions_detail_fold_tests::session(&run_id);
+                session.status = SessionStatus::Executing;
+                session.unit_ix = 0;
+                session.attempt = 1;
+                if let Some(ord) = power_build {
+                    let mut power = crate::power::PowerState::launched(true, 0);
+                    power.orchestrator.ord = Some(ord);
+                    session.power = Some(power);
+                }
+                let mut first = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "review");
+                first.status = status;
+                first.assigned_cli = Some("codex".into());
+                if dispatched {
+                    first.last_attempt = Some(1);
+                }
+                let mut second = WorkUnit::pending(format!("{run_id}:u2"), &run_id, 2, "test");
+                second.assigned_cli = Some("codex".into());
+                put_nodes(
+                    &mut store,
+                    &[session.to_node(), first.to_node(), second.to_node()],
+                )
+                .unwrap();
+            } // Release the seed writer before starting the actor.
+            let core = crate::Core::spawn_with_engine(
+                db.to_str().unwrap().to_string(),
+                Arc::new(StubDispatcher),
+                Arc::new(NoopRunner),
+            );
+            (run_id, core)
+        };
+        let codex = || InjectTarget::Cli("codex".into());
+        let heard = |run: &str, ord: u32| -> Vec<String> {
+            crate::power::take_operator_messages(run, "codex", ord)
+                .into_iter()
+                .map(|m| m.message)
+                .collect()
+        };
+
+        // The reported shape: the review step's one turn is running.
+        let (run, core) = seed("mid-turn", true, None, UnitStatus::Distributed);
+        let refused = core.inject_worker_message(&run, "check the README too", codex());
+        let (running, next) = (heard(&run, 1), heard(&run, 2));
+        let err = refused
+            .expect_err("a step mid-turn cannot hear it: refuse, never answer OK")
+            .to_string();
+        assert!(
+            err.contains("step 1") && err.contains("would not reach it"),
+            "{err}"
+        );
+        assert!(
+            running.is_empty() && next.is_empty(),
+            "a refused message is not queued"
+        );
+        // A broadcast is that step's too (core#1486): refused, never handed to another step.
+        let refused = core.inject_worker_message(&run, "keep it small", InjectTarget::All);
+        assert!(refused.is_err(), "a broadcast mid-turn is refused too");
+        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
+
+        // A step a gate retry runs again keeps its last result's status: still mid-turn.
+        let (run, core) = seed("gate-retry", true, None, UnitStatus::Rejected);
+        let refused = core.inject_worker_message(&run, "check the README too", codex());
+        assert!(refused.is_err(), "a retried step mid-turn is refused");
+        assert!(heard(&run, 1).is_empty() && heard(&run, 2).is_empty());
+
+        // Not dispatched yet: the step hears it when it is.
+        let (run, core) = seed("pending", false, None, UnitStatus::Distributed);
+        core.inject_worker_message(&run, "check the README too", codex())
+            .expect("queued for the step's dispatch");
+        assert!(heard(&run, 2).is_empty(), "it is that step's, not the next");
+        assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
+
+        // A power build hears it at its next turn.
+        let (run, core) = seed("power-build", true, Some(1), UnitStatus::Distributed);
+        core.inject_worker_message(&run, "check the README too", codex())
+            .expect("queued for the build's next turn");
+        assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
     }
 
     #[test]

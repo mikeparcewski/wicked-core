@@ -1256,14 +1256,18 @@ fn boundary_denial_judged(
             // binary / raw SQLite still evades a literal scan; the OS sandbox is the hermetic layer).
             // Where the shell could be standing when a segment opens a database (issue #645
             // second half): the effective cwd `here` — the install fence's per-attempt sidecar,
-            // so a `cd` in an EARLIER allowed call counts — plus every `cd` destination in THIS
-            // command, resolved through the boundary's own normalize chain. Without these, `cd
-            // <graph-dir> && sqlite3 graph.db 'UPDATE nodes SET risk = 0'` named the store in no
-            // way the literal scan could see.
-            let cwd_bases = graph_store_cwd_bases(command, &here, home);
-            if let Some(hit) =
-                classify_estate_command(command, estate_store_pinned, graph_store, &cwd_bases, home)
-            {
+            // so a `cd` in an EARLIER allowed call counts — plus THIS command's own `cd` moves
+            // ([`segment_cwd_bases`], core#1956), through the boundary's own normalize chain.
+            // Without these, `cd <graph-dir> && sqlite3 graph.db 'UPDATE nodes SET risk = 0'`
+            // named the store in no way the literal scan could see.
+            if let Some(hit) = classify_estate_command(
+                command,
+                estate_store_pinned,
+                graph_store,
+                std::slice::from_ref(&here),
+                home,
+                Some(cwd),
+            ) {
                 return Some((
                     format!(
                         "{ESTATE_DENY_REASON_PREFIX} `{}` — {}; {ESTATE_DENY_REMEDY}",
@@ -6408,18 +6412,148 @@ fn token_names_graph_store(
     graph_store: &[std::path::PathBuf],
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
+    own_tree: Option<&std::path::Path>,
+    // The word is an interpreter's inline program (`python3 -c <word>`), see [`spells_own_tree`].
+    inline_code: bool,
 ) -> bool {
     if ESTATE_STORE_PIN_ENV.iter().any(|k| tok.contains(k)) {
         return true;
     }
     let normalised = script_path(tok);
-    if graph_store
-        .iter()
-        .any(|g| names_path(&normalised, &g.to_string_lossy()))
-    {
+    // (core#1956) A location that strictly HOLDS the unit's tree (an app's worktree under
+    // `WICKED_HOME/apps`) is not named by an occurrence that spells a file of the tree itself:
+    // the absolute path of a file in the tree is the tree's business. Judged on the word as the
+    // program receives it (the shell's one reading, never the quote-trimmed text): every other
+    // occurrence still names the store, and so does every one past [`OWN_TREE_OCCURRENCES`], or
+    // one the reading does not show.
+    let reading = own_tree.and_then(|_| exact_reading(tok, home));
+    if graph_store.iter().any(|g| {
+        let g_text = g.to_string_lossy();
+        let named = path_occurrences(&normalised, &g_text).count();
+        if named == 0 {
+            return false;
+        }
+        let (Some(tree), Some(r)) = (
+            own_tree.filter(|tree| holds_tree(g, tree, home)),
+            reading.as_deref(),
+        ) else {
+            return true;
+        };
+        let mut exempt = 0;
+        for (n, at) in path_occurrences(r, &g_text).enumerate() {
+            if n >= OWN_TREE_OCCURRENCES
+                || !spells_own_tree(r, at, inline_code, tree, graph_store, home)
+            {
+                return true;
+            }
+            exempt += 1;
+        }
+        exempt < named
+    }) {
         return true;
     }
-    relative_token_names_graph_store(&normalised, graph_store, cwd_bases, home)
+    relative_token_names_graph_store(&normalised, graph_store, cwd_bases, home, own_tree)
+}
+
+/// (core#1956) Does the occurrence at `at` in `reading` (one shell word as its program receives
+/// it) of a store location that holds `tree` spell exactly one path INSIDE the unit's own tree,
+/// and in no store?
+///
+/// Only two shapes are read, the ones whose path the word proves. The tree's spelling (plain path
+/// characters only: letters, digits, `.`, `_`, `-`, `/`, so the shell expanded nothing in it) on a
+/// name boundary (`<tree>-old` is a sibling), then a run of the same plain characters with no
+/// `..` component, that is either
+/// * the WHOLE word (`python3 <tree>/check.py`): the path itself; or
+/// * a quoted literal in an interpreter's inline program (`node -e 'require("<tree>/x")'`, the
+///   word right after its inline-code flag, `inline_code`): a quote opens it, right after the
+///   word's start, a blank, `(`, `,`, `=` or `[`, and the same quote closes it, followed by the
+///   end, `)`, `,`, `]` or `;`. The whole rest of the word, read as one path, is judged too.
+///
+/// Anything else (a prefix such as `p=` before the tree, a quote, glob, `?`, `%`, `:` or blank in
+/// the name, a blank after it, which an inner shell line may continue) could make the program
+/// open another path, so it still names the store. Each path must resolve inside the tree through
+/// the boundary's normalize → symlink chain (a link out of the tree still names the store) and
+/// outside every store location that does not hold the tree (one inside it included).
+fn spells_own_tree(
+    reading: &str,
+    at: usize,
+    inline_code: bool,
+    tree: &std::path::Path,
+    graph_store: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> bool {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
+    let spelled = tree.to_string_lossy();
+    if !spelled.chars().all(plain) {
+        return false;
+    }
+    let Some(rest) = reading[at..].strip_prefix(spelled.as_ref()) else {
+        return false;
+    };
+    let run_len = rest.find(|c: char| !plain(c)).unwrap_or(rest.len());
+    let (run, after) = rest.split_at(run_len);
+    if !(run.is_empty() || run.starts_with('/')) || run.split('/').any(|part| part == "..") {
+        return false;
+    }
+    let paths = if at == 0 {
+        if !after.is_empty() {
+            return false;
+        }
+        vec![format!("{spelled}{run}")]
+    } else {
+        if !inline_code {
+            return false;
+        }
+        let mut before = reading[..at].chars().rev();
+        let Some(q) = before.next().filter(|c| matches!(c, '"' | '\'')) else {
+            return false;
+        };
+        let opens = before
+            .next()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ',' | '=' | '['));
+        let mut next = after.chars();
+        let closes = next.next() == Some(q)
+            && next
+                .next()
+                .is_none_or(|c| matches!(c, ')' | ',' | ']' | ';'));
+        if !(opens && closes) {
+            return false;
+        }
+        vec![format!("{spelled}{run}"), format!("{spelled}{rest}")]
+    };
+    paths.iter().all(|path| {
+        crate::path_policy::raw_resolves_within(path, tree, home, tree)
+            && !graph_store
+                .iter()
+                .filter(|g| !holds_tree(g, tree, home))
+                .any(|g| crate::path_policy::raw_resolves_within(path, tree, home, g))
+    })
+}
+
+/// (core#1956) The one word `tok` is to its program, when the shell's reading of it is exactly
+/// one string with nothing left to expand (no backslash: on Windows it may be read two ways).
+fn exact_reading(tok: &str, home: Option<&std::path::Path>) -> Option<String> {
+    if tok.contains('\\') {
+        return None;
+    }
+    let readings = resolve_shell_readings(tok, home)?;
+    match readings.as_slice() {
+        [r] if !r.contains(OPAQUE_EXPANSION) => Some(r.clone()),
+        _ => None,
+    }
+}
+
+/// The most occurrences of a store location in one token [`spells_own_tree`] reads (each is one
+/// filesystem walk): past them, the token names the store, as before core#1956.
+const OWN_TREE_OCCURRENCES: usize = 64;
+
+/// Does store location `g` strictly contain the unit's own tree (same normalize → symlink chain
+/// as the boundary)? A location equal to the tree, or inside it, is a store the tree holds.
+fn holds_tree(g: &std::path::Path, tree: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    let within = |a: &std::path::Path, b: &std::path::Path| {
+        crate::path_policy::raw_resolves_within(&a.to_string_lossy(), a, home, b)
+    };
+    within(tree, g) && !within(g, tree)
 }
 
 /// Does a RELATIVE token name the graph store from where the shell STANDS (issue #645, second
@@ -6438,15 +6572,30 @@ fn token_names_graph_store(
 /// word would refuse a whole segment the moment the shell stood in the store dir (`select` would
 /// "resolve into" it), which is a false refusal — and a control that fires on legitimate work is
 /// how a control gets switched off ([`crate::path_policy`]'s module doc).
+///
+/// (crew#1935) The unit's own tree (`own_tree`) is never the store. crew keeps an app's worktree
+/// under `WICKED_HOME/apps`, and `WICKED_HOME` is a store location, so every relative word of an
+/// interpreter's program text (`.`, `f.name`) resolved "into the store" and crew's own apps
+/// self-check was refused. A location that strictly HOLDS the tree is named by a relative word
+/// only when it resolves inside the location AND outside the tree: `../../memory.db`,
+/// `cd <home> && sqlite3 memory.db` and an existing link in the tree to a store still are. The
+/// absolute arm above exempts only an absolute spelling of a file of the tree
+/// ([`spells_own_tree`], core#1956).
 fn relative_token_names_graph_store(
     normalised: &str,
     graph_store: &[std::path::PathBuf],
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
+    own_tree: Option<&std::path::Path>,
 ) -> bool {
     if cwd_bases.is_empty() || graph_store.is_empty() {
         return false;
     }
+    // Each location, with the tree it holds (if any): a word inside that tree is not the store.
+    let stores: Vec<(&std::path::PathBuf, Option<&std::path::Path>)> = graph_store
+        .iter()
+        .map(|g| (g, own_tree.filter(|tree| holds_tree(g, tree, home))))
+        .collect();
     // A token may be a bare argument, a `--db=<path>` flag or an interpreter's whole `-c` program
     // text, so split on the characters no path continues through and judge each fragment.
     normalised
@@ -6465,44 +6614,50 @@ fn relative_token_names_graph_store(
         })
         .any(|f| {
             cwd_bases.iter().any(|base| {
-                graph_store
-                    .iter()
-                    .any(|g| crate::path_policy::raw_resolves_within(f, base, home, g))
+                stores.iter().any(|(g, held)| {
+                    crate::path_policy::raw_resolves_within(f, base, home, g)
+                        && !held.is_some_and(|tree| {
+                            crate::path_policy::raw_resolves_within(f, base, home, tree)
+                        })
+                })
             })
         })
 }
 
-/// Is `path` named somewhere in `text`, on a name boundary at both ends?
+/// Where `path` is named in `text`, on a name boundary at both ends: the byte offset of each
+/// such occurrence, so a caller can judge each one on its own (core#1956).
 ///
 /// * before the match: the start of the token, or a character no path continues through (a quote,
 ///   a space, `=`, `(`, `,`) — a leading `/` or a letter means a DIFFERENT path
 ///   (`/mnt/backup/srv/g` is a copy, not the store);
 /// * after it: the end, a `/` (a file inside the dir) or any non-name character — a letter, digit,
 ///   `-`, `_` or `.` means a longer sibling name.
-fn names_path(text: &str, path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
+fn path_occurrences<'a>(text: &'a str, path: &'a str) -> impl Iterator<Item = usize> + 'a {
     let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
     let mut from = 0;
-    while let Some(i) = text[from..].find(path) {
-        let start = from + i;
-        let end = start + path.len();
-        let before_ok = start == 0
-            || text[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| !(name_char(c) || c == '/'));
-        let after_ok = match text[end..].chars().next() {
-            Some(c) => !name_char(c),
-            None => true, // the path ends the token
-        };
-        if before_ok && after_ok {
-            return true;
+    std::iter::from_fn(move || {
+        if path.is_empty() {
+            return None;
         }
-        from = end;
-    }
-    false
+        while let Some(i) = text[from..].find(path) {
+            let start = from + i;
+            let end = start + path.len();
+            from = end;
+            let before_ok = start == 0
+                || text[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| !(name_char(c) || c == '/'));
+            let after_ok = match text[end..].chars().next() {
+                Some(c) => !name_char(c),
+                None => true, // the path ends the token
+            };
+            if before_ok && after_ok {
+                return Some(start);
+            }
+        }
+        None
+    })
 }
 
 /// Does this segment OPEN the shared graph store as a raw SQLite database (issue #645)?
@@ -6523,16 +6678,30 @@ fn opens_graph_store(
     graph_store: &[std::path::PathBuf],
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
+    own_tree: Option<&std::path::Path>,
 ) -> bool {
+    // (core#1956) A word is an interpreter's inline program only right after its inline-code
+    // flag: a quoted literal there is the string the program opens, while anywhere else a quote
+    // is part of a file name.
+    let client =
+        SQLITE_CLIENTS.contains(&base.trim_end_matches(".exe").to_ascii_lowercase().as_str());
     is_sqlite_capable_program(base)
-        && words
-            .iter()
-            .any(|t| token_names_graph_store(t, graph_store, cwd_bases, home))
+        && words.iter().enumerate().any(|(i, t)| {
+            let inline_code = !client
+                && i.checked_sub(1).is_some_and(|p| {
+                    matches!(
+                        strip_one_quote_layer(words[p]),
+                        "-c" | "-e" | "-E" | "-p" | "--eval" | "--print" | "eval"
+                    )
+                });
+            token_names_graph_store(t, graph_store, cwd_bases, home, own_tree, inline_code)
+        })
 }
 
 /// The directories a relative token in a sqlite-capable segment could resolve against (issue #645
 /// second half): where the shell STANDS (`here` — the install fence's per-attempt cwd sidecar, so a
-/// `cd` in an earlier allowed call still counts) plus every `cd` destination in THIS command.
+/// `cd` in an earlier allowed call still counts) plus every `cd` destination in THIS command: the
+/// whole-line union every line keeps but the one `cd` shape [`sqlite_cd_narrowing`] proves.
 ///
 /// The destinations (`cd` and `pushd`) are resolved with [`crate::path_policy`]'s normalize chain,
 /// each against the one before it, so `cd ../graphs/abc123` becomes an absolute base rather than a
@@ -6558,6 +6727,186 @@ fn graph_store_cwd_bases(
     bases
 }
 
+/// (core#1956) Where the shell can stand when the segments of one command line run, for the
+/// raw-SQLite fence's relative arm, from `start` (where it stands when the line begins): the
+/// bases for the FIRST segment, the bases for every later one (`None`: the same), and whether
+/// those already hold the moves of the line's inner shell strings (an inner rescan must not apply
+/// them again).
+///
+/// Judging every segment from every base the line can reach (#645) refused an app's own
+/// `cd queries && python3 -c 'open("../apps.json")'`: from the worktree root, `../apps.json` is
+/// outside the tree and inside `WICKED_HOME`. Only the shape [`sqlite_cd_narrowing`] proves is
+/// narrowed: later segments run where its one `cd` leads. Every other line keeps the whole-line
+/// union ([`graph_store_cwd_bases`]) for every segment, as before.
+fn segment_cwd_bases(
+    command: &str,
+    start: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> (
+    Vec<std::path::PathBuf>,
+    Option<Vec<std::path::PathBuf>>,
+    bool,
+) {
+    if let Some(dest) = sqlite_cd_narrowing(command, home) {
+        let after = start
+            .iter()
+            .map(|at| crate::path_policy::normalize_for_fence(&dest, at, home))
+            .collect();
+        return (start.to_vec(), Some(after), false);
+    }
+    // A line that names no move adds no base, and is not scanned again (the budget is shared).
+    if start.is_empty() || !["cd", "pushd"].iter().any(|m| command.contains(m)) {
+        return (start.to_vec(), None, false);
+    }
+    let mut all: Vec<std::path::PathBuf> = start
+        .iter()
+        .flat_map(|here| graph_store_cwd_bases(command, here, home))
+        .collect();
+    all.sort();
+    all.dedup();
+    (all, None, true)
+}
+
+/// (core#1956) The destination of a line `cd <dir> && <rest>` whose `rest` provably runs where
+/// that `cd` leads, else `None`.
+///
+/// `<dir>` is one plain word (letters, digits, `.`, `_`, `-`, `/`; no leading `-`, no `..`
+/// component). `<rest>` holds no separator but `&&` and `|` (each part runs only once the `cd`
+/// succeeded, in the shell it moved), no line break, comment, backslash, backtick or `$`, and no
+/// word, as the shell reads it, that can resolve to anything else. Nor may any word of that
+/// reading (split at every character that is not a letter, digit or `_`, both as written and
+/// with its quotes, blanks and `+` removed, so `c""d` and `"c" "d"` are read as `cd`) move a
+/// shell or a program, start a shell or another program from text, or re-read code: the
+/// builtins (`cd`, `pushd`, `popd`, `.`, `eval`, `source`, `trap`, `alias`, `shopt`, `builtin`,
+/// `command`, `function`, `exec…`), the shells, startup and lookup variables (`BASH_ENV`, `ENV`,
+/// `CDPATH`, `OLDPWD`), a sqlite client (it reads commands that move it: `.read`, `-init`),
+/// wrappers that take a directory (`env`, `sudo`, `find`, a short-option cluster holding `C`, `D`
+/// or `X` such as `ruby -Cback`, `--chdir`, `--directory`, `--prefix`,
+/// `--cwd`, `--wd`, …) and the interpreters' own moves and
+/// launches (`chdir`, `system`, `popen`, `spawn…`, `subprocess`, `child_process`). A path or a
+/// program assembled at run time is outside this literal scan, as everywhere in it.
+///
+/// Known limit: a `CDPATH` the seat's shell inherits (set by the operator, not by this line)
+/// can send a bare `cd <dir>` elsewhere.
+fn sqlite_cd_narrowing(command: &str, home: Option<&std::path::Path>) -> Option<String> {
+    if command.contains(['\n', '\\', '`', '#', '$'])
+        || command
+            .chars()
+            .any(|c| c.is_whitespace() && !matches!(c, ' ' | '\t'))
+    {
+        return None;
+    }
+    let toks = shell_tokens_with_operators(command, true);
+    let [cd, dest, sep, rest @ ..] = toks.as_slice() else {
+        return None;
+    };
+    let plain = !dest.is_empty()
+        && !dest.starts_with('-')
+        && dest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+        && !dest.split('/').any(|part| part == "..");
+    if cd != "cd" || sep != "&&" || !plain || rest.is_empty() {
+        return None;
+    }
+    const BANNED: [&str; 44] = [
+        "cd",
+        "pushd",
+        "popd",
+        "eval",
+        "source",
+        "trap",
+        "alias",
+        "shopt",
+        "builtin",
+        "command",
+        "function",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "mksh",
+        "ash",
+        "busybox",
+        "fish",
+        "BASH_ENV",
+        "ENV",
+        "CDPATH",
+        "OLDPWD",
+        "env",
+        "sudo",
+        "doas",
+        "su",
+        "runuser",
+        "setpriv",
+        "chroot",
+        "nsenter",
+        "unshare",
+        "find",
+        "xargs",
+        "C",
+        "D",
+        "chdir",
+        "directory",
+        "prefix",
+        "cwd",
+        "wd",
+        "workdir",
+        "script",
+    ];
+    const BANNED_IN_WORD: [&str; 8] = [
+        "chdir",
+        "execdir",
+        "okdir",
+        "system",
+        "popen",
+        "spawn",
+        "subprocess",
+        "child_process",
+    ];
+    let banned = |text: &str| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|w| {
+                BANNED.contains(&w)
+                    || BANNED_IN_WORD.iter().any(|b| w.contains(b))
+                    || (w.starts_with("exec") && !w.starts_with("execute"))
+            })
+    };
+    for t in rest {
+        if matches!(t.as_str(), "&&" | "|") || redirect_glob(t).is_some() {
+            continue;
+        }
+        if t.chars()
+            .all(|c| matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '!'))
+        {
+            return None;
+        }
+        for r in resolve_shell_readings(t, home)? {
+            let joined: String = r
+                .chars()
+                .filter(|c| !(c.is_whitespace() || matches!(c, '\'' | '"' | '+')))
+                .collect();
+            // `.` sources a file into this shell; a short-option cluster may carry a directory
+            // (`ruby -Cback`, `ruby -Xback`, `sudo -Dx`).
+            let dot = r.trim() == ".";
+            let dir_option =
+                r.starts_with('-') && !r.starts_with("--") && r[1..].contains(['C', 'D', 'X']);
+            // A sqlite client reads commands that move it (`.read` a file holding `.cd`, `-init`).
+            let client = SQLITE_CLIENTS.contains(&program_basename(&r));
+            if r.contains([OPAQUE_EXPANSION, '\\', '`', '$'])
+                || dot
+                || dir_option
+                || client
+                || banned(&r)
+                || banned(&joined)
+            {
+                return None;
+            }
+        }
+    }
+    Some(dest.clone())
+}
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
 /// `clusters` joins them only WITHOUT `--annotate` (judged at the call site). (core#729) `lineage`,
 /// `traverse` and the `rank` alias `hotspots` (estate#241/#242) are read-only too, and so are
@@ -6784,6 +7133,9 @@ fn classify_estate_command(
     graph_store: &[std::path::PathBuf],
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
+    // The unit's own tree (the hook's cwd): never the store, even under a store location
+    // (crew#1935, [`relative_token_names_graph_store`]).
+    own_tree: Option<&std::path::Path>,
 ) -> Option<EstateDeny> {
     let _scan = ShellScanGuard::session();
     classify_estate_command_in(
@@ -6791,7 +7143,9 @@ fn classify_estate_command(
         store_pinned_by_env,
         graph_store,
         cwd_bases,
+        false,
         home,
+        own_tree,
         true,
         readonly_env_disarmed(command),
     )
@@ -6846,10 +7200,15 @@ fn classify_estate_command_in(
     command: &str,
     store_pinned_by_env: bool,
     graph_store: &[std::path::PathBuf],
-    // Where the shell could be standing, for the raw-SQLite fence's relative arm (issue #645
-    // second half): the effective cwd plus this command's own `cd` destinations.
+    // Where the shell stands when this command line begins, for the raw-SQLite fence's relative
+    // arm (issue #645 second half); each segment is judged from the bases this line's own `cd`
+    // moves can leave it on ([`segment_cwd_bases`], core#1956).
     cwd_bases: &[std::path::PathBuf],
+    // The bases already hold this line's own moves (an inner rescan of a line whose whole-line
+    // union was taken), so they are used as they are.
+    cwd_settled: bool,
     home: Option<&std::path::Path>,
+    own_tree: Option<&std::path::Path>,
     unwrap_inline: bool,
     // (core#804) The command could clear or override the read-only default the carriers arm on
     // every worker ([`readonly_env_disarmed`]); `false` ⇒ the shim is read-only by default and a
@@ -6888,10 +7247,21 @@ fn classify_estate_command_in(
     if !seg.is_empty() {
         segments.push(seg);
     }
-    for (words, unwrapped) in segments.iter().flat_map(|words| {
+    // A settled line's bases are used as they are, borrowed (an inner rescan copies nothing).
+    let computed = (!cwd_settled).then(|| segment_cwd_bases(command, cwd_bases, home));
+    let (first_bases, later_bases, settled) = match &computed {
+        Some((first, later, settled)) => (
+            first.as_slice(),
+            later.as_deref().unwrap_or(first.as_slice()),
+            *settled,
+        ),
+        None => (cwd_bases, cwd_bases, true),
+    };
+    for (words, cwd_bases, unwrapped) in segments.iter().enumerate().flat_map(|(i, words)| {
+        let b = if i == 0 { first_bases } else { later_bases };
         unwrap_programs(words)
             .into_iter()
-            .map(move |unwrapped| (words, unwrapped))
+            .map(move |unwrapped| (words, b, unwrapped))
     }) {
         // Find the program word, seeing through the common, LEGITIMATE prefixes that would otherwise
         // hide it (Copilot #385, core #475): leading `NAME=value` env-assignments
@@ -6921,7 +7291,9 @@ fn classify_estate_command_in(
                         store_pinned_by_env,
                         graph_store,
                         cwd_bases,
+                        settled,
                         home,
+                        own_tree,
                         unwrap_inline && argv_expansion,
                         readonly_env_disarmed,
                     );
@@ -6995,7 +7367,7 @@ fn classify_estate_command_in(
         }
 
         // RAW SQLITE FENCE (issue #645).
-        if opens_graph_store(words, base, graph_store, cwd_bases, home) {
+        if opens_graph_store(words, base, graph_store, cwd_bases, home, own_tree) {
             return deny(ESTATE_WHY_RAW_SQLITE);
         }
     }
@@ -15229,7 +15601,7 @@ mod boundary_tests {
     /// written against (shadows `super::classify_estate_command`, whose third argument the
     /// raw-SQLite arm of issue #645 needs and which has its own tests).
     fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
-        super::classify_estate_command(command, store_pinned_by_env, &[], &[], None)
+        super::classify_estate_command(command, store_pinned_by_env, &[], &[], None, None)
     }
 
     // Env is process-global and Rust runs tests in threads, so these serialize on the CRATE-WIDE
@@ -15908,7 +16280,7 @@ mod boundary_tests {
         let after_writes = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
         bash_cd_targets_inner(&command, true);
         let after_cd = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
-        super::classify_estate_command(&command, true, &[], &[], None);
+        super::classify_estate_command(&command, true, &[], &[], None, None);
         let after_estate = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
         assert!(after_reads < after_writes && after_writes < after_cd && after_cd < after_estate);
         assert!(after_estate <= MAX_SHELL_SCAN_BYTES);
@@ -19058,7 +19430,7 @@ mod boundary_tests {
             "python3 -c 'import os,sqlite3; sqlite3.connect(os.environ[\"WICKED_ESTATE_DB\"]).execute(\"CREATE TABLE t (x)\")'",
             "node -e 'require(\"node:sqlite\").open(process.env.WICKED_MEMORY_DB)'",
         ] {
-            let hit = super::classify_estate_command(command, true, &store, &[], None)
+            let hit = super::classify_estate_command(command, true, &store, &[], None, None)
                 .unwrap_or_else(|| panic!("not refused: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
@@ -19070,7 +19442,7 @@ mod boundary_tests {
             "python3 -c 'import sqlite3; sqlite3.connect(\"/srv/estate/graphs/abc123/graph.db\").execute(\"CREATE TABLE t (x)\")'",
             "sqlite3 \"/srv/estate/graphs/abc123\"/graph.db 'DELETE FROM nodes'",
         ] {
-            let hit = super::classify_estate_command(command, false, &store, &[], None)
+            let hit = super::classify_estate_command(command, false, &store, &[], None, None)
                 .unwrap_or_else(|| panic!("the resolved graph path is refused too: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
@@ -19111,7 +19483,7 @@ mod boundary_tests {
             "wicked-estate query --db /srv/estate/graphs/abc123/graph.db 'fn:main'",
         ] {
             assert!(
-                super::classify_estate_command(allowed, true, &store, &[], None).is_none(),
+                super::classify_estate_command(allowed, true, &store, &[], None, None).is_none(),
                 "the read-only estate transport stays allowed: {allowed}"
             );
         }
@@ -19127,7 +19499,7 @@ mod boundary_tests {
             "sqlite3 /mnt/backup/srv/estate/graphs/abc123/graph.db 'select 1'",
         ] {
             assert!(
-                super::classify_estate_command(benign, true, &store, &[], None).is_none(),
+                super::classify_estate_command(benign, true, &store, &[], None, None).is_none(),
                 "{benign}"
             );
         }
@@ -19151,9 +19523,9 @@ mod boundary_tests {
         let store = [graph.clone()];
         let wt = std::path::PathBuf::from("/srv/work/wt");
         // `here` is where the shell stands; the command's own moves walk on from there.
-        let bases = |command: &str, here: &std::path::Path| {
-            super::graph_store_cwd_bases(command, here, None)
-        };
+        // Where the shell stands when the line begins, as the hook passes it: the line's own
+        // moves are the classifier's (core#1956).
+        let bases = |_command: &str, here: &std::path::Path| vec![here.to_path_buf()];
 
         // The reproduced escape: a cd in the SAME command, absolute or relative, and after a `sh -c`.
         for command in [
@@ -19175,7 +19547,7 @@ mod boundary_tests {
             "cd /srv/estate/graphs/abc123 && litecli graph.db",
         ] {
             let b = bases(command, &wt);
-            let hit = super::classify_estate_command(command, false, &store, &b, None)
+            let hit = super::classify_estate_command(command, false, &store, &b, None, None)
                 .unwrap_or_else(|| panic!("a relative spelling is refused: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
@@ -19185,15 +19557,22 @@ mod boundary_tests {
         let command = "sqlite3 graph.db \'UPDATE nodes SET risk = 0\'";
         let b = bases(command, &graph);
         assert_eq!(
-            super::classify_estate_command(command, false, &store, &b, None)
+            super::classify_estate_command(command, false, &store, &b, None, None)
                 .expect("a shell already standing in the store is refused")
                 .why,
             ESTATE_WHY_RAW_SQLITE,
         );
         // … and with the shell in the worktree the very same command is nobody\'s business.
         assert!(
-            super::classify_estate_command(command, false, &store, &bases(command, &wt), None)
-                .is_none(),
+            super::classify_estate_command(
+                command,
+                false,
+                &store,
+                &bases(command, &wt),
+                None,
+                None
+            )
+            .is_none(),
             "the same relative name from the worktree is a local db, not the graph",
         );
 
@@ -19213,17 +19592,385 @@ mod boundary_tests {
         ] {
             let b = bases(benign, &wt);
             assert!(
-                super::classify_estate_command(benign, true, &store, &b, None).is_none(),
+                super::classify_estate_command(benign, true, &store, &b, None, None).is_none(),
                 "{benign}"
             );
         }
         // The grounding transport stays allowed from inside the store dir too.
         let allowed = "wicked-estate-mcp --readonly --db graph.db";
         assert!(
-            super::classify_estate_command(allowed, true, &store, &bases(allowed, &graph), None)
-                .is_none(),
+            super::classify_estate_command(
+                allowed,
+                true,
+                &store,
+                &bases(allowed, &graph),
+                None,
+                None
+            )
+            .is_none(),
             "the read-only transport is not the raw-SQLite arm\'s business",
         );
+    }
+
+    /// crew#1935: an app's own worktree sits under `WICKED_HOME` (crew `apps/store.ts`
+    /// `wickedHomeDir('WICKED_CREW_APPS_ROOT', 'apps')`), and `WICKED_HOME` is one of the store
+    /// locations the raw-SQLite arm guards ([`graph_store_paths`]). Every path-shaped word of an
+    /// interpreter's program text (`.`, `f.name`) resolved from the worktree "into the store", so
+    /// crew's own taught apps self-check was refused as a raw SQLite open of the graph and no
+    /// Apps build landed (train 14, rows 15/16). The unit's own tree is never the store: a home
+    /// that HOLDS the worktree names the store only through a path that lands outside the tree.
+    #[test]
+    fn an_apps_worktree_under_wicked_home_runs_crews_self_check_1935() {
+        // crew `packages/crew/src/apps/turns.ts:46` APPS_SELF_CHECK_COMMAND, byte for byte.
+        const APPS_SELF_CHECK_COMMAND: &str = r#"python3 -c 'import json,pathlib
+def text(f):
+ try: return f.read_text(encoding="utf-8") if f.is_file() and not f.is_symlink() else None
+ except (UnicodeError,OSError): return None
+files={}
+for f in sorted(pathlib.Path(".").iterdir()):
+ if f.name in (".git","tmp"): continue
+ if f.name=="queries" and f.is_dir() and not f.is_symlink():
+  files.update({str(q):text(q) for q in sorted(f.iterdir())})
+ else: files[f.name]=text(f)
+print(json.dumps({"files":files}))' | wicked-garden run scripts/mcp/shim.py call mcp:apps/check --args-file -"#;
+        // The builder's refused Bash call on the train-14 proof daemon (run record
+        // `apps-steering-rules-project-d40721c09526`, `denial.refused_before_run[0].command`), kept
+        // as a fixture: its heredoc closes a JSON object on a bare `}` line, which would end this
+        // module early for the source scanners that strip test items (`production`).
+        const T14_BUILDER_COMMAND: &str =
+            include_str!("../tests/fixtures/crew-1935-apps-builder-command.txt");
+        assert!(T14_BUILDER_COMMAND.contains(APPS_SELF_CHECK_COMMAND));
+
+        let wicked_home =
+            std::env::temp_dir().join(format!("wicked-1935-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wicked_home);
+        let wt = wicked_home.join(
+            "apps/steering-rules-project.wicked/wicked-worktrees/\
+             apps-steering-rules-project-d40721c09526",
+        );
+        std::fs::create_dir_all(wt.join("queries")).unwrap();
+        std::fs::write(wicked_home.join("memory.db"), "fixture").unwrap();
+        let store = [wicked_home.clone()];
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let judge = |command: &str| {
+            boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+                None,
+                true,
+                &store,
+            )
+        };
+
+        // The gate hook's whole judgement allows crew's self-check, alone and as the builder ran it.
+        for command in [APPS_SELF_CHECK_COMMAND, T14_BUILDER_COMMAND] {
+            assert_eq!(judge(command), None, "{command}");
+        }
+
+        // The home's stores stay fenced: any spelling that lands outside the unit's own tree.
+        #[cfg(unix)]
+        {
+            let home = wicked_home.display();
+            std::os::unix::fs::symlink(wicked_home.join("memory.db"), wt.join("m.db")).unwrap();
+            for command in [
+                // The pin-variable arm (unchanged; kept so a refactor cannot drop it for a home).
+                "sqlite3 \"$WICKED_HOME/memory.db\" 'DELETE FROM memories'".to_string(),
+                format!("sqlite3 {home}/memory.db 'DELETE FROM memories'"),
+                format!("sqlite3 --db={home}/memory.db 'DELETE FROM memories'"),
+                format!("python3 -c 'import sqlite3; sqlite3.connect(\"{home}/memory.db\")'"),
+                "sqlite3 ../../../../memory.db 'DELETE FROM memories'".to_string(),
+                format!("cd {home} && sqlite3 memory.db 'DELETE FROM memories'"),
+                // A link in the tree that already points at the store resolves to the store.
+                "sqlite3 m.db 'DELETE FROM memories'".to_string(),
+                // The absolute arm is unchanged for a home (round 1, codex): a SQLite URI.
+                format!("python3 -c 'import sqlite3; sqlite3.connect(\"file:{home}/memory.db\", uri=True)'"),
+            ] {
+                let hit = super::classify_estate_command(
+                    &command,
+                    true,
+                    &store,
+                    std::slice::from_ref(&wt),
+                    None,
+                    Some(wt.as_path()),
+                )
+                .unwrap_or_else(|| panic!("the home's store stays fenced: {command}"));
+                assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+            }
+            // A home whose path holds a space is still named whole by the absolute arm.
+            let spaced = wicked_home.join("a home");
+            let spaced_tree = spaced.join("apps/x.wicked/wicked-worktrees/apps-x-1");
+            std::fs::create_dir_all(&spaced_tree).unwrap();
+            let command = format!(
+                "python3 -c 'import sqlite3; sqlite3.connect(\"{}/memory.db\")'",
+                spaced.display()
+            );
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                std::slice::from_ref(&spaced),
+                std::slice::from_ref(&spaced_tree),
+                None,
+                Some(spaced_tree.as_path()),
+            )
+            .unwrap_or_else(|| panic!("a spaced home stays fenced: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+            // … and a sqlite call on the app's own files is the app's business.
+            for benign in [
+                "sqlite3 queries/local.db 'select 1'",
+                "python3 -c 'print(1.5)'",
+            ] {
+                assert!(
+                    super::classify_estate_command(
+                        benign,
+                        true,
+                        &store,
+                        std::slice::from_ref(&wt),
+                        None,
+                        Some(wt.as_path())
+                    )
+                    .is_none(),
+                    "{benign}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&wicked_home);
+    }
+
+    /// core#1956: #1947 stopped the raw-SQLite arm reading an app's own worktree as the store for
+    /// RELATIVE words only. An app's worktree sits under `WICKED_HOME/apps`, and the home is a
+    /// store location, so two spellings still ended an Apps build with a fatal estate deny: a file
+    /// of the worktree named by its ABSOLUTE path (seats are steered to absolute paths), and a `cd`
+    /// inside the worktree with a `..` word, which was judged from every base of the command, the
+    /// worktree root included. The tree is still never a way into the home: a `..` after it, a
+    /// link out of it, a sibling tree, and every base the shell could still be standing on are
+    /// refused as before.
+    #[cfg(unix)]
+    #[test]
+    fn an_apps_worktree_names_its_own_files_by_absolute_path_and_cd_dotdot_1956() {
+        let wicked_home =
+            std::env::temp_dir().join(format!("wicked-1956-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wicked_home);
+        let wt = wicked_home.join(
+            "apps/steering-rules-project.wicked/wicked-worktrees/\
+             apps-steering-rules-project-d40721c09526",
+        );
+        std::fs::create_dir_all(wt.join("queries")).unwrap();
+        std::fs::write(wicked_home.join("memory.db"), "fixture").unwrap();
+        for f in ["check.py", "apps.json", "x.js", "queries/q.json"] {
+            std::fs::write(wt.join(f), "{}").unwrap();
+        }
+        std::os::unix::fs::symlink(wicked_home.join("memory.db"), wt.join("m.db")).unwrap();
+        // A link in the tree to a directory of the home: a `..` after it leaves the home's `apps`.
+        std::os::unix::fs::symlink(wicked_home.join("apps"), wt.join("up")).unwrap();
+        // Directory links whose names hold a `;` and a backslash, out to the home.
+        std::os::unix::fs::symlink(&wicked_home, wt.join("a;b")).unwrap();
+        std::os::unix::fs::symlink(&wicked_home, wt.join("a\\b")).unwrap();
+        std::os::unix::fs::symlink(&wicked_home, wt.join("a\")x")).unwrap();
+        // `a/a` leads home: an inner shell's `cd a` taken twice would stand there (round 2).
+        std::fs::create_dir_all(wt.join("a")).unwrap();
+        std::os::unix::fs::symlink(&wicked_home, wt.join("a/a")).unwrap();
+        // Round 3 (codex): a name that ends in a quote, and a relative `p=<tree>` that leads home.
+        std::os::unix::fs::symlink(wicked_home.join("memory.db"), wt.join("m.db\"")).unwrap();
+        let rel_tree = wt.strip_prefix("/").unwrap();
+        std::fs::create_dir_all(wt.join("p=").join(rel_tree.parent().unwrap())).unwrap();
+        std::os::unix::fs::symlink(&wicked_home, wt.join("p=").join(rel_tree)).unwrap();
+        std::os::unix::fs::symlink(wicked_home.join("apps"), wt.join("queries/back")).unwrap();
+        let store = [wicked_home.clone()];
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let (home, tree) = (wicked_home.display(), wt.display());
+
+        // The issue's spellings, judged by the whole gate hook from the worktree.
+        for command in [
+            format!("python3 {tree}/check.py"),
+            format!("python3 -m json.tool {tree}/apps.json"),
+            format!("node -e 'require(\"{tree}/x\")'"),
+            format!("python3 {tree}/check.py && python3 -m json.tool {tree}/queries/q.json"),
+            "cd queries && python3 -c 'open(\"../apps.json\")'".to_string(),
+        ] {
+            let verdict = boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+                None,
+                true,
+                &store,
+            );
+            assert_eq!(verdict, None, "{command}");
+        }
+
+        // The estate fence's own judgement of more moves inside the tree, from where the shell
+        // stands (the worktree), as the hook calls it.
+        for command in [
+            "cd queries && python3 -m json.tool ../apps.json".to_string(),
+            format!("cd {tree}/queries && python3 -m json.tool ../apps.json"),
+            "cd queries && cd .. && python3 -m json.tool apps.json".to_string(),
+            // An inner shell's `cd` is in the line's union once, not again inside it (round 2).
+            "sh -c 'cd a && sqlite3 local.db .tables'".to_string(),
+        ] {
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                &store,
+                std::slice::from_ref(&wt),
+                None,
+                Some(wt.as_path()),
+            );
+            assert!(hit.is_none(), "{command}: {:?}", hit.map(|h| h.why));
+        }
+
+        // Still the store: judged from where the shell stands (the worktree), as the hook calls it.
+        for command in [
+            // The tree's own spelling, then out of it.
+            format!(
+                "python3 -c 'import sqlite3; sqlite3.connect(\"{tree}/../../../../memory.db\")'"
+            ),
+            format!("python3 -c 'open(\"{tree}/x /../../../../../memory.db\")'"),
+            // A link in the tree to the store, alone and followed by more words.
+            format!("sqlite3 {tree}/m.db 'DELETE FROM memories'"),
+            format!("python3 -c 'import os; os.system(\"sqlite3 {tree}/m.db .tables\")'"),
+            // A `..` after a link leaves the link's target: absolute, relative, and after a cd.
+            format!("sqlite3 {tree}/up/../memory.db 'DELETE FROM memories'"),
+            "sqlite3 up/../memory.db 'DELETE FROM memories'".to_string(),
+            "cd up && sqlite3 ../memory.db 'DELETE FROM memories'".to_string(),
+            // bash's logical `cd ..` returns from the link into the tree, whose parents lead home.
+            "cd up && cd .. && sqlite3 ../../../../memory.db 'DELETE FROM memories'".to_string(),
+            // A sibling tree is not this tree, and a second occurrence is judged on its own.
+            format!("python3 -m json.tool {tree}-old/apps.json"),
+            format!("python3 -c 'open(\"{tree}/apps.json\"); open(\"{home}/memory.db\")'"),
+            // Every base the shell can still stand on: a failed cd, a skipped one, a subshell, a
+            // pipeline member, a popd, a loop's next pass, a function run later, CDPATH, an inner
+            // shell's cd, and an eval's.
+            "cd nope && true; python3 -m json.tool ../apps.json".to_string(),
+            "true || cd queries && python3 -m json.tool ../apps.json".to_string(),
+            "( cd queries ) && python3 -m json.tool ../apps.json".to_string(),
+            "cd queries | true && python3 -m json.tool ../apps.json".to_string(),
+            "pushd queries && popd && python3 -m json.tool ../apps.json".to_string(),
+            // (A body's first word follows `do` / `{`, which this literal scan does not see
+            // through; the words after it are judged as their own segments.)
+            "cd queries && while true; do true; python3 -m json.tool ../apps.json; cd ..; done"
+                .to_string(),
+            "f() { true; python3 -m json.tool apps.json; }; cd .. && f".to_string(),
+            format!("CDPATH={home} cd apps && python3 -m json.tool ../memory.db"),
+            "sh -c 'cd queries' && python3 -m json.tool ../apps.json".to_string(),
+            // A move the words do not prove (round 1, codex): an escape, an option, a wrapper
+            // that only asks, a trap, `cd -`, a comment.
+            "cd q\\uery && sqlite3 ../memory.db".to_string(),
+            "pushd -n queries && sqlite3 ../memory.db".to_string(),
+            format!("command -v cd {tree}/queries && sqlite3 ../memory.db"),
+            format!("'trap' 'cd {tree}' DEBUG; cd queries && sqlite3 ../memory.db"),
+            "cd - && sqlite3 ../memory.db".to_string(),
+            "#; cd queries &&\nsqlite3 ../memory.db".to_string(),
+            // The shell joins a quoted tree to what follows; a quoted name may hold `;` or `\`.
+            format!("sqlite3 \"{tree}\"/../memory.db"),
+            format!("sqlite3 '{tree}/a;b/memory.db'"),
+            format!("sqlite3 '{tree}/a\\b/memory.db'"),
+            // Round 2 (codex): the shell or the program opens a path other than the plain run.
+            format!("sqlite3 {tree}/m\"\".db 'DELETE FROM memories'"),
+            format!("sqlite3 {tree}/m*.db 'DELETE FROM memories'"),
+            format!("sqlite3 '{tree}/a\")x/memory.db' 'DELETE FROM memories'"),
+            format!(
+                "python3 -c 'import sqlite3; sqlite3.connect(\"file:{tree}/m.db?mode=rw\", uri=True)'"
+            ),
+            format!("python3 -c 'import sqlite3; sqlite3.connect(\"{tree}/m\" \".db\")'"),
+            // Many occurrences: the first one that is not a plain run names the store, and past
+            // the cap even plain runs do.
+            format!("sqlite3 {}", format!("{tree}/x:").repeat(200)),
+            format!(
+                "python3 -c '{}'",
+                format!("open(\"{tree}/apps.json\"); ").repeat(OWN_TREE_OCCURRENCES + 1)
+            ),
+            // Round 2 (codex): a later word that moves the shell or the program after the `cd`.
+            "cd queries && c\"\"d ../up && sqlite3 ../memory.db".to_string(),
+            "cd queries && env -C .. sqlite3 ../memory.db".to_string(),
+            "cd queries && BASH_ENV=./move.sh bash -c 'sqlite3 ../memory.db'".to_string(),
+            "cd queries && python3 -c 'import os; os.chdir(\"..\"); open(\"../memory.db\")'"
+                .to_string(),
+            "cd queries && python3 -c 'import os; os.system(\"c\" \"d ..; sqlite3 ../memory.db\")'"
+                .to_string(),
+            // Round 3 (codex): the word as the program gets it, and more moves after the `cd`.
+            format!("sqlite3 '{tree}/m.db\"' 'DELETE FROM memories'"),
+            format!("sqlite3 p={tree}/memory.db 'DELETE FROM memories'"),
+            "cd queries && . ./move.rc && sqlite3 ../memory.db".to_string(),
+            "cd queries && ruby -Cback -e 'SQLite3::Database.new(\"../memory.db\").execute(\"x\")'"
+                .to_string(),
+            // Round 4 (codex): a quoted name outside inline code, `ruby -X`, a sqlite client.
+            format!("sqlite3 'p=\"{tree}/probe.db\"' 'CREATE TABLE t(x)'"),
+            "cd queries && ruby -Xback -e 'SQLite3::Database.new(\"../memory.db\").execute(\"x\")'"
+                .to_string(),
+            "cd queries && sqlite3 -cmd '.read ../move.sql' :memory: \"ATTACH '../memory.db' AS v\""
+                .to_string(),
+        ] {
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                &store,
+                std::slice::from_ref(&wt),
+                None,
+                Some(wt.as_path()),
+            )
+            .unwrap_or_else(|| panic!("the home's store stays fenced: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+
+        // A store inside the tree stays a store: an absolute link to it is not the tree's file.
+        std::fs::create_dir_all(wt.join("graph")).unwrap();
+        std::fs::write(wt.join("graph/graph.db"), "fixture").unwrap();
+        std::os::unix::fs::symlink(wt.join("graph/graph.db"), wt.join("local.db")).unwrap();
+        let nested = [wicked_home.clone(), wt.join("graph")];
+        for command in [
+            format!("sqlite3 {tree}/local.db 'DELETE FROM nodes'"),
+            format!("sqlite3 {tree}/graph/graph.db 'DELETE FROM nodes'"),
+        ] {
+            let hit = super::classify_estate_command(
+                &command,
+                true,
+                &nested,
+                std::slice::from_ref(&wt),
+                None,
+                Some(wt.as_path()),
+            )
+            .unwrap_or_else(|| panic!("a store inside the tree stays fenced: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+
+        // Round 3 (codex): a tree whose own spelling the shell would expand (`app[12]` matches
+        // the sibling `app1`) is never read as itself.
+        let globbed = wicked_home.join("apps/app[12]/wt");
+        std::fs::create_dir_all(&globbed).unwrap();
+        std::fs::create_dir_all(wicked_home.join("apps/app1/wt")).unwrap();
+        std::os::unix::fs::symlink(
+            wicked_home.join("memory.db"),
+            wicked_home.join("apps/app1/wt/memory.db"),
+        )
+        .unwrap();
+        let command = format!(
+            "sqlite3 {}/memory.db 'DELETE FROM memories'",
+            globbed.display()
+        );
+        let hit = super::classify_estate_command(
+            &command,
+            true,
+            &store,
+            std::slice::from_ref(&globbed),
+            None,
+            Some(globbed.as_path()),
+        )
+        .unwrap_or_else(|| panic!("a globbed tree spelling stays fenced: {command}"));
+        assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        let _ = std::fs::remove_dir_all(&wicked_home);
     }
 
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),

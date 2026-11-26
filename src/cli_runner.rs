@@ -856,6 +856,183 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// (core#1945) The lines the WORK cites, read by the harness from the run's worktree. The judge runs
+/// with no tree of its own ([`crate::validator`]'s judge calls carry no workdir and no
+/// governance), so without this a review-change judge cannot check a single `path:line` finding:
+/// run f1d5b8e9's judge said so, and its reply never closed. Each cited `path:line` or
+/// `path:line-line` that names a regular file under the worktree root (relative, no `..`, the
+/// file opened beneath the root with no link followed) is shown with two lines of context,
+/// redacted like the activity feed; a cite the harness cannot read is named as such. Bounded: the first
+/// [`CITED_MAX`] distinct cites, [`CITED_SPAN`] lines each, [`CITED_CAP`] bytes in all. `None`
+/// when the WORK cites nothing.
+fn cited_source_for_judge(workdir: &std::path::Path, work: &str) -> Option<String> {
+    // Only a unix host opens beneath the root with no link followed; elsewhere a junction or a link
+    // under the checkout could lead the read out, so the judge gets no cited lines there.
+    if !cfg!(unix) {
+        return None;
+    }
+    let root = std::fs::canonicalize(workdir).ok()?;
+    let mut seen: Vec<(String, usize, usize)> = Vec::new();
+    for cite in work
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | ':')))
+        .filter_map(parse_cite)
+    {
+        if seen.len() == CITED_MAX {
+            break;
+        }
+        if !seen.contains(&cite) {
+            seen.push(cite);
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "\n\nCITED SOURCE (read by the harness from the run's worktree at each path:line the work \
+         cites; you have no repository access, so check the citations against these lines):\n",
+    );
+    for (path, first, last) in seen {
+        let mut block = String::new();
+        // Opened beneath the root with no link followed and read through the open handle, so a
+        // path swapped for a link or a FIFO after the cite was parsed cannot lead the read out.
+        let bytes = crate::draft_render::open_beneath(&root, &root.join(&path))
+            .ok()
+            .and_then(|f| {
+                use std::io::Read;
+                if !f.metadata().ok()?.is_file() {
+                    return None;
+                }
+                let mut buf = Vec::new();
+                f.take(CITED_FILE_MAX + 1).read_to_end(&mut buf).ok()?;
+                (buf.len() as u64 <= CITED_FILE_MAX).then_some(buf)
+            });
+        match bytes {
+            None => block.push_str(&format!(
+                "{path}:{first}: (not read: no regular file at that path in the worktree, a \
+                 link, or over {CITED_FILE_MAX} bytes)\n"
+            )),
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                if first > lines.len() {
+                    block.push_str(&format!(
+                        "{path}:{first}: (past the end: the file has {} lines)\n",
+                        lines.len()
+                    ));
+                } else {
+                    let from = first.saturating_sub(2).max(1);
+                    let to = last
+                        .min(first.saturating_add(CITED_SPAN))
+                        .saturating_add(2)
+                        .min(lines.len());
+                    let shown = redacted_lines(&lines, from - 1, to - 1);
+                    for n in from..=to {
+                        match &shown[n - from] {
+                            Some(line) => {
+                                let line: String = line.chars().take(240).collect();
+                                block.push_str(&format!("{path}:{n}: {line}\n"));
+                            }
+                            None => block.push_str(&format!(
+                                "{path}:{n}: (withheld: a continued line the redactor cuts)\n"
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        if out.len() + block.len() > CITED_CAP {
+            out.push_str("… [further cited lines elided by the harness]\n");
+            break;
+        }
+        out.push_str(&block);
+    }
+    Some(out)
+}
+
+/// Lines `from..=to` (0-based) of a file, redacted for the judge: a line on its own is redacted as
+/// the activity feed's prose is; a shell continuation chain (lines ending in `\`) is redacted
+/// whole, as the shell joins it, and every line of a chain the redactor cuts is withheld (`None`),
+/// however many continuations it spans.
+fn redacted_lines(lines: &[&str], from: usize, to: usize) -> Vec<Option<String>> {
+    let continues = |l: &str| l.trim_end_matches([' ', '\t']).ends_with('\\');
+    let mut start = from;
+    while start > 0 && continues(lines[start - 1]) {
+        start -= 1;
+    }
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut i = start;
+    while i <= to {
+        let mut j = i;
+        while j + 1 < lines.len() && continues(lines[j]) {
+            j += 1;
+        }
+        let chain = &lines[i..=j];
+        let shown: Vec<Option<String>> = if chain.len() == 1 {
+            vec![Some(crate::tool_activity::redact_prose(chain[0]))]
+        } else {
+            let plain: String = chain
+                .iter()
+                .enumerate()
+                .map(|(k, l)| {
+                    if k + 1 < chain.len() {
+                        let t = l.trim_end_matches([' ', '\t']);
+                        &t[..t.len() - 1]
+                    } else {
+                        l
+                    }
+                })
+                .collect();
+            let clean = crate::tool_activity::redact(&chain.join("\n")) == plain;
+            chain.iter().map(|l| clean.then(|| l.to_string())).collect()
+        };
+        for (k, line) in shown.into_iter().enumerate() {
+            if (from..=to).contains(&(i + k)) {
+                out.push(line);
+            }
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// At most this many distinct cites are shown to the judge.
+const CITED_MAX: usize = 12;
+/// A cited range shows at most this many lines past its first.
+const CITED_SPAN: usize = 20;
+/// The CITED SOURCE section's byte budget.
+const CITED_CAP: usize = 6 * 1024;
+/// A cited file larger than this is not read.
+const CITED_FILE_MAX: u64 = 4 << 20;
+
+/// One `path:line` or `path:line-line` cite (a trailing `:column` is ignored), as
+/// `(path, first, last)`. The path is relative, has no `..` or empty component, and its last
+/// component has an extension, so prose such as `note:3` or a URL is not a cite.
+fn parse_cite(token: &str) -> Option<(String, usize, usize)> {
+    let token = token.trim_end_matches(['.', ':', '-']);
+    let (path, rest) = token.split_once(':')?;
+    let digits = |s: &str| -> Option<usize> {
+        let d: String = s.chars().take_while(char::is_ascii_digit).collect();
+        d.parse().ok().filter(|n| *n > 0)
+    };
+    let first = digits(rest)?;
+    let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let last = after
+        .strip_prefix('-')
+        .and_then(digits)
+        .filter(|l| *l >= first)
+        .unwrap_or(first);
+    let ok_path = !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|c| !c.is_empty() && c != ".." && c != ".")
+        && path
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.rsplit_once('.'))
+            .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+    ok_path.then(|| (path.to_string(), first, last))
+}
+
 /// (DES-RULE-CHECK-001 S2) Whether this attempt's gate runs the steering-rule check: a review
 /// (Evaluator-role) agent unit that answered, bound to a worktree, on a run with a policy store —
 /// not a tool, deliver or team-member step.
@@ -872,17 +1049,26 @@ pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool
             .is_some_and(|g| !g.db_path.trim().is_empty())
 }
 
-/// The production judge of the rule check: one headless call on a roster seat.
+/// The production judge of the rule check: one headless call on a roster seat, or on the run's
+/// judge stand-in ([`rule_judge_stand_in`]).
 struct SeatRuleJudge<'a> {
     seats: &'a [crate::AgenticCli],
     runner: &'a dyn StepRunner,
     parent_run_id: Option<&'a str>,
     creator_providers: &'a [crate::observed_provider::Provider],
+    /// (DES-STANDIN-001 §3.6, core#1944) The judge stand-in's key, when the check took it: its
+    /// prompt opens with the stand-in preface, and the provider-sharing approval rule does not
+    /// apply to it (a stand-in shares its base's provider by definition and is stamped as one).
+    stand_in: Option<&'a str>,
 }
 
 impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
         match self.seats.iter().find(|c| c.key == seat) {
+            Some(c) if self.stand_in == Some(seat) => {
+                let prompt = format!("{}\n\n{prompt}", crate::standin::preface(None));
+                crate::validator::run_rule_judge(&prompt, c, self.runner, self.parent_run_id)
+            }
             Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner, self.parent_run_id),
             None => {
                 crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
@@ -891,6 +1077,9 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     }
 
     fn approval_failure(&self, seat: &str) -> Option<String> {
+        if self.stand_in == Some(seat) {
+            return None;
+        }
         let observed = crate::observed_provider::observed_this_thread(seat);
         crate::observed_provider::shares_identity(
             seat,
@@ -987,6 +1176,39 @@ pub(crate) fn rule_judge_seats(
             (keys, why)
         }
     }
+}
+
+/// (DES-STANDIN-001 §3.6, T-R9, core#1944) The rule judge's stand-in: with no real seat left
+/// (`no_real_seat`), the judge stand-in the run's actor offered this unit
+/// ([`crate::standin::judge_offer`]: consented, stand-in-aware, not reduced, base not benched)
+/// judges the rules, as the same binding, so it is one helper whichever check it does. Its record
+/// is its base's, keyed by the binding: the base's exact invocation, and its identities for
+/// `judge_ids`, so a council never seats the base on a row it ruled. `None` when there is no offer,
+/// or its base has no record, launches nothing, is not eligible for work, or is a seat the launch
+/// excluded from this unit (a stand-in fills a shortage, never the person's exclusion).
+fn rule_judge_stand_in(
+    offer: Option<&crate::standin::StandInBinding>,
+    no_real_seat: bool,
+    exclude_seats: &[String],
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+) -> Option<crate::AgenticCli> {
+    let b = offer.filter(|_| no_real_seat)?;
+    let base = crate::standin::base_record(pool, registry, &b.key)?;
+    if base.headless_invocation.trim().is_empty() || !base.seat_eligible_for_work {
+        return None;
+    }
+    let excluded = excluded_identities(exclude_seats, registry);
+    if exclude_seats
+        .iter()
+        .any(|k| wicked_apps_core::spawn::seat_id::credential(k) == b.base)
+        || record_identities(base).iter().any(|i| excluded.contains(i))
+    {
+        return None;
+    }
+    let mut seat = base.clone();
+    seat.key = b.key.clone();
+    Some(seat)
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.3) Every identity the `exclude_seats` keys may execute: each one's
@@ -2104,6 +2326,7 @@ pub(crate) fn delivery_rule_check(
         runner: &*ctx.runner,
         parent_run_id: Some(&ctx.run_id),
         creator_providers: &ctx.creator_providers,
+        stand_in: None,
     };
     let report = crate::rule_check::check(
         &crate::rule_check::CheckInput {
@@ -2386,6 +2609,36 @@ fn run_rule_check(
         emit_delta,
         None,
         None,
+        None,
+    )
+}
+
+/// (core#1944, T-R9) [`run_rule_check`] on a consented stand-in-aware run: `stand_in` is the
+/// judge stand-in the run's actor offered the unit ([`crate::standin::judge_offer`]).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check_standing_in(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+    stand_in: &crate::standin::StandInBinding,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    run_rule_check_with(
+        input,
+        creators,
+        creator_bins,
+        pool,
+        registry,
+        None,
+        runner,
+        emit_delta,
+        None,
+        None,
+        Some(stand_in),
     )
 }
 
@@ -2411,6 +2664,7 @@ fn run_rule_check_with(
     emit_delta: &DeltaSink,
     settle: Option<Settle<'_>>,
     stop: Option<crate::repo_checks::FloorStop>,
+    stand_in: Option<&crate::standin::StandInBinding>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
@@ -2529,6 +2783,26 @@ fn run_rule_check_with(
         registry,
         no_agent_creator,
     );
+    // (DES-STANDIN-001 §3.6, T-R9, core#1944) No real seat is left: the run's judge stand-in
+    // judges the rules, labelled as one. Never beside a real seat, and never a council voter.
+    // Only a shortage of distinct seats: when the work's authorship is not known, a stand-in fixes
+    // nothing and the rules hold on that, as before (as `JudgeExclusions` reads provenance).
+    let provenance_known = no_agent_creator || (!creators.is_empty() && creator_bins.is_some());
+    let stand_in_seat = rule_judge_stand_in(
+        stand_in,
+        seats.is_empty() && provenance_known,
+        &input.unit.exclude_seats,
+        pool,
+        registry,
+    );
+    let (seats, no_seat) = match &stand_in_seat {
+        Some(c) => (vec![c.key.clone()], None),
+        None => (seats, no_seat),
+    };
+    let judge_seats: std::borrow::Cow<'_, [crate::AgenticCli]> = match &stand_in_seat {
+        Some(c) => std::borrow::Cow::Owned(pool.iter().cloned().chain([c.clone()]).collect()),
+        None => std::borrow::Cow::Borrowed(pool),
+    };
     // (codex r1, r2) A cached judicial verdict (the unit's own last rows, or a council ruling from
     // another gate) is reused only when fresh selection would still seat every party to it.
     let exclusions = JudgeExclusions::of(
@@ -2598,12 +2872,23 @@ fn run_rule_check_with(
     engine_note(
         emit_delta,
         &format!(
-            "rule check: {} steering rule(s) in force; judges: {}",
+            "rule check: {} steering rule(s) in force; judges: {}{}",
             rules.len(),
             if seats.is_empty() {
                 "none".to_string()
             } else {
                 seats.join(", ")
+            },
+            match stand_in.filter(|_| stand_in_seat.is_some()) {
+                Some(b) => {
+                    let mut as_rule_judge = b.clone();
+                    as_rule_judge.role = crate::standin::Role::RuleJudge;
+                    format!(
+                        " ({})",
+                        crate::standin::label(&as_rule_judge, as_rule_judge.display())
+                    )
+                }
+                None => String::new(),
             }
         ),
     );
@@ -2615,10 +2900,11 @@ fn run_rule_check_with(
         .cloned()
         .collect();
     let judge = SeatRuleJudge {
-        seats: pool,
+        seats: &judge_seats,
         runner,
         parent_run_id: Some(&input.run_id),
         creator_providers: &creator_providers,
+        stand_in: stand_in_seat.as_ref().map(|c| c.key.as_str()),
     };
     let mut report = with_floor_heartbeat(
         emit_delta,
@@ -2670,7 +2956,7 @@ fn run_rule_check_with(
             )
         },
     );
-    stamp_judge_ids(&mut report, pool);
+    stamp_judge_ids(&mut report, &judge_seats);
     if let Some(st) = settle {
         settle_rule_disputes(
             &mut report,
@@ -6369,6 +6655,15 @@ fn run_unit_and_judge_in<'scope, 'env>(
         Some(evidence) => std::borrow::Cow::Owned(format!("{work_owned}{evidence}")),
         None => work_owned,
     };
+    // (core#1945) …and the lines the work cites, read from the same worktree.
+    let work_owned = match will_judge
+        .then_some(input.workdir.as_deref())
+        .flatten()
+        .and_then(|dir| cited_source_for_judge(dir, &work_owned))
+    {
+        Some(cited) => std::borrow::Cow::Owned(format!("{work_owned}{cited}")),
+        None => work_owned,
+    };
     // (DES-STANDIN-001 §3.4) A stand-in judge never reads the team's ledger or comms: its work is
     // taken here, before the team render. Only when the actor offered one.
     let stand_in_offer: Option<&crate::standin::StandInBinding> =
@@ -7147,6 +7442,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 council_pool: &eligible_run,
             }),
             stop.clone(),
+            fallback.stand_in_judge.and_then(|j| j.offer.as_ref()),
         )
     } else {
         None
@@ -8810,6 +9106,217 @@ mod tests {
                 governed: false,
             }
         }
+    }
+
+    /// (core#1945) A review whose finding cites `src/math.js:2`; a judge that answers `PASS` with
+    /// its reason on the same line and no closing line, then the bare word when asked to confirm.
+    #[derive(Default)]
+    struct CitingRunner(std::sync::Mutex<Vec<StepInput>>);
+
+    impl StepRunner for CitingRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let mut calls = self.0.lock().unwrap();
+            calls.push(input.clone());
+            let judged = calls
+                .iter()
+                .filter(|i| i.unit.session_id == "validator")
+                .count();
+            let output = match (input.unit.session_id == "validator", judged) {
+                (false, _) => {
+                    "FINDING (high): src/math.js:2 starts the loop at 1, so sum() \
+                               skips the first element.\nRECOMMENDATION: reject\nVERDICT: PASS"
+                }
+                (true, 1) => {
+                    "PASS — the cited line starts the loop at 1, as the review says.\n\
+                              - src/math.js:2 holds `for (let i = 1; ...)`"
+                }
+                (true, _) => "PASS",
+            };
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: output.into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cited_source_stays_in_the_worktree_and_bounded_1945() {
+        assert_eq!(
+            parse_cite("src/a.js:007-009"),
+            Some(("src/a.js".into(), 7, 9))
+        );
+        assert_eq!(
+            parse_cite("src/a.js:12:5"),
+            Some(("src/a.js".into(), 12, 12))
+        );
+        for not_a_cite in [
+            "../x.js:1",
+            "/etc/hosts.txt:1",
+            "src/./a.js:1",
+            "note:3",
+            "http://example.com:80",
+            "src/a.js:0",
+        ] {
+            assert_eq!(parse_cite(not_a_cite), None, "{not_a_cite}");
+        }
+        let dir = std::env::temp_dir().join(format!("core-1945-cite-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("core-1945-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "OUTSIDE-THE-TREE\n").unwrap();
+        std::fs::write(dir.join("src/a.js"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(
+            dir.join("src/env.sh"),
+            "API_KEY=\\\nOpaqueValue0123456789\nNot logged in\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/env3.sh"),
+            "API_KEY=\\\n\\\nOpaqueValue0123456789\nnext\n",
+        )
+        .unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join("src/pipe.txt").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: a plain libc call on a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(
+            dir.join("src/long.txt"),
+            format!("{}\n", "x".repeat(200)).repeat(400),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/max.txt"), "a".repeat(CITED_FILE_MAX as usize)).unwrap();
+        std::fs::write(
+            dir.join("src/over.txt"),
+            "a".repeat(CITED_FILE_MAX as usize + 1),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("src/link.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+        let shown = cited_source_for_judge(
+            &dir,
+            &format!(
+                "src/a.js:{} src/a.js:2 src/link.txt:1 out/secret.txt:1 src/env.sh:2 \
+                 src/env3.sh:3 src/pipe.txt:1 src/max.txt:1 src/over.txt:1",
+                usize::MAX
+            ),
+        )
+        .unwrap();
+        assert!(shown.contains("src/a.js:2: two"), "{shown}");
+        assert!(shown.contains("past the end"), "{shown}");
+        assert!(!shown.contains("OUTSIDE-THE-TREE"), "{shown}");
+        assert!(shown.contains("src/link.txt:1: (not read"), "{shown}");
+        assert!(shown.contains("out/secret.txt:1: (not read"), "{shown}");
+        assert!(!shown.contains("OpaqueValue0123456789"), "{shown}");
+        assert!(shown.contains("src/env3.sh:3: (withheld"), "{shown}");
+        assert!(shown.contains("src/env3.sh:4: next"), "{shown}");
+        // A FIFO is opened without blocking and refused; the size limit is inclusive.
+        assert!(shown.contains("src/pipe.txt:1: (not read"), "{shown}");
+        assert!(shown.contains("src/max.txt:1: aaa"), "{shown}");
+        assert!(shown.contains("src/over.txt:1: (not read"), "{shown}");
+        // The byte budget cuts a long section and says so.
+        let long: String = (0..12)
+            .map(|k| format!("src/long.txt:{}-{} ", k * 30 + 1, k * 30 + 20))
+            .collect();
+        let shown = cited_source_for_judge(&dir, &long).unwrap();
+        assert!(shown.contains("src/long.txt:1: xxx"), "{shown}");
+        assert!(shown.contains("[further cited lines elided by the harness]"));
+        assert!(!shown.contains("src/long.txt:331:"));
+        assert!(shown.len() <= CITED_CAP + 100, "{}", shown.len());
+        // Many cites stay within the count.
+        let many: String = (1..=200).map(|n| format!("src/f{n}.js:{n} ")).collect();
+        let shown = cited_source_for_judge(&dir, &many).unwrap();
+        assert!(shown.len() <= CITED_CAP + 200, "{}", shown.len());
+        assert_eq!(shown.matches("(not read").count(), CITED_MAX);
+        assert!(cited_source_for_judge(&dir, "no cites here").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn a_review_judge_reads_the_cited_lines_and_confirms_an_unclosed_verdict_1945() {
+        let dir = std::env::temp_dir().join(format!("core-1945-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/math.js"),
+            "function sum(xs) {\n  for (let i = 1; i < xs.length; i++) {}\n}\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        let mut input = report_input(&dir);
+        input.unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&dir, &dir).unwrap());
+        let roster = [
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let rec = Arc::new(CitingRunner::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        let (_, verdict, _) = run_unit_and_judge_on(
+            &runner,
+            &input,
+            None,
+            &|_| {},
+            &roster,
+            &[],
+            &[],
+            JudgeFallbackCtx::default(),
+            None,
+            None,
+            None,
+        );
+        let calls = rec.0.lock().unwrap();
+        let judge: Vec<&StepInput> = calls
+            .iter()
+            .filter(|i| i.unit.session_id == "validator")
+            .collect();
+        // The judge has no tree of its own: the harness hands it the cited lines.
+        let asked = &judge[0].unit.description;
+        if cfg!(unix) {
+            assert!(asked.contains("CITED SOURCE"), "{asked}");
+            assert!(
+                asked.contains("src/math.js:2: ")
+                    && asked.contains("for (let i = 1; i < xs.length"),
+                "{asked}"
+            );
+        } else {
+            assert!(!asked.contains("CITED SOURCE"), "{asked}");
+        }
+        // An opening PASS with no closing line is confirmed once by the same seat, not denied.
+        assert_eq!(judge.len(), 2, "one confirm call");
+        assert_eq!(judge[1].unit.assigned_cli, judge[0].unit.assigned_cli);
+        let verdict = verdict.expect("a verdict");
+        assert!(verdict.pass, "{verdict:?}");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -13502,6 +14009,141 @@ mod tests {
             assert!(report.passed, "the floor judged the FIXED tree: {report:?}");
             // (deliver honors an override) An operator's floor re-run (here a floor fix) is never
             // keyed: nothing stands on it in place of the ordinary floor at deliver.
+            assert!(report.key.is_none(), "a re-run is never keyed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#1962: a plain approve at a floor the disk stopped arms a `retry`: no seat runs (a
+    /// creator with nothing left to change failed the substance floor when its seat ran again),
+    /// the reviewed output is the attempt's output, and only the floor runs, on the tree as it is.
+    #[test]
+    fn a_disk_retry_runs_no_seat_and_only_the_floor_1962() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::process::Command;
+        use std::sync::Mutex;
+
+        struct Seat {
+            calls: Mutex<u32>,
+        }
+        impl StepRunner for Seat {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                *self.calls.lock().unwrap() += 1;
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "ran again".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: true,
+                }
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base =
+            std::env::temp_dir().join(format!("wicked-core-disk-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(
+            repo.join(crate::repo_checks::CONFIG_PATH),
+            serde_json::json!({ "test": ["sh", "-c", "test -f built.txt"] }).to_string(),
+        )
+        .unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/disk-retry",
+            ],
+        );
+        // The build's work, already in the tree from the attempt the disk stopped.
+        std::fs::write(wt.join("built.txt"), "built\n").unwrap();
+
+        const BUILT: &str = "Built the change and committed it.";
+        let refused: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:build", "r", 2, "build the change");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        unit.assigned_cli = Some("claude".into());
+        unit.repo_checks_floor = true;
+        unit.repo_checks = Some(crate::repo_checks::RepoChecksReport {
+            targeted_test: None,
+            requested_rerun: Some(crate::repo_checks::FloorRerun {
+                mode: crate::repo_checks::FloorRerunMode::Retry,
+                waive: Vec::new(),
+                output: BUILT.into(),
+                fix: None,
+            }),
+            ..refused
+        });
+        let input = StepInput {
+            base_commit: None,
+            run_id: "r".into(),
+            unit_ix: 1,
+            attempt: 3,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let seat = Arc::new(Seat {
+            calls: Mutex::new(0),
+        });
+        let runner: Arc<dyn StepRunner> = seat.clone();
+        let noop: &DeltaSink = &|_| {};
+        let (out, _verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[], &[]);
+
+        assert_eq!(*seat.calls.lock().unwrap(), 0, "no seat ran");
+        assert_eq!(out.status, StepStatus::Ok);
+        assert_eq!(out.output, BUILT, "the reviewed output is the attempt's");
+        assert!(!out.governed, "no seat turn to hold to the substance floor");
+        let report = evidence.repo_checks.expect("the floor ran");
+        assert_eq!(
+            report.rerun,
+            Some(crate::repo_checks::FloorRerunMode::Retry)
+        );
+        if report.sandbox_error.is_some() {
+            eprintln!("cli_runner: no sandbox tool here — the retry's floor cannot run");
+        } else {
+            assert!(
+                report.passed,
+                "the floor judged the tree as it is: {report:?}"
+            );
             assert!(report.key.is_none(), "a re-run is never keyed");
         }
         let _ = std::fs::remove_dir_all(&base);

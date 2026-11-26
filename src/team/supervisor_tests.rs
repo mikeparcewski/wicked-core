@@ -152,6 +152,11 @@ impl FakeHost {
 }
 
 impl MonitorHost for FakeHost {
+    /// (core#1952) The built-in roster's name for its one display-named CLI, read as the ACP
+    /// host's `registry_record` reads it: the key, then its CLI's (`claude#2` is Claude Code).
+    fn display_name(&self, seat: &str) -> Option<String> {
+        (wicked_apps_core::spawn::seat_cli_key(seat) == "claude").then(|| "Claude Code".to_string())
+    }
     fn one_shot(&self) -> bool {
         self.one_shot.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -2660,6 +2665,46 @@ fn an_absent_reviewer_is_on_the_record_with_a_minted_key() {
         ev.key().unwrap(),
         tev::key_member_joined(RUN, 3, 1, "m1", 1)
     );
+}
+
+/// core#1952: on a stand-in run the step's creator is a stand-in seat (`claude~1`). The absent
+/// reviewer's error is shown to the user as the engine wrote it, so it names the seat as the
+/// stand-in wire does (its CLI, "a stand-in"), never by the reserved `<base>~N` key.
+#[test]
+fn an_absent_reviewer_names_a_stand_in_creator_as_a_stand_in_1952() {
+    let mut h = Harness::new("absent1952");
+    // The launch roster as distribution writes it (no stand-in key on it); the stand-in is the
+    // step's creator, and the PA is never a member candidate.
+    h.start("claude", &["claude"], "20-39");
+    h.claim(3, 1, "claude~1");
+    h.fx.write("src/lib.rs", "fn a() {}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    let error = joined[0]["error"].as_str().unwrap();
+    assert!(error.contains("no seat distinct from the PA"), "{error}");
+    assert!(
+        !error.contains('~'),
+        "no stand-in key in the words: {error}"
+    );
+    assert!(
+        error.contains("(Claude Code, a stand-in)"),
+        "its CLI's display name: {error}"
+    );
+}
+
+/// core#1952: the words helper. A stand-in of an instance reads its CLI's name, and its
+/// credential key when the host has none; a real seat keeps its key even when it has a display
+/// name.
+#[test]
+fn seat_words_names_stand_ins_and_keeps_real_keys_1952() {
+    let host = FakeHost::new(|_, _| Ok("DONE".into()));
+    assert_eq!(seat_words(&host, "claude~3"), "Claude Code, a stand-in");
+    assert_eq!(seat_words(&host, "claude#2~1"), "Claude Code, a stand-in");
+    assert_eq!(seat_words(&host, "codex#2~1"), "codex#2, a stand-in");
+    assert_eq!(seat_words(&host, "claude"), "claude");
+    assert_eq!(seat_words(&host, "codex#2"), "codex#2");
 }
 
 fn help_scaffold(

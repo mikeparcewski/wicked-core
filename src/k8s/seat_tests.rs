@@ -1197,7 +1197,7 @@ fn seat_pod(view: Option<PathBuf>, scope: Option<String>) -> SeatPod {
         deadline_secs: 60,
         scope,
         view,
-        deps: None,
+        deps: Vec::new(),
     }
 }
 
@@ -4733,7 +4733,7 @@ fn k8s_a_read_only_view_copy_fails_when_either_side_fails() {
 #[test]
 fn k8s_a_deps_seat_writes_its_tool_caches_over_the_read_only_claim() {
     let mut s = seat_pod(None, None);
-    s.deps = Some(("deps-1".into(), PathBuf::from("/home/u/wt")));
+    s.deps = vec![("deps-1".into(), PathBuf::from("/home/u/wt"))];
     let pod = render::seat_pod_spec(&s).unwrap();
     let mounts = pod
         .pointer("/containers/0/volumeMounts")
@@ -4754,6 +4754,49 @@ fn k8s_a_deps_seat_writes_its_tool_caches_over_the_read_only_claim() {
         assert_eq!(vol["emptyDir"]["medium"], "Memory");
     }
     assert!(render::NM_WRITABLE.contains(&".vite-temp"));
+}
+
+/// core#1970: a subfolder package's claim is mounted read-only at its own node_modules, beside the
+/// root's, each with its own volume and its own writable tool caches.
+#[test]
+fn k8s_each_package_claim_is_mounted_at_its_own_node_modules_1970() {
+    let mut s = seat_pod(None, None);
+    s.deps = vec![
+        ("deps-root".into(), PathBuf::from("/home/u/wt")),
+        ("deps-notes".into(), PathBuf::from("/home/u/wt/notes")),
+    ];
+    let pod = render::seat_pod_spec(&s).unwrap();
+    let mounts = pod
+        .pointer("/containers/0/volumeMounts")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let at = |p: &str| mounts.iter().find(|m| m["mountPath"] == p).cloned();
+    let volumes = pod["volumes"].as_array().unwrap();
+    let claim_of = |name: &serde_json::Value| {
+        volumes
+            .iter()
+            .find(|v| &v["name"] == name)
+            .and_then(|v| v["persistentVolumeClaim"]["claimName"].as_str())
+            .map(str::to_string)
+    };
+    let root = at("/home/u/wt/node_modules").expect("the root's claim");
+    let notes = at("/home/u/wt/notes/node_modules").expect("notes' claim");
+    assert_eq!(root["readOnly"], true);
+    assert_eq!(notes["readOnly"], true);
+    assert_eq!(claim_of(&root["name"]).as_deref(), Some("deps-root"));
+    assert_eq!(claim_of(&notes["name"]).as_deref(), Some("deps-notes"));
+    for d in render::NM_WRITABLE {
+        let r = at(&format!("/home/u/wt/node_modules/{d}")).expect(d);
+        let n = at(&format!("/home/u/wt/notes/node_modules/{d}")).expect(d);
+        assert_ne!(r["name"], n["name"], "{d}: each claim's caches are its own");
+        assert_ne!(n["readOnly"], true, "{d}");
+    }
+    let mut names: Vec<&str> = volumes.iter().filter_map(|v| v["name"].as_str()).collect();
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "volume names are unique: {names:?}");
 }
 
 /// k8s-final arm timing: a plain root's host read is reused while its host signature holds,
@@ -6651,7 +6694,7 @@ fn try_warm_arm(
         gateway_ip: None,
         deadline: Duration::from_secs(30),
         role: "judge",
-        deps: None,
+        deps: &[],
         optional: &[],
     };
     seat::arm_warm(kube, &spec, vec![], checkout, Some((image, "floor")))
