@@ -57,6 +57,11 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 fn fixture(name: &str, tag: &str) -> Fixture {
+    fixture_of(name, name, tag)
+}
+
+/// The store dump `store.sql` over a copy of the tree `name` (one tree, several runs over it).
+fn fixture_of(name: &str, store: &str, tag: &str) -> Fixture {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/domain_v3");
     let dir = std::env::temp_dir().join(format!("wicked-core-dm3-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -64,7 +69,7 @@ fn fixture(name: &str, tag: &str) -> Fixture {
     let tree = dir.join(name);
     copy_dir(&src.join(name), &tree);
     let db = dir.join("estate.db");
-    let sql = std::fs::read_to_string(src.join(format!("{name}.sql"))).unwrap();
+    let sql = std::fs::read_to_string(src.join(format!("{store}.sql"))).unwrap();
     rusqlite::Connection::open(&db)
         .unwrap()
         .execute_batch(&sql)
@@ -91,17 +96,47 @@ fn validates(doc: &Value) {
     assert!(errors.is_empty(), "{}\n{doc:#}", errors.join("\n"));
 }
 
-/// The statements of the model, by id.
+/// Every statement of the model, by id: the requirements' and `metadata.statements` (as crew
+/// reads them, `domainModelOf`). An id held twice fails here.
 fn rules(doc: &Value) -> std::collections::BTreeMap<String, Value> {
     let mut out = std::collections::BTreeMap::new();
+    for b in held_rules(doc).into_iter().chain(
+        doc["metadata"]["statements"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    ) {
+        let id = b["id"].as_str().unwrap().to_string();
+        assert!(out.insert(id.clone(), b).is_none(), "{id} is held twice");
+    }
+    out
+}
+
+/// The statements the requirements hold.
+fn held_rules(doc: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
     for d in doc["domains"].as_object().unwrap().values() {
         for r in d["requirements"].as_object().unwrap().values() {
-            for b in r["business_rules"].as_array().unwrap() {
-                out.insert(b["id"].as_str().unwrap().to_string(), b.clone());
-            }
+            out.extend(r["business_rules"].as_array().unwrap().iter().cloned());
         }
     }
     out
+}
+
+/// The ids of the statements the requirements hold, and of those in `metadata.statements`.
+fn split(doc: &Value) -> (Vec<String>, Vec<String>) {
+    let ids = |v: Vec<Value>| -> Vec<String> {
+        v.iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    (
+        ids(held_rules(doc)),
+        ids(doc["metadata"]["statements"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()),
+    )
 }
 
 fn sid(n: u32) -> String {
@@ -171,6 +206,9 @@ fn the_real_runs_store_builds_its_statements_groups_followups_and_targets() {
     assert_eq!(reqs.len(), 1);
     let req = reqs.values().next().unwrap();
     assert_eq!(req["title"], "Overtime pay");
+    // garden#1545: the requirement holds the statement the business rule cites; the three open
+    // statements no sentence cites are the model's other statements (each has its follow-up).
+    assert_eq!(split(&doc), (vec![sid(0)], vec![sid(1), sid(2), sid(3)]));
     let rs = rules(&doc);
     let status = |n| rs[&sid(n)]["status"].as_str().unwrap().to_string();
     assert_eq!(
@@ -250,6 +288,94 @@ fn a_typescript_run_orders_housekeeping_last() {
     assert_eq!(doc["metadata"]["accounting"]["accounted"], 1);
 }
 
+/// garden#1545, on the train-16 cert's shape (`mini-cobol-cert.sql`, gen_cert.py): MAIN-PARA's
+/// file open is cited only by a housekeeping rule the prose check withheld (the cert's 22 open and
+/// close paragraphs, g15.r/g16.r), its file close only by a shown housekeeping rule, READ-PARA's
+/// open statement by nothing. None of them is a requirement; each stays readable by id, so every
+/// group cite and every follow-up resolves.
+#[test]
+fn a_statement_is_a_requirement_only_when_a_shown_business_sentence_cites_it() {
+    let f = fixture_of("mini-cobol", "mini-cobol-cert", "cert");
+    let doc = build(&f);
+    validates(&doc);
+    let main = |n: u32| format!("{MAIN_PARA}#{n}");
+    let groups = doc["metadata"]["rule_groups"].as_array().unwrap();
+    let shape: Vec<(&str, bool, usize)> = groups
+        .iter()
+        .map(|g| {
+            (
+                g["kind"].as_str().unwrap(),
+                g["rule"].is_null(),
+                g["withheld"].as_array().unwrap().len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("business", false, 0),
+            ("housekeeping", true, 1),
+            ("housekeeping", false, 0)
+        ],
+        "the store holds the cert's shape"
+    );
+    assert_eq!(groups[1]["withheld"][0]["cites"], json!([main(0)]));
+    assert_eq!(groups[2]["rule"]["cites"], json!([main(1)]));
+    // One requirement: READ-PARA's, holding the statement the business rule cites.
+    let reqs = doc["domains"][PROG]["requirements"].as_object().unwrap();
+    assert_eq!(reqs.len(), 1, "{reqs:#?}");
+    let req = reqs.values().next().unwrap();
+    assert_eq!(req["title"], "Overtime pay");
+    assert_eq!(doc["domains"][PROG]["description"], "PAYCALC1");
+    assert_eq!(
+        split(&doc),
+        (vec![sid(0)], vec![main(0), main(1), sid(1)]),
+        "the open and close are not requirements; they and the open statement are the others"
+    );
+    // Each keeps its status, key and claims where crew reads it.
+    let rs = rules(&doc);
+    assert_eq!(
+        [&rs[&main(0)], &rs[&main(1)], &rs[&sid(1)]].map(|r| r["status"].as_str().unwrap()),
+        ["Checked", "Checked", "open"]
+    );
+    assert!(rs
+        .values()
+        .all(|r| r["statement_key"].as_str().unwrap().starts_with("v1:")));
+    // Every cite of every sentence, shown or withheld, and every follow-up's statement resolves.
+    for g in groups {
+        for s in std::iter::once(&g["rule"])
+            .filter(|r| !r.is_null())
+            .chain(g["details"].as_array().unwrap())
+            .chain(g["withheld"].as_array().unwrap())
+        {
+            for c in s["cites"].as_array().unwrap() {
+                assert!(rs.contains_key(c.as_str().unwrap()), "cite {c} resolves");
+            }
+        }
+    }
+    for fu in doc["metadata"]["followups"].as_array().unwrap() {
+        if let Some(s) = fu["statement"].as_str() {
+            assert!(rs.contains_key(s), "follow-up statement {s} resolves");
+        }
+    }
+    // The open statement still takes a ruling from what the document says, and stays where it is.
+    rule_on(&f, 1, "confirm", None).unwrap();
+    let after = build(&f);
+    assert_eq!(split(&after), split(&doc));
+    assert_eq!(rules(&after)[&sid(1)]["status"], "confirmed");
+    // The persisted model reads back whole, its other statements included; one requirement node.
+    let mut store = open(&f);
+    let (model, outcome) = build_and_persist(&mut store, &f.tree, 9).unwrap();
+    assert_eq!(outcome.requirements, 1);
+    let built = serde_json::to_value(&model).unwrap();
+    let (read, _, _, _) = wicked_governance::load_domain_graph_with_units(&store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(read["metadata"], built["metadata"]);
+    assert_eq!(read["metadata"]["statements"].as_array().unwrap().len(), 3);
+    validates(&read);
+}
+
 /// The truth table (§3.2, R10): a confirm settles only its statement; the target is accounted once
 /// every statement is settled; a reject keeps the target open and the statement out of the model
 /// (it stays on the target with its note); a confirm on an unaccounted target accounts for its lines.
@@ -258,6 +384,9 @@ fn rulings_settle_what_they_name_and_the_target_follows() {
     let f = fixture("mini-cobol", "truth");
     rule_on(&f, 1, "confirm", None).unwrap();
     let doc = build(&f);
+    // A confirm moves nothing between the requirements and the other statements (garden#1545):
+    // only a business sentence makes a requirement, and the next run's prose writes those.
+    assert_eq!(split(&doc), (vec![sid(0)], vec![sid(1), sid(2), sid(3)]));
     let rs = rules(&doc);
     assert_eq!(rs[&sid(1)]["status"], "confirmed");
     assert_eq!(rs[&sid(1)]["checked_by"], "you");
@@ -379,6 +508,9 @@ fn a_changed_checkout_makes_its_targets_stale() {
     validates(&doc);
     let rs = rules(&doc);
     assert!(rs.values().all(|r| r["status"] == "stale"), "{rs:#?}");
+    // The edit withholds the business rule as changed, yet its statement stays the requirement,
+    // shown stale, instead of leaving the Requirements tab until the next run (garden#1545).
+    assert_eq!(split(&doc), (vec![sid(0)], vec![sid(1), sid(2), sid(3)]));
     assert!(rs.values().all(|r| r.get("checked_by").is_none()));
     assert_eq!(rs[&sid(0)]["confidence"], 0.4);
     let g = &doc["metadata"]["rule_groups"][0];

@@ -597,6 +597,13 @@ pub struct ExtractMeta {
     pub rule_groups: Vec<Value>,
     pub followups: Vec<Value>,
     pub targets: Vec<Value>,
+    /// Every emitted statement no shown sentence of a business group cites (garden#1545): one a
+    /// housekeeping group or only a withheld sentence cites, or none (an open statement, whose
+    /// follow-up names it). A requirement is a business decision; these stay readable by id (a
+    /// group cites them, a follow-up's ruling names their key) without being one. Absent on a
+    /// model persisted before it.
+    #[serde(default)]
+    pub statements: Vec<crate::domain_model::Rule>,
     /// When the build judged freshness, unix seconds (R06: the model is as of this time).
     pub built_at: i64,
     pub skipped: Skipped,
@@ -639,6 +646,53 @@ fn stem(file: &str) -> String {
     }
 }
 
+/// A statement as the model shows it: in a requirement's `business_rules`, or in `statements`.
+fn rule_of(st: &Statement) -> crate::domain_model::Rule {
+    use crate::domain_model::{Provenance, Rule};
+    let anchor = anchor_of(&st.contract);
+    let source_ref = anchor.as_ref().map(|(f, a, b)| format!("{f}#L{a}-L{b}"));
+    let claims = st
+        .contract
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| c.is_object())
+                .map(claim_view)
+                .collect()
+        })
+        .unwrap_or_default();
+    Rule {
+        id: st.id.clone(),
+        statement: str_of(&st.row.value, "statement")
+            .unwrap_or_default()
+            .to_string(),
+        confidence: confidence_of(st.effective),
+        provenance: Provenance {
+            source: "domain-run".into(),
+            reference: source_ref
+                .clone()
+                .or_else(|| st.target.clone())
+                .unwrap_or_else(|| st.id.clone()),
+            source_kinds: vec!["code-body".into()],
+        },
+        source_ref,
+        extract: Some(StatementView {
+            statement_key: st.key.clone(),
+            status: st.effective.label().into(),
+            located: anchor.is_some(),
+            target: st.target.clone(),
+            claims,
+            checked_by: match st.effective {
+                Effective::Checked => Some("codex".into()),
+                Effective::Confirmed => Some("you".into()),
+                _ => None,
+            },
+            ruling: st.ruling.as_ref().map(ruling_view),
+        }),
+    }
+}
+
 /// Build a 1.2.0 model from the store's v3 rows (DES-C2-v2 §2). Requirement keys are provisional
 /// (`REQ-NNN` in anchor order within each file domain); the caller stabilizes them against the
 /// previous build without carrying absent ones.
@@ -647,11 +701,13 @@ pub fn build_extract_model(
     repo_root: &Path,
     built_at: i64,
 ) -> anyhow::Result<crate::domain_model::DomainModel> {
-    use crate::domain_model::{Domain, DomainModel, Metadata, Provenance, Requirement, Rule};
+    use crate::domain_model::{Domain, DomainModel, Metadata, Requirement, Rule};
     let idx = ExtractIndex::load(store, Some(repo_root))?;
 
     // Groups: validated against their cited statements (R11), business first, housekeeping last.
-    let mut groups: Vec<(String, Value)> = Vec::new();
+    // Each group with the statements its sentences cite that this build withheld because the code
+    // or a statement moved since the writer's check (shown sentences, as written).
+    let mut groups: Vec<(String, Value, Vec<String>)> = Vec::new();
     for (id, row) in &idx.groups {
         let Some(g) = row.value.get("group").filter(|g| g.is_object()) else {
             continue;
@@ -696,17 +752,30 @@ pub fn build_extract_model(
                 "cites": s.get("cites").cloned().unwrap_or(json!([])),
             })
         };
+        let mut moved: Vec<Value> = Vec::new();
         if let Some(rule) = g.get("rule").filter(|r| r.is_object()).cloned() {
             if !sound(&rule) {
-                withheld.push(changed(&rule));
+                moved.push(rule);
                 g["rule"] = Value::Null;
             }
         }
         if let Some(details) = g.get("details").and_then(Value::as_array).cloned() {
             let (keep, drop): (Vec<Value>, Vec<Value>) = details.into_iter().partition(sound);
-            withheld.extend(drop.iter().map(changed));
+            moved.extend(drop);
             g["details"] = Value::Array(keep);
         }
+        withheld.extend(moved.iter().map(changed));
+        let moved: Vec<String> = moved
+            .iter()
+            .flat_map(|s| {
+                s.get("cites")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
         // Stale when any statement it cites, shown or withheld, rests on code that changed.
         let stale = withheld
             .iter()
@@ -737,19 +806,25 @@ pub fn build_extract_model(
                 o.insert("desc".into(), d.clone());
             }
         }
-        groups.push((id.clone(), g));
+        groups.push((id.clone(), g, moved));
     }
-    groups.sort_by_key(|(id, g)| {
+    groups.sort_by_key(|(id, g, _)| {
         (
             str_of(g, "kind") == Some("housekeeping"),
             g.get("g").and_then(Value::as_i64).unwrap_or(i64::MAX),
             id.clone(),
         )
     });
-    // The groups citing each statement, by display index.
+    // The business groups whose sentences cite each statement, by display index: only these make a
+    // statement a requirement (garden#1545). A housekeeping group is plumbing, and a sentence the
+    // writer's check withheld was never shown. A shown sentence this build withheld because its
+    // statements moved still counts, so an edit shows its requirement stale instead of hiding it.
     let mut citing: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (gi, (_, g)) in groups.iter().enumerate() {
-        let mut cites: BTreeSet<&str> = BTreeSet::new();
+    for (gi, (_, g, moved)) in groups.iter().enumerate() {
+        if str_of(g, "kind") != Some("business") {
+            continue;
+        }
+        let mut cites: BTreeSet<&str> = moved.iter().map(String::as_str).collect();
         for s in std::iter::once(g.get("rule")).flatten().chain(
             g.get("details")
                 .and_then(Value::as_array)
@@ -772,13 +847,15 @@ pub fn build_extract_model(
         }
     }
 
-    // Requirements: one per node holding an emitted (non-rejected) statement, in a file domain.
+    // Requirements: one per node holding an emitted (non-rejected) statement a shown business
+    // sentence cites, in a file domain. Every other emitted statement goes to `statements`.
     struct Draft<'a> {
         file: String,
         first: u64,
         statements: Vec<&'a Statement>,
     }
     let mut drafts: BTreeMap<&str, Draft> = BTreeMap::new();
+    let mut loose: Vec<(String, u64, &Statement)> = Vec::new();
     for st in idx.statements.values() {
         if st.effective == Effective::Rejected {
             continue;
@@ -795,6 +872,10 @@ pub fn build_extract_model(
             })
             .unwrap_or_default();
         let first = anchor.as_ref().map(|a| a.1).unwrap_or(u64::MAX);
+        if !citing.contains_key(st.id.as_str()) {
+            loose.push((file, first, st));
+            continue;
+        }
         let d = drafts.entry(st.row.symbol.as_str()).or_insert(Draft {
             file,
             first,
@@ -822,51 +903,7 @@ pub fn build_extract_model(
             .find_map(|gi| str_of(&groups[*gi].1, "title").filter(|t| !t.trim().is_empty()))
             .map(String::from);
         voted.entry(d.file.clone()).or_default().extend(cited_by);
-        let mut business_rules = Vec::new();
-        for st in &d.statements {
-            let anchor = anchor_of(&st.contract);
-            let source_ref = anchor.as_ref().map(|(f, a, b)| format!("{f}#L{a}-L{b}"));
-            let claims = st
-                .contract
-                .get("claims")
-                .and_then(Value::as_array)
-                .map(|cs| {
-                    cs.iter()
-                        .filter(|c| c.is_object())
-                        .map(claim_view)
-                        .collect()
-                })
-                .unwrap_or_default();
-            business_rules.push(Rule {
-                id: st.id.clone(),
-                statement: str_of(&st.row.value, "statement")
-                    .unwrap_or_default()
-                    .to_string(),
-                confidence: confidence_of(st.effective),
-                provenance: Provenance {
-                    source: "domain-run".into(),
-                    reference: source_ref
-                        .clone()
-                        .or_else(|| st.target.clone())
-                        .unwrap_or_else(|| st.id.clone()),
-                    source_kinds: vec!["code-body".into()],
-                },
-                source_ref,
-                extract: Some(StatementView {
-                    statement_key: st.key.clone(),
-                    status: st.effective.label().into(),
-                    located: anchor.is_some(),
-                    target: st.target.clone(),
-                    claims,
-                    checked_by: match st.effective {
-                        Effective::Checked => Some("codex".into()),
-                        Effective::Confirmed => Some("you".into()),
-                        _ => None,
-                    },
-                    ruling: st.ruling.as_ref().map(ruling_view),
-                }),
-            });
-        }
+        let business_rules: Vec<Rule> = d.statements.iter().map(|st| rule_of(st)).collect();
         let name = node.as_ref().map(|n| n.name.clone());
         let domain = domains.entry(d.file.clone()).or_default();
         let key = format!("REQ-{:03}", domain.requirements.len() + 1);
@@ -903,6 +940,12 @@ pub fn build_extract_model(
             .map(|(area, _)| area.to_string());
         domain.description = Some(label.unwrap_or_else(|| stem(file)));
     }
+
+    // The statements no requirement holds, in anchor order (file, first line, node, then id).
+    loose.sort_by_cached_key(|(file, first, st)| {
+        (file.clone(), *first, st.row.symbol.clone(), natural(&st.id))
+    });
+    let statements: Vec<Rule> = loose.into_iter().map(|(_, _, st)| rule_of(st)).collect();
 
     // Follow-ups, in their writer's order, each with its subject's live ruling.
     let mut followups: Vec<(i64, String, Value)> = idx
@@ -995,9 +1038,10 @@ pub fn build_extract_model(
             business_domains: Vec::new(),
             extract: Some(ExtractMeta {
                 accounting,
-                rule_groups: groups.into_iter().map(|(_, g)| g).collect(),
+                rule_groups: groups.into_iter().map(|(_, g, _)| g).collect(),
                 followups: followups.into_iter().map(|(_, _, v)| v).collect(),
                 targets,
+                statements,
                 built_at,
                 skipped: idx.skipped.clone(),
             }),
