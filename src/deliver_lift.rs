@@ -2486,6 +2486,19 @@ fn env_of(env: &[(&str, &Path)], name: &str) -> Option<String> {
     }
 }
 
+/// One refspec that maps `refs/heads/<S>` onto `refs/remotes/origin/<S>`, the same non-empty `<S>`
+/// (a name or a pattern), forced or not: [`ORIGIN_REFSPEC`] gives every ref it names the same
+/// destination (core#1994).
+fn refspec_keeps_names(spec: &str) -> bool {
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    spec.split_once(':').is_some_and(|(src, dst)| {
+        matches!(
+            (src.strip_prefix("refs/heads/"), dst.strip_prefix("refs/remotes/origin/")),
+            (Some(a), Some(b)) if !a.is_empty() && a == b
+        )
+    })
+}
+
 /// Whether origin's `remote.origin.fetch`, in every scope (includes followed), is exactly
 /// [`ORIGIN_REFSPEC`]: the one mapping the credentialed fetch (an explicit URL with that refspec)
 /// keeps. A credentialed fetch runs only then (core#1959, core#1994); any other mapping, or none,
@@ -2841,6 +2854,108 @@ mod tests {
     fn a_pat_becomes_the_deliver_helpers_basic_header() {
         // base64(":pat") — the exact shape `ado-deliver-helper.ts` mints.
         assert_eq!(pat_header("pat"), "Basic OnBhdA==");
+    }
+
+    /// (core#1994, codex-check on 73c685e) A clone made with `git clone --single-branch` maps
+    /// `+refs/heads/main:refs/remotes/origin/main`. It keeps branch names, so the credentialed fetch
+    /// gives `origin/main` the same commit its own mapping would: it keeps the Azure DevOps
+    /// credential, as on main. The mapping is the one git itself writes, not a hand-written value.
+    #[test]
+    fn a_single_branch_clone_keeps_the_ado_credential_1994() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let names: Vec<&str> = std::iter::once(ADO_PAT_ENV)
+            .chain(ADO_SP_ENV.iter().copied())
+            .collect();
+        let prev: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for n in &names {
+            std::env::remove_var(n);
+        }
+        std::env::set_var(ADO_PAT_ENV, "fake-pat-for-the-1994-test"); // ggignore: a made-up test value, not a secret
+        let base = scratch("ado-single-branch-1994");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("README.md"), "main\n").unwrap();
+        run_git(&seed, &["add", "-A"]);
+        run_git(&seed, &["commit", "-qm", "main"]);
+        run_git(&seed, &["branch", "release"]);
+        let clone = base.join("clone");
+        run_git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                "--branch",
+                "main",
+                seed.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let env: Vec<(&str, &Path)> = vec![
+            ("GIT_CONFIG_GLOBAL", Path::new("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", Path::new("1")),
+        ];
+        let mapping = git_string(
+            &clone,
+            &["config", "--get-all", "remote.origin.fetch"],
+            &env,
+        );
+        run_git(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://dev.azure.com/org/p/_git/repo",
+            ],
+        );
+        let got = ado_fetch_for(&clone, &env);
+        for (k, v) in names.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert_eq!(
+            mapping.ok().as_deref(),
+            Some("+refs/heads/main:refs/remotes/origin/main"),
+            "git's own single-branch mapping"
+        );
+        assert!(
+            matches!(&got, Ok(Some(a)) if a.url == "https://dev.azure.com/org/p/_git/repo"),
+            "a single-branch clone keeps the credential: {:?}",
+            got.map(|a| a.map(|a| a.url))
+        );
+    }
+
+    /// (core#1994) Which mappings the credentialed fetch keeps: every `refs/heads/<S>` onto
+    /// `refs/remotes/origin/<S>`, the same `<S>`, forced or not. Nothing else.
+    #[test]
+    fn only_name_keeping_mappings_get_a_credentialed_fetch_1994() {
+        for keeps in [
+            "+refs/heads/*:refs/remotes/origin/*",
+            "refs/heads/*:refs/remotes/origin/*",
+            "+refs/heads/main:refs/remotes/origin/main",
+            "+refs/heads/feature/*:refs/remotes/origin/feature/*",
+        ] {
+            assert!(refspec_keeps_names(keeps), "{keeps}");
+        }
+        for renames in [
+            "+refs/heads/release:refs/remotes/origin/main",
+            "+refs/heads/*:refs/remotes/upstream/*",
+            "+refs/heads/*:refs/heads/*",
+            "+refs/*:refs/*",
+            "^refs/heads/tmp/*",
+            "+refs/heads/:refs/remotes/origin/",
+            "+refs/heads/main",
+            "",
+        ] {
+            assert!(!refspec_keeps_names(renames), "{renames}");
+        }
     }
 
     /// (core#1994) An Azure DevOps origin whose own config maps `release` onto `origin/main` gets no
