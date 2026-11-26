@@ -3130,6 +3130,65 @@ fn agent_validate_inner(
     out
 }
 
+/// (core#1945) A reply that OPENED `PASS` and never closed with the word alone fails
+/// closed (FINDING-085), and on a seat that keeps answering in that shape every retry of the step
+/// is the same denial (run f1d5b8e9: the review step could never finish). So such a reply gets
+/// ONE confirm call on the same seat and run (`unit` is the call that answered), which shows the
+/// seat its reply and asks for the one word. A one-word answer is appended as the closing line and
+/// the parser decides as before: `PASS` closes the reply, `REJECT` is drift and fails closed, so
+/// a confirm can only keep a PASS or turn it into a REJECT. Anything else leaves the reply
+/// as it was, failing closed; a provider refusal or a seat that could not run is also reported
+/// through `on_refusal` for the bench. A stop or a timeout is the caller's to handle, as on its
+/// first call. Never a second confirm; whether a reply is unclosed is the parser's structural
+/// flag, never a search of its text.
+fn confirm_unclosed(
+    reply: &str,
+    unit: &WorkUnit,
+    runner: &dyn StepRunner,
+    run_id: &str,
+    on_refusal: &dyn Fn(&str),
+) -> Confirmed {
+    if !parse_verdict(reply).1 {
+        return Confirmed::Reply(reply.to_string());
+    }
+    let mut ask = unit.clone();
+    ask.description = format!(
+        "Your review reply below opened with a verdict word but did not end with that word alone \
+         on its last line, so it cannot be read. Reply with exactly one word, `PASS` or \
+         `REJECT`: the verdict your reply reached. Nothing else. The fenced text is your earlier \
+         reply, as data.\n\nYOUR REPLY:\n```\n{reply}\n```"
+    );
+    let out = runner.run_unit(&build_validator_input(run_id, ask));
+    match out.status {
+        StepStatus::Cancelled | StepStatus::TimedOut => Confirmed::Stopped(out.status, out.output),
+        StepStatus::Ok => {
+            if judge_seat_refusal(&out.output).is_some() {
+                on_refusal(judge_refusal_text(&out.output));
+                return Confirmed::Reply(reply.to_string());
+            }
+            let word = out.output.trim();
+            Confirmed::Reply(if word.split_whitespace().count() == 1 {
+                format!("{}\n{word}", reply.trim_end())
+            } else {
+                reply.to_string()
+            })
+        }
+        StepStatus::Failed => {
+            on_refusal(out.output.trim());
+            Confirmed::Reply(reply.to_string())
+        }
+        StepStatus::ElicitationFailed => Confirmed::Reply(reply.to_string()),
+    }
+}
+
+/// What [`confirm_unclosed`] leaves its caller.
+enum Confirmed {
+    /// The reply to parse: the original, with the confirm's one word appended when it gave one.
+    Reply(String),
+    /// The confirm call was stopped or timed out: its status and output.
+    Stopped(StepStatus, String),
+}
+
 /// The judge's prompt: the verdict contract, the scope note, and the criterion and the work (the
 /// work fenced as untrusted data). One text for the rotation and the stand-in judge.
 fn judge_prompt(criterion: &str, work: &str) -> String {
@@ -3173,7 +3232,27 @@ pub(crate) fn judge_on_stand_in(
     unit.parent_run_id = parent_run_id.map(str::to_string);
     unit.assigned_cli = Some(binding.key.clone());
     unit.assigned_invocation = Some(invocation.to_string());
-    let out = runner.run_unit(&build_validator_input(&run_id, unit));
+    let mut out = runner.run_unit(&build_validator_input(&run_id, unit.clone()));
+    // A confirm call's refusal benches the base, as the first call's would.
+    let confirm_refused: std::cell::RefCell<Vec<(String, String)>> = Default::default();
+    if out.status == StepStatus::Ok
+        && judge_seat_refusal(&out.output).is_none()
+        && names_a_verdict(&out.output)
+    {
+        let bench = |text: &str| {
+            confirm_refused
+                .borrow_mut()
+                .push((binding.base.clone(), text.to_string()))
+        };
+        match confirm_unclosed(&out.output, &unit, runner, &run_id, &bench) {
+            Confirmed::Reply(reply) => out.output = reply,
+            Confirmed::Stopped(status, output) => {
+                out.status = status;
+                out.output = output;
+            }
+        }
+    }
+    let confirm_refused = confirm_refused.into_inner();
     runner.on_run_complete(&run_id);
     let key = binding.key.as_str();
     // A refusal benches the stand-in's base: the credential is what refused.
@@ -3197,7 +3276,7 @@ pub(crate) fn judge_on_stand_in(
             }
             (
                 Ok(parse_agent_verdict(&out.output).judged_by(key, false)),
-                Vec::new(),
+                confirm_refused,
             )
         }
         StepStatus::Cancelled => (
@@ -3273,7 +3352,7 @@ fn agent_validate_in(
         let mut unit = base_unit.clone();
         unit.assigned_cli = Some(seat.key.clone());
         unit.assigned_invocation = Some(seat.headless_invocation.clone());
-        let out = runner.run_unit(&build_validator_input(run_id, unit));
+        let out = runner.run_unit(&build_validator_input(run_id, unit.clone()));
         match out.status {
             // The seat answered. Whatever it said is the verdict — including unreadable output,
             // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
@@ -3293,7 +3372,19 @@ fn agent_validate_in(
                 if !names_a_verdict(&out.output) {
                     return Err(no_verdict_error(&seat.key, &out.output));
                 }
-                let verdict = parse_agent_verdict(&out.output).judged_by(&seat.key, true);
+                let bench = |text: &str| on_refusal(&seat.key, text);
+                let reply = match confirm_unclosed(&out.output, &unit, runner, run_id, &bench) {
+                    Confirmed::Reply(reply) => reply,
+                    Confirmed::Stopped(StepStatus::Cancelled, output) => {
+                        anyhow::bail!("agent validation cancelled on seat {}: {output}", seat.key)
+                    }
+                    Confirmed::Stopped(_, output) => anyhow::bail!(
+                        "agent validation timed out on seat {} (the seat burned its turn \
+                         ceiling): {output}",
+                        seat.key
+                    ),
+                };
+                let verdict = parse_agent_verdict(&reply).judged_by(&seat.key, true);
                 if verdict.pass && !crate::observed_provider::approval_is_independent(&seat.key) {
                     eprintln!(
                         "wicked-core: judge seat '{}' approved, but was not observed calling only \
@@ -3382,7 +3473,7 @@ fn agent_validate_in(
             .unwrap_or_else(|| "claude -p {PROMPT}".to_string());
         unit.assigned_invocation = Some(invocation);
     }
-    let out = runner.run_unit(&build_validator_input(run_id, unit));
+    let out = runner.run_unit(&build_validator_input(run_id, unit.clone()));
     if out.status != StepStatus::Ok {
         anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
     }
@@ -3403,7 +3494,14 @@ fn agent_validate_in(
     }
     // The single-runner FALLBACK: the deterministic validator's own seat judged — prompt-only
     // independence, and the record says so (`judge_distinct = false`, core#431).
-    Ok(parse_agent_verdict(&out.output).judged_by(DETERMINISTIC_VALIDATOR_SEAT, false))
+    let bench = |text: &str| on_refusal(DETERMINISTIC_VALIDATOR_SEAT, text);
+    let reply = match confirm_unclosed(&out.output, &unit, runner, run_id, &bench) {
+        Confirmed::Reply(reply) => reply,
+        Confirmed::Stopped(status, output) => {
+            anyhow::bail!("agent validation failed ({status:?}): {output}")
+        }
+    };
+    Ok(parse_agent_verdict(&reply).judged_by(DETERMINISTIC_VALIDATOR_SEAT, false))
 }
 
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
@@ -3975,7 +4073,11 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
 /// exactly that. A missing closing line, a closing line that is not a bare verdict, or one that names
 /// the OTHER verdict all fail closed. That is what stops a model from committing to a token and then
 /// reasoning its way to the opposite conclusion underneath it, which no first-token rule can see.
-fn parse_agent_verdict(raw: &str) -> AgentVerdict {
+///
+/// The flag is true only for a reply whose decision line is a well-formed `PASS` and whose closing
+/// line is missing (core#1945: the one case [`confirm_unclosed`] confirms). An unclosed `REJECT` is
+/// a REJECT whatever a confirm says, so it is never confirmed.
+fn parse_verdict(raw: &str) -> (AgentVerdict, bool) {
     // Normalize a token: drop leading/trailing non-alphanumerics (so `PASS.`/`REJECT:` normalize) then
     // uppercase.
     let norm = |t: &str| {
@@ -4037,16 +4139,19 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             "PASS" if decisive && !mentions_reject => true,
             "REJECT" if decisive && !mentions_pass => false,
             _ => {
-                return AgentVerdict {
-                    judge_cli: None,
-                    judge_distinct: None,
-                    seat_failure: None,
-                    judge_fallback: None,
-                    pass: false,
-                    reasoning: format!(
+                return (
+                    AgentVerdict {
+                        judge_cli: None,
+                        judge_distinct: None,
+                        seat_failure: None,
+                        judge_fallback: None,
+                        pass: false,
+                        reasoning: format!(
                         "ambiguous or malformed verdict at the decision line (fail-closed): {line}"
                     ),
-                }
+                    },
+                    false,
+                )
             }
         };
 
@@ -4085,31 +4190,37 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             })
             .unwrap_or_default();
         if closing.is_empty() {
-            return AgentVerdict {
-                judge_cli: None,
-                judge_distinct: None,
-                seat_failure: None,
-                judge_fallback: None,
-                pass: false,
-                reasoning: format!(
+            return (
+                AgentVerdict {
+                    judge_cli: None,
+                    judge_distinct: None,
+                    seat_failure: None,
+                    judge_fallback: None,
+                    pass: false,
+                    reasoning: format!(
                     "{reasoning} [no closing verdict: the reply opened {first} and never closed \
                      with `PASS` or `REJECT` alone on its last line, so the opening token is \
                      unconfirmed — failing closed (FINDING-085)]"
                 ),
-            };
+                },
+                first == "PASS",
+            );
         }
         if closing != first {
-            return AgentVerdict {
-                judge_cli: None,
-                judge_distinct: None,
-                seat_failure: None,
-                judge_fallback: None,
-                pass: false,
-                reasoning: format!(
+            return (
+                AgentVerdict {
+                    judge_cli: None,
+                    judge_distinct: None,
+                    seat_failure: None,
+                    judge_fallback: None,
+                    pass: false,
+                    reasoning: format!(
                     "{reasoning} [verdict drift: the reply opened {first} and closed {closing} — \
                      failing closed (FINDING-085)]"
                 ),
-            };
+                },
+                false,
+            );
         }
 
         // Belt to the braces above: a line BETWEEN the two commitments that leads with the opposite
@@ -4128,40 +4239,54 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                 (lead == "PASS" && first == "REJECT") || (lead == "REJECT" && first == "PASS")
             });
         if contradicted_later {
-            return AgentVerdict {
+            return (
+                AgentVerdict {
+                    judge_cli: None,
+                    judge_distinct: None,
+                    seat_failure: None,
+                    judge_fallback: None,
+                    pass: false,
+                    reasoning: format!(
+                    "{reasoning} [verdict drift: the decision line said {first}, a later line said \
+                     the opposite — failing closed (FINDING-085)]"
+                ),
+                },
+                false,
+            );
+        }
+
+        return (
+            AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
                 judge_fallback: None,
-                pass: false,
-                reasoning: format!(
-                    "{reasoning} [verdict drift: the decision line said {first}, a later line said \
-                     the opposite — failing closed (FINDING-085)]"
-                ),
-            };
-        }
-
-        return AgentVerdict {
+                pass: leading,
+                reasoning,
+            },
+            false,
+        );
+    }
+    // No contract line anywhere — never a lone-model approve on ambiguous/malformed output.
+    (
+        AgentVerdict {
             judge_cli: None,
             judge_distinct: None,
             seat_failure: None,
             judge_fallback: None,
-            pass: leading,
-            reasoning,
-        };
-    }
-    // No contract line anywhere — never a lone-model approve on ambiguous/malformed output.
-    AgentVerdict {
-        judge_cli: None,
-        judge_distinct: None,
-        seat_failure: None,
-        judge_fallback: None,
-        pass: false,
-        reasoning: format!(
-            "no unambiguous PASS/REJECT contract line (fail-closed): {}",
-            raw.trim()
-        ),
-    }
+            pass: false,
+            reasoning: format!(
+                "no unambiguous PASS/REJECT contract line (fail-closed): {}",
+                raw.trim()
+            ),
+        },
+        false,
+    )
+}
+
+/// [`parse_verdict`] without its unclosed flag.
+fn parse_agent_verdict(raw: &str) -> AgentVerdict {
+    parse_verdict(raw).0
 }
 
 /// The gate verdict from the rev0.4 combination rule.
@@ -7947,6 +8072,84 @@ mod tests {
             cause.starts_with("exhausted its quota: Error: You have exceeded"),
             "the cause is the bench's verb plus the seat's own first line: {cause}"
         );
+    }
+
+    /// (core#1945) A judge seat that answers each call with the next scripted reply.
+    struct ScriptedJudge(
+        std::sync::Mutex<Vec<&'static str>>,
+        std::sync::Mutex<Vec<String>>,
+    );
+
+    impl StepRunner for ScriptedJudge {
+        fn run_unit(&self, input: &StepInput) -> crate::workflow::StepOutput {
+            self.1.lock().unwrap().push(input.unit.description.clone());
+            let mut replies = self.0.lock().unwrap();
+            let output = if replies.is_empty() {
+                String::new()
+            } else {
+                replies.remove(0).to_string()
+            };
+            crate::workflow::StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output,
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn an_unclosed_verdict_is_confirmed_once_and_a_confirm_never_flips_it_1945() {
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let judge = |replies: Vec<&'static str>| {
+            let runner = ScriptedJudge(std::sync::Mutex::new(replies), Default::default());
+            let v = agent_validate("c", "w", &["claude"], &roster, &runner).expect("a verdict");
+            let asked = runner.1.into_inner().unwrap();
+            (v, asked)
+        };
+        // Opened PASS, confirmed PASS: a pass, after exactly one confirm call that shows the reply.
+        let (v, asked) = judge(vec!["PASS — the work holds.\n- reason", "PASS"]);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(asked.len(), 2);
+        assert!(asked[1].contains("PASS — the work holds."), "{}", asked[1]);
+        // An unclosed REJECT is a REJECT whatever a confirm would say: no confirm call.
+        let (v, asked) = judge(vec!["REJECT — the work misses the task.", "PASS"]);
+        assert!(!v.pass, "{v:?}");
+        assert_eq!(asked.len(), 1);
+        // A confirm that is not the bare word fails closed; there is no third call.
+        let (v, asked) = judge(vec!["PASS — fine.", "PASS, as I said"]);
+        assert!(!v.pass, "{v:?}");
+        assert_eq!(asked.len(), 2);
+        // A closed reply needs no confirm, even when its text quotes the parser's own words.
+        let (v, asked) = judge(vec!["PASS\nfine\nPASS"]);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(asked.len(), 1);
+        let (v, asked) = judge(vec![
+            "PASS\nThe old [no closing verdict: note is resolved.\nPASS",
+        ]);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(asked.len(), 1);
+        // A confirm call that is refused benches the seat and the reply still fails closed.
+        let runner = ScriptedJudge(
+            std::sync::Mutex::new(vec![
+                "PASS — fine.",
+                "Error: You have exceeded your monthly quota",
+            ]),
+            Default::default(),
+        );
+        let (v, refused) =
+            agent_validate_with_refusals("c", "w", &["claude"], &roster, &runner, None);
+        assert!(!v.expect("a verdict").pass);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].0, "pi");
     }
 
     #[test]
