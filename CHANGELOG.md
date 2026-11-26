@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The independence preflight answers only for roles the run's plan seats** (core#1954). A launch with no plan
+  and no workflow plans one unit with no review step: the preflight no longer lists a reviewer, and its judge is
+  conditional (the unit convenes one only when it changes the worktree). A team run's monitor row is sized from
+  the plan's launch score and its own ask, not always three: a plan the PA scopes keeps the top band until its
+  scope step scores it, and a zero target drops the row. `canStandIn` is true only where a stand-in sits today
+  (the reviewer, the judge, the QE reviewer, a party's place, and the rule judge on a run that is not reduced);
+  the council, rule council and monitor rows offer none.
 - **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
   (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
   from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
