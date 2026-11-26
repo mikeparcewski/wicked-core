@@ -283,8 +283,11 @@ mod tests {
         std::fs::write(&launcher, "#!/bin/sh\necho \"launched $*\"\nexit 3\n").unwrap();
         std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         let run = |root: Option<&std::path::Path>| {
+            use wicked_apps_core::HardenedCommand;
+            // spawn-audit: hardened run of the shipped step command, as the Tool step runs it.
             let mut c = std::process::Command::new(&cmd[0]);
-            c.arg(&cmd[1])
+            c.hardened()
+                .arg(&cmd[1])
                 .arg(&cmd[2])
                 .args(["domain-run", "/db", "/repo"])
                 .env("WICKED_DOMAIN_SCOPE", "/scope.json")
