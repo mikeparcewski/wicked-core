@@ -1982,25 +1982,39 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
     }
 }
 
-/// The `finding_id`s whose council STARTED voting in `rows` (`council.convened`, core#1822), each
-/// with the seats that sat (core#1997), in the attempt the rows' terminal `step.completed` names
-/// (every row when none names one, as the fold reads them). [`synthesize_timeout`] reads it: a
-/// council that never convened did not time out, and one that did still names who sat.
-pub fn convened_findings(rows: &[TeamRow]) -> std::collections::HashMap<String, Vec<String>> {
+/// The councils that STARTED voting in an attempt's rows, each with the seats that sat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Convened {
+    /// A finding's council (`finding:<raise_seq>`), by `finding_id`.
+    pub findings: std::collections::HashMap<String, Vec<String>>,
+    /// (core#2011) A member step's council, by its subject (`step:<id>:<attempt>`).
+    pub steps: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// The councils whose voting STARTED in `rows` (`council.convened`, core#1822), each with the
+/// seats that sat (core#1997), in the attempt the rows' terminal `step.completed` names (every row
+/// when none names one, as the fold reads them). [`synthesize_timeout`] reads it: a council that
+/// never convened did not time out, and one that did still names who sat.
+pub fn convened_councils(rows: &[TeamRow]) -> Convened {
     let terminal = rows.iter().find_map(|r| match r.event.body {
         TeamBody::StepCompleted(_) => Some((r.event.env.ord, r.event.env.attempt)),
         _ => None,
     });
-    rows.iter()
+    let mut out = Convened::default();
+    for r in rows
+        .iter()
         .filter(|r| terminal.is_none_or(|at| (r.event.env.ord, r.event.env.attempt) == at))
-        .filter_map(|r| match &r.event.body {
-            // A finding's council only (`finding:<raise_seq>`); a member step's has no finding.
+    {
+        match &r.event.body {
             TeamBody::CouncilConvened(b) if b.subject.starts_with("finding:") => {
-                b.finding_id.clone().map(|id| (id, b.seats.clone()))
+                if let Some(id) = &b.finding_id {
+                    out.findings.insert(id.clone(), b.seats.clone());
+                }
             }
-            _ => None,
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The words on a finding's `not_convened` dispute when the final pass ended first.
@@ -2009,13 +2023,10 @@ pub const NOT_CONVENED_STEP_ENDED: &str = "the step ended before its turn";
 /// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every HIGH settling now
 /// missing a hold-round reply or a council verdict gets `{kind:"hold", reason:"no reply (final
 /// pass timed out)"}` and a no-verdict dispute. (core#1822) The dispute says `timeout` only when
-/// the finding's council STARTED voting (`convened`, from [`convened_findings`]); a council that
+/// the finding's council STARTED voting (`convened`, from [`convened_councils`]); a council that
 /// never convened is `not_convened` with [`NOT_CONVENED_STEP_ENDED`]. Recorded results are kept;
 /// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. `teamPause` is recomputed.
-pub fn synthesize_timeout(
-    mut ledger: TeamLedger,
-    convened: &std::collections::HashMap<String, Vec<String>>,
-) -> TeamLedger {
+pub fn synthesize_timeout(mut ledger: TeamLedger, convened: &Convened) -> TeamLedger {
     ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
         if f.finding.severity != Severity::High || !settles_now(f) {
@@ -2032,20 +2043,22 @@ pub fn synthesize_timeout(
             });
         }
         if f.dispute.is_none() {
-            f.dispute = Some(if let Some(seats) = convened.get(&f.finding.finding_id) {
-                // (core#1997, codex r2) The council started: who sat stays on the record, so its
-                // voters reach the receipt's roles.
-                Dispute {
-                    seats: seats.clone(),
-                    independence: super::council_independence(seats),
-                    ..no_verdict(NoVerdictReason::Timeout)
-                }
-            } else {
-                Dispute {
-                    detail: Some(NOT_CONVENED_STEP_ENDED.to_string()),
-                    ..no_verdict(NoVerdictReason::NotConvened)
-                }
-            });
+            f.dispute = Some(
+                if let Some(seats) = convened.findings.get(&f.finding.finding_id) {
+                    // (core#1997, codex r2) The council started: who sat stays on the record, so its
+                    // voters reach the receipt's roles.
+                    Dispute {
+                        seats: seats.clone(),
+                        independence: super::council_independence(seats),
+                        ..no_verdict(NoVerdictReason::Timeout)
+                    }
+                } else {
+                    Dispute {
+                        detail: Some(NOT_CONVENED_STEP_ENDED.to_string()),
+                        ..no_verdict(NoVerdictReason::NotConvened)
+                    }
+                },
+            );
         }
     }
     ledger.refresh_pause();

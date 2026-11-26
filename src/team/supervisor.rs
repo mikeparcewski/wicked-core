@@ -3242,7 +3242,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     l.final_pass = FinalPass::StreamGap;
                     l.refresh_pause();
                 } else if timed_out {
-                    l = tev::synthesize_timeout(l, &tev::convened_findings(&rows));
+                    l = tev::synthesize_timeout(l, &tev::convened_councils(&rows));
                 }
                 (
                     l,
