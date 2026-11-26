@@ -39767,6 +39767,97 @@ mod live_output_stream_tests {
         );
     }
 
+    /// core#1964 W6: a message to a step whose one turn is already running was queued for that
+    /// step, which had taken its messages when it was dispatched and hears none mid-turn, so it
+    /// was never delivered while the route answered OK and the sheet said "Sent". Such a message
+    /// is now refused (the route's 409, with the reason); a broadcast steers the run and is kept
+    /// for the next step. A step not yet dispatched, and a power build between its turns, still
+    /// hear theirs.
+    #[test]
+    fn a_message_to_a_step_mid_turn_is_refused_or_kept_for_the_next_step_1964() {
+        use crate::command::InjectTarget;
+        use crate::domain::{put_nodes, UnitStatus, WorkUnit};
+        use wicked_apps_core::open_store;
+
+        let seed = |tag: &str, dispatched: bool, power_build: Option<u32>| {
+            let run_id = format!("inject-1964-{tag}-{}", uuid::Uuid::new_v4());
+            let dir = std::env::temp_dir().join(&run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("estate.db");
+            {
+                let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+                let mut session = super::sessions_detail_fold_tests::session(&run_id);
+                session.status = SessionStatus::Executing;
+                session.unit_ix = 0;
+                session.attempt = 1;
+                if let Some(ord) = power_build {
+                    let mut power = crate::power::PowerState::launched(true, 0);
+                    power.orchestrator.ord = Some(ord);
+                    session.power = Some(power);
+                }
+                let mut first = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "review");
+                first.status = UnitStatus::Distributed;
+                first.assigned_cli = Some("codex".into());
+                if dispatched {
+                    first.last_attempt = Some(1);
+                }
+                let mut second = WorkUnit::pending(format!("{run_id}:u2"), &run_id, 2, "test");
+                second.assigned_cli = Some("codex".into());
+                put_nodes(
+                    &mut store,
+                    &[session.to_node(), first.to_node(), second.to_node()],
+                )
+                .unwrap();
+            } // Release the seed writer before starting the actor.
+            let core = crate::Core::spawn_with_engine(
+                db.to_str().unwrap().to_string(),
+                Arc::new(StubDispatcher),
+                Arc::new(NoopRunner),
+            );
+            (run_id, core)
+        };
+        let codex = || InjectTarget::Cli("codex".into());
+        let heard = |run: &str, ord: u32| -> Vec<String> {
+            crate::power::take_operator_messages(run, "codex", ord)
+                .into_iter()
+                .map(|m| m.message)
+                .collect()
+        };
+
+        // The reported shape: the review step's one turn is running.
+        let (run, core) = seed("mid-turn", true, None);
+        let refused = core.inject_worker_message(&run, "check the README too", codex());
+        let (running, next) = (heard(&run, 1), heard(&run, 2));
+        let err = refused
+            .expect_err("a step mid-turn cannot hear it: refuse, never answer OK")
+            .to_string();
+        assert!(
+            err.contains("step 1") && err.contains("would not reach it"),
+            "{err}"
+        );
+        assert!(
+            running.is_empty() && next.is_empty(),
+            "a refused message is not queued"
+        );
+        // A broadcast steers the run: the next step hears it.
+        core.inject_worker_message(&run, "keep it small", InjectTarget::All)
+            .expect("a broadcast is kept for the next step");
+        assert_eq!(heard(&run, 2), vec!["keep it small".to_string()]);
+
+        // Not dispatched yet: the step hears it when it is.
+        let (run, core) = seed("pending", false, None);
+        core.inject_worker_message(&run, "check the README too", codex())
+            .expect("queued for the step's dispatch");
+        assert!(heard(&run, 2).is_empty(), "it is that step's, not the next");
+        assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
+
+        // A power build hears it at its next turn.
+        let (run, core) = seed("power-build", true, Some(1));
+        core.inject_worker_message(&run, "check the README too", codex())
+            .expect("queued for the build's next turn");
+        assert_eq!(heard(&run, 1), vec!["check the README too".to_string()]);
+    }
+
     #[test]
     fn live_output_redacts_tokens_at_every_chunk_split_on_the_wire() {
         let dir = std::env::temp_dir().join(format!("wicked-live-redact-{}", uuid::Uuid::new_v4()));
