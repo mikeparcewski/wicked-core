@@ -1063,7 +1063,7 @@ mod tests {
         let real = |role, seat: &str| RoleRecord::real(role, seat, 2, 1);
         let monitor = real(crate::standin::Role::Monitor, "claude");
         assert_eq!(
-            receipt_independence(&[monitor.clone()]),
+            receipt_independence(std::slice::from_ref(&monitor)),
             None,
             "only a real team role"
         );
