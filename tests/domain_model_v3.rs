@@ -617,13 +617,16 @@ fn the_live_record_policy_holds_in_the_model_and_the_coverage_report() {
         !unaccounted(&after, READ_PARA),
         "open statements still account for it"
     );
+    // (core#1955 R2-2) The store holds v3 rows, so the old-loop rule is not counted, as the model
+    // skips it (`skipped.old_loop`): the report and the model tell one story.
     assert!(
-        !unaccounted(&after, MAIN_PARA),
-        "the old-loop rule counts the old way"
+        unaccounted(&after, MAIN_PARA),
+        "the old-loop rule is not counted beside v3 rows"
     );
     assert_eq!(
-        after.resolved, fresh.resolved,
-        "READ-PARA no longer resolves; MAIN-PARA (old loop, 0.9) now does"
+        after.resolved + 1,
+        fresh.resolved,
+        "READ-PARA no longer resolves, and MAIN-PARA's old-loop rule (0.9) does not either"
     );
 
     // A changed checkout: READ-PARA's Checked statement is stale, so it no longer resolves.
@@ -633,6 +636,43 @@ fn the_live_record_policy_holds_in_the_model_and_the_coverage_report() {
     assert_eq!(counts(&g)[0], RuleCount::Unresolved);
     assert!(!unaccounted(&stale, READ_PARA));
     assert_eq!(stale.resolved + 1, fresh.resolved);
+}
+
+/// (core#1955 R2-1(d)) A build that another build overtakes is refused at the persist, and writes
+/// nothing: A is assembled (its ids numbered against the store's build), B builds and commits, then
+/// A's persist is refused and the store still holds B's model at B's generation. Fails without the
+/// generation the persist expects: A would write its older model over B's.
+#[test]
+fn a_build_another_build_overtook_is_refused_and_writes_nothing() {
+    let f = fixture("mini-cobol", "overtaken");
+    let mut store = open(&f);
+    let a = wicked_governance::assemble_build(&store, &f.tree, 9).unwrap();
+    let (b, b_outcome) = build_and_persist(&mut store, &f.tree, 10).unwrap();
+    assert_ne!(
+        serde_json::to_value(a.model()).unwrap()["metadata"],
+        serde_json::to_value(&b).unwrap()["metadata"],
+        "A and B differ, so a write of A shows"
+    );
+    let err = wicked_governance::persist_build(&mut store, a)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("another requirements-graph build committed")
+            && err.contains("nothing was written"),
+        "{err}"
+    );
+    let (read, build, _, _) = wicked_governance::load_domain_graph_with_units(&store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(build.generation, b_outcome.generation, "no new generation");
+    assert_eq!(
+        read["metadata"],
+        serde_json::to_value(&b).unwrap()["metadata"]
+    );
+    assert_eq!(
+        read["domains"],
+        serde_json::to_value(&b).unwrap()["domains"]
+    );
 }
 
 /// F18/F13/R16: the model persists and reads back whole (lists included), and a later build with

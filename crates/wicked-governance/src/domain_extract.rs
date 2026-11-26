@@ -436,13 +436,20 @@ impl ExtractIndex {
 
     /// For the coverage report (R22): how the `business_rule` annotation (`key`, `value`) on a node
     /// counts, by the same effective status the model shows.
+    ///
+    /// An old-loop row (no `contract`) counts the 1.1.0 way only in a store with no v3 row: there
+    /// it is the stored 1.1.0 graph's own rule (core#1924 keeps those readable). Once the store
+    /// holds v3 rows the 1.2.0 model skips it (`skipped.old_loop`), so the report does too and the
+    /// two never tell different stories (core#1955 R2-2).
     pub fn rule_counts(&self, key: &str, value: &str) -> RuleCount {
         let v3_shaped = is_v3_value(value);
+        // RED (core#1955): the old reading, Legacy beside v3 rows too.
+        let not_v3 = RuleCount::Legacy;
         let Some(id) = key.strip_prefix("business_rule:") else {
             return if v3_shaped {
                 RuleCount::Ignored
             } else {
-                RuleCount::Legacy
+                not_v3
             };
         };
         match self.statements.get(id) {
@@ -457,7 +464,7 @@ impl ExtractIndex {
             }
             // An older copy of a key that is live elsewhere, a tombstone, or a skipped v3 row.
             _ if v3_shaped => RuleCount::Ignored,
-            _ => RuleCount::Legacy,
+            _ => not_v3,
         }
     }
 }
@@ -469,9 +476,10 @@ pub enum RuleCount {
     Resolved(f64),
     /// A v3 statement that is open, rejected or stale: accounted, not resolved.
     Unresolved,
-    /// A v3 row that is not the live one (retired, superseded or malformed): not counted at all.
+    /// A v3 row that is not the live one (retired, superseded or malformed), or an old-loop row in
+    /// a store that holds v3 rows: not counted at all.
     Ignored,
-    /// Not a v3 row: the 1.1.0 reading (its confidence) applies.
+    /// Not a v3 row, in a store with no v3 row: the 1.1.0 reading (its confidence) applies.
     Legacy,
 }
 
@@ -1169,17 +1177,30 @@ pub struct BuildOutcome {
     pub accounting: Accounting,
 }
 
-/// Build the 1.2.0 model from the store's v3 rows, keep the ids of requirements still present,
-/// and persist it into the same store (refused, nothing written, when another build committed in
-/// between). The one build path of `domain-graph`, `domain-ruling` and core-ts.
-pub fn build_and_persist(
-    store: &mut dyn wicked_apps_core::GraphStore,
+/// A 1.2.0 model assembled from the store's v3 rows and numbered against one build generation,
+/// not yet persisted ([`assemble_build`], then [`persist_build`]).
+#[derive(Debug, Clone)]
+pub struct AssembledBuild {
+    model: crate::domain_model::DomainModel,
+    generation: u64,
+}
+
+impl AssembledBuild {
+    /// The model as it will be persisted.
+    pub fn model(&self) -> &crate::domain_model::DomainModel {
+        &self.model
+    }
+}
+
+/// Build the 1.2.0 model from the store's v3 rows and keep the ids of requirements still present.
+/// The first half of [`build_and_persist`].
+pub fn assemble_build(
+    read: &dyn GraphRead,
     repo_root: &Path,
     built_at: i64,
-) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
-    let read: &dyn GraphRead = &*store;
+) -> anyhow::Result<AssembledBuild> {
     // The generation is read BEFORE the rows: a build that commits while this one assembles its
-    // model moves it, and the persist below then refuses instead of writing the older model over it.
+    // model moves it, and the persist then refuses instead of writing the older model over it.
     let before = crate::domain_model::build_generation(read)?;
     let mut model = build_extract_model(read, repo_root, built_at)?;
     let generation = crate::domain_model::stabilize_requirement_ids_with(read, &mut model, false)?;
@@ -1187,8 +1208,18 @@ pub fn build_and_persist(
         generation == before,
         "another build of this domain model committed while this one was assembled; build again"
     );
-    let (nodes, edges) =
-        crate::domain_model::persist_domain_model_expecting(store, &model, Some(generation))?;
+    Ok(AssembledBuild { model, generation })
+}
+
+/// Persist an [`assemble_build`] model into the same store: refused, nothing written, when another
+/// build committed after it was numbered. The second half of [`build_and_persist`].
+pub fn persist_build(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    build: AssembledBuild,
+) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
+    let AssembledBuild { model, generation } = build;
+    // RED (core#1955): no expected generation.
+    let (nodes, edges) = crate::domain_model::persist_domain_model_expecting(store, &model, None)?;
     let outcome = BuildOutcome {
         generation: generation + 1,
         nodes,
@@ -1204,10 +1235,62 @@ pub fn build_and_persist(
     Ok((model, outcome))
 }
 
+/// Build the 1.2.0 model from the store's v3 rows, keep the ids of requirements still present,
+/// and persist it into the same store (refused, nothing written, when another build committed in
+/// between). The one build path of `domain-graph`, `domain-ruling` and core-ts.
+pub fn build_and_persist(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    repo_root: &Path,
+    built_at: i64,
+) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
+    let build = assemble_build(&*store, repo_root, built_at)?;
+    persist_build(store, build)
+}
+
 /// Unix seconds now (a build's `built_at`, a ruling's `at`).
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (core#1955 R2-2) An old-loop `business_rule` row (no `contract`, either key spelling) counts
+    /// the 1.1.0 way in a store with no v3 row (a stored 1.1.0 graph's own rules; the store-level
+    /// case is `domain_model::tests::resolved_risk_split_and_mean_confidence_resolved_only`), and
+    /// is not counted once the store holds v3 rows, as the 1.2.0 model skips it. A v3 tombstone is
+    /// never counted. Fails with the old `Legacy` arms.
+    #[test]
+    fn an_old_loop_rule_counts_the_old_way_only_in_a_store_with_no_v3_row() {
+        let old_loop = [
+            ("r", "amount > 0".to_string()),
+            ("business_rule:r", json!({"rule": "amount > 0"}).to_string()),
+        ];
+        let tombstone = json!({"status": RETIRED}).to_string();
+        let pure = ExtractIndex::default();
+        assert!(pure.is_empty());
+        for (key, value) in &old_loop {
+            assert_eq!(pure.rule_counts(key, value), RuleCount::Legacy, "{key}");
+        }
+        assert_eq!(pure.rule_counts("r", &tombstone), RuleCount::Ignored);
+        let mut mixed = ExtractIndex::default();
+        mixed.followups.insert(
+            "f".to_string(),
+            Row {
+                symbol: "s".to_string(),
+                value: json!({"kind": "open"}),
+                ts: 0,
+                seq: 0,
+            },
+        );
+        assert!(!mixed.is_empty());
+        for (key, value) in &old_loop {
+            assert_eq!(mixed.rule_counts(key, value), RuleCount::Ignored, "{key}");
+        }
+        assert_eq!(mixed.rule_counts("r", &tombstone), RuleCount::Ignored);
+    }
 }
