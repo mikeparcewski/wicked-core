@@ -2642,6 +2642,13 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
     {
         cmd.env(k, v);
     }
+    // (core#1993) gh leads its own process group, so a child it leaves holding stdout ends with
+    // the group (as `k8s::run_capped` does).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2666,6 +2673,16 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
         let _ = tx.send(out);
     });
     let deadline = Instant::now() + GH_TOKEN_TIMEOUT;
+    let group = child.id();
+    let end_group = || {
+        #[cfg(unix)]
+        // SAFETY: killpg on gh's own process group (pgid == its pid, set at spawn).
+        unsafe {
+            libc::killpg(group as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = group;
+    };
     let late = || {
         format!(
             "gh did not answer for its token within {}s",
@@ -2677,6 +2694,7 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                end_group();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(late());
@@ -2684,13 +2702,24 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
         }
     };
     // (pi r2) A gh that exited just inside the deadline still gets a moment for its last bytes.
-    let out = rx
-        .recv_timeout(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1)),
-        )
-        .map_err(|_| late())?;
+    // (core#1993) On unix that moment is 1 s: a read still open after it means a child gh left
+    // holds stdout, so the group is ended and the read keeps what gh printed.
+    let grace = if cfg!(unix) {
+        Duration::from_secs(1)
+    } else {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1))
+    };
+    let out = match rx.recv_timeout(grace) {
+        Ok(out) => out,
+        Err(_) if cfg!(unix) => {
+            end_group();
+            rx.recv_timeout(Duration::from_secs(1))
+                .map_err(|_| late())?
+        }
+        Err(_) => return Err(late()),
+    };
     let token = out.trim();
     if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {
         return Err(format!(
