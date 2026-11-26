@@ -48,7 +48,7 @@ fn seat() -> SeatPod {
         deadline_secs: 3600,
         scope: None,
         view: None,
-        deps: None,
+        deps: Vec::new(),
     }
 }
 
@@ -937,9 +937,79 @@ fn k8s_every_node_modules_of_a_provisioned_tree_is_the_engines() {
     assert!(seat::in_node_modules("tests/fixtures/Node_Modules/p.js"));
     assert!(!seat::in_node_modules("src/node_modules_helper.rs"));
     // Emptied whatever it is (a link included), and the seat does not start if one survives.
-    let s = seat::nested_unpack_script(Path::new("/w/t"));
+    let s = seat::nested_unpack_script(Path::new("/w/t"), &[String::new()]);
     assert!(!s.contains("-type d"), "a planted link must go too: {s}");
     assert!(s.contains("could not be removed") && s.contains("exit 1"));
+}
+
+/// core#1970: with the root's claim and a subfolder package's (`notes/`) mounted, the seat's
+/// unpack keeps both mounts, empties every other node_modules, and unpacks each claim's nested
+/// archive in its own package dir. Run with the host's find, rm and tar standing in for busybox.
+#[cfg(unix)]
+#[test]
+fn k8s_the_unpack_keeps_each_mounted_claim_and_unpacks_its_archive_in_its_dir_1970() {
+    let t = std::env::temp_dir().join(format!("unpack-1970-{}", uuid::Uuid::new_v4()));
+    let mk = |rel: &str| {
+        let p = t.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x").unwrap();
+    };
+    mk("node_modules/root-dep/index.js");
+    mk("notes/node_modules/@opentelemetry/api/package.json");
+    mk("packages/a/node_modules/stale/planted.js");
+    mk("notes/sub/node_modules/stale/planted.js");
+    // notes' claim carries its nested archive, relative to notes/ (as the fill writes it).
+    let stage = std::env::temp_dir().join(format!("unpack-1970-stage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(stage.join("w/node_modules/inner")).unwrap();
+    std::fs::write(stage.join("w/node_modules/inner/i.js"), "y").unwrap();
+    let tar = t
+        .join("notes/node_modules")
+        .join(crate::checks_container::NESTED_TAR);
+    // spawn-audit: test-only — builds the fixture archive.
+    let o = std::process::Command::new("tar")
+        .args(["-c", "-f"])
+        .arg(&tar)
+        .arg("./w/node_modules")
+        .current_dir(&stage)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let script = seat::nested_unpack_script(&t, &[String::new(), "notes".into()])
+        .replace("F=/floor/busybox", "F=");
+    // spawn-audit: test-only — runs the rendered script on the fixture tree.
+    let o = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "{script}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        t.join("node_modules/root-dep/index.js").is_file(),
+        "the root claim stays"
+    );
+    assert!(
+        t.join("notes/node_modules/@opentelemetry/api/package.json")
+            .is_file(),
+        "notes' claim stays"
+    );
+    assert!(
+        !t.join("packages/a/node_modules").exists(),
+        "a stale one goes"
+    );
+    assert!(
+        !t.join("notes/sub/node_modules").exists(),
+        "a stale one under notes goes"
+    );
+    assert!(
+        t.join("notes/w/node_modules/inner/i.js").is_file(),
+        "notes' archive unpacks in notes/"
+    );
+    assert!(!t.join("w").exists(), "never at the root");
+    let _ = std::fs::remove_dir_all(&t);
+    let _ = std::fs::remove_dir_all(&stage);
 }
 
 #[test]

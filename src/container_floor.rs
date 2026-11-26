@@ -3221,7 +3221,7 @@ pub(crate) fn arm_noting(
         .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
         .collect();
     // The run's node_modules cache for this tree, when the unit's provisioning filled one (B14).
-    let deps = crate::checks_container::seat_claim(run_id, &tree);
+    let deps = crate::checks_container::seat_claims(run_id, &tree);
     // The lifecycle this launch arms in, captured before the first attempt (codex confirmation
     // and coord codex-check on #1527).
     let generation = crate::k8s::lifecycle(run_id);
@@ -3252,7 +3252,7 @@ pub(crate) fn arm_noting(
             crate::workflow::unit_timeout_ceiling()
         },
         role,
-        deps: deps.as_deref(),
+        deps: &deps,
         optional: &optional,
     };
     // (core#1491) A pod that did not become ready (or was held for the node) is retried after a

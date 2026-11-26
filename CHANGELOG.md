@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Each npm package of a seat's tree gets its own `node_modules`** (core#1970). On pod seats the engine filled one
+  read-only `node_modules` claim, from the root's lockfile. A run that built a new package in a subfolder
+  (`notes/`, with its own `package.json` and lockfile) left its seats resolving the root's dependencies, so QE's
+  harness crashed on a version the subfolder had not locked, while the floor, which installs per package, passed.
+  The seats now get a claim for the root and for each subfolder package with its own npm lockfile that the
+  root's workspaces do not hold (at most 8, the rest named). Each is filled as the floor fills that package and
+  mounted read-only at its own `node_modules`. The set is read again at every unit, so a package a step adds is
+  filled before the next seat. A tree with no root package is no longer "not node" when a subfolder package
+  has a lockfile. A tree with no npm lockfile at all is still skipped before any snapshot. Host (non-pod) seats
+  still install the root only.
+
 - **A stand-in seat is named as one in the team's words** (core#1952). When a step's creator was a stand-in
   (`claude~1`) and no other seat could watch it, the absent reviewer's error read "the roster has no seat distinct
   from the PA (claude~1)", and studio shows that text as written. It now names the stand-in by its CLI and says
