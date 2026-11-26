@@ -7702,8 +7702,10 @@ pub(crate) fn apply_no_code_posture(
     Ok(p.lever)
 }
 
-/// (core#1881) Claude Code's switch that turns its auto-memory off, reads and writes alike.
-pub(crate) const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+/// (core#1881) Claude Code's switch that turns its auto-memory off, reads and writes alike (one
+/// spelling, shared with the ballot path, core#1996).
+pub(crate) const CLAUDE_DISABLE_AUTO_MEMORY_ENV: &str =
+    wicked_apps_core::spawn::CLAUDE_DISABLE_AUTO_MEMORY_ENV;
 
 /// (core#1881) The template options that would put a stand-in back into a session its base's
 /// builder left: each CLI's resume / continue / named-session selectors (bare or `--opt=value`).
