@@ -443,8 +443,11 @@ impl ExtractIndex {
     /// two never tell different stories (core#1955 R2-2).
     pub fn rule_counts(&self, key: &str, value: &str) -> RuleCount {
         let v3_shaped = is_v3_value(value);
-        // RED (core#1955): the old reading, Legacy beside v3 rows too.
-        let not_v3 = RuleCount::Legacy;
+        let not_v3 = if self.is_empty() {
+            RuleCount::Legacy
+        } else {
+            RuleCount::Ignored
+        };
         let Some(id) = key.strip_prefix("business_rule:") else {
             return if v3_shaped {
                 RuleCount::Ignored
@@ -1218,8 +1221,8 @@ pub fn persist_build(
     build: AssembledBuild,
 ) -> anyhow::Result<(crate::domain_model::DomainModel, BuildOutcome)> {
     let AssembledBuild { model, generation } = build;
-    // RED (core#1955): no expected generation.
-    let (nodes, edges) = crate::domain_model::persist_domain_model_expecting(store, &model, None)?;
+    let (nodes, edges) =
+        crate::domain_model::persist_domain_model_expecting(store, &model, Some(generation))?;
     let outcome = BuildOutcome {
         generation: generation + 1,
         nodes,
