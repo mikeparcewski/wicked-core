@@ -1001,6 +1001,11 @@ pub(super) fn auto_send_back(
 ) -> Option<String> {
     // Mutates `session` only: the caller (`escalate_denied_unit`) persists it with the pause, so
     // nothing written here can be overwritten by the caller's copy.
+    // (core#1962) Checks the machine stopped (no check ran for want of disk): nothing about the
+    // work failed, so no round is spent and no send-back is queued (only a retry answers it).
+    if super::floor_not_run(unit).is_some() {
+        return None;
+    }
     let run_id = session.id.clone();
     let power = session.power.as_mut().filter(|p| p.on)?;
     let build = power.orchestrator.ord?;

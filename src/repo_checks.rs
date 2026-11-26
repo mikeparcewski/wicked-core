@@ -394,6 +394,9 @@ pub enum FloorRerunMode {
     Targeted,
     AcceptPartial,
     FloorFix,
+    /// (core#1962) The same checks again, on the work already there: armed by a plain approve at
+    /// a floor the machine stopped (no check ran for want of disk), never as its own answer.
+    Retry,
 }
 
 impl FloorRerunMode {
@@ -404,6 +407,7 @@ impl FloorRerunMode {
             FloorRerunMode::Targeted => "targeted",
             FloorRerunMode::AcceptPartial => "accept_partial",
             FloorRerunMode::FloorFix => "floor_fix",
+            FloorRerunMode::Retry => "retry",
         }
     }
 }

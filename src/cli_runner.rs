@@ -14017,6 +14017,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// core#1962: a plain approve at a floor the disk stopped arms a `retry`: no seat runs (a
+    /// creator with nothing left to change failed the substance floor when its seat ran again),
+    /// the reviewed output is the attempt's output, and only the floor runs, on the tree as it is.
+    #[test]
+    fn a_disk_retry_runs_no_seat_and_only_the_floor_1962() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::process::Command;
+        use std::sync::Mutex;
+
+        struct Seat {
+            calls: Mutex<u32>,
+        }
+        impl StepRunner for Seat {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                *self.calls.lock().unwrap() += 1;
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "ran again".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: true,
+                }
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base =
+            std::env::temp_dir().join(format!("wicked-core-disk-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(
+            repo.join(crate::repo_checks::CONFIG_PATH),
+            serde_json::json!({ "test": ["sh", "-c", "test -f built.txt"] }).to_string(),
+        )
+        .unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/disk-retry",
+            ],
+        );
+        // The build's work, already in the tree from the attempt the disk stopped.
+        std::fs::write(wt.join("built.txt"), "built\n").unwrap();
+
+        const BUILT: &str = "Built the change and committed it.";
+        let refused: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:build", "r", 2, "build the change");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        unit.assigned_cli = Some("claude".into());
+        unit.repo_checks_floor = true;
+        unit.repo_checks = Some(crate::repo_checks::RepoChecksReport {
+            targeted_test: None,
+            requested_rerun: Some(crate::repo_checks::FloorRerun {
+                mode: crate::repo_checks::FloorRerunMode::Retry,
+                waive: Vec::new(),
+                output: BUILT.into(),
+                fix: None,
+            }),
+            ..refused
+        });
+        let input = StepInput {
+            base_commit: None,
+            run_id: "r".into(),
+            unit_ix: 1,
+            attempt: 3,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let seat = Arc::new(Seat {
+            calls: Mutex::new(0),
+        });
+        let runner: Arc<dyn StepRunner> = seat.clone();
+        let noop: &DeltaSink = &|_| {};
+        let (out, _verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[], &[]);
+
+        assert_eq!(*seat.calls.lock().unwrap(), 0, "no seat ran");
+        assert_eq!(out.status, StepStatus::Ok);
+        assert_eq!(out.output, BUILT, "the reviewed output is the attempt's");
+        assert!(!out.governed, "no seat turn to hold to the substance floor");
+        let report = evidence.repo_checks.expect("the floor ran");
+        assert_eq!(
+            report.rerun,
+            Some(crate::repo_checks::FloorRerunMode::Retry)
+        );
+        if report.sandbox_error.is_some() {
+            eprintln!("cli_runner: no sandbox tool here — the retry's floor cannot run");
+        } else {
+            assert!(
+                report.passed,
+                "the floor judged the tree as it is: {report:?}"
+            );
+            assert!(report.key.is_none(), "a re-run is never keyed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// core#782 (review): a floor fix whose guard baseline cannot be re-taken leaves NO baseline,
     /// so the guard reads the tree as unverifiable and denies — fail closed, never a pass.
     #[test]
