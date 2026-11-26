@@ -3946,10 +3946,12 @@ pub struct EvaluatorVerdict {
     /// findings ABOVE the verdict line) — for `gateEscalated.verdictSummary` and the rework context
     /// a `request_changes` hands the creator (PR-1B). Past the cap, [`cap_findings`] keeps every
     /// ITEM line and the verdict line whole and cuts the rest, steering-rule `N/A` lines first
-    /// (core#2004); only ITEM lines can take it past 4096.
+    /// (core#2004); only the ITEM and verdict lines, with the one note naming a cut, can take it
+    /// past 4096.
     pub findings: String,
     /// (core#549) `true` when the evaluator's output exceeded [`EVALUATOR_FINDINGS_CAP`] chars and
-    /// `findings` is cut ([`cap_findings`]). Propagates to `UnitDenial.findings_trimmed` and then to
+    /// [`cap_findings`] cut a line of it (core#2004: ITEM lines alone past the cap are kept whole
+    /// and are not a trim). Propagates to `UnitDenial.findings_trimmed` and then to
     /// `gateEscalated.verdictSummaryTrimmed` so a client can detect the cap without parsing `…`.
     pub findings_trimmed: bool,
 }
@@ -4032,9 +4034,10 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     }
     let trimmed = raw.trim();
     let count = trimmed.chars().count();
-    let findings_trimmed = count > EVALUATOR_FINDINGS_CAP;
-    let findings = if !findings_trimmed {
-        trimmed.to_string()
+    // (core#2004) Trimmed means a line was cut, not that the output passed the cap: ITEM lines
+    // alone past it are kept whole and carry no elision.
+    let (findings, findings_trimmed) = if count <= EVALUATOR_FINDINGS_CAP {
+        (trimmed.to_string(), false)
     } else {
         cap_findings(trimmed)
     };
@@ -4086,8 +4089,10 @@ fn is_rule_na_line(line: &str) -> bool {
 /// kept whole. The rest fills what is left of the cap: other lines from the end (one that does not
 /// fit is tail-trimmed into the room left, the old elision), then rule `N/A` lines from the end.
 /// Lines keep their order, and a note where the first cut line was names what was cut. The
-/// findings pass the cap only when the ITEM and verdict lines alone do: no item verdict is lost.
-fn cap_findings(trimmed: &str) -> String {
+/// findings pass the cap only when the ITEM and verdict lines, with that one note line, do: no
+/// item verdict is lost. Answers whether any line was cut (none is when only ITEM and verdict lines
+/// pass the cap).
+fn cap_findings(trimmed: &str) -> (String, bool) {
     #[derive(Clone, Copy, PartialEq)]
     enum Class {
         Keep,
@@ -4112,6 +4117,7 @@ fn cap_findings(trimmed: &str) -> String {
     let size = |l: &str| l.chars().count() + 1;
     let mut shown: Vec<Option<String>> = vec![None; lines.len()];
     let mut room = EVALUATOR_FINDINGS_CAP.saturating_sub(FINDINGS_NOTE_RESERVE);
+    let mut tail_cut = false;
     for (i, l) in lines.iter().enumerate() {
         if class[i] == Class::Keep {
             shown[i] = Some((*l).to_string());
@@ -4129,6 +4135,7 @@ fn cap_findings(trimmed: &str) -> String {
             let n = l.chars().count();
             let tail: String = l.chars().skip(n - (room - 2)).collect();
             shown[i] = Some(format!("…{tail}"));
+            tail_cut = true;
             room = 0;
         }
         break;
@@ -4170,7 +4177,7 @@ fn cap_findings(trimmed: &str) -> String {
         }
         out.extend(s);
     }
-    out.join("\n")
+    (out.join("\n"), note.is_some() || tail_cut)
 }
 
 /// Parse the reviewer's verdict FAIL-CLOSED (core#128). Keyword-FREE lines (CLI warning banners,
