@@ -14,7 +14,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.16.0** — 2026-11-26 — minor release on the train-16 cut f413ba88, carrying 12 PRs since 0.15.51: #1968, #1966, #1967, #1963, #1978, #1976, #1984, #1983, #1969, #1951, #1982, #1987. The engine's domain CLI loses commands and flags (J6 C3, core#1951, below), so this is a minor version.
+- **core-ts 0.16.0** — 2026-11-26 — minor release on the train-16 cut f413ba88, carrying 12 PRs since 0.15.51: #1968, #1966, #1967, #1963, #1978, #1976, #1984, #1983, #1969, #1951, #1982, #1987. The engine's domain CLI loses commands and flags (J6 C3, core#1951, below), so this is a minor version. It builds on wicked-estate 0.36.2 (estate#642: `memory.learn` honours its scope and tier).
   The entries below were written from each PR's changelog entry (the PR title or body where it had none).
 
   - **The requirements minimum is gone from the engine** (core#1924, J6 C3; phase 2 after crew#1930 and studio#1434).
