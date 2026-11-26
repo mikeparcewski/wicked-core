@@ -515,6 +515,8 @@ pub(crate) enum Command {
         /// (codex r1 on #1990) The bases the caller's host admits for the role (a monitor's): the
         /// reservation takes only these. Empty: any usable base.
         bases: Vec<String>,
+        /// (core#1999) When the asker stops waiting for the reply: past it, nothing is reserved.
+        give_up: std::time::Instant,
         reply: std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
     },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before

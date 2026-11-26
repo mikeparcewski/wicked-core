@@ -1063,7 +1063,7 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     let s = held_high(true);
     assert_eq!(
         convened_findings(&s.rows),
-        std::collections::HashSet::from([fid(1)])
+        std::collections::HashMap::from([(fid(1), vec!["codex".to_string()])])
     );
     let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
     let d = l.findings[0]
@@ -1071,7 +1071,11 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
         .as_ref()
         .expect("a no-verdict dispute");
     assert_eq!(d.reason, Some(NoVerdictReason::Timeout));
-    assert_eq!(serde_json::to_value(d).unwrap(), no_verdict("timeout"));
+    // (core#1997) A council that started names who sat, as its ruling would have.
+    let mut want = no_verdict("timeout");
+    want["seats"] = json!(["codex"]);
+    want["independence"] = json!("independent");
+    assert_eq!(serde_json::to_value(d).unwrap(), want);
     // A `council.convened` of another attempt does not count for this one.
     let mut s = held_high(false);
     s.convened(1);
