@@ -1627,6 +1627,10 @@ impl crate::team::MonitorHost for RunnerHost {
     fn one_shot(&self) -> bool {
         true
     }
+    /// (core#1952) The registry record's display name, read as a member's seat is.
+    fn display_name(&self, seat: &str) -> Option<String> {
+        registry_record(seat).map(|c| c.display_name)
+    }
     /// A turn handed a view gets that tree as a read-only directory in its seat container
     /// ([`MemberView`]).
     fn repo_view(&self) -> bool {
