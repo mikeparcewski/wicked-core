@@ -638,6 +638,101 @@ fn the_live_record_policy_holds_in_the_model_and_the_coverage_report() {
     assert_eq!(stale.resolved + 1, fresh.resolved);
 }
 
+/// The governance coverage report on fixture `f`'s store, judged against its checkout.
+fn coverage(f: &Fixture) -> wicked_governance::CoverageReport {
+    let cfg = wicked_governance::CoverageConfig {
+        repo_root: Some(f.tree.clone()),
+        ..Default::default()
+    };
+    wicked_governance::recompute_front_half_coverage_with(&open(f), &cfg).unwrap()
+}
+
+fn unaccounted_in(r: &wicked_governance::CoverageReport, sym: &str) -> bool {
+    r.unaccounted_nodes.iter().any(|n| n.symbol_id == sym)
+}
+
+/// An old-loop rule on MAIN-PARA, as the old loop wrote one (no contract, its confidence in the
+/// column; `Annotation::new` as the old loop did).
+fn add_old_loop_rule(f: &Fixture) {
+    let mut store = open(f);
+    store
+        .annotate(
+            &wicked_apps_core::SymbolId::from(MAIN_PARA),
+            wicked_estate_core::Annotation::new("business_rule", "r", "amount > 0")
+                .with_confidence(0.9),
+        )
+        .unwrap();
+}
+
+/// (core#1955 R2-2, codex round 1) A store stays a v3 store when every v3 row in it is retired (a
+/// run that found no rules retires them all): an old-loop rule there is still not counted, as the
+/// model skips it. Fails when "a v3 store" means "a store with a live v3 row".
+#[test]
+fn an_old_loop_rule_is_not_counted_once_every_v3_row_is_retired() {
+    let f = fixture("mini-cobol", "all-retired");
+    let mut store = open(&f);
+    for ty in [
+        "business_rule",
+        "domain_target",
+        "rule_group",
+        "domain_followup",
+    ] {
+        // garden's tombstone shape (store.py:373-379) over every row of every v3 type.
+        for (sym, a) in store.annotations_by_type(ty).unwrap() {
+            store
+                .annotate(
+                    &sym,
+                    wicked_estate_core::Annotation::new(
+                        ty,
+                        a.key,
+                        json!({"status": "retired"}).to_string(),
+                    ),
+                )
+                .unwrap();
+        }
+    }
+    drop(store);
+    add_old_loop_rule(&f);
+    let idx = ExtractIndex::load(&open(&f), Some(&f.tree)).unwrap();
+    assert!(idx.is_empty(), "no live v3 row is left");
+    assert_eq!(
+        build(&f)["metadata"]["skipped"]["old_loop"],
+        1,
+        "the model skips it"
+    );
+    assert!(
+        unaccounted_in(&coverage(&f), MAIN_PARA),
+        "the report skips it too"
+    );
+}
+
+/// (core#1955 R2-2) A store the old loop alone wrote counts its rules the 1.1.0 way (its stored
+/// 1.1.0 graph keeps its label) until a 1.2.0 build is persisted over it. From then on the report
+/// follows that model, which skips them. The store is the fixture's indexed nodes with no row.
+#[test]
+fn an_old_loop_store_counts_the_old_way_until_a_1_2_0_build_is_persisted() {
+    let f = fixture("mini-cobol", "old-loop-only");
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .execute_batch("DELETE FROM annotations")
+        .unwrap();
+    add_old_loop_rule(&f);
+    let before = coverage(&f);
+    assert!(
+        !unaccounted_in(&before, MAIN_PARA),
+        "the old loop's rule counts"
+    );
+    let mut store = open(&f);
+    build_and_persist(&mut store, &f.tree, 9).unwrap();
+    drop(store);
+    let after = coverage(&f);
+    assert!(
+        unaccounted_in(&after, MAIN_PARA),
+        "the 1.2.0 model skips it, and so does the report"
+    );
+    assert_eq!(after.resolved + 1, before.resolved);
+}
+
 /// (core#1955 R2-1(d)) A build that another build overtakes is refused at the persist, and writes
 /// nothing: A is assembled (its ids numbered against the store's build), B builds and commits, then
 /// A's persist is refused and the store still holds B's model at B's generation. Fails without the
