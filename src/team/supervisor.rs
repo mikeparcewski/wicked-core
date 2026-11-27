@@ -258,6 +258,14 @@ impl ActorCouncil {
         // (codex r2 on #1990) The ask may have run the budget out (a slow engine): no council
         // starts that its caller can no longer wait for (the slot is released at once).
         if Instant::now() >= deadline {
+            // (core#2015) Its stand-ins, if any, will run nothing: they are let go.
+            if !stood.is_empty() {
+                let _ = self.tx.send(crate::command::Command::AbandonStandIns {
+                    run_id: req.session_id.clone(),
+                    seated: stood,
+                    pending: None,
+                });
+            }
             return CouncilOutcome::NotConvened(not_convened::NOT_STARTED.into());
         }
         let clis = if !stood.is_empty() {
@@ -343,8 +351,21 @@ pub(crate) fn reserve_stand_ins(
     {
         return Vec::new();
     }
-    rx.recv_timeout(give_up.saturating_duration_since(Instant::now()))
-        .unwrap_or_default()
+    match rx.recv_timeout(give_up.saturating_duration_since(Instant::now())) {
+        Ok(seated) => seated,
+        // (core#2015) Stopped waiting: the receiver goes to the engine, which runs commands in
+        // order, so by then it holds whatever this ask reserved, and that is let go. Dropping it
+        // here instead could still take a reply sent in the instant before the drop.
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = tx.send(crate::command::Command::AbandonStandIns {
+                run_id: run_id.to_string(),
+                seated: Vec::new(),
+                pending: Some(rx),
+            });
+            Vec::new()
+        }
+        Err(RecvTimeoutError::Disconnected) => Vec::new(),
+    }
 }
 
 /// (core#1289) The seats a team council may draw from `roster`, each party in `excluded`

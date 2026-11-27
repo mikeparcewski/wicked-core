@@ -3751,21 +3751,16 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
 fn a_stand_in_ask_its_asker_stopped_waiting_for_is_let_go_2015() {
     let (tx, rx) = channel();
     let engine = std::thread::spawn(move || {
-        let scope = match rx.recv_timeout(Duration::from_secs(10)) {
+        // The engine holds its reply until the asker has let the ask go (codex r1: no timing
+        // margin), then writes it: the receiver it got must still take it.
+        let (role, need, scope, reply) = match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(crate::command::Command::ReserveStandIns {
                 role,
                 need,
                 scope,
-                give_up,
                 reply,
                 ..
-            }) => {
-                // The reservation is written after the asker gave up.
-                std::thread::sleep(give_up.saturating_duration_since(Instant::now()));
-                std::thread::sleep(Duration::from_millis(200));
-                let _ = reply.send(reserved_on("claude", role, need, &scope));
-                scope
-            }
+            }) => (role, need, scope, reply),
             _ => return None,
         };
         match rx.recv_timeout(Duration::from_secs(10)) {
@@ -3774,6 +3769,7 @@ fn a_stand_in_ask_its_asker_stopped_waiting_for_is_let_go_2015() {
                 seated,
                 pending,
             }) => {
+                reply.send(reserved_on("claude", role, need, &scope)).ok()?;
                 let late = pending.and_then(|p| p.try_recv().ok()).unwrap_or_default();
                 Some((run_id, seated.len(), late, scope))
             }

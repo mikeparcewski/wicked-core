@@ -524,7 +524,6 @@ pub(crate) enum Command {
     /// holds (the reply of an ask its asker stopped waiting for), is left `failed` and
     /// `abandoned` on the run's record. Commands run in order, so `pending` already holds the
     /// reply of the `ReserveStandIns` sent before this, if that ask reserved any.
-    #[allow(dead_code)] // red scaffold: nothing sends it yet (core#2015)
     AbandonStandIns {
         run_id: String,
         seated: Vec<crate::standin::SeatedStandIn>,

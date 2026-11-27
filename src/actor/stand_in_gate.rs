@@ -516,6 +516,7 @@ fn abandon_team(
         });
         if ours && b.state == crate::standin::STATE_SEATED {
             b.state = crate::standin::STATE_FAILED.to_string();
+            b.abandoned = true;
             changed = true;
         }
     }
