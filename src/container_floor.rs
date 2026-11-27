@@ -4048,12 +4048,20 @@ pub fn seat_image_repo(
     })
 }
 
-/// (core#2024) `seat-image`'s `--repo <id>` and `--db <path>` taken out of `args`: the repo id,
-/// the store path, then the other arguments. `--repo` with `--layers` is refused (a repo's layers
-/// are its own), as is a flag with no value.
-pub fn seat_image_repo_args(
-    args: &[String],
-) -> Result<(Option<String>, Option<String>, Vec<String>), String> {
+/// (core#2024) What [`seat_image_repo_args`] took out of `seat-image`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatImageArgs {
+    /// `--repo <id>`.
+    pub repo: Option<String>,
+    /// `--db <path>`: the engine's store.
+    pub db: Option<String>,
+    /// Every other argument, in order.
+    pub rest: Vec<String>,
+}
+
+/// (core#2024) `seat-image`'s `--repo <id>` and `--db <path>` taken out of `args`. `--repo` with
+/// `--layers` is refused (a repo's layers are its own), as is a flag with no value.
+pub fn seat_image_repo_args(args: &[String]) -> Result<SeatImageArgs, String> {
     let mut repo = None;
     let mut db = None;
     let mut rest = Vec::new();
@@ -4091,7 +4099,7 @@ pub fn seat_image_repo_args(
     if repo.is_none() && db.is_some() {
         return Err("--db is read only with --repo".into());
     }
-    Ok((repo, db, rest))
+    Ok(SeatImageArgs { repo, db, rest })
 }
 
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images
@@ -7907,7 +7915,7 @@ esac
     #[test]
     fn seat_image_repo_args_take_the_repo_and_the_store_2024() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let (repo, db, rest) = seat_image_repo_args(&a(&[
+        let SeatImageArgs { repo, db, rest } = seat_image_repo_args(&a(&[
             "build",
             "--repo",
             "acme",
@@ -7919,12 +7927,13 @@ esac
         assert_eq!(repo.as_deref(), Some("acme"));
         assert_eq!(db.as_deref(), Some("/s/core.db"));
         assert_eq!(rest, a(&["build", "codex"]));
-        let (repo, db, rest) =
+        let SeatImageArgs { repo, db, rest } =
             seat_image_repo_args(&a(&["status", "--repo=acme", "--json"])).unwrap();
         assert_eq!(repo.as_deref(), Some("acme"));
         assert_eq!(db, None);
         assert_eq!(rest, a(&["status", "--json"]));
-        let (repo, _, rest) = seat_image_repo_args(&a(&["build", "--layers", "go"])).unwrap();
+        let SeatImageArgs { repo, rest, .. } =
+            seat_image_repo_args(&a(&["build", "--layers", "go"])).unwrap();
         assert_eq!(repo, None);
         assert_eq!(rest, a(&["build", "--layers", "go"]));
         for bad in [

@@ -275,7 +275,7 @@ pub use code_graph::{
 pub use command::InjectTarget;
 pub use container_floor::{
     default_seat_floor, seat_image_main, seat_image_main_for, seat_image_repo,
-    seat_image_repo_args, SeatImageRepo,
+    seat_image_repo_args, SeatImageArgs, SeatImageRepo,
 };
 pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};

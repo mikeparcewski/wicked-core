@@ -377,13 +377,14 @@ fn main() {
         if handled_help("seat-image", &args) {
             return;
         }
-        let (repo, db, rest) = match wicked_core::seat_image_repo_args(&args[2..]) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("wicked-core seat-image: {e}");
-                std::process::exit(2);
-            }
-        };
+        let wicked_core::SeatImageArgs { repo, db, rest } =
+            match wicked_core::seat_image_repo_args(&args[2..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("wicked-core seat-image: {e}");
+                    std::process::exit(2);
+                }
+            };
         let Some(repo) = repo else {
             std::process::exit(wicked_core::seat_image_main(&rest));
         };
