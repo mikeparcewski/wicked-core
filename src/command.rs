@@ -799,6 +799,7 @@ impl Command {
             Command::RegisterRepo { .. } => "RegisterRepo",
             Command::UnregisterRepo { .. } => "UnregisterRepo",
             Command::SetRepoSeatLayersOff { .. } => "SetRepoSeatLayersOff",
+            Command::SetRepoSeatBaseImage { .. } => "SetRepoSeatBaseImage",
             Command::ListRepos { .. } => "ListRepos",
             Command::ProjectCreate { .. } => "ProjectCreate",
             Command::ProjectUpdate { .. } => "ProjectUpdate",
