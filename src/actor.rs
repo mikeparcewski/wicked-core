@@ -35377,6 +35377,75 @@ mod request_changes_tests {
         );
     }
 
+    /// (core#2029) PARTIAL FAILURE: accepting the evaluator's suggestion applies it to the worktree
+    /// before the answer commits. When the rewind's writes then fail, the gate re-opens AND the
+    /// worktree goes back to the tree the gate reviewed: the suggestion is not left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_accept_suggestion_leaves_the_reviewed_tree_2029() {
+        let wt = crate::worktree_guard::tests::creator_worktree("accept-fails-2029");
+        let repo = wt.parent().unwrap().join("repo");
+        let before = crate::worktree_guard::snapshot(&wt, &repo).unwrap();
+        std::fs::write(wt.join("src/a.ts"), "export const a = 3; // evaluator\n").unwrap();
+        std::fs::write(wt.join("src/c.ts"), "export const c = 1;\n").unwrap();
+        let mut m = crate::worktree_guard::compare(&wt, &before)
+            .unwrap()
+            .expect("the evaluator changed the tree");
+        crate::worktree_guard::restore_creator_tree(
+            &wt,
+            &mut m,
+            Some("refs/wicked/suggestions/accept-fails-2029/4/0"),
+        )
+        .expect("the guard restores the creator's tree");
+        assert!(m.restored && m.suggestion_ref.is_some());
+        let reviewed = std::fs::read_to_string(wt.join("src/a.ts")).unwrap();
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "accept-suggestion-fails";
+        park_send_back_gate(&mut store, run_id);
+        let mut session = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        session.workdir = Some(wt.to_string_lossy().into_owned());
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, run_id).unwrap();
+        units[3].denial = Some(crate::domain::UnitDenial::new(
+            "worktree_guard",
+            "the evaluator edited",
+        ));
+        units[3].worktree_mutation = Some(m);
+        put_node(&mut store, units[3].to_node()).unwrap();
+
+        let mut failing = send_back_commit_store::SendBackStore {
+            inner: &mut store,
+            run_id,
+            commits: Vec::new(),
+            fail_rewind: true,
+        };
+        let (r, _) = answer(&mut failing, run_id, HumanDecision::AcceptSuggestion);
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("disk I/O error"), "{err}");
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate is open again");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            reviewed,
+            "the suggestion's edit is not left in the worktree"
+        );
+        assert!(
+            !wt.join("src/c.ts").exists(),
+            "the suggestion's added file is not left in the worktree"
+        );
+        assert_eq!(
+            crate::worktree_guard::snapshot(&wt, &repo).unwrap().tree,
+            before.tree,
+            "the worktree holds the tree the gate reviewed"
+        );
+    }
+
     /// (core#1313) The first answer commit contains the row AND its redo state; nested
     /// domain batches must not expose an answered row before the redo is reserved.
     #[test]
