@@ -647,11 +647,32 @@ impl Drop for ProbationGuard<'_> {
     }
 }
 
+/// (core#1998) The key a seat's HEALTH is kept under: its credential. A stand-in ballot
+/// (`claude~1`) runs on its base's login, so its bench, probation and failure streak are the
+/// base's (`claude`): a fresh binding never skips the base's probation, and its failures re-bench
+/// the base. A real seat key is its own credential.
+fn health_key(key: &str) -> String {
+    wicked_apps_core::spawn::seat_id::credential(key).to_string()
+}
+
+/// (core#1996) What a ballot's environment pins beyond its seat configuration: a STAND-IN claude
+/// ballot runs with auto-memory off (reads and writes), as a stand-in governed unit does, so it
+/// never loads or writes its base's memory. A real seat's ballot is unchanged.
+fn stand_in_ballot_env(program: &str, key: &str) -> Vec<(&'static str, &'static str)> {
+    if wicked_apps_core::spawn::seat_id::is_stand_in(key)
+        && wicked_apps_core::spawn::binary_is_claude(program)
+    {
+        vec![(wicked_apps_core::spawn::CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]
+    } else {
+        Vec::new()
+    }
+}
+
 impl RealDispatcher {
     /// The health gate at the top of every dispatch.
     fn seat_gate(&self, cli: &AgenticCli) -> GateDecision {
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
-        let health = seats.entry(cli.key.clone()).or_default();
+        let health = seats.entry(health_key(&cli.key)).or_default();
         match *health {
             SeatHealth::Healthy { .. } => GateDecision::Dispatch,
             SeatHealth::Benched { until, backoff } => {
@@ -701,7 +722,7 @@ impl RealDispatcher {
         // ranking can never disagree about what a hollow return was.
         let usable = outcome.is_usable_vote();
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
-        let health = seats.entry(cli.key.clone()).or_default();
+        let health = seats.entry(health_key(&cli.key)).or_default();
         if usable {
             *health = SeatHealth::default();
             return;
@@ -807,7 +828,7 @@ impl RealDispatcher {
     /// NEXT dispatch becomes the probationary ballot instead.
     fn reopen_probation(&self, cli: &AgenticCli) {
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(health) = seats.get_mut(&cli.key) {
+        if let Some(health) = seats.get_mut(&health_key(&cli.key)) {
             if let SeatHealth::Probation { backoff } = *health {
                 *health = SeatHealth::Benched {
                     until: Instant::now(),
@@ -1076,7 +1097,7 @@ impl RealDispatcher {
 impl Dispatcher for RealDispatcher {
     fn seat_benched(&self, key: &str) -> bool {
         let seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
-        match seats.get(key) {
+        match seats.get(&health_key(key)) {
             Some(SeatHealth::Benched { until, .. }) => Instant::now() < *until,
             Some(SeatHealth::Probation { .. }) => true,
             _ => false,
@@ -1291,6 +1312,9 @@ fn run_in_isolation(
     // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear to a
     // known slate, then set exactly what this path intends (and strip the foreign seats').
     seat_config.apply(&mut command);
+    for (k, v) in stand_in_ballot_env(program, &cli.key) {
+        command.env(k, v);
+    }
 
     // Give the seat its own process group so the timeout path can signal the whole tree. Without
     // this, killing a CLI that shelled out leaves the grandchild alive and holding our pipes.
@@ -3297,6 +3321,62 @@ mod failure_diagnostics_tests {
     }
 
     // AC-2 — load-induced timeout must not advance the bench streak (#537)
+
+    /// core#1998: a stand-in ballot's health is its base credential's. After the base's bench
+    /// expires, exactly one ballot (real or stand-in) is the probation; a fresh binding abstains
+    /// while it is in flight, and a failed stand-in ballot re-benches the base.
+    #[test]
+    fn a_stand_in_ballot_shares_its_base_credentials_health_1998() {
+        let d = RealDispatcher::default();
+        let base = shell_seat("claude", "true");
+        let first = shell_seat("claude~1", "true");
+        let second = shell_seat("claude~2", "true");
+        d.seats.lock().unwrap().insert(
+            "claude".into(),
+            SeatHealth::Benched {
+                until: Instant::now(),
+                backoff: Duration::from_secs(1),
+            },
+        );
+        assert!(matches!(d.seat_gate(&first), GateDecision::Probe));
+        assert!(matches!(d.seat_gate(&second), GateDecision::Abstain(_)));
+        assert!(matches!(d.seat_gate(&base), GateDecision::Abstain(_)));
+        assert!(
+            d.seat_benched("claude~2"),
+            "the base's probation benches every binding"
+        );
+        d.record_seat_outcome(
+            &first,
+            &DispatchOutcome::Failed(SeatFailure::new(SeatFailureKind::NonZeroExit, "x")),
+            false,
+        );
+        let seats = d.seats.lock().unwrap();
+        assert!(
+            matches!(seats.get("claude"), Some(SeatHealth::Benched { .. })),
+            "the failed probation re-benches the base: {:?}",
+            seats.get("claude")
+        );
+        assert!(
+            !seats.contains_key("claude~1"),
+            "no health is kept under a binding key"
+        );
+    }
+
+    /// core#1996: a stand-in claude ballot runs with auto-memory off; a real claude ballot and a
+    /// stand-in on another CLI are unchanged.
+    #[test]
+    fn a_stand_in_claude_ballot_pins_auto_memory_off_1996() {
+        assert_eq!(
+            stand_in_ballot_env("claude", "claude~1"),
+            vec![(wicked_apps_core::spawn::CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]
+        );
+        assert_eq!(
+            stand_in_ballot_env("/usr/local/bin/claude", "claude#2~1"),
+            vec![(wicked_apps_core::spawn::CLAUDE_DISABLE_AUTO_MEMORY_ENV, "1")]
+        );
+        assert!(stand_in_ballot_env("claude", "claude").is_empty());
+        assert!(stand_in_ballot_env("codex", "codex~1").is_empty());
+    }
 
     #[test]
     fn a_timeout_under_load_does_not_bench_a_healthy_seat() {

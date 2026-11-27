@@ -385,7 +385,24 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         Some(entry) => (entry.graph_key, entry.seat_layers_off),
         None => (crate::code_graph::mint_repo_graph_key(&id), Vec::new()),
     };
-    let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
+    let (code_graph_db, mut findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
+    // (core#2001) Once, at registration: a partial clone whose recent history a seat cannot copy
+    // is warned about here, and refused at each container-floor run start. Registration still
+    // succeeds (the floor can change, and a fetch can fill the objects).
+    if let Some(gap) = git(&root_path, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|(ok, _, _)| *ok)
+        .and_then(|(_, head, _)| partial_clone_gap(Path::new(&root_path), &head))
+    {
+        findings.push(RepoFinding {
+            code: FINDING_PARTIAL_CLONE_GAP.to_string(),
+            message: format!(
+                "{gap}; a run on the container floor is refused at its start until they are: {}",
+                crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+            ),
+            path: None,
+        });
+    }
     let seat_layers = seat_layer_rows(&root_path, &seat_layers_off);
     let entry = RepoEntry {
         id,
@@ -1153,6 +1170,79 @@ fn git_run(
             Err(_) => return None,
         }
     }
+}
+
+/// (core#2001) The repo-card finding a registration adds when its checkout is a partial clone
+/// whose recent history the engine cannot copy into a seat ([`partial_clone_gap`]).
+pub const FINDING_PARTIAL_CLONE_GAP: &str = "partial_clone_gap";
+
+/// (core#2001, core#1667) Whether the checkout at `tree` is a partial clone (a remote marked
+/// promisor, or `extensions.partialClone`) missing objects of the last
+/// [`crate::k8s::seat::REPLICA_DEPTH`] commits from `sha`. The engine never fetches them lazily
+/// (`GIT_NO_LAZY_FETCH`), so a seat's copy of that history cannot be made. `Some` names the
+/// promisor remote, the count and the first missing object. `None` for a complete clone, a
+/// partial clone with those objects present, or a git that cannot answer.
+pub(crate) fn partial_clone_gap(tree: &Path, sha: &str) -> Option<String> {
+    let bounded = |args: &[&str]| {
+        let mut c = crate::k8s::sync::git(tree);
+        c.args(args).env("GIT_NO_LAZY_FETCH", "1");
+        crate::k8s::run_capped(c, None, crate::k8s::seat::GIT_CALL, 64 << 20)
+    };
+    let promisor = bounded(&["config", "--get-regexp", r"^remote\..*\.promisor$"]);
+    let remote = if promisor.ok() {
+        String::from_utf8_lossy(&promisor.stdout)
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let key = fields.next()?;
+                if !fields.next()?.eq_ignore_ascii_case("true") {
+                    return None;
+                }
+                key.strip_prefix("remote.")?
+                    .strip_suffix(".promisor")
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    }
+    .or_else(|| {
+        let partial = bounded(&["config", "--get", "extensions.partialClone"]);
+        partial
+            .ok()
+            .then(|| String::from_utf8_lossy(&partial.stdout).trim().to_string())
+            .filter(|name| !name.is_empty())
+    })?;
+    let depth = crate::k8s::seat::REPLICA_DEPTH;
+    let objects = bounded(&["rev-list", "--objects", "--missing=print", "-n", depth, sha]);
+    if !objects.ok() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&objects.stdout);
+    let mut missing = stdout.lines().filter_map(|line| line.strip_prefix('?'));
+    let first = missing.next()?;
+    let count = 1 + missing.count();
+    Some(format!(
+        "the repository is a partial clone (promisor remote `{remote}`) and {count} object(s) of \
+         its last {depth} commits were never fetched (first {first})"
+    ))
+}
+
+/// (core#2001) The refusal a run start gives, before the first dispatch, when the container floor
+/// would copy a partial clone's missing history into a seat: the floor's remedy and the gap.
+/// `None` off the container floor, where no seat replica is made.
+pub(crate) fn partial_clone_start_refusal(
+    root: &Path,
+    commit: &str,
+    container: bool,
+) -> Option<String> {
+    if !container {
+        return None;
+    }
+    let gap = partial_clone_gap(root, commit)?;
+    Some(format!(
+        "the run did not start: {} ({gap})",
+        crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+    ))
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
@@ -4350,6 +4440,157 @@ mod tests {
     /// symlink meaning, so it would not falsify there.) We assert equality to `absolute(root)`, NOT to
     /// `canonicalize`: the fix must not resolve symlinks (canonicalize breaks `git worktree add` on
     /// Windows via `\?\` and rewrites `/var`→`/private/var` on macOS — see the fn's doc comment).
+    /// (core#2001) A real partial clone (`git clone --filter=blob:none` of a local repo), its source
+    /// then removed so the missing blobs cannot be fetched: `(source, clone, head)`.
+    #[cfg(unix)]
+    fn partial_clone_2001(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let host = std::env::temp_dir().join(format!(
+            "wicked-2001-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        rm_repo(&host);
+        let source = host.join("source");
+        let part = host.join("partial");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |dir: &Path, args: &[&str]| -> String {
+            let out = crate::k8s::sync::git(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&source, &["init", "-q", "-b", "main"]);
+        for content in ["one", "two", "three"] {
+            std::fs::write(source.join("file.txt"), content).unwrap();
+            git(&source, &["add", "file.txt"]);
+            git(&source, &["commit", "-q", "-m", content]);
+        }
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        git(
+            &host,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                "--no-local",
+                "--filter=blob:none",
+                &format!("file://{}", source.display()),
+                part.to_str().unwrap(),
+            ],
+        );
+        let head = git(&part, &["rev-parse", "HEAD"]);
+        (source, part, head)
+    }
+
+    /// (core#2001) A partial clone whose last commits lack objects the remote can no longer give is
+    /// refused at run start on the container floor, before any step, with the remedy and the gap;
+    /// its registration succeeds with a `partial_clone_gap` warning on the repo card.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_clone_missing_history_is_refused_at_start_and_warned_at_registration_2001() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (source, part, head) = partial_clone_2001("missing");
+        std::fs::remove_dir_all(&source).unwrap();
+        let why = partial_clone_start_refusal(&part, &head, true).expect("the start is refused");
+        assert!(why.contains("partial clone"), "{why}");
+        assert!(why.contains("--refetch"), "the remedy is named: {why}");
+        assert!(why.contains("promisor remote `origin`"), "{why}");
+        assert!(why.contains("never fetched"), "{why}");
+        assert_eq!(
+            partial_clone_start_refusal(&part, &head, false),
+            None,
+            "off the container floor the run starts as today"
+        );
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Partial 2001".into(),
+                root_path: part.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .expect("registration still succeeds");
+        let finding = entry
+            .findings
+            .iter()
+            .find(|f| f.code == FINDING_PARTIAL_CLONE_GAP)
+            .expect("registration warns");
+        assert!(finding.message.contains("--refetch"), "{}", finding.message);
+        rm_repo(part.parent().unwrap());
+    }
+
+    /// (core#2001) A complete clone, and a partial clone whose objects were all fetched, start and
+    /// register as today: no refusal, no warning.
+    #[cfg(unix)]
+    #[test]
+    fn a_complete_clone_starts_and_registers_without_a_partial_clone_note_2001() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_, part, head) = partial_clone_2001("fetched");
+        for args in [
+            &["config", "--unset", "remote.origin.partialclonefilter"][..],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "-q",
+                "--refetch",
+                "origin",
+            ][..],
+        ] {
+            let out = crate::k8s::sync::git(&part).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let full = git_repo("full-2001");
+        let full_head = git(full.to_str().unwrap(), &["rev-parse", "HEAD"])
+            .unwrap()
+            .1;
+        for (root, commit) in [(&part, &head), (&full, &full_head)] {
+            assert_eq!(
+                partial_clone_start_refusal(root, commit, true),
+                None,
+                "{}",
+                root.display()
+            );
+            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+            let entry = register_repo(
+                &mut store,
+                RepoSpec {
+                    name: "Complete 2001".into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                    registered_at: 0,
+                },
+            )
+            .unwrap();
+            assert!(
+                entry
+                    .findings
+                    .iter()
+                    .all(|f| f.code != FINDING_PARTIAL_CLONE_GAP),
+                "{}",
+                root.display()
+            );
+        }
+        rm_repo(part.parent().unwrap());
+        rm_repo(&full);
+    }
+
     #[test]
     fn register_repo_stores_an_absolute_normalised_root() {
         // Read side of the repo-graph-root env lock: a fresh repo's code_graph_db resolves through

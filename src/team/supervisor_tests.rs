@@ -3693,8 +3693,8 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     };
     let engine = std::thread::spawn({
         let path = path.clone();
-        move || match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(crate::command::Command::ConveneDecision {
+        move || match convene_cmd(&rx) {
+            Some(crate::command::Command::ConveneDecision {
                 clis, lock, reply, ..
             }) => {
                 let busy = matches!(
@@ -3743,6 +3743,61 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// codex r2 on #1990: the council's stand-in ask can run the budget out on a slow engine. Then no
+/// council starts: the outcome is `NotConvened`, the engine is never handed a council its caller
+/// stopped waiting for, and the host slot is free at once.
+#[test]
+fn a_stand_in_ask_that_spends_the_budget_starts_no_council_1972() {
+    let path = slot_path("ask-late");
+    let (tx, rx) = channel();
+    let council = ActorCouncil {
+        tx,
+        lock_path: path.clone(),
+    };
+    let engine = std::thread::spawn(move || {
+        let mut convened = false;
+        while let Ok(cmd) = rx.recv_timeout(Duration::from_secs(2)) {
+            match cmd {
+                crate::command::Command::ReserveStandIns { reply, .. } => {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = reply.send(Vec::new());
+                }
+                crate::command::Command::ConveneDecision { .. } => convened = true,
+                _ => {}
+            }
+        }
+        convened
+    });
+    let out = council.convene_from(
+        vec![
+            builtin_seat("claude"),
+            builtin_seat("codex"),
+            builtin_seat("pi"),
+        ],
+        council_request(),
+        &["claude#1".to_string()],
+        Duration::from_millis(300),
+        &mut |_: &[String]| {},
+    );
+    assert!(
+        matches!(&out, CouncilOutcome::NotConvened(w) if w == not_convened::NOT_STARTED),
+        "{out:?}"
+    );
+    assert!(
+        // A short wait, never zero: a test child forked elsewhere in this process can hold the
+        // descriptor for an instant before its exec closes it.
+        crate::cli_runner::HostCouncilLock::acquire_until(
+            &path,
+            Instant::now() + Duration::from_secs(2)
+        )
+        .is_ok(),
+        "the slot is free"
+    );
+    drop(council);
+    assert!(!engine.join().unwrap(), "no council reached the engine");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// core#1822 (T-R16): the engine reports the ballots starting before the ruling. A council whose
 /// ballots started and then ran past the budget is `TimedOut`, after `on_convened` heard its seats;
 /// one the engine never started within the budget is `NotConvened`, and `on_convened` never ran.
@@ -3757,8 +3812,8 @@ fn core_1822_a_council_times_out_only_after_its_ballots_started() {
         };
         // The stub engine takes the command, reports the ballots starting (or not), then never
         // rules; it keeps the reply sender until the convener has given up.
-        let engine = std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(crate::command::Command::ConveneDecision { reply, lock, .. }) => {
+        let engine = std::thread::spawn(move || match convene_cmd(&rx) {
+            Some(crate::command::Command::ConveneDecision { reply, lock, .. }) => {
                 if started {
                     let _ = reply.send(crate::command::CouncilReply::Convened(vec![
                         "codex".into(),
@@ -3900,4 +3955,275 @@ fn core_1822_a_council_whose_turn_comes_after_the_budget_is_not_convened() {
     let l = h.folded(3, 1);
     assert_eq!(l.final_pass, FinalPass::TimedOut, "{l:?}");
     assert!(l.team_pause, "{l:?}");
+}
+
+// ── DES-STANDIN-001 T-R7 / T-R10: team councils and monitors on stand-ins (core#1972, core#1973) ──
+
+/// `need` stand-ins for `role` on `base`, as the actor's reservation hands them back
+/// (`Command::ReserveStandIns`): fresh slots, one lens per position, each on the base's record
+/// re-keyed to its binding.
+fn reserved_on(
+    base: &str,
+    role: crate::standin::Role,
+    need: usize,
+    scope: &crate::standin::BindingScope,
+) -> Vec<crate::standin::SeatedStandIn> {
+    const LENSES: [&str; 3] = ["correctness", "security and safety", "user impact"];
+    (0..need)
+        .map(|i| {
+            let key = format!("{base}~{}", i + 1);
+            let binding = crate::standin::StandInBinding {
+                key: key.clone(),
+                base: base.to_string(),
+                role,
+                slot: u32::try_from(i + 1).unwrap(),
+                model: None,
+                builder_model: None,
+                lens: Some(LENSES[i % LENSES.len()].to_string()),
+                // (codex r1 on #1990) Scoped as the request asked, as `reserve_team` scopes it.
+                ord: scope.ord,
+                attempt: scope.attempt,
+                subject: scope.subject.clone(),
+                evidence: scope.evidence.clone(),
+                invocation: format!("inv-{i}"),
+                reason: crate::standin::Reason::OnlyOneHelper {
+                    cli: "Claude Code".into(),
+                },
+                state: crate::standin::STATE_SEATED.to_string(),
+                display: Some("Claude Code".into()),
+            };
+            let mut record = builtin_seat(base);
+            record.key = key;
+            let label = crate::standin::label(&binding, "Claude Code");
+            crate::standin::SeatedStandIn {
+                binding,
+                record,
+                label,
+            }
+        })
+        .collect()
+}
+
+/// core#1972 (T-R7): a team council on a one-CLI roster has no non-party seat. The council asks
+/// the engine for stand-ins (a council's size of them) and sits on the ones it reserved; with none
+/// reserved (no consent, a reduced run) it is `NoSeats` with today's words and the engine is
+/// never asked to convene.
+#[test]
+fn a_one_cli_team_council_sits_on_the_stand_ins_the_engine_reserved_1972() {
+    for consented in [true, false] {
+        let path = slot_path(if consented { "si-council" } else { "si-none" });
+        let (tx, rx) = channel();
+        let council = ActorCouncil {
+            tx,
+            lock_path: path.clone(),
+        };
+        let engine = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            let mut sat: Option<Vec<String>> = None;
+            while let Ok(cmd) = rx.recv_timeout(Duration::from_secs(30)) {
+                match cmd {
+                    crate::command::Command::ReserveStandIns {
+                        run_id,
+                        role,
+                        need,
+                        scope,
+                        reply,
+                        ..
+                    } => {
+                        asked.push((run_id, role, need, scope.ord));
+                        let _ = reply.send(if consented {
+                            reserved_on("claude", role, need, &scope)
+                        } else {
+                            Vec::new()
+                        });
+                    }
+                    crate::command::Command::ConveneDecision {
+                        clis, lock, reply, ..
+                    } => {
+                        sat = Some(clis.into_iter().map(|c| c.key).collect());
+                        drop(lock);
+                        let _ = reply.send(crate::command::CouncilReply::Ruled(Err(
+                            anyhow::anyhow!("stub engine"),
+                        )));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (asked, sat)
+        });
+        let out = council.convene_from(
+            vec![builtin_seat("claude")],
+            council_request(),
+            &["claude#1".to_string()],
+            Duration::from_secs(30),
+            &mut |_: &[String]| {},
+        );
+        drop(council);
+        let (asked, sat) = engine.join().unwrap();
+        let size = wicked_council::pick::council_size();
+        assert_eq!(
+            asked,
+            vec![(
+                "run-1289".to_string(),
+                crate::standin::Role::Council,
+                size,
+                Some(1)
+            )],
+            "the council asked the engine for its stand-ins"
+        );
+        if consented {
+            assert!(
+                matches!(&out, CouncilOutcome::Failed(e) if e.contains("stub engine")),
+                "{out:?}"
+            );
+            let want: Vec<String> = (1..=size).map(|i| format!("claude~{i}")).collect();
+            assert_eq!(sat, Some(want), "the council sat on the reserved stand-ins");
+        } else {
+            assert!(
+                matches!(&out, CouncilOutcome::NoSeats(w)
+                    if w.starts_with("no council seat is left after excluding the parties")),
+                "{out:?}"
+            );
+            assert_eq!(sat, None, "nothing convened without stand-ins");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The stub engine's next command past the council's stand-in ask (codex r1 on #1990: a team
+/// council asks the engine first, with the host slot held, and a run with a real seat left gets
+/// none): the ask is answered with no stand-ins.
+fn convene_cmd(
+    rx: &std::sync::mpsc::Receiver<crate::command::Command>,
+) -> Option<crate::command::Command> {
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(crate::command::Command::ReserveStandIns { reply, voters, .. }) => {
+                assert!(!voters.is_empty(), "the council hands its candidates");
+                let _ = reply.send(Vec::new());
+            }
+            Ok(cmd) => return Some(cmd),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// One `ReserveStandIns` the stub engine got: role, need, scope ord, scope attempt.
+type Reserved = (crate::standin::Role, usize, Option<u32>, Option<u32>);
+
+/// A supervisor config whose engine is a stub answering every `ReserveStandIns` with `seat` (or
+/// nothing), and the requests it got.
+fn stand_in_engine(
+    consented: bool,
+) -> (
+    Sender<crate::command::Command>,
+    std::thread::JoinHandle<Vec<Reserved>>,
+) {
+    let (tx, rx) = channel();
+    let engine = std::thread::spawn(move || {
+        let mut asked = Vec::new();
+        while let Ok(cmd) = rx.recv() {
+            if let crate::command::Command::ReserveStandIns {
+                role,
+                need,
+                scope,
+                reply,
+                ..
+            } = cmd
+            {
+                asked.push((role, need, scope.ord, scope.attempt));
+                let _ = reply.send(if consented {
+                    reserved_on("claude", role, need, &scope)
+                } else {
+                    Vec::new()
+                });
+            }
+        }
+        asked
+    });
+    (tx, engine)
+}
+
+/// core#1973 (T-R10): on a one-CLI roster the plan's monitor has no seat distinct from the PA. The
+/// supervisor asks the engine for a monitor stand-in for the attempt and seats it: joined as a
+/// stand-in (its label, never as an independent reviewer), opened on its binding key, and its turn
+/// opens with the stand-in preface and its lens. With none reserved the absent error stands, and a
+/// real distinct seat is seated without asking.
+#[test]
+fn a_one_cli_team_run_seats_a_stand_in_monitor_1973() {
+    for consented in [true, false] {
+        let (tx, engine) = stand_in_engine(consented);
+        let mut h = Harness::with(
+            if consented {
+                "si-monitor"
+            } else {
+                "si-monitor-none"
+            },
+            move |rig| SupervisorConfig {
+                engine: Some(tx.clone()),
+                ..sup_cfg(rig)
+            },
+            FakeCouncil::yes(),
+        );
+        h.start("claude", &["claude"], "20-39");
+        h.claim(3, 1, "claude");
+        h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+        h.checkpoint(3, 1, 1, "edit");
+        h.pump();
+        let joined = h.rows(tev::MEMBER_JOINED);
+        let opens = h.host.opens.lock().unwrap().clone();
+        let prompts = h.host.prompts_matching("");
+        drop(h);
+        let asked = engine.join().unwrap();
+        assert_eq!(
+            asked,
+            vec![(crate::standin::Role::Monitor, 1, Some(3), Some(1))],
+            "the supervisor asked for the one monitor the plan wants"
+        );
+        assert_eq!(joined.len(), 1, "{joined:#?}");
+        let j = &joined[0];
+        if consented {
+            assert_eq!(j["status"], "attached", "{j}");
+            assert_eq!(j["seat"], "claude~1");
+            let reason = j["reason"].as_str().unwrap();
+            assert!(reason.contains("stood in for the monitors"), "{reason}");
+            assert!(
+                opens.iter().any(|(_, seat)| seat == "claude~1"),
+                "{opens:?}"
+            );
+            assert!(!prompts.is_empty(), "the stand-in monitor took a turn");
+            assert!(
+                prompts[0].starts_with(&crate::standin::preface(Some("correctness"))),
+                "{}",
+                prompts[0]
+            );
+        } else {
+            assert_eq!(j["status"], "failed");
+            assert!(j["seat"].is_null(), "{j}");
+            assert!(opens.is_empty());
+        }
+    }
+    // A real distinct seat wins: no stand-in is asked for.
+    let (tx, engine) = stand_in_engine(true);
+    let mut h = Harness::with(
+        "si-monitor-real",
+        move |rig| SupervisorConfig {
+            engine: Some(tx.clone()),
+            ..sup_cfg(rig)
+        },
+        FakeCouncil::yes(),
+    );
+    h.start("claude", &["claude", "codex"], "20-39");
+    h.claim(3, 1, "claude");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    drop(h);
+    assert!(
+        engine.join().unwrap().is_empty(),
+        "a real seat needs no stand-in"
+    );
+    assert_eq!(joined[0]["seat"], "codex");
 }

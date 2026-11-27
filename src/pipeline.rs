@@ -1684,13 +1684,18 @@ pub(crate) fn apply_and_finish_unit(
                 .map(|b| (*k, b))
             }) {
                 let semantic = agent_verdict.and_then(|v| v.judge_cli.as_deref()) == Some(key);
-                if !semantic
-                    && !evidence
+                if !semantic {
+                    // (core#1985) Seated for the rules alone: the rule check's stand-in, recorded
+                    // as one (the delivery line lists the run's bindings by role; it read as a
+                    // second judge).
+                    b.role = crate::standin::Role::RuleJudge;
+                    if !evidence
                         .rule_check
                         .as_ref()
                         .is_some_and(|rc| rule_stand_in_ruled(rc, key))
-                {
-                    b.state = crate::standin::STATE_FAILED.to_string();
+                    {
+                        b.state = crate::standin::STATE_FAILED.to_string();
+                    }
                 }
                 confirmed = Some(key.to_string());
                 let display = b.display().to_string();
@@ -4461,27 +4466,22 @@ fn gate_receipt(
             },
         });
     }
-    if let Some(roles) = roles {
-        r.independence = a::independence_of(&roles);
+    if let Some(mut roles) = roles {
+        // (core#1997) The attempt's team roles are role records too: each council voter and each
+        // monitor its team ledger recorded.
+        if let Some(ledger) = unit.team.as_ref().and_then(|t| t.ledger.as_ref()) {
+            roles.extend(a::team_roles(
+                run,
+                unit.ord,
+                attempt,
+                &a::ledger_councils(ledger),
+                &ledger.monitors,
+            ));
+        }
+        r.independence = a::receipt_independence(&roles);
         if roles.iter().any(a::RoleRecord::is_stand_in) {
             r.stand_in_label = run.stand_in_label.clone();
-            // (DES-STANDIN-001 §5.1) THE WHOLE-RECEIPT CONSERVATIVE PROJECTION: once any stand-in
-            // took part, no reader on main may read an independent check off this receipt —
-            // neither instrument is `ran`, both seats are null, and a stronger skip a role already
-            // has stands (`skip` keeps the first).
-            let label = run.stand_in_label.clone().unwrap_or_default();
-            for (instrument, role) in [(a::DISTINCT_EVALUATOR, "review"), (a::JUDGE, "judge")] {
-                if r.ran.iter().any(|i| i == instrument) {
-                    r.ran.retain(|i| i != instrument);
-                    r.skip(
-                        instrument,
-                        a::SKIP_STAND_IN,
-                        Some(format!("{label} (the {role} itself was a real helper)")),
-                    );
-                }
-            }
-            r.evaluator = None;
-            r.judge = None;
+            r.project_stand_ins(&run.stand_in_label.clone().unwrap_or_default());
         }
         r.roles = Some(roles);
     }
@@ -8097,6 +8097,354 @@ mod guarded_read_step_tests {
             .denial(&recorded, None)
             .reason
             .contains("reassign it to a distinct signed-in seat"));
+    }
+
+    /// core#1997: a two-helper run whose evaluator and judge are real seats, but whose team
+    /// council seated stand-in voters (or a monitor ran on a stand-in binding), never reads
+    /// `independent`: the gate and the delivery read `mixed`, and their legacy projection drops the
+    /// independent checks, as for a stood-in role. Without a team stand-in both read independent.
+    #[test]
+    fn a_team_stand_in_makes_the_gate_and_the_delivery_mixed_1997() {
+        use crate::team::events as tev;
+        use wicked_apps_core::ToNode;
+        let build = unit(1, StageKind::Build, PhaseRole::Creator, "sj-claude");
+        let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "sj-codex");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_nodes(&mut store, &[build.to_node(), review.to_node()]).unwrap();
+        let mut run = crate::standin::LaunchStandIn {
+            aware: true,
+            consent: Some(crate::standin::StandInConsent {
+                scope: crate::standin::SCOPE_JOB.into(),
+                by: "operator".into(),
+                at: 1,
+                via: "launch".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(crate::assurance::RunAssurance::default());
+        // (core#1997) The run's team bindings as the engine mints them (`standin::fill`, the call
+        // `stand_in_gate::reserve_team` makes): a council of three (`sj-claude~1..3`) and then a
+        // monitor (`sj-claude~4`) on the one base, scoped to the review unit.
+        for (role, need) in [
+            (crate::standin::Role::Council, 3),
+            (crate::standin::Role::Monitor, 1),
+        ] {
+            let crate::standin::Fill::Seats { stand_ins, .. } =
+                crate::standin::fill(crate::standin::FillRequest {
+                    role,
+                    need,
+                    real: Vec::new(),
+                    bases: vec!["sj-claude".into()],
+                    builder_model: None,
+                    consent: run.stand_in.as_ref(),
+                    reason: crate::standin::Reason::OnlyOneHelper {
+                        cli: "sj-claude".into(),
+                    },
+                    scope: crate::standin::BindingScope {
+                        ord: Some(2),
+                        ..Default::default()
+                    },
+                    taken: &run.stand_ins,
+                })
+            else {
+                panic!("the run mints its team stand-ins");
+            };
+            run.stand_ins.extend(stand_ins);
+        }
+        let verdict = crate::validator::AgentVerdict {
+            pass: true,
+            reasoning: "ok".into(),
+            judge_cli: Some("sj-claude".into()),
+            judge_distinct: Some(true),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        let facts = || super::GateFacts {
+            own_observed: Some(&[]),
+            pinned: None,
+            checks: None,
+            checks_waived: None,
+            judge: Some(&verdict),
+            judge_skipped: None,
+            judge_not_due: (crate::assurance::SKIP_NOT_APPLICABLE, String::new()),
+            rules: None,
+            eval_ran: true,
+            eval_error: None,
+            qe: None,
+            tree: None,
+        };
+        // The council's ruling as the product writes it (`team::events::dispute_of`).
+        let dispute = tev::dispute_of(&tev::CouncilRuled {
+            subject: tev::subject_finding(1),
+            verdict: crate::team::Verdict::Yes,
+            reason: None,
+            task_id: Some("task-1".into()),
+            consensus: true,
+            agreement_pct: 100,
+            dissent: vec![],
+            returned: 3,
+            seated: 3,
+            seats: vec![
+                "sj-claude~1".into(),
+                "sj-claude~2".into(),
+                "sj-claude~3".into(),
+            ],
+            seed: Some(1),
+            eligible: Vec::new(),
+            ballots_in: None,
+            detail: None,
+        });
+        let finding = crate::team::LedgerFinding {
+            finding: crate::team::Finding {
+                finding_id: "f1".into(),
+                monitor_id: "m1".into(),
+                seat: "sj-claude".into(),
+                severity: crate::team::Severity::High,
+                path: "src/a.rs".into(),
+                line: 1,
+                evidence: "e".into(),
+                claim: "c".into(),
+                suggestion: None,
+                tree: "t".into(),
+                in_diff: true,
+                checkpoint_seq: 0,
+                anchor: String::new(),
+                carried_from_attempt: None,
+                target: Default::default(),
+            },
+            final_line: None,
+            corroborated_by: vec![],
+            delivery: crate::team::LedgerDelivery::Injected,
+            status: crate::team::FindingStatus::Declined,
+            worker_reason: None,
+            monitor_reply: None,
+            dispute: Some(dispute),
+        };
+        let teamed = |monitors: Vec<crate::team::LedgerMonitor>, findings| {
+            let mut u = review.clone();
+            let mut stamp =
+                crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+            stamp.ledger = Some(crate::team::TeamLedger::new(
+                crate::team::FinalPass::Completed,
+                monitors,
+                findings,
+                Default::default(),
+            ));
+            u.team = Some(stamp);
+            u
+        };
+        let mut session: crate::domain::AgentSession = serde_json::from_value(serde_json::json!({
+            "id": "r", "workflow_id": "wf", "problem": "p",
+            "entity_mode": "shared", "clis": [], "status": "executing"
+        }))
+        .unwrap();
+        session.assurance = run.clone();
+        let delivered = |u: &crate::domain::WorkUnit| {
+            let gate = super::gate_receipt(&store, "r", u, &run, 1, facts());
+            let mut carried = u.clone();
+            carried.assurance = Some(gate.clone());
+            let delivery = crate::deliver_lift::delivery_receipt(&session, &[carried]);
+            (gate, delivery)
+        };
+        // All real: independent at the gate and at delivery, both checks ran. A real monitor is a
+        // record of its own and changes nothing (codex r1).
+        let (gate, delivery) = delivered(&teamed(
+            vec![crate::team::LedgerMonitor {
+                monitor_id: "m1".into(),
+                seat: "sj-codex".into(),
+                batches: 1,
+                status: crate::team::MonitorStatus::Completed,
+                error: None,
+            }],
+            vec![],
+        ));
+        for r in [&gate, &delivery] {
+            let monitor = team_records(r, "monitor");
+            assert_eq!(monitor.len(), 1, "{monitor:?}");
+            assert_eq!(monitor[0].filled, crate::assurance::FILLED_REAL);
+        }
+        assert_eq!(
+            gate.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENT)
+        );
+        assert_eq!(
+            delivery.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENT)
+        );
+        assert!(gate
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::DISTINCT_EVALUATOR));
+        // A stand-in council decided a dispute: mixed, and no independent check reads `ran`.
+        for u in [
+            teamed(vec![], vec![finding.clone()]),
+            teamed(
+                vec![crate::team::LedgerMonitor {
+                    monitor_id: "m1".into(),
+                    seat: "sj-claude~4".into(),
+                    batches: 1,
+                    status: crate::team::MonitorStatus::Completed,
+                    error: None,
+                }],
+                vec![],
+            ),
+        ] {
+            let (gate, delivery) = delivered(&u);
+            assert_eq!(
+                gate.independence.as_deref(),
+                Some(crate::assurance::INDEPENDENCE_MIXED)
+            );
+            assert_eq!(
+                delivery.independence.as_deref(),
+                Some(crate::assurance::INDEPENDENCE_MIXED)
+            );
+            for r in [&gate, &delivery] {
+                assert!(!r
+                    .ran
+                    .iter()
+                    .any(|i| i == crate::assurance::DISTINCT_EVALUATOR
+                        || i == crate::assurance::JUDGE));
+                assert!(r
+                    .skipped
+                    .iter()
+                    .any(|k| k.instrument == crate::assurance::DISTINCT_EVALUATOR
+                        && k.reason == crate::assurance::SKIP_STAND_IN));
+            }
+            assert_eq!(gate.evaluator, None);
+            assert_eq!(gate.judge, None);
+            // (core#1997) Each team role that took part is a role record of its own, at the gate
+            // and at delivery: its binding, its unit, and what it decided on.
+            let council = !u
+                .team
+                .as_ref()
+                .unwrap()
+                .ledger
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty();
+            let (role, seats, subject): (&str, &[&str], &str) = if council {
+                (
+                    "council",
+                    &["sj-claude~1", "sj-claude~2", "sj-claude~3"],
+                    "finding:f1",
+                )
+            } else {
+                ("monitor", &["sj-claude~4"], "monitor:m1")
+            };
+            for r in [&gate, &delivery] {
+                let team = team_records(r, role);
+                assert_eq!(team.len(), seats.len(), "{role}: {team:?}");
+                for (rec, seat) in team.iter().zip(seats) {
+                    assert_eq!(rec.seat.as_deref(), Some(*seat));
+                    assert_eq!(rec.filled, crate::assurance::FILLED_STAND_IN);
+                    assert_eq!(rec.state, crate::standin::STATE_ANSWERED);
+                    assert_eq!(rec.ord, Some(2));
+                    assert_eq!(rec.subject.as_deref(), Some(subject));
+                    let stamp = rec.stand_in.as_ref().expect("the binding's stamp");
+                    assert_eq!(stamp.base, "sj-claude");
+                }
+            }
+        }
+        // A gate cut before the team was read (it says independent) still delivers mixed: the
+        // delivery reads the unit's own ledger, never the gate's reading alone.
+        let old_gate = super::gate_receipt(&store, "r", &teamed(vec![], vec![]), &run, 1, facts());
+        let mut carried = teamed(
+            vec![crate::team::LedgerMonitor {
+                monitor_id: "m1".into(),
+                seat: "sj-claude~4".into(),
+                batches: 1,
+                status: crate::team::MonitorStatus::Completed,
+                error: None,
+            }],
+            vec![],
+        );
+        carried.assurance = Some(old_gate);
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[carried]);
+        assert_eq!(
+            delivery.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENCE_MIXED)
+        );
+        assert_eq!(
+            team_records(&delivery, "monitor").len(),
+            1,
+            "the delivery records the monitor off the unit's own ledger"
+        );
+        // (codex r1) A unit with no ledger left delivers the councils its gate recorded, though
+        // that gate predates team role records; a member-step council keeps the attempt its
+        // review judged.
+        let mut gate = super::gate_receipt(
+            &store,
+            "r",
+            &teamed(vec![], vec![finding.clone()]),
+            &run,
+            1,
+            facts(),
+        );
+        gate.roles.as_mut().unwrap().retain(|x| x.role != "council");
+        let mut ledgerless = review.clone();
+        ledgerless.assurance = Some(gate);
+        ledgerless.member_step = Some(crate::domain::MemberStepState {
+            reviews: vec![crate::team::StepReviewRecord {
+                step_id: "s1".into(),
+                reviewed_attempt: 0,
+                verdict: crate::team::events::StepVerdict::Rejected,
+                to: None,
+                reason: "r".into(),
+                held: Some(true),
+                member_reason: None,
+                dispute: finding.dispute.clone(),
+            }],
+            ..Default::default()
+        });
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[ledgerless]);
+        let council = team_records(&delivery, "council");
+        let on = |subject: &str| {
+            council
+                .iter()
+                .filter(|r| r.subject.as_deref() == Some(subject))
+                .map(|r| r.attempt)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on("council:0"), vec![Some(1); 3], "{council:?}");
+        assert!(on("finding:f1").is_empty(), "{council:?}");
+        assert_eq!(on("step:s1:0"), vec![Some(0); 3], "{council:?}");
+        assert_eq!(
+            delivery.independence.as_deref(),
+            Some(crate::assurance::INDEPENDENCE_MIXED)
+        );
+        // (codex r2) A ledgerless unit whose gate already has its council records delivers each
+        // voter once, under the gate's own subject.
+        let mut ledgerless = review.clone();
+        ledgerless.assurance = Some(super::gate_receipt(
+            &store,
+            "r",
+            &teamed(vec![], vec![finding.clone()]),
+            &run,
+            1,
+            facts(),
+        ));
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &[ledgerless]);
+        let council = team_records(&delivery, "council");
+        assert_eq!(council.len(), 3, "{council:?}");
+        assert!(council
+            .iter()
+            .all(|r| r.subject.as_deref() == Some("finding:f1")));
+    }
+
+    /// The role records a receipt keeps for one team role, in seat order.
+    fn team_records<'a>(
+        r: &'a crate::assurance::AssuranceReceipt,
+        role: &str,
+    ) -> Vec<&'a crate::assurance::RoleRecord> {
+        let mut v: Vec<&crate::assurance::RoleRecord> = r
+            .roles
+            .iter()
+            .flatten()
+            .filter(|x| x.role == role)
+            .collect();
+        v.sort_by(|a, b| a.seat.cmp(&b.seat));
+        v
     }
 
     /// T-R5 (the receipt, DES-STANDIN-001 §5.1): a stand-in judge's PASS is never `ran` for the

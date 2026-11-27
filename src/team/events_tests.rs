@@ -1063,7 +1063,7 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     let s = held_high(true);
     assert_eq!(
         convened_findings(&s.rows),
-        std::collections::HashSet::from([fid(1)])
+        std::collections::HashMap::from([(fid(1), vec!["codex".to_string()])])
     );
     let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
     let d = l.findings[0]
@@ -1071,7 +1071,11 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
         .as_ref()
         .expect("a no-verdict dispute");
     assert_eq!(d.reason, Some(NoVerdictReason::Timeout));
-    assert_eq!(serde_json::to_value(d).unwrap(), no_verdict("timeout"));
+    // (core#1997) A council that started names who sat, as its ruling would have.
+    let mut want = no_verdict("timeout");
+    want["seats"] = json!(["codex"]);
+    want["independence"] = json!("independent");
+    assert_eq!(serde_json::to_value(d).unwrap(), want);
     // A `council.convened` of another attempt does not count for this one.
     let mut s = held_high(false);
     s.convened(1);
@@ -2398,6 +2402,54 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
     assert_eq!(d.verdict, Verdict::NoVerdict);
     assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
     assert_eq!(d.seed, Some(77));
+}
+
+/// core#1972 (DES-STANDIN-001 §5.1): a dispute says who decided as a receipt reads it. A council of
+/// stand-ins is `stand_in`, one with a stand-in beside real seats `mixed`, all real seats
+/// `independent`; nobody sat, nothing. Never independent once a stand-in sat.
+#[test]
+fn a_dispute_records_its_councils_independence_1972() {
+    let ruled = |seats: &[&str]| CouncilRuled {
+        subject: subject_finding(4),
+        verdict: Verdict::Yes,
+        reason: None,
+        task_id: Some("task-1".into()),
+        consensus: true,
+        agreement_pct: 100,
+        dissent: vec![],
+        returned: 3,
+        seated: 3,
+        seats: seats.iter().map(|s| s.to_string()).collect(),
+        seed: Some(1),
+        eligible: Vec::new(),
+        ballots_in: None,
+        detail: None,
+    };
+    let of = |seats: &[&str]| dispute_of(&ruled(seats)).independence;
+    assert_eq!(
+        of(&["claude~1", "claude~2", "claude~3"]).as_deref(),
+        Some("stand_in")
+    );
+    assert_eq!(
+        of(&["codex", "claude~1", "claude~2"]).as_deref(),
+        Some("mixed")
+    );
+    assert_eq!(
+        of(&["codex", "pi", "opencode"]).as_deref(),
+        Some("independent")
+    );
+    assert_eq!(of(&[]), None);
+    let none = CouncilRuled {
+        verdict: Verdict::NoVerdict,
+        reason: Some(NoVerdictReason::NoQuorum),
+        ..ruled(&["claude~1", "claude~2", "claude~3"])
+    };
+    assert_eq!(dispute_of(&none).independence.as_deref(), Some("stand_in"));
+    // On the wire only when set; a dispute recorded before the field still loads.
+    let wire = serde_json::to_value(dispute_of(&ruled(&[]))).unwrap();
+    assert!(wire.get("independence").is_none(), "{wire}");
+    let back: crate::team::Dispute = serde_json::from_value(wire).unwrap();
+    assert_eq!(back.independence, None);
 }
 
 /// core#1206: deferred HIGHs survive wire/persisted-ledger round trips and timeout without HOLD.

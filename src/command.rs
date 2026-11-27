@@ -498,6 +498,27 @@ pub(crate) enum Command {
         lock: crate::cli_runner::HostCouncilLock,
         reply: std::sync::mpsc::Sender<CouncilReply>,
     },
+    /// (DES-STANDIN-001 §3.2, core#1972, core#1973) Reserve `need` stand-ins for `role` on run
+    /// `run_id`, in `scope`, on the single writer: the bindings are numbered, persisted on the
+    /// run's contract and announced before the reply, so two reservations never mint one key.
+    /// Empty when the run cannot take stand-ins (not stand-in-aware, no consent, reduced, or no
+    /// base). A team council and the team monitors ask through it when no real seat is left.
+    ReserveStandIns {
+        run_id: String,
+        role: crate::standin::Role,
+        need: usize,
+        scope: crate::standin::BindingScope,
+        /// (codex r1 on #1990) A council's non-party candidates as its caller resolved them: the
+        /// actor reserves only when none of them sits on this run (`council_roster`, the same
+        /// narrowing the council itself applies). Empty for a monitor, or when none was left.
+        voters: Vec<wicked_council::AgenticCli>,
+        /// (codex r1 on #1990) The bases the caller's host admits for the role (a monitor's): the
+        /// reservation takes only these. Empty: any usable base.
+        bases: Vec<String>,
+        /// (core#1999) When the asker stops waiting for the reply: past it, nothing is reserved.
+        give_up: std::time::Instant,
+        reply: std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
+    },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before
     /// it starts; replies `false` once the run has spent its budget.
     ReserveRuleCouncil {
@@ -805,6 +826,7 @@ impl Command {
             Command::CampaignNodeAwaiting { .. } => "CampaignNodeAwaiting",
             Command::CampaignTick { .. } => "CampaignTick",
             Command::ConveneDecision { .. } => "ConveneDecision",
+            Command::ReserveStandIns { .. } => "ReserveStandIns",
             Command::ReserveRuleCouncil { .. } => "ReserveRuleCouncil",
             Command::ConveneRuleCouncil { .. } => "ConveneRuleCouncil",
             Command::RegisterWorkflow { .. } => "RegisterWorkflow",

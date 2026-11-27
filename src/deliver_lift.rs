@@ -1601,25 +1601,90 @@ pub(crate) fn delivery_receipt(
         }
     }
     // (DES-STANDIN-001 §5.1, T-R15, T-R20) A stand-in-aware run's delivery is canonical: the keyed
-    // union (role, ord, attempt) of every gate's records, so a role real at one gate and stood in at
-    // another lists both, and an obligation unfilled at one gate stays there. Independence reads
-    // them all: `mixed` once any stand-in took part beside a real helper.
+    // union (role, ord, attempt, subject; and seat for a team role) of every gate's records, so a
+    // role real at one gate and stood in at another lists both, an obligation unfilled at one gate
+    // stays there, and the several voters of one council (or monitors of one unit) stay apart. Independence reads them all: `mixed` once any
+    // stand-in took part beside a real helper.
     if session.assurance.roles.is_some() {
         use crate::assurance::RoleRecord;
+        let team_role = [
+            crate::standin::Role::Council.as_str(),
+            crate::standin::Role::Monitor.as_str(),
+        ];
+        let key = |x: &RoleRecord| {
+            (
+                x.role.clone(),
+                x.ord,
+                x.attempt,
+                x.subject.clone(),
+                x.seat
+                    .clone()
+                    .filter(|_| team_role.contains(&x.role.as_str())),
+            )
+        };
         let mut roles: Vec<RoleRecord> = Vec::new();
+        let mut add = |role: RoleRecord| {
+            if !roles.iter().any(|x| key(x) == key(&role)) {
+                roles.push(role);
+            }
+        };
         for role in units
             .iter()
             .filter_map(|u| u.assurance.as_ref())
             .flat_map(|g| g.roles.iter().flatten())
         {
-            let key = |x: &RoleRecord| (x.role.clone(), x.ord, x.attempt);
-            if !roles.iter().any(|x| key(x) == key(role)) {
-                roles.push(role.clone());
+            add(role.clone());
+        }
+        // (core#1997) Each unit's team roles off its own records, never off its gate alone (a gate
+        // cut before team roles were records carries none): its ledger's councils and monitors at
+        // its gate's attempt, else the councils its gate recorded (a unit whose ledger is gone,
+        // codex r1); and each council a member-step review convened after its gate, at the
+        // attempt that review judged.
+        for u in units {
+            let gate = u.assurance.as_ref();
+            let attempt = gate.map_or(0, |g| g.attempt);
+            let s = &session.assurance;
+            if let Some(ledger) = u.team.as_ref().and_then(|t| t.ledger.as_ref()) {
+                let councils = crate::assurance::ledger_councils(ledger);
+                for role in
+                    crate::assurance::team_roles(s, u.ord, attempt, &councils, &ledger.monitors)
+                {
+                    add(role);
+                }
+            } else if let Some(g) = gate.filter(|g| {
+                // (codex r2) Only a gate that predates council role records: one that has them
+                // already carries these voters, under their own subject.
+                !g.roles
+                    .iter()
+                    .flatten()
+                    .any(|r| r.role == crate::standin::Role::Council.as_str())
+            }) {
+                let councils: Vec<(String, &crate::team::Dispute)> = g
+                    .councils
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| (format!("council:{i}"), d))
+                    .collect();
+                for role in crate::assurance::team_roles(s, u.ord, attempt, &councils, &[]) {
+                    add(role);
+                }
+            }
+            for x in u.member_step.iter().flat_map(|m| m.reviews.iter()) {
+                let Some(d) = x.dispute.as_ref() else {
+                    continue;
+                };
+                let subject = crate::team::events::subject_step(&x.step_id, x.reviewed_attempt);
+                for role in
+                    crate::assurance::team_roles(s, u.ord, x.reviewed_attempt, &[(subject, d)], &[])
+                {
+                    add(role);
+                }
             }
         }
-        r.independence = crate::assurance::independence_of(&roles);
+        r.independence = crate::assurance::receipt_independence(&roles);
         if roles.iter().any(RoleRecord::is_stand_in) {
             r.stand_in_label = session.assurance.stand_in_label.clone();
+            r.project_stand_ins(&session.assurance.stand_in_label.clone().unwrap_or_default());
         }
         r.roles = Some(roles);
     }

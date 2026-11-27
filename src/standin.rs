@@ -213,11 +213,16 @@ pub enum Reason {
 
 impl Reason {
     /// The reason in a person's words (display names are the caller's, from the roster).
+    ///
+    /// (core#1985) The engine counts the helpers ON the run (the launch's own seats), never which
+    /// other helpers are signed in, so the words say "picked for this job": a run that picked one
+    /// helper while others were signed in was recorded as "only Claude Code was signed in". (The
+    /// `signed_in` field keeps its wire name; it counts the job's helpers.)
     pub fn words(&self) -> String {
         match self {
-            Reason::OnlyOneHelper { cli } => format!("only {cli} was signed in"),
+            Reason::OnlyOneHelper { cli } => format!("only {cli} was picked for this job"),
             Reason::AllParties { seats } => format!(
-                "every signed-in helper ({}) built or reviewed this work",
+                "every helper picked for this job ({}) built or reviewed this work",
                 seats.join(", ")
             ),
             Reason::HelpersShort {
@@ -225,8 +230,8 @@ impl Reason {
                 need,
                 have,
             } => format!(
-                "{signed_in} helper{} signed in: {have} can check this job independently and it \
-                 needs {need}",
+                "{signed_in} helper{} picked for this job: {have} can check this job \
+                 independently and it needs {need}",
                 if *signed_in == 1 { " is" } else { "s are" }
             ),
             Reason::LostMidRun { seat, cause } => format!("{seat} stopped mid-run ({cause})"),
@@ -313,6 +318,34 @@ pub(crate) struct BindingScope {
     pub evidence: Option<String>,
 }
 
+/// (§3.5) The lenses, by position inside one council or monitor pool (never by session slot).
+pub(crate) const LENSES: [&str; 9] = [
+    "correctness",
+    "security and safety",
+    "user impact",
+    "operability",
+    "maintainability",
+    "cost",
+    "data handling",
+    "accessibility",
+    "compatibility",
+];
+
+/// The lens at `position` inside one council or pool.
+pub(crate) fn lens_at(position: usize) -> &'static str {
+    LENSES[position % LENSES.len()]
+}
+
+/// (§3.2, core#1972, core#1973) A stand-in the actor reserved for a team role: its binding as the
+/// run's contract now holds it, the base's record re-keyed to the binding (what a ballot or a
+/// member turn runs), and its stamp's words.
+#[derive(Debug, Clone)]
+pub(crate) struct SeatedStandIn {
+    pub binding: StandInBinding,
+    pub record: crate::AgenticCli,
+    pub label: String,
+}
+
 /// (§3.2) What one role asks [`fill`] for, after its own admission gave up.
 pub(crate) struct FillRequest<'a> {
     pub role: Role,
@@ -375,6 +408,45 @@ pub(crate) fn next_slot<'a>(
         .max()
         .unwrap_or(0)
         + 1
+}
+
+/// (codex r1 on #1990) `taken` plus, for each base in `in_flight`, the next slot held back: the
+/// one a judge dispatched with a stand-in offer on that base may hold unrecorded until it answers
+/// ([`judge_offer`] mints at dispatch, [`judge_answered`] records). A team reservation counts
+/// these as taken, so a team role never takes an in-flight judge's key.
+pub(crate) fn with_judge_slots_held(
+    taken: &[StandInBinding],
+    in_flight: &[String],
+) -> Vec<StandInBinding> {
+    let mut out = taken.to_vec();
+    for base in in_flight {
+        if out
+            .iter()
+            .any(|b| b.base == *base && b.invocation.is_empty())
+        {
+            continue;
+        }
+        let slot = next_slot(out.iter(), base);
+        out.push(StandInBinding {
+            key: binding_key(base, slot),
+            base: base.clone(),
+            role: Role::Judge,
+            slot,
+            model: None,
+            builder_model: None,
+            lens: None,
+            ord: None,
+            attempt: None,
+            subject: None,
+            evidence: None,
+            // Empty: held back, never a binding.
+            invocation: String::new(),
+            reason: Reason::OnlyOneHelper { cli: base.clone() },
+            state: STATE_SEATED.to_string(),
+            display: None,
+        });
+    }
+    out
 }
 
 /// `<base>~<slot>`, the reserved grammar ([`seat_id`]).
@@ -528,8 +600,11 @@ pub(crate) fn reason_from_run(
 }
 
 /// (§3.6) The binding of a stand-in judge that ANSWERED as `key`, for the fold to record: the
-/// unit's own offer, recomputed on the single writer, when `key` is exactly that offer's key. `None` for any other key (fail closed: a `~` key the run never offered is no
-/// stand-in, and the receipt reads it as an ordinary judge seat).
+/// unit's own offer, recomputed on the single writer, when `key` is exactly that offer's key, or
+/// an earlier slot on the offer's base that no recorded binding holds (a team reservation made
+/// while the judge ran moved the next slot on, codex r1 on #1990). `None` for any other key (fail
+/// closed: a recorded or foreign `~` key is no stand-in judge, and the receipt reads it as an
+/// ordinary judge seat).
 pub(crate) fn judge_answered(
     run: &crate::assurance::RunAssurance,
     unit: &crate::domain::WorkUnit,
@@ -541,7 +616,21 @@ pub(crate) fn judge_answered(
 ) -> Option<StandInBinding> {
     let mut b = judge_offer(run, unit, attempt, roster, run_seats, benched)?;
     if b.key != key {
-        return None;
+        // (codex r1 on #1990) A team reservation recorded while this judge ran moves the next
+        // slot past its offer (the reservation held the judge's slot back,
+        // [`with_judge_slots_held`]): the judge's own earlier slot on the same base stands, as
+        // long as no recorded binding holds it.
+        let prefix = format!("{}{}", b.base, wicked_apps_core::spawn::STAND_IN_SEP);
+        let slot = key.strip_prefix(prefix.as_str())?.parse::<u32>().ok()?;
+        if slot == 0
+            || slot >= b.slot
+            || binding_key(&b.base, slot) != key
+            || run.stand_ins.iter().any(|t| t.key == key)
+        {
+            return None;
+        }
+        b.key = key.to_string();
+        b.slot = slot;
     }
     b.state = STATE_ANSWERED.to_string();
     Some(b)
@@ -616,7 +705,7 @@ pub(crate) fn packet_keeps(label: &str) -> bool {
 }
 
 /// (§3.7) The stamp's label: who stood in, on what, and why ("Claude Code stood in for the
-/// review, using Claude Code's default model: only Claude Code was signed in").
+/// review, using Claude Code's default model: only Claude Code was picked for this job").
 pub(crate) fn label(binding: &StandInBinding, display: &str) -> String {
     let model = match (&binding.model, &binding.builder_model) {
         (Some(m), Some(b)) if m != b => format!("using another model ({m})"),
@@ -993,6 +1082,37 @@ mod tests {
         ];
         for l in dropped {
             assert!(!packet_keeps(l), "dropped by default: {l}");
+        }
+    }
+
+    /// core#1985: the engine knows the helpers ON the run (the launch's own seats), never which
+    /// other helpers are signed in. A run that picked one helper while others were signed in was
+    /// recorded "only Claude Code was signed in", on the run page and in the pull request. The
+    /// reason says what the run's facts hold: the helpers picked for this job.
+    #[test]
+    fn a_reason_names_the_helpers_picked_for_the_job_never_who_was_signed_in_1985() {
+        let one = Reason::OnlyOneHelper {
+            cli: "Claude Code".into(),
+        };
+        assert_eq!(one.words(), "only Claude Code was picked for this job");
+        let short = Reason::HelpersShort {
+            signed_in: 2,
+            need: 2,
+            have: 1,
+        };
+        assert_eq!(
+            short.words(),
+            "2 helpers are picked for this job: 1 can check this job independently and it needs 2"
+        );
+        let all = Reason::AllParties {
+            seats: vec!["Claude Code".into(), "Codex".into()],
+        };
+        assert_eq!(
+            all.words(),
+            "every helper picked for this job (Claude Code, Codex) built or reviewed this work"
+        );
+        for r in [one, short, all] {
+            assert!(!r.words().contains("signed in"), "{}", r.words());
         }
     }
 }
