@@ -463,14 +463,38 @@ pub(crate) fn reserve_team(
 
 /// (core#2009) Hand a reservation to its asker. An asker that stopped waiting has dropped its
 /// receiver, so the send fails: the bindings it would have run on never run, and each is left on
-/// the run's record as `failed`, never `seated`.
+/// the run's record as `failed`, never `seated` (its key stays taken). An asker that drops a
+/// reservation it did receive, or whose receiver outlives its wait, is core#2015.
 pub(crate) fn reply_or_abandon(
-    _store: &mut dyn GraphStore,
-    _run_id: &str,
+    store: &mut dyn GraphStore,
+    run_id: &str,
     seated: Vec<crate::standin::SeatedStandIn>,
     reply: &std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
 ) -> anyhow::Result<()> {
-    let _ = reply.send(seated);
+    let Err(std::sync::mpsc::SendError(abandoned)) = reply.send(seated) else {
+        return Ok(());
+    };
+    if abandoned.is_empty() {
+        return Ok(());
+    }
+    let Some(mut session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for b in &mut session.assurance.stand_ins {
+        let ours = abandoned.iter().any(|s| {
+            s.binding.key == b.key
+                && s.binding.role == b.role
+                && (s.binding.ord, s.binding.attempt) == (b.ord, b.attempt)
+        });
+        if ours && b.state == crate::standin::STATE_SEATED {
+            b.state = crate::standin::STATE_FAILED.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        crate::domain::put_node(store, session.to_node())?;
+    }
     Ok(())
 }
 
