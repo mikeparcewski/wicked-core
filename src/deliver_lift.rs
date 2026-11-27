@@ -5044,7 +5044,7 @@ mod tests {
     /// (core#2030) Linux: the child's stat line. Measured under load (Debian 12, dash as `sh`, 480
     /// kills of the #1993 test's `sleep`): a killed child read R, then Z, then X, then no pid. A
     /// task released between the signal-0 probe and the stat read gives a read that fails (the
-    /// open ENOENT or ESRCH, or the read ESRCH). 131 runs read Z and then X or such a failed read.
+    /// open ENOENT or ESRCH, or the read ESRCH). 132 runs read Z and then X or such a failed read.
     #[cfg(target_os = "linux")]
     fn state_gone_2030(p: libc::pid_t) -> bool {
         stat_read_gone_2030(std::fs::read_to_string(format!("/proc/{p}/stat")))
