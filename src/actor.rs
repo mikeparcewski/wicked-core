@@ -22195,6 +22195,53 @@ fn adoptable_suggestion(
         })
 }
 
+/// (core#2036) At most this many changed paths are named in [`worktree_holds_reviewed_tree`]'s
+/// refusal; the rest are counted.
+const HAND_EDIT_PATHS_SHOWN: usize = 10;
+
+/// (core#2036) Whether the worktree still holds the tree the guard restored for this gate
+/// (`m.before.tree`), read without writing into the repository's object store. `Err` (the refusal
+/// of `accept_suggestion`) when it changed, naming the paths (escaped, at most
+/// [`HAND_EDIT_PATHS_SHOWN`]), or when it cannot be read (the apply would overwrite what was not
+/// read).
+fn worktree_holds_reviewed_tree(
+    worktree: &std::path::Path,
+    m: &crate::worktree_guard::WorktreeMutation,
+) -> anyhow::Result<()> {
+    let changed =
+        crate::worktree_guard::changed_since_readonly(worktree, &m.before).map_err(|e| {
+            anyhow::anyhow!(
+            "could not read the worktree to check it still holds the tree this gate reviewed, so \
+             the suggestion is not applied ({}) — approve (retry), request changes or reject",
+            e.to_string().escape_debug()
+        )
+        })?;
+    let Some(changed) = changed else {
+        return Ok(());
+    };
+    let mut named: Vec<String> = changed
+        .iter()
+        .take(HAND_EDIT_PATHS_SHOWN)
+        .map(|c| format!("{} {}", c.status, c.path.escape_debug()))
+        .collect();
+    if changed.len() > HAND_EDIT_PATHS_SHOWN {
+        named.push(format!(
+            "and {} more",
+            changed.len() - HAND_EDIT_PATHS_SHOWN
+        ));
+    }
+    anyhow::bail!(
+        "the worktree changed since this gate was raised ({}): accepting the suggestion would \
+         overwrite those edits — undo them first (committing them does not help: the content \
+         still differs), or answer approve (retry), request changes or reject",
+        if named.is_empty() {
+            "its tree differs".to_string()
+        } else {
+            named.join(", ")
+        }
+    )
+}
+
 /// (core#467) Apply the evaluator's pinned edit to the worktree — the reverse of the guard's
 /// restore: `git read-tree --reset -u <edit tree>` through the PINNED git dir, then `git reset -q`
 /// (index → HEAD, working tree untouched) so the change reads as the creator's uncommitted work.
@@ -22621,7 +22668,13 @@ pub(crate) fn refuse_before_resolving(
             let cursor = cursor.ok_or_else(|| {
                 anyhow::anyhow!("run {run_id} has no unit at its cursor to take a suggestion from")
             })?;
-            adoptable_suggestion(cursor)?;
+            let suggestion = adoptable_suggestion(cursor)?;
+            // (core#2036) The apply resets the worktree to the evaluator's edit: refused when the
+            // parked worktree no longer holds the tree this gate reviewed (an edit by hand), so
+            // those edits are never overwritten. Read-only: a gate read probes this too.
+            if let Some(workdir) = session.workdir.as_deref() {
+                worktree_holds_reviewed_tree(std::path::Path::new(workdir), suggestion)?;
+            }
             let has_creator = cursor.role == crate::workflow::PhaseRole::Creator
                 || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
             if !has_creator {
@@ -35564,6 +35617,120 @@ mod request_changes_tests {
             "{err}"
         );
         assert_reviewed_tree(&reviewed);
+    }
+
+    /// (core#2036) STALE READS / PARTIAL FAILURE: accepting the evaluator's suggestion is refused
+    /// when the parked worktree no longer holds the tree the gate reviewed (edited by hand): the
+    /// refusal names the changed paths (UNTRUSTED TEXT OUT: escaped, at most ten, the rest
+    /// counted), nothing is resolved, and the hand edits are intact.
+    #[cfg(unix)]
+    #[test]
+    fn accept_suggestion_never_overwrites_hand_edits_2036() {
+        let tag = "hand-edits-2036";
+        let wt = crate::worktree_guard::tests::creator_worktree(tag);
+        let repo = wt.parent().unwrap().join("repo");
+        let before = crate::worktree_guard::snapshot(&wt, &repo).unwrap();
+        std::fs::write(wt.join("src/a.ts"), "export const a = 3; // evaluator\n").unwrap();
+        let mut m = crate::worktree_guard::compare(&wt, &before)
+            .unwrap()
+            .expect("the evaluator changed the tree");
+        crate::worktree_guard::restore_creator_tree(
+            &wt,
+            &mut m,
+            Some(&format!("refs/wicked/suggestions/{tag}/4/0")),
+        )
+        .expect("the guard restores the creator's tree");
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        park_send_back_gate(&mut store, tag);
+        let mut session = crate::domain::get_session(&store, tag).unwrap().unwrap();
+        session.workdir = Some(wt.to_string_lossy().into_owned());
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, tag).unwrap();
+        units[3].denial = Some(crate::domain::UnitDenial::new(
+            "worktree_guard",
+            "the evaluator edited",
+        ));
+        units[3].worktree_mutation = Some(m);
+        put_node(&mut store, units[3].to_node()).unwrap();
+
+        let reviewed_a = std::fs::read_to_string(wt.join("src/a.ts")).unwrap();
+        // Someone edits the parked worktree by hand: a tracked file, a control character in a new
+        // file's name, and more new files than the refusal names.
+        std::fs::write(wt.join("src/a.ts"), "export const a = 9; // by hand\n").unwrap();
+        std::fs::write(wt.join("src/\u{1b}[31mx.ts"), "x\n").unwrap();
+        for n in 0..11 {
+            std::fs::write(wt.join(format!("src/hand{n:02}.ts")), "h\n").unwrap();
+        }
+
+        let (r, events) = answer(&mut store, tag, HumanDecision::AcceptSuggestion);
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("the worktree changed since this gate was raised"),
+            "{err}"
+        );
+        assert!(
+            err.contains("src/\\u{1b}[31mx.ts") && !err.contains('\u{1b}'),
+            "{err}"
+        );
+        assert!(err.contains("and 3 more"), "{err}");
+        // (codex on #2038: W8) The remedy is to undo them: a commit keeps the content differing.
+        assert!(
+            err.contains("undo them first") && !err.contains("commit or undo"),
+            "{err}"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 9; // by hand\n",
+            "the hand edit is intact"
+        );
+        assert!(wt.join("src/hand10.ts").exists());
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(tag),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate is still open");
+
+        // (codex on #2038: W10) The edits are undone but one is in a directory git cannot open
+        // (writable and searchable, not listable): git warns and exits 0, and a plain read would
+        // call the tree unchanged. The accept is refused and the file is intact.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(wt.join("src/a.ts"), &reviewed_a).unwrap();
+        std::fs::remove_file(wt.join("src/\u{1b}[31mx.ts")).unwrap();
+        for n in 0..11 {
+            std::fs::remove_file(wt.join(format!("src/hand{n:02}.ts"))).unwrap();
+        }
+        let locked = wt.join("hand");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("notes.ts"), "by hand\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("SKIP: this user lists a mode-300 directory (root)");
+        } else {
+            let (r, events) = answer(&mut store, tag, HumanDecision::AcceptSuggestion);
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("could not read the worktree"), "{err}");
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(locked.join("notes.ts")).unwrap(),
+                "by hand\n",
+                "the hand edit in the unreadable directory is intact"
+            );
+            assert_eq!(
+                std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+                reviewed_a,
+                "the suggestion was not applied"
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// (core#1313) The first answer commit contains the row AND its redo state; nested
