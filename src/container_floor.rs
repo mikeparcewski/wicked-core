@@ -912,7 +912,13 @@ fn build_seat_image_on(
     let (tag, dockerfile) = if base.operator {
         let (tag, from) = match image_id(rt, &base.image) {
             Some(id) => {
-                let pin = pin_seat_image(rt, &base.image, &id).map_err(no_image)?;
+                // (core#1043 part 3) A repo's base is pinned where no registry answers.
+                let pin = if base.from_repo {
+                    pin_repo_base(rt, &base.image, &id)
+                } else {
+                    pin_seat_image(rt, &base.image, &id)
+                }
+                .map_err(no_image)?;
                 let from = pin.tag().to_string();
                 _base_pin = Some(pin);
                 (seat_image_tag(cli, &base.image, Some(&id), &[]), from)
@@ -1341,11 +1347,32 @@ pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<Seat
         Some(colon) if slash.is_none_or(|slash| colon > slash) => &reference[..colon],
         _ => reference,
     };
+    pin_seat_image_in(rt, repo, &id, hex)
+}
+
+/// (core#1043 part 3, codex r1 delta) The repository a repo's own seat base is pinned under: a
+/// host in `.invalid`, which is reserved never to resolve (RFC 6761), so a builder that cannot
+/// see the runtime's local images (a BuildKit OCI worker, core#1919) fails the build instead of
+/// fetching the pin's name, which an API-set reference could make a registry's, from a registry.
+/// One repository per base name, so the pin cleanup keeps each base's newest pin.
+pub(crate) const REPO_BASE_PIN_HOST: &str = "wicked-seat-pin.invalid";
+
+/// [`pin_seat_image`] for a repo's own seat base: the inspected id tagged under
+/// [`REPO_BASE_PIN_HOST`], never under the base's own name.
+fn pin_repo_base(rt: &Runtime, image: &str, id: &str) -> Result<SeatPin, String> {
+    let id = valid_image_id(id).ok_or("cannot pin seat image: invalid inspected id")?;
+    let hex = id.strip_prefix("sha256:").unwrap_or(&id);
+    let repo = format!("{REPO_BASE_PIN_HOST}/base-{}", content_tag(&[image]));
+    pin_seat_image_in(rt, &repo, &id, hex)
+}
+
+/// Tag `id` as `<repo>:id-<hex>` and hold it ([`SeatPin`]); older pins of `repo` are cleaned.
+fn pin_seat_image_in(rt: &Runtime, repo: &str, id: &str, hex: &str) -> Result<SeatPin, String> {
     let pinned = format!("{repo}:id-{hex}");
     let result = {
         let mut held = seat_pins_held();
         let mut cmd = rt.cmd();
-        cmd.args(["tag", &id, &pinned]);
+        cmd.args(["tag", id, &pinned]);
         let result = crate::k8s::run_bounded(cmd, None, rt.bound(PROBE_TIMEOUT));
         if result.ok() {
             *held.entry(pinned.clone()).or_default() += 1;
@@ -5258,6 +5285,24 @@ esac
             seat_image_tag("claude", "acme/seat-base:go", Some(&id), &[]).unwrap(),
             "keyed by the base's image id: a rebuild under the name is a new seat image"
         );
+
+        // (codex r1 delta) A present repo base is built FROM its pin under a host no registry
+        // answers, never FROM its own name.
+        let built = build_seat_image_on(&rt, "claude", seat_package("claude").unwrap(), &repo, &[])
+            .unwrap();
+        assert_eq!(built, go);
+        let calls = std::fs::read_to_string(dir.0.join("calls.log")).unwrap();
+        let from = calls
+            .lines()
+            .find_map(|l| l.split(" --build-arg BASE=").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .expect("the seat build names its base");
+        assert!(
+            from.starts_with(&format!("{REPO_BASE_PIN_HOST}/base-"))
+                && from.ends_with(&format!(":id-{}", "b".repeat(64))),
+            "{from}"
+        );
+        assert!(!calls.contains("BASE=acme/"), "{calls}");
 
         // Missing: refused before any build, naming the repo's setting, never the daemon's.
         let gone = c4_temp();
