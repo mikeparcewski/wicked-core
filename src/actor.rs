@@ -34947,6 +34947,312 @@ mod request_changes_tests {
         }
     }
 
+    mod send_back_commit_store {
+        use wicked_estate_core::*;
+
+        /// (core#2022) What each real commit left durable: whether the gate's row is answered, and
+        /// the session's cursor and status. `fail_rewind` refuses the rewind's session write once.
+        pub(super) struct SendBackStore<'a> {
+            pub inner: &'a mut dyn GraphStore,
+            pub run_id: &'a str,
+            pub commits: Vec<(bool, usize, String)>,
+            pub fail_rewind: bool,
+        }
+
+        impl GraphRead for SendBackStore<'_> {
+            fn capabilities(&self) -> StoreCapabilities {
+                self.inner.capabilities()
+            }
+            fn get_node(&self, id: &SymbolId) -> Result<Option<Node>> {
+                self.inner.get_node(id)
+            }
+            fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                self.inner.find_symbols(query)
+            }
+            fn count_symbols(&self, query: &SymbolQuery) -> Result<usize> {
+                self.inner.count_symbols(query)
+            }
+            fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                self.inner.find_structural_symbols(query)
+            }
+            fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
+                self.inner.neighbors(id, dir)
+            }
+            fn traverse(&self, start: &SymbolId, spec: &TraversalSpec) -> Result<Subgraph> {
+                self.inner.traverse(start, spec)
+            }
+            fn traverse_multi(
+                &self,
+                starts: &[SymbolId],
+                spec: &TraversalSpec,
+            ) -> Result<Subgraph> {
+                self.inner.traverse_multi(starts, spec)
+            }
+            fn all_nodes(&self) -> Result<Vec<Node>> {
+                self.inner.all_nodes()
+            }
+            fn all_edges(&self) -> Result<Vec<Edge>> {
+                self.inner.all_edges()
+            }
+            fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
+                self.inner.unresolved_refs_for_name(name)
+            }
+            fn indexed_files(&self) -> Result<Vec<String>> {
+                self.inner.indexed_files()
+            }
+            fn file_digest(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_digest(file)
+            }
+            fn file_git_sha(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_git_sha(file)
+            }
+            fn repo_info(&self) -> Result<Option<RepoInfo>> {
+                self.inner.repo_info()
+            }
+            fn edge_history(&self, file: &str) -> Result<Vec<HistoricalEdge>> {
+                self.inner.edge_history(file)
+            }
+            fn file_content(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_content(file)
+            }
+            fn file_call_refs(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_call_refs(file)
+            }
+            fn symbol_source(&self, node: &Node) -> Result<Option<String>> {
+                self.inner.symbol_source(node)
+            }
+            fn changes_since(&self, cursor: u64) -> Result<Vec<Change>> {
+                self.inner.changes_since(cursor)
+            }
+            fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
+                self.inner.node_semantics(symbol)
+            }
+            fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
+                self.inner.find_by_requirement(requirement)
+            }
+            fn annotations(&self, symbol: &SymbolId) -> Result<Vec<Annotation>> {
+                self.inner.annotations(symbol)
+            }
+            fn annotations_by_type(&self, ty: &str) -> Result<Vec<(SymbolId, Annotation)>> {
+                self.inner.annotations_by_type(ty)
+            }
+            fn annotations_stale_since(&self, cutoff: i64) -> Result<Vec<(SymbolId, Annotation)>> {
+                self.inner.annotations_stale_since(cutoff)
+            }
+            fn symbol_epoch(&self, id: &SymbolId) -> Result<Option<u64>> {
+                self.inner.symbol_epoch(id)
+            }
+            fn edge_supports(
+                &self,
+                source: &SymbolId,
+                target: &SymbolId,
+                kind: &EdgeKind,
+            ) -> Result<Vec<EdgeSupport>> {
+                self.inner.edge_supports(source, target, kind)
+            }
+            fn support_generation(&self, owner: &SupportOwner) -> Result<Option<u64>> {
+                self.inner.support_generation(owner)
+            }
+            fn support_owners(&self) -> Result<Vec<SupportOwnerState>> {
+                self.inner.support_owners()
+            }
+            fn stats(&self) -> Result<GraphStats> {
+                self.inner.stats()
+            }
+        }
+
+        impl GraphWrite for SendBackStore<'_> {
+            fn begin_batch(&mut self) -> Result<()> {
+                self.inner.begin_batch()
+            }
+            fn commit_batch(&mut self) -> Result<()> {
+                self.inner.commit_batch()?;
+                let rows = crate::interaction::list_interactions(
+                    self.inner,
+                    Some(self.run_id),
+                    Some(crate::interaction::InteractionStatus::Answered),
+                )
+                .unwrap();
+                let session = crate::domain::get_session(self.inner, self.run_id)
+                    .unwrap()
+                    .unwrap();
+                self.commits.push((
+                    !rows.is_empty(),
+                    session.unit_ix,
+                    format!("{:?}", session.status),
+                ));
+                Ok(())
+            }
+            fn upsert_nodes(&mut self, nodes: &[Node]) -> Result<()> {
+                let rewinding = nodes.iter().any(|n| {
+                    matches!(&n.kind, NodeKind::Other(k) if k == wicked_apps_core::AGENT_SESSION)
+                        && n.metadata.get("status").and_then(|v| v.as_str()) == Some("executing")
+                });
+                if self.fail_rewind && rewinding {
+                    self.fail_rewind = false;
+                    return Err(Error::Storage("disk I/O error (test)".into()));
+                }
+                self.inner.upsert_nodes(nodes)
+            }
+            fn upsert_edges(&mut self, edges: &[Edge]) -> Result<()> {
+                self.inner.upsert_edges(edges)
+            }
+            fn upsert_unresolved_refs(&mut self, refs: &[UnresolvedRef]) -> Result<()> {
+                self.inner.upsert_unresolved_refs(refs)
+            }
+            fn remove_file(&mut self, file: &str) -> Result<()> {
+                self.inner.remove_file(file)
+            }
+            fn set_file_digest(&mut self, file: &str, digest: &str) -> Result<()> {
+                self.inner.set_file_digest(file, digest)
+            }
+            fn set_repo_info(&mut self, info: &RepoInfo) -> Result<()> {
+                self.inner.set_repo_info(info)
+            }
+            fn set_file_content(&mut self, file: &str, text: &str) -> Result<()> {
+                self.inner.set_file_content(file, text)
+            }
+            fn set_file_call_refs(&mut self, file: &str, refs_json: &str) -> Result<()> {
+                self.inner.set_file_call_refs(file, refs_json)
+            }
+            fn prune_dangling_edges(&mut self) -> Result<usize> {
+                self.inner.prune_dangling_edges()
+            }
+            fn log_change(&mut self, op: ChangeOp, target: &str) -> Result<()> {
+                self.inner.log_change(op, target)
+            }
+            fn set_node_semantics(
+                &mut self,
+                symbol: &SymbolId,
+                description: Option<&str>,
+                requirement: Option<&str>,
+                validation: Option<&wicked_estate_core::ValidationClaim>,
+            ) -> Result<()> {
+                self.inner
+                    .set_node_semantics(symbol, description, requirement, validation)
+            }
+            fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
+                self.inner.annotate(symbol, annotation)
+            }
+            fn delete_annotations(
+                &mut self,
+                symbol: &SymbolId,
+                ty: Option<&str>,
+                key: &str,
+            ) -> Result<usize> {
+                self.inner.delete_annotations(symbol, ty, key)
+            }
+            fn replace_edge_supports(
+                &mut self,
+                owner: &SupportOwner,
+                generation: u64,
+                facts: &[SupportFact],
+            ) -> Result<SupportReplacement> {
+                self.inner.replace_edge_supports(owner, generation, facts)
+            }
+        }
+    }
+
+    /// (core#2022) A gate's send-back at the verify gate (bug-with-deliver, cursor 3, a rejected
+    /// verify), with the gate's row open.
+    fn park_send_back_gate(store: &mut dyn GraphStore, run_id: &str) {
+        seed_judge_unavailable_verify(store, run_id);
+        let gate =
+            crate::interaction::open_gate(run_id, 4, None, "the verify gate", "escalation", 1);
+        put_node(store, gate.to_node()).unwrap();
+    }
+
+    /// (core#2022) PARTIAL FAILURE: the answered row and the rewind (units and session) commit
+    /// together. No commit ever holds an answered row on a run still parked at its gate.
+    #[test]
+    fn a_send_back_commits_the_answer_and_the_rewind_together_2022() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "send-back-one-commit";
+        park_send_back_gate(&mut store, run_id);
+        let mut counted = send_back_commit_store::SendBackStore {
+            inner: &mut store,
+            run_id,
+            commits: Vec::new(),
+            fail_rewind: false,
+        };
+        let (r, events) = answer(
+            &mut counted,
+            run_id,
+            HumanDecision::RequestChanges {
+                note: Some("tighten the fix".into()),
+            },
+        );
+        r.unwrap();
+        let commits = counted.commits.clone();
+        let first_answered = commits
+            .iter()
+            .find(|(answered, _, _)| *answered)
+            .unwrap_or_else(|| panic!("the answer committed: {commits:?}"));
+        assert_ne!(
+            first_answered.2, "AwaitingHuman",
+            "an answered row never commits on a run parked at its gate: {commits:?}"
+        );
+        assert!(
+            first_answered.1 < 3,
+            "the cursor moved back to the creator: {commits:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
+    }
+
+    /// (core#2022) PARTIAL FAILURE: a store write failing inside the rewind leaves the gate open and
+    /// the run as the answer found it (no rollback exists: the rows, units and session are put back
+    /// in the same batch before the error path commits it).
+    #[test]
+    fn a_send_back_whose_rewind_fails_leaves_the_gate_open_2022() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "send-back-fails";
+        park_send_back_gate(&mut store, run_id);
+        let units_before = crate::domain::session_units(&store, run_id).unwrap();
+        let session_before = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let mut failing = send_back_commit_store::SendBackStore {
+            inner: &mut store,
+            run_id,
+            commits: Vec::new(),
+            fail_rewind: true,
+        };
+        let (r, events) = answer(
+            &mut failing,
+            run_id,
+            HumanDecision::RequestChanges { note: None },
+        );
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("disk I/O error"), "{err}");
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            CoreEvent::UnitReworkAmended { .. } | CoreEvent::Resumed { .. }
+        )));
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate is open again");
+        assert!(open[0].answer.is_none() && open[0].resolved_at.is_none());
+        let answered = crate::interaction::list_interactions(
+            &store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Answered),
+        )
+        .unwrap();
+        assert!(answered.is_empty(), "{answered:?}");
+        assert_eq!(
+            crate::domain::session_units(&store, run_id).unwrap(),
+            units_before
+        );
+        assert_eq!(
+            crate::domain::get_session(&store, run_id).unwrap().unwrap(),
+            session_before
+        );
+    }
+
     /// (core#1313) The first answer commit contains the row AND its redo state; nested
     /// domain batches must not expose an answered row before the redo is reserved.
     #[test]
