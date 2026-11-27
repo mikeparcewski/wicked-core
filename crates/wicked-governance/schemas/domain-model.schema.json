@@ -425,6 +425,11 @@
           },
           "description": "v1.2.0. Every target of the model: id, file, lines, target_hash, accounted, stale, unaccounted_reasons, statements, rejected (each with its ruling), ruling."
         },
+        "statements": {
+          "type": "array",
+          "items": { "allOf": [{ "$ref": "#/$defs/rule" }, { "required": ["statement_key", "status"] }] },
+          "description": "v1.2.0, optional (schema bundle 1.4.1, garden#1545). Every emitted statement no requirement holds, because no sentence of a business rule group cites it, shown or withheld only because the code or a statement changed since it was written (such a requirement stays: shown stale after a code change; after a statement change its sentence is withheld): a housekeeping group cites it, only a sentence the writer's check withheld does, or none does (an open statement, which its follow-up names). The same rule shape as a requirement's business_rules: a group cites it and a ruling names its key, by id. Absent on a model built before it."
+        },
         "built_at": {
           "type": "integer",
           "description": "v1.2.0. When the build judged the model against the checkout, unix seconds: the model is as of this time."
