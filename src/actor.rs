@@ -21060,7 +21060,9 @@ pub(crate) fn confirm_gate_expecting(
                     Ok(r) => r,
                     Err((e, before)) => {
                         if let Err(re) = restore_send_back(store, &opened, before) {
-                            return Err(e.context(format!("the gate could not be re-opened: {re}")));
+                            return Err(
+                                e.context(format!("the send-back could not be put back: {re}"))
+                            );
                         }
                         return Err(e);
                     }
@@ -23983,10 +23985,12 @@ fn rewind_writes(
 }
 
 /// (core#2022) What a gate's send-back wrote before it failed, to put back: the run's units and its
-/// session as they were when the answer arrived.
+/// session as they were when the answer arrived, and (core#2029) the worktree a suggestion was
+/// applied to, with the guard's record of that suggestion.
 struct SendBackBefore {
     units: Vec<crate::domain::WorkUnit>,
     session: crate::domain::AgentSession,
+    applied: Option<(std::path::PathBuf, crate::worktree_guard::WorktreeMutation)>,
 }
 
 /// (core#2022) A gate's send-back (request changes, or accept the evaluator's suggestion): the
@@ -24000,9 +24004,10 @@ fn send_back_writes(
     adopt_suggestion: bool,
 ) -> Result<Rewound, (anyhow::Error, Option<Box<SendBackBefore>>)> {
     let units = crate::domain::session_units(store, run_id).map_err(|e| (e, None))?;
-    let before = Box::new(SendBackBefore {
+    let mut before = Box::new(SendBackBefore {
         units: units.clone(),
         session: session.clone(),
+        applied: None,
     });
     let fail = |e: anyhow::Error, before: Box<SendBackBefore>| (e, Some(before));
     let (note, scope) = if adopt_suggestion {
@@ -24013,6 +24018,11 @@ fn send_back_writes(
             let workdir = session.workdir.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("run {run_id} has no worktree to apply the suggestion to")
             })?;
+            // (core#2029) From here the worktree may change: a failure undoes the apply.
+            before.applied = Some((
+                std::path::PathBuf::from(workdir),
+                adoptable_suggestion(cursor)?.clone(),
+            ));
             apply_suggestion(cursor, std::path::Path::new(workdir))
         })();
         match applied {
@@ -24027,18 +24037,38 @@ fn send_back_writes(
 
 /// (core#2022) Put a failed send-back back as the answer found it, in the answer's batch: the gate's
 /// rows open again, and the run's units and session (any of them the rewind had written) as they were.
+/// (core#2029) Then a suggestion it applied comes out of the worktree again ([`undo_suggestion`]).
 fn restore_send_back(
     store: &mut dyn GraphStore,
     opened: &[crate::interaction::InteractionRequest],
     before: Option<Box<SendBackBefore>>,
 ) -> anyhow::Result<()> {
-    if let Some(before) = before {
-        for u in &before.units {
-            put_node(store, u.to_node())?;
-        }
-        put_node(store, before.session.to_node())?;
+    let Some(before) = before else {
+        return crate::interaction::reopen(store, opened);
+    };
+    for u in &before.units {
+        put_node(store, u.to_node())?;
     }
-    crate::interaction::reopen(store, opened)
+    put_node(store, before.session.to_node())?;
+    crate::interaction::reopen(store, opened)?;
+    if let Some((worktree, m)) = &before.applied {
+        undo_suggestion(worktree, m)
+            .map_err(|e| e.context("the suggestion stays in the worktree"))?;
+    }
+    Ok(())
+}
+
+/// (core#2029) Take an applied suggestion back out of the worktree: the guard's own restore, run
+/// again from the same record, puts the creator's tree back (the edited paths reset, the added
+/// ones deleted) and proves it with a fresh snapshot. HEAD did not move for the apply, and nothing
+/// is pinned again.
+fn undo_suggestion(
+    worktree: &std::path::Path,
+    m: &crate::worktree_guard::WorktreeMutation,
+) -> anyhow::Result<()> {
+    let mut back = m.clone();
+    back.head_moved = false;
+    crate::worktree_guard::restore_creator_tree(worktree, &mut back, None)
 }
 
 /// (core#2022) Announce a rewind [`rewind_writes`] wrote, and dispatch its target unit.
