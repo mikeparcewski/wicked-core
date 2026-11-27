@@ -5027,6 +5027,39 @@ mod tests {
         assert!(!still_alive, "the child holding stdout outlived the read");
     }
 
+    /// (core#1993, codex-check on 0825145) A child that leaves gh's process group (`setsid`) and
+    /// holds stdout for a while is waited for, as on main: the token comes back once it closes
+    /// stdout, within the deadline, never a 2 s "did not answer".
+    #[cfg(unix)]
+    #[test]
+    fn a_setsid_child_holding_stdout_briefly_still_gives_the_token_1993() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("gh-setsid-1993");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\necho fake-gh-token-setsid-1993\n\
+             perl -e 'use POSIX qw(setsid); setsid(); sleep 3' &\nexit 0\n", // ggignore: a made-up test value, not a secret
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let started = Instant::now();
+        let got = gh_token(&[("PATH", Path::new(&path))]);
+        assert_eq!(
+            got,
+            Ok("fake-gh-token-setsid-1993".into()),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// (core#1959, codex r1) A repository whose own config steers HTTP (here a proxy and TLS
     /// verification off, one through an include) is not given the GitHub credential.
     #[test]
