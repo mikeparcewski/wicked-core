@@ -50,7 +50,10 @@ turns one off for that repo with `Core::set_repo_seat_layers_off` (persisted `se
 on `GovernanceContext.seat_layers_off` at dispatch, left out at arm). A repo may name its own seat base image
 (`Core::set_repo_seat_base_image`, a local image reference; persisted `seat_base_image`, handed to each unit on
 `GovernanceContext.seat_base_image`): it wins over `WICKED_SEAT_BASE_IMAGE` and is an operator base (never pulled,
-keyed by its image id, no layer on it; missing is `seat_base_missing` naming the repo's setting). A layer set that does not build never
+keyed by its image id, no layer on it; missing is `seat_base_missing` naming the repo's setting), and its own seat
+memory limit (`Core::set_repo_seat_memory`, a whole number and k/m/g; persisted `seat_memory`, handed on
+`GovernanceContext.seat_memory`; repo > `WICKED_SEAT_MEMORY` > `3g`, core#2024). `seat-image build|status --repo <id>
+[--db <store>]` reads that repo's row read-only and builds (or reports) the images its units arm with. A layer set that does not build never
 blocks a unit: it runs on the plain seat image with a note naming the layers, the build error and the
 `seat-image build <cli> --layers <ids>` retry. A new layered build removes the older images of its set. A seat unit's
 `CARGO_HOME` always lives under `<worker home>/seat-build/<cli>` in the per-run, per-CLI replica

@@ -3043,6 +3043,7 @@ mod tests {
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
         };
         let run = AgentSession {
             id: "under-b".to_string(),

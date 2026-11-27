@@ -2546,6 +2546,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 human_confirm: HumanConfirm::All,
                 apps: None,
             }),
@@ -2617,6 +2618,7 @@ mod tests {
                 repo_id: repo.map(str::to_string),
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 human_confirm: HumanConfirm::None,
                 apps: None,
             })

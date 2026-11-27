@@ -262,6 +262,10 @@ pub struct GovernanceContext {
     /// still deserializes; absent on the wire when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_base_image: Option<String>,
+    /// (core#2024) The run's repo's own seat memory limit (`RepoEntry::seat_memory`), read at
+    /// dispatch; the arm gives the seat pod this limit instead of the daemon's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_memory: Option<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

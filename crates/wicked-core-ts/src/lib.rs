@@ -2103,6 +2103,23 @@ impl Core {
         })
     }
 
+    /// (core#2024) Set a repo's own seat memory limit (`null` or a blank string clears it): its
+    /// seats get that limit instead of the daemon's (`WICKED_SEAT_MEMORY`, else `3g`). Resolves to
+    /// the updated `RepoEntry` JSON object (`seat_memory`). Rejects a size that is not a whole
+    /// number with a unit (`6g`, `512m`), or an unknown repo.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_repo_seat_memory(
+        &self,
+        repo_id: String,
+        memory: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let entry = core.set_repo_seat_memory(&repo_id, memory).map_err(err)?;
+            serde_json::to_string(&entry).map_err(err)
+        })
+    }
+
     // ── Presets (DES-TEAMING-002 §8.4, seam C2) ────────────────────────────────
     // Commands through the actor (the single writer), reads included, so a list reflects every
     // write the actor has acknowledged.

@@ -200,6 +200,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         repo_id: None,
         seat_layers_off: Vec::new(),
         seat_base_image: None,
+        seat_memory: None,
         apps: None,
     })
 }
@@ -3069,6 +3070,17 @@ pub(crate) fn run(
                     &mut store,
                     &repo_id,
                     image.as_deref(),
+                ));
+            }
+            Command::SetRepoSeatMemory {
+                repo_id,
+                memory,
+                reply,
+            } => {
+                let _ = reply.send(crate::repo::set_seat_memory(
+                    &mut store,
+                    &repo_id,
+                    memory.as_deref(),
                 ));
             }
             Command::ListRepos { reply } => {
@@ -14883,6 +14895,7 @@ fn dispatch_unit_with(
             // (core#1043 part 3) …and its own seat base image, read the same way: the arm builds
             // the unit's seat image on it instead of the daemon's base.
             seat_base_image: crate::repo::seat_base_image_for(&*store, session.repo_ref.as_deref()),
+            seat_memory: crate::repo::seat_memory_for(&*store, session.repo_ref.as_deref()),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
             // (DES-APPS-001 K0, narrowed by DES-KNOWLEDGE-DATA-001 §9.3) An Apps run's units get no
@@ -43335,6 +43348,7 @@ mod worker_code_graph_tests {
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -43798,6 +43812,7 @@ mod project_graph_binding_tests {
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));

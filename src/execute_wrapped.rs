@@ -4491,6 +4491,10 @@ impl WrappedCliStepRunner {
                         .governance
                         .as_ref()
                         .and_then(|g| g.seat_base_image.as_deref()),
+                    input
+                        .governance
+                        .as_ref()
+                        .and_then(|g| g.seat_memory.as_deref()),
                 );
                 if let Some((phases, total_ms)) = crate::k8s::clock::take() {
                     self.emit_event(crate::event::CoreEvent::SeatArmTimed {
@@ -10810,6 +10814,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let project = gov(&dir_a.join("code-graph.db"));
@@ -11440,6 +11445,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         });
         assert!(warm_judge_key(&input).is_none());
@@ -11745,6 +11751,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -11928,6 +11935,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -12447,6 +12455,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -12646,6 +12655,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -13031,6 +13041,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let input = StepInput {
@@ -13281,6 +13292,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let input = |governance: Option<crate::workflow::GovernanceContext>| {
@@ -14022,6 +14034,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -16382,6 +16395,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             },
             &format!("mcptest-repo-{}", std::process::id()),
@@ -16421,6 +16435,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             },
             &format!("mcptest-norepo-{}", std::process::id()),
@@ -17092,6 +17107,7 @@ mod tests {
                 repo_id: None,
                 seat_layers_off: Vec::new(),
                 seat_base_image: None,
+                seat_memory: None,
                 apps: None,
             }),
             prior_outputs: vec![],
@@ -20094,6 +20110,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let input = StepInput {
@@ -20295,6 +20312,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let input = StepInput {
@@ -22522,6 +22540,7 @@ mod ask_config_tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let mut input = StepInput {

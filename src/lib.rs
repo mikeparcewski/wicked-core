@@ -273,7 +273,10 @@ pub use code_graph::{
     RepoGraphWrite,
 };
 pub use command::InjectTarget;
-pub use container_floor::{default_seat_floor, seat_image_main};
+pub use container_floor::{
+    default_seat_floor, seat_image_main, seat_image_main_for, seat_image_repo,
+    seat_image_repo_args, SeatImageArgs, SeatImageRepo,
+};
 pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -1638,6 +1641,27 @@ impl Core {
             .send(Command::SetRepoSeatBaseImage {
                 repo_id: repo_id.to_string(),
                 image,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (core#2024) Set the repo `repo_id`'s own seat memory limit (`None` or a blank size clears
+    /// it): its seats get that limit instead of the daemon's (`WICKED_SEAT_MEMORY`, else `3g`) from
+    /// the next unit dispatched. A size that is not a whole number with a unit (`6g`, `512m`), or an
+    /// unknown repo, is refused by name and nothing is written. Returns the updated [`RepoEntry`].
+    pub fn set_repo_seat_memory(
+        &self,
+        repo_id: &str,
+        memory: Option<String>,
+    ) -> anyhow::Result<RepoEntry> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::SetRepoSeatMemory {
+                repo_id: repo_id.to_string(),
+                memory,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
