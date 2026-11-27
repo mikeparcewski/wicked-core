@@ -883,6 +883,19 @@ pub fn snapshot(worktree: &Path, repo_root: &Path) -> anyhow::Result<WorktreeSna
 /// store. New blobs and trees live only in a per-call scratch directory; existing objects are
 /// read through the COMMON git directory, including for a linked worktree's pinned git dir.
 pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow::Result<String> {
+    with_scratch_objects(worktree, git_dir, |worktree, git_dir, objects| {
+        snapshot_through_inner(worktree, git_dir, objects, false).map(|snapshot| snapshot.tree)
+    })
+}
+
+/// Run `f` with an object environment whose NEW objects land in a per-call scratch directory
+/// (removed afterwards, on success and on error), existing ones read through the COMMON git
+/// directory: [`snapshot_tree_readonly`]'s confinement, for any read that must make objects.
+fn with_scratch_objects<T>(
+    worktree: &Path,
+    git_dir: &Path,
+    f: impl FnOnce(&Path, &Path, &[(&str, &Path)]) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let worktree = plain_path(worktree.to_path_buf());
     let git_dir = plain_path(git_dir.to_path_buf());
     let common = git_string(
@@ -899,19 +912,59 @@ pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow:
     )?);
     let temporary_objects = plain_path(scratch_index_path().with_extension("objects"));
     std::fs::create_dir(&temporary_objects)?;
-    let result = snapshot_through_inner(
+    let result = f(
         &worktree,
         &git_dir,
         &[
             ("GIT_OBJECT_DIRECTORY", temporary_objects.as_path()),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_path()),
         ],
-        false,
-    )
-    .map(|snapshot| snapshot.tree);
+    );
     // Remove newly written objects on success AND on any snapshot error.
     let _ = std::fs::remove_dir_all(&temporary_objects);
     result
+}
+
+/// (core#2036) The paths the worktree's content changed since `baseline` (its tree over tracked +
+/// untracked-not-ignored content, as [`snapshot`] takes it), read without writing into the
+/// repository's object store ([`with_scratch_objects`]): a gate read may ask it. `Ok(None)` when
+/// the tree is the baseline's; `Ok(Some(paths))` otherwise (`git diff-tree --name-status`
+/// statuses; empty only if git names no path for a differing tree). `Err` when the baseline has no
+/// pinned git dir or git fails.
+pub(crate) fn changed_since_readonly(
+    worktree: &Path,
+    baseline: &WorktreeSnapshot,
+) -> anyhow::Result<Option<Vec<ChangedPath>>> {
+    let git_dir = baseline
+        .git_dir
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the baseline snapshot carries no pinned git dir"))?;
+    with_scratch_objects(
+        worktree,
+        Path::new(git_dir),
+        |worktree, git_dir, objects| {
+            let now = snapshot_through_inner(worktree, git_dir, objects, false)?;
+            if now.tree == baseline.tree {
+                return Ok(None);
+            }
+            let mut env: Vec<(&str, &Path)> =
+                vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+            env.extend_from_slice(objects);
+            Ok(Some(parse_name_status_z(&git(
+                worktree,
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--name-status",
+                    "--no-renames",
+                    &baseline.tree,
+                    &now.tree,
+                ],
+                &env,
+            )?)))
+        },
+    )
 }
 
 /// Read-only content tree pinned to the registered repository, as [`snapshot`] pins its snapshot.
@@ -2150,6 +2203,39 @@ pub(crate) mod tests {
                 && reason.contains(&format!("git read-tree --reset -u {}", before.tree)),
             "the denial names the paths, the rule and the restore: {reason}"
         );
+    }
+
+    /// (core#2036) SHARED/CACHED READS: the changed paths since a baseline are read without
+    /// writing a single object into the repository's object store (a gate read asks it); `None`
+    /// for an unchanged tree.
+    #[test]
+    fn changed_since_readonly_names_the_paths_and_writes_no_object_2036() {
+        let wt = creator_worktree("changed-ro-2036");
+        let base = snapshot(&wt, &repo_of(&wt)).unwrap();
+        let objects = repo_of(&wt).join(".git/objects");
+        assert_eq!(changed_since_readonly(&wt, &base).unwrap(), None);
+        std::fs::write(wt.join("src/a.ts"), "export const a = 9;\n").unwrap();
+        std::fs::write(wt.join("src/new.ts"), "export const n = 1;\n").unwrap();
+        let stored = object_files(&objects);
+        let changed = changed_since_readonly(&wt, &base)
+            .unwrap()
+            .expect("the tree changed");
+        let mut named: Vec<(String, String)> =
+            changed.into_iter().map(|c| (c.status, c.path)).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                ("A".to_string(), "src/new.ts".to_string()),
+                ("M".to_string(), "src/a.ts".to_string())
+            ]
+        );
+        assert_eq!(object_files(&objects), stored, "no object was written");
+        let no_pin = WorktreeSnapshot {
+            git_dir: None,
+            ..base.clone()
+        };
+        assert!(changed_since_readonly(&wt, &no_pin).is_err());
     }
 
     /// core#431 (F-3R2-010): the engine restores the creator's tree itself. After the F-036

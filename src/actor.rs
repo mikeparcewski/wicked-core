@@ -22195,6 +22195,52 @@ fn adoptable_suggestion(
         })
 }
 
+/// (core#2036) At most this many changed paths are named in [`worktree_holds_reviewed_tree`]'s
+/// refusal; the rest are counted.
+const HAND_EDIT_PATHS_SHOWN: usize = 10;
+
+/// (core#2036) Whether the worktree still holds the tree the guard restored for this gate
+/// (`m.before.tree`), read without writing into the repository's object store. `Err` (the refusal
+/// of `accept_suggestion`) when it changed, naming the paths (escaped, at most
+/// [`HAND_EDIT_PATHS_SHOWN`]), or when it cannot be read (the apply would overwrite what was not
+/// read).
+fn worktree_holds_reviewed_tree(
+    worktree: &std::path::Path,
+    m: &crate::worktree_guard::WorktreeMutation,
+) -> anyhow::Result<()> {
+    let changed =
+        crate::worktree_guard::changed_since_readonly(worktree, &m.before).map_err(|e| {
+            anyhow::anyhow!(
+            "could not read the worktree to check it still holds the tree this gate reviewed, so \
+             the suggestion is not applied ({e}) — approve (retry), request changes or reject"
+        )
+        })?;
+    let Some(changed) = changed else {
+        return Ok(());
+    };
+    let mut named: Vec<String> = changed
+        .iter()
+        .take(HAND_EDIT_PATHS_SHOWN)
+        .map(|c| format!("{} {}", c.status, c.path.escape_debug()))
+        .collect();
+    if changed.len() > HAND_EDIT_PATHS_SHOWN {
+        named.push(format!(
+            "and {} more",
+            changed.len() - HAND_EDIT_PATHS_SHOWN
+        ));
+    }
+    anyhow::bail!(
+        "the worktree changed since this gate was raised ({}): accepting the suggestion would \
+         overwrite those edits — commit or undo them first, or answer approve (retry), request \
+         changes or reject",
+        if named.is_empty() {
+            "its tree differs".to_string()
+        } else {
+            named.join(", ")
+        }
+    )
+}
+
 /// (core#467) Apply the evaluator's pinned edit to the worktree — the reverse of the guard's
 /// restore: `git read-tree --reset -u <edit tree>` through the PINNED git dir, then `git reset -q`
 /// (index → HEAD, working tree untouched) so the change reads as the creator's uncommitted work.
@@ -22621,7 +22667,13 @@ pub(crate) fn refuse_before_resolving(
             let cursor = cursor.ok_or_else(|| {
                 anyhow::anyhow!("run {run_id} has no unit at its cursor to take a suggestion from")
             })?;
-            adoptable_suggestion(cursor)?;
+            let suggestion = adoptable_suggestion(cursor)?;
+            // (core#2036) The apply resets the worktree to the evaluator's edit: refused when the
+            // parked worktree no longer holds the tree this gate reviewed (an edit by hand), so
+            // those edits are never overwritten. Read-only: a gate read probes this too.
+            if let Some(workdir) = session.workdir.as_deref() {
+                worktree_holds_reviewed_tree(std::path::Path::new(workdir), suggestion)?;
+            }
             let has_creator = cursor.role == crate::workflow::PhaseRole::Creator
                 || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
             if !has_creator {
