@@ -199,6 +199,47 @@ fn types_of(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+/// What a live subscriber received for `session`, as JSON, in order: everything up to and including
+/// the run's terminal event, then whatever follows it within 200 ms.
+///
+/// The terminal event being in the LOG says nothing about the subscriber (core#2040 review):
+/// `EventSink::emit` hands the record to the background writer first and only then fans it out, so
+/// the actor can be descheduled in between while the writer makes the record readable. So this
+/// waits on the subscriber's own copy of the terminal event, with a 20 s bound.
+fn live_events(rx: &std::sync::mpsc::Receiver<CoreEvent>, session: &str) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    let mut ended = false;
+    loop {
+        let wait = if ended {
+            Duration::from_millis(200)
+        } else {
+            match deadline.checked_duration_since(Instant::now()) {
+                Some(left) => left,
+                None => panic!(
+                    "the subscriber never received `{session}`'s terminal event in 20s: {:?}",
+                    types_of(&seen)
+                ),
+            }
+        };
+        let ev = match rx.recv_timeout(wait) {
+            Ok(ev) => ev,
+            Err(_) if ended => return seen,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the subscriber was dropped before `{session}` ended: {:?}",
+                types_of(&seen)
+            ),
+        };
+        let json = ev.to_json();
+        if json.get("session").and_then(|v| v.as_str()) != Some(session) {
+            continue;
+        }
+        ended |= TERMINAL_EVENTS.contains(&json["type"].as_str().unwrap_or(""));
+        seen.push(json);
+    }
+}
+
 /// Poll until `session` reports `want`, naming the last-seen status on timeout so a stalled run and a
 /// merely slow one are distinguishable.
 fn wait_status(core: &Core, session: &str, want: SessionStatus) {
@@ -331,8 +372,7 @@ fn the_recorded_history_matches_what_the_live_stream_carried() {
 
     // Collect what the socket saw, using the same exclusions the log applies.
     let mut live: Vec<String> = Vec::new();
-    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
-        let json = ev.to_json();
+    for json in live_events(&rx, "evlog-agree") {
         let Some(ty) = json.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -342,9 +382,7 @@ fn the_recorded_history_matches_what_the_live_stream_carried() {
         ) {
             continue;
         }
-        if json.get("session").and_then(|v| v.as_str()) == Some("evlog-agree") {
-            live.push(ty.to_string());
-        }
+        live.push(ty.to_string());
     }
 
     let logged: Vec<String> = core
@@ -444,14 +482,10 @@ fn no_event_reaches_a_subscriber_without_also_reaching_the_log() {
     wait_terminal(&core, "evlog-nogap");
 
     let mut live: std::collections::BTreeSet<String> = Default::default();
-    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
-        let j: serde_json::Value = ev.to_json();
+    for j in live_events(&rx, "evlog-nogap") {
         let Some(ty) = j.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
-        if j.get("session").and_then(|v| v.as_str()) != Some("evlog-nogap") {
-            continue;
-        }
         if matches!(
             ty,
             "cliOutputDelta" | "chatDelta" | "terminalOutput" | "heartbeat"
