@@ -1045,8 +1045,8 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     };
     // Attempt 3: no council started before the unit ended.
     let s = held_high(false);
-    assert!(convened_findings(&s.rows).is_empty());
-    let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
+    assert_eq!(convened_councils(&s.rows), Convened::default());
+    let l = synthesize_timeout(s.fold(), &convened_councils(&s.rows));
     let d = l.findings[0]
         .dispute
         .as_ref()
@@ -1062,10 +1062,10 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     // Attempt 4: the council convened and was still voting.
     let s = held_high(true);
     assert_eq!(
-        convened_findings(&s.rows),
+        convened_councils(&s.rows).findings,
         std::collections::HashMap::from([(fid(1), vec!["codex".to_string()])])
     );
-    let l = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
+    let l = synthesize_timeout(s.fold(), &convened_councils(&s.rows));
     let d = l.findings[0]
         .dispute
         .as_ref()
@@ -1083,7 +1083,7 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     stray.event.env.run_id = "f88faa2f".into();
     stray.event.env.ord = Some(6);
     stray.event.env.attempt = Some(4);
-    assert!(convened_findings(&s.rows).is_empty());
+    assert_eq!(convened_councils(&s.rows), Convened::default());
     // A member step's council names no finding: it never stands in for one.
     let mut s = held_high(false);
     s.push(
@@ -1098,7 +1098,97 @@ fn core_1822_a_council_that_never_convened_is_not_a_timeout() {
     step.event.env.run_id = "f88faa2f".into();
     step.event.env.ord = Some(6);
     step.event.env.attempt = Some(3);
-    assert!(convened_findings(&s.rows).is_empty());
+    let convened = convened_councils(&s.rows);
+    assert!(convened.findings.is_empty(), "{convened:?}");
+    // (core#2011) It is a step's council, by its subject.
+    assert_eq!(
+        convened.steps,
+        std::collections::HashMap::from([(subject_step("build", 3), vec!["codex".to_string()])])
+    );
+}
+
+/// core#2011: a member-step council the final pass outlived (its ballots started, its ruling never
+/// came) keeps the seats that sat, as a finding's council does, so its voters reach the receipt's
+/// roles. One that never convened stays without a dispute; the engine pauses on both alike.
+#[test]
+fn a_step_council_the_final_pass_outlived_keeps_its_seats_2011() {
+    let step = |convened: bool| {
+        let mut s = Stream::new();
+        s.push(
+            "claude#1",
+            TeamBody::StepReviewed(StepReviewed {
+                step_id: "build".into(),
+                verdict: StepVerdict::Rejected,
+                to: Some(ReworkBy::Member),
+                reason: "the tests do not run".into(),
+                reviewed_attempt: Some(0),
+            }),
+        )
+        .push(
+            "engine",
+            TeamBody::CouncilCalled(CouncilCalled {
+                subject: subject_step("build", 0),
+                finding_id: None,
+                trigger: CouncilTrigger::MemberStep,
+                question: "does the step count?".into(),
+                positions: vec![CouncilPosition {
+                    by: "member:codex".into(),
+                    position: "hold".into(),
+                    reason: "they do".into(),
+                }],
+                evidence: String::new(),
+                excluded_seats: vec!["codex".into()],
+                transcript: Vec::new(),
+            }),
+        );
+        if convened {
+            s.push(
+                "engine",
+                TeamBody::CouncilConvened(CouncilConvened {
+                    subject: subject_step("build", 0),
+                    finding_id: None,
+                    seats: vec!["claude~1".into(), "claude~2".into()],
+                }),
+            );
+        }
+        s.completed("ok");
+        s
+    };
+    let s = step(true);
+    assert_eq!(
+        convened_councils(&s.rows).steps,
+        std::collections::HashMap::from([(
+            subject_step("build", 0),
+            vec!["claude~1".to_string(), "claude~2".to_string()]
+        )])
+    );
+    let folded = s.fold();
+    assert_eq!(folded.step_reviews[0].held, Some(true));
+    assert_eq!(
+        folded.step_reviews[0].dispute, None,
+        "no ruling on the stream"
+    );
+    let l = synthesize_timeout(folded, &convened_councils(&s.rows));
+    let d = l.step_reviews[0]
+        .dispute
+        .as_ref()
+        .expect("the outlived council is on the record");
+    assert_eq!(d.verdict, crate::team::Verdict::NoVerdict);
+    assert_eq!(d.reason, Some(NoVerdictReason::Timeout));
+    assert_eq!(
+        d.seats,
+        vec!["claude~1".to_string(), "claude~2".to_string()]
+    );
+    assert_eq!(
+        d.independence,
+        crate::team::council_independence(&d.seats),
+        "the stand-in voters read as they sat"
+    );
+    assert!(d.independence.is_some());
+    // A step council that never convened did not time out: no dispute, as before.
+    let s = step(false);
+    let l = synthesize_timeout(s.fold(), &convened_councils(&s.rows));
+    assert_eq!(l.step_reviews[0].dispute, None);
 }
 
 /// core#1822: `not_convened` and a ruling's `detail` are additive on the wire — a no-verdict
@@ -1528,7 +1618,7 @@ fn fixture_16_continue_or_pause() {
         .answered(3, "build", "declined", "documented")
         .settled(3, "held", "the finding stands", Some(43))
         .ruled(3, "yes", None);
-    let j = synthesize_timeout(s.fold(), &convened_findings(&s.rows));
+    let j = synthesize_timeout(s.fold(), &convened_councils(&s.rows));
     let want = ledger(
         "timed_out",
         true,

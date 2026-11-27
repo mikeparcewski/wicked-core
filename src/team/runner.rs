@@ -1201,7 +1201,7 @@ fn complete_at(
                 l.refresh_pause();
                 l
             } else {
-                tev::synthesize_timeout(folded, &tev::convened_findings(&rows))
+                tev::synthesize_timeout(folded, &tev::convened_councils(&rows))
             };
             (ledger, transcript_of(&rows, TRANSCRIPT_CAP))
         }
