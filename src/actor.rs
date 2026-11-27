@@ -21075,7 +21075,9 @@ pub(crate) fn confirm_gate_expecting(
                     Ok(r) => r,
                     Err((e, before)) => {
                         if let Err(re) = restore_send_back(store, &opened, before) {
-                            return Err(e.context(format!("the gate could not be re-opened: {re}")));
+                            return Err(
+                                e.context(format!("the send-back could not be put back: {re}"))
+                            );
                         }
                         return Err(e);
                     }
@@ -23998,10 +24000,12 @@ fn rewind_writes(
 }
 
 /// (core#2022) What a gate's send-back wrote before it failed, to put back: the run's units and its
-/// session as they were when the answer arrived.
+/// session as they were when the answer arrived, and (core#2029) the worktree a suggestion was
+/// applied to, with the guard's record of that suggestion.
 struct SendBackBefore {
     units: Vec<crate::domain::WorkUnit>,
     session: crate::domain::AgentSession,
+    applied: Option<(std::path::PathBuf, crate::worktree_guard::WorktreeMutation)>,
 }
 
 /// (core#2022) A gate's send-back (request changes, or accept the evaluator's suggestion): the
@@ -24015,9 +24019,10 @@ fn send_back_writes(
     adopt_suggestion: bool,
 ) -> Result<Rewound, (anyhow::Error, Option<Box<SendBackBefore>>)> {
     let units = crate::domain::session_units(store, run_id).map_err(|e| (e, None))?;
-    let before = Box::new(SendBackBefore {
+    let mut before = Box::new(SendBackBefore {
         units: units.clone(),
         session: session.clone(),
+        applied: None,
     });
     let fail = |e: anyhow::Error, before: Box<SendBackBefore>| (e, Some(before));
     let (note, scope) = if adopt_suggestion {
@@ -24028,6 +24033,11 @@ fn send_back_writes(
             let workdir = session.workdir.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("run {run_id} has no worktree to apply the suggestion to")
             })?;
+            // (core#2029) From here the worktree may change: a failure undoes the apply.
+            before.applied = Some((
+                std::path::PathBuf::from(workdir),
+                adoptable_suggestion(cursor)?.clone(),
+            ));
             apply_suggestion(cursor, std::path::Path::new(workdir))
         })();
         match applied {
@@ -24042,18 +24052,47 @@ fn send_back_writes(
 
 /// (core#2022) Put a failed send-back back as the answer found it, in the answer's batch: the gate's
 /// rows open again, and the run's units and session (any of them the rewind had written) as they were.
+/// (core#2029) Then a suggestion it applied comes out of the worktree again ([`undo_suggestion`]).
 fn restore_send_back(
     store: &mut dyn GraphStore,
     opened: &[crate::interaction::InteractionRequest],
     before: Option<Box<SendBackBefore>>,
 ) -> anyhow::Result<()> {
-    if let Some(before) = before {
+    let Some(before) = before else {
+        return crate::interaction::reopen(store, opened);
+    };
+    let stored = (|| -> anyhow::Result<()> {
         for u in &before.units {
             put_node(store, u.to_node())?;
         }
         put_node(store, before.session.to_node())?;
+        crate::interaction::reopen(store, opened)
+    })();
+    // The worktree is undone whether or not the store could be put back: it is the one part of a
+    // failed send-back that no later answer re-derives.
+    let undone = match &before.applied {
+        Some((worktree, m)) => undo_suggestion(worktree, m)
+            .map_err(|e| e.context("the suggestion stays in the worktree")),
+        None => Ok(()),
+    };
+    match (stored, undone) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(s), Err(u)) => Err(s.context(format!("{u:#}"))),
     }
-    crate::interaction::reopen(store, opened)
+}
+
+/// (core#2029) Take an applied suggestion back out of the worktree: the guard's own restore, run
+/// again from the same record, puts the creator's tree back (the edited paths reset, the added
+/// ones deleted) and proves it with a fresh snapshot. HEAD did not move for the apply, and nothing
+/// is pinned again.
+fn undo_suggestion(
+    worktree: &std::path::Path,
+    m: &crate::worktree_guard::WorktreeMutation,
+) -> anyhow::Result<()> {
+    let mut back = m.clone();
+    back.head_moved = false;
+    crate::worktree_guard::restore_creator_tree(worktree, &mut back, None)
 }
 
 /// (core#2022) Announce a rewind [`rewind_writes`] wrote, and dispatch its target unit.
@@ -35096,6 +35135,9 @@ mod request_changes_tests {
             pub run_id: &'a str,
             pub commits: Vec<(bool, usize, String)>,
             pub fail_rewind: bool,
+            /// (core#2029) Every write after the injected failure fails too (the restore's).
+            pub stay_broken: bool,
+            pub broken: bool,
         }
 
         impl GraphRead for SendBackStore<'_> {
@@ -35227,8 +35269,12 @@ mod request_changes_tests {
                     matches!(&n.kind, NodeKind::Other(k) if k == wicked_apps_core::AGENT_SESSION)
                         && n.metadata.get("status").and_then(|v| v.as_str()) == Some("executing")
                 });
+                if self.broken {
+                    return Err(Error::Storage("disk still failing (test)".into()));
+                }
                 if self.fail_rewind && rewinding {
                     self.fail_rewind = false;
+                    self.broken = self.stay_broken;
                     return Err(Error::Storage("disk I/O error (test)".into()));
                 }
                 self.inner.upsert_nodes(nodes)
@@ -35313,6 +35359,8 @@ mod request_changes_tests {
             run_id,
             commits: Vec::new(),
             fail_rewind: false,
+            stay_broken: false,
+            broken: false,
         };
         let (r, events) = answer(
             &mut counted,
@@ -35355,6 +35403,8 @@ mod request_changes_tests {
             run_id,
             commits: Vec::new(),
             fail_rewind: true,
+            stay_broken: false,
+            broken: false,
         };
         let (r, events) = answer(
             &mut failing,
@@ -35390,6 +35440,130 @@ mod request_changes_tests {
             crate::domain::get_session(&store, run_id).unwrap().unwrap(),
             session_before
         );
+    }
+
+    /// (core#2029) What a gate reviewed: the worktree as [`failed_accept_suggestion`] set it up.
+    #[cfg(unix)]
+    struct Reviewed {
+        wt: std::path::PathBuf,
+        repo: std::path::PathBuf,
+        tree: String,
+        a_ts: String,
+    }
+
+    /// (core#2029) An accept-suggestion answer at a verify gate over a real worktree whose
+    /// evaluator edit the guard restored and pinned, with the rewind's session write failing once
+    /// (and, with `stay_broken`, every write after it: the restore's too). Returns the answer's
+    /// error and what the gate reviewed.
+    #[cfg(unix)]
+    fn failed_accept_suggestion(
+        store: &mut dyn GraphStore,
+        tag: &str,
+        stay_broken: bool,
+    ) -> (String, Reviewed) {
+        let wt = crate::worktree_guard::tests::creator_worktree(tag);
+        let repo = wt.parent().unwrap().join("repo");
+        let before = crate::worktree_guard::snapshot(&wt, &repo).unwrap();
+        let a_ts = std::fs::read_to_string(wt.join("src/a.ts")).unwrap();
+        std::fs::write(wt.join("src/a.ts"), "export const a = 3; // evaluator\n").unwrap();
+        std::fs::write(wt.join("src/c.ts"), "export const c = 1;\n").unwrap();
+        let mut m = crate::worktree_guard::compare(&wt, &before)
+            .unwrap()
+            .expect("the evaluator changed the tree");
+        crate::worktree_guard::restore_creator_tree(
+            &wt,
+            &mut m,
+            Some(&format!("refs/wicked/suggestions/{tag}/4/0")),
+        )
+        .expect("the guard restores the creator's tree");
+        assert!(m.restored && m.suggestion_ref.is_some());
+
+        let run_id = tag;
+        park_send_back_gate(store, run_id);
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.workdir = Some(wt.to_string_lossy().into_owned());
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        units[3].denial = Some(crate::domain::UnitDenial::new(
+            "worktree_guard",
+            "the evaluator edited",
+        ));
+        units[3].worktree_mutation = Some(m);
+        put_node(store, units[3].to_node()).unwrap();
+
+        let mut failing = send_back_commit_store::SendBackStore {
+            inner: store,
+            run_id,
+            commits: Vec::new(),
+            fail_rewind: true,
+            stay_broken,
+            broken: false,
+        };
+        let (r, _) = answer(&mut failing, run_id, HumanDecision::AcceptSuggestion);
+        let err = format!("{:#}", r.unwrap_err());
+        let reviewed = Reviewed {
+            wt,
+            repo,
+            tree: before.tree,
+            a_ts,
+        };
+        (err, reviewed)
+    }
+
+    /// (core#2029) The worktree holds the tree the gate reviewed: the evaluator's edit reset, its
+    /// added file gone, the snapshot equal to the guard's baseline.
+    #[cfg(unix)]
+    fn assert_reviewed_tree(r: &Reviewed) {
+        assert_eq!(
+            std::fs::read_to_string(r.wt.join("src/a.ts")).unwrap(),
+            r.a_ts,
+            "the suggestion's edit is not left in the worktree"
+        );
+        assert!(
+            !r.wt.join("src/c.ts").exists(),
+            "the suggestion's added file is not left in the worktree"
+        );
+        assert_eq!(
+            crate::worktree_guard::snapshot(&r.wt, &r.repo)
+                .unwrap()
+                .tree,
+            r.tree,
+            "the worktree holds the tree the gate reviewed"
+        );
+    }
+
+    /// (core#2029) PARTIAL FAILURE: accepting the evaluator's suggestion applies it to the worktree
+    /// before the answer commits. When the rewind's writes then fail, the gate re-opens AND the
+    /// worktree goes back to the tree the gate reviewed: the suggestion is not left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_accept_suggestion_leaves_the_reviewed_tree_2029() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (err, reviewed) = failed_accept_suggestion(&mut store, "accept-fails-2029", false);
+        assert!(err.contains("disk I/O error"), "{err}");
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some("accept-fails-2029"),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate is open again");
+        assert_reviewed_tree(&reviewed);
+    }
+
+    /// (core#2029, codex on #2033) The worktree is undone even when the store cannot be put back
+    /// (every write after the first failure fails too): both failures are reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_restore_still_takes_the_suggestion_out_of_the_worktree_2029() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (err, reviewed) = failed_accept_suggestion(&mut store, "accept-fails-twice-2029", true);
+        assert!(
+            err.contains("the send-back could not be put back")
+                && err.contains("disk still failing"),
+            "{err}"
+        );
+        assert_reviewed_tree(&reviewed);
     }
 
     /// (core#1313) The first answer commit contains the row AND its redo state; nested
