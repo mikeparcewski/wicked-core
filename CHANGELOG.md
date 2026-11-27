@@ -14,6 +14,28 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.16.1** — 2026-11-27 — patch release on the train-17 cut 10788226, carrying 7 PRs since 0.16.0: #1986, #1989, #1990, #2002, #2008, #2010, #2007.
+  The entries below were written from each PR's changelog entry (the PR title where it had none).
+
+  - **domain:** the coverage report and the 1.2.0 domain model agree on old-loop rules. In a store that holds a 1.2.0 build or any J6 v3 row, a rule the retired page loop wrote is no longer counted, because the model skips it. A store the old loop alone wrote keeps its 1.1.0 label. `domain-run` refuses a wicked-garden too old to map a domain, in words, before it runs anything. A domain build that another build overtook is still refused and writes nothing, and a test now pins this. (#1955, #1986)
+  - **A big change's rule check asks its parts at once** (core#1958, #1989). A change too big for one judge call is
+    judged in parts; the parts after the first now go to the same judge seat together (at most 3 judge calls in
+    flight for the whole check), not one after another, and are read in part order as before. A `/new mcp`
+    review step's rule check took 21 minutes, most of it parts and re-asks waiting in line.
+  - **The engine reads a private GitHub origin with the deliver credential** (core#1959, #1989). On a repo whose
+    `git fetch origin` is refused (no git credential helper), the run base and the deliver lift fetch once more
+    with the credential the deliver step uses (`GH_TOKEN`, else gh's login for github.com), so a run no longer
+    starts on a stale base while its record says it is current. A repository whose own git config sets `http.*`
+    settings, or maps `remote.origin.fetch` other than git's default, is not given the credential, and the
+    run's note says so.
+  - **standin:** seat stand-ins for team councils, monitors and one-seat publishes (#1972, #1973, #1974, #1985, #1926; #1990).
+  - **standin:** team stand-ins as role records; an abandoned reservation reserves nothing (#1997, #1999; #2008).
+  - **A partial clone missing recent history is caught before the run** (core#2001, #2010). On the container floor, a run
+    whose base is a partial clone missing objects of its last 50 commits is refused at its start, with the remedy,
+    instead of at its first step. Registering such a checkout warns on the repo card.
+  - **domain model**: a requirement is now a statement that a shown sentence of a business rule group cites (wicked-garden#1545, #2007). Statements cited only by housekeeping groups or withheld sentences, and open statements, move to the new optional `metadata.statements` (schema bundle 1.4.1). A code edit keeps its requirement, shown stale. Needs wicked-crew with wicked-crew#1961.
+  - **test:** the judge-registry seat-directory check runs alone in a child process (core#2000, #2002).
+
 - **core-ts 0.16.0** — 2026-11-26 — minor release on the train-16 cut f413ba88, carrying 12 PRs since 0.15.51: #1968, #1966, #1967, #1963, #1978, #1976, #1984, #1983, #1969, #1951, #1982, #1987. The engine's domain CLI loses commands and flags (J6 C3, core#1951, below), so this is a minor version. It builds on wicked-estate 0.36.2 (estate#642: `memory.learn` honours its scope and tier).
   The entries below were written from each PR's changelog entry (the PR title or body where it had none).
 
