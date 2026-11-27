@@ -20619,7 +20619,8 @@ pub(crate) fn confirm_gate_expecting(
             }
             Ok(())
         };
-    crate::interaction::resolve_open_for_session(
+    // (core#2022) The rows as they were open, for a send-back whose rewind fails to put back.
+    let opened = crate::interaction::resolve_open_for_session_keeping(
         store,
         run_id,
         crate::interaction::InteractionStatus::Answered,
@@ -21049,32 +21050,30 @@ pub(crate) fn confirm_gate_expecting(
             // (core#467) ACCEPT SUGGESTION: the evaluator's pinned edit is applied to the worktree
             // first; the creator's rework then owns it (and its floor judges the tree).
             if let Some(note) = rework {
-                finish_answer(store, subscribers)?;
-                let (note, scope) = if adopt_suggestion {
-                    let units = crate::domain::session_units(store, run_id)?;
-                    let cursor = units
-                        .get(session.unit_ix)
-                        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
-                    let workdir = session.workdir.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("run {run_id} has no worktree to apply the suggestion to")
-                    })?;
-                    (
-                        Some(apply_suggestion(cursor, std::path::Path::new(workdir))?),
-                        "accept_suggestion",
-                    )
-                } else {
-                    (note, "request_changes")
+                // (core#2022) The rewind's writes ride the answer's batch: ONE commit holds the
+                // answered row, the units and the session, so a crash before it leaves the gate
+                // open, never answered on a run still parked at it. A failure inside the writes
+                // puts the rows, units and session back in the same batch first (there is no
+                // rollback: the error path commits, `AnswerTx::drop`).
+                let rewound = match send_back_writes(store, session, run_id, note, adopt_suggestion)
+                {
+                    Ok(r) => r,
+                    Err((e, before)) => {
+                        if let Err(re) = restore_send_back(store, &opened, before) {
+                            return Err(e.context(format!("the gate could not be re-opened: {re}")));
+                        }
+                        return Err(e);
+                    }
                 };
-                return rewind_to_creator_scoped(
+                finish_answer(store, subscribers)?;
+                return rewind_dispatch(
                     store,
                     subscribers,
                     runner,
                     self_tx,
                     in_flight,
-                    session,
                     run_id,
-                    note,
-                    scope,
+                    rewound,
                     lifecycle_maps,
                     actor_maps,
                     process_gen,
@@ -23764,6 +23763,41 @@ fn rewind_to_creator_scoped(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<SessionStatus> {
+    let rewound = rewind_writes(store, session, run_id, note, scope)?;
+    rewind_dispatch(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        run_id,
+        rewound,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    )
+}
+
+/// (core#2022) What [`rewind_writes`] wrote, for [`rewind_dispatch`] to announce and dispatch.
+struct Rewound {
+    target_ix: usize,
+    target_ord: u32,
+    amendment: String,
+    updated_description: String,
+    scope: String,
+}
+
+/// (core#2022) The rewind's reads and writes, with no event and no dispatch: every unit from the
+/// target on, then the session. A gate's send-back runs it inside the answer's batch, so the
+/// answered row, the units and the session commit together.
+fn rewind_writes(
+    store: &mut dyn GraphStore,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    note: Option<String>,
+    scope: &str,
+) -> anyhow::Result<Rewound> {
     let mut units = crate::domain::session_units(store, run_id)?;
     // (core#2005) At the terminal gate the unit under review is the last one (the cursor is past it).
     let cursor_ix = send_back_cursor_ix(&session, &units).unwrap_or(session.unit_ix);
@@ -23939,14 +23973,104 @@ fn rewind_to_creator_scoped(
     s.verified_tree = None;
     s.status = SessionStatus::Executing;
     put_node(store, s.to_node())?;
+    Ok(Rewound {
+        target_ix,
+        target_ord,
+        amendment,
+        updated_description: units[target_ix].description.clone(),
+        scope: scope.to_string(),
+    })
+}
+
+/// (core#2022) What a gate's send-back wrote before it failed, to put back: the run's units and its
+/// session as they were when the answer arrived.
+struct SendBackBefore {
+    units: Vec<crate::domain::WorkUnit>,
+    session: crate::domain::AgentSession,
+}
+
+/// (core#2022) A gate's send-back (request changes, or accept the evaluator's suggestion): the
+/// suggestion applied to the worktree when it is accepted, then [`rewind_writes`]. An error comes
+/// with the units and session as they were, for [`restore_send_back`].
+fn send_back_writes(
+    store: &mut dyn GraphStore,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    note: Option<String>,
+    adopt_suggestion: bool,
+) -> Result<Rewound, (anyhow::Error, Option<Box<SendBackBefore>>)> {
+    let units = crate::domain::session_units(store, run_id).map_err(|e| (e, None))?;
+    let before = Box::new(SendBackBefore {
+        units: units.clone(),
+        session: session.clone(),
+    });
+    let fail = |e: anyhow::Error, before: Box<SendBackBefore>| (e, Some(before));
+    let (note, scope) = if adopt_suggestion {
+        let applied = (|| -> anyhow::Result<String> {
+            let cursor = units
+                .get(session.unit_ix)
+                .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+            let workdir = session.workdir.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("run {run_id} has no worktree to apply the suggestion to")
+            })?;
+            apply_suggestion(cursor, std::path::Path::new(workdir))
+        })();
+        match applied {
+            Ok(n) => (Some(n), "accept_suggestion"),
+            Err(e) => return Err(fail(e, before)),
+        }
+    } else {
+        (note, "request_changes")
+    };
+    rewind_writes(store, session, run_id, note, scope).map_err(|e| fail(e, before))
+}
+
+/// (core#2022) Put a failed send-back back as the answer found it, in the answer's batch: the gate's
+/// rows open again, and the run's units and session (any of them the rewind had written) as they were.
+fn restore_send_back(
+    store: &mut dyn GraphStore,
+    opened: &[crate::interaction::InteractionRequest],
+    before: Option<Box<SendBackBefore>>,
+) -> anyhow::Result<()> {
+    if let Some(before) = before {
+        for u in &before.units {
+            put_node(store, u.to_node())?;
+        }
+        put_node(store, before.session.to_node())?;
+    }
+    crate::interaction::reopen(store, opened)
+}
+
+/// (core#2022) Announce a rewind [`rewind_writes`] wrote, and dispatch its target unit.
+#[allow(clippy::too_many_arguments)]
+fn rewind_dispatch(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    rewound: Rewound,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    let Rewound {
+        target_ix,
+        target_ord,
+        amendment,
+        updated_description,
+        scope,
+    } = rewound;
     emit(
         subscribers,
         CoreEvent::UnitReworkAmended {
             session: run_id.to_string(),
             ord: target_ord,
             amendment,
-            updated_description: units[target_ix].description.clone(),
-            scope: scope.to_string(),
+            updated_description,
+            scope,
         },
     );
     emit(
