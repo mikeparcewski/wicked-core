@@ -1622,6 +1622,29 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#1043 part 3) Set the repo `repo_id`'s own seat base image (`None` or a blank reference
+    /// clears it): its seats are built on that local image instead of the daemon's base from the
+    /// next unit dispatched, with no toolchain layer composed on it, and a base the container
+    /// runtime lacks is refused at the arm (`seat_base_missing`), never pulled. A reference that is
+    /// not a local image name, or an unknown repo, is refused by name and nothing is written.
+    /// Returns the updated [`RepoEntry`].
+    pub fn set_repo_seat_base_image(
+        &self,
+        repo_id: &str,
+        image: Option<String>,
+    ) -> anyhow::Result<RepoEntry> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::SetRepoSeatBaseImage {
+                repo_id: repo_id.to_string(),
+                image,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// List every registered repository.
     pub fn list_repos(&self) -> anyhow::Result<Vec<RepoEntry>> {
         let (reply, rx) = channel();

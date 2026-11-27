@@ -659,6 +659,14 @@ export declare class Core {
    */
   setRepoSeatLayersOff(repoId: string, offJson: string): Promise<string>
   /**
+   * (core#1043 part 3) Set a repo's own seat base image (`null` or a blank string clears it):
+   * its seats are built on that local image instead of the daemon's base, with no toolchain
+   * layer on it, and a base the container runtime lacks is refused at the arm, never pulled.
+   * Resolves to the updated `RepoEntry` JSON object (`seat_base_image`, and `seat_layers` rows
+   * off by `repo_base`). Rejects a reference that is not a local image name, or an unknown repo.
+   */
+  setRepoSeatBaseImage(repoId: string, image?: string | undefined | null): Promise<string>
+  /**
    * Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
    * plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's
    * scope; `createdBy` defaults to `api`. Resolves to the stored `Preset` JSON object

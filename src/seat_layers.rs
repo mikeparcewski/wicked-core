@@ -378,18 +378,23 @@ pub(crate) fn for_tree_except(
 /// (core#1043 part 2) The repo card's rows for the checkout at `tree`: every layer it is detected
 /// to need, in catalog order, and what turned one off. `off` is the repo's own switch; `setting`
 /// is [`LAYERS_ENV`]'s value and `operator_base` whether the operator set a seat base image, either
-/// of which turns every layer off for every repo.
+/// of which turns every layer off for every repo. (part 3) `repo_base` is whether the repo has its
+/// own seat base image, which turns every layer off for it and is named over the others.
 pub(crate) fn rows(
     tree: &Path,
     off: &[String],
     setting: Option<&str>,
     operator_base: bool,
+    repo_base: bool,
 ) -> Vec<crate::repo::RepoSeatLayer> {
     let daemon_off = setting.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
     detect_cached(tree)
         .into_iter()
         .map(|l| {
-            let off_by = if operator_base {
+            // (core#1043 part 3) The repo's own base wins over the daemon's, as at the arm.
+            let off_by = if repo_base {
+                Some("repo_base")
+            } else if operator_base {
                 Some("operator_base")
             } else if daemon_off {
                 Some("daemon")
@@ -818,7 +823,7 @@ mod tests {
         std::fs::write(t.join("go.mod"), "module x\n").unwrap();
         let view = |off: &[&str], setting: Option<&str>, operator_base: bool| {
             let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
-            rows(&t, &off, setting, operator_base)
+            rows(&t, &off, setting, operator_base, false)
                 .into_iter()
                 .map(|r| (r.id, r.enabled, r.off_by))
                 .collect::<Vec<_>>()
@@ -835,5 +840,18 @@ mod tests {
             view(&[], None, true),
             [off("go", "operator_base"), off("rust", "operator_base")]
         );
+        // (core#1043 part 3) The repo's own base is its toolchain, over the daemon's.
+        let rows_of = |operator_base: bool| {
+            rows(&t, &["go".to_string()], Some("off"), operator_base, true)
+                .into_iter()
+                .map(|r| (r.id, r.enabled, r.off_by))
+                .collect::<Vec<_>>()
+        };
+        for operator_base in [false, true] {
+            assert_eq!(
+                rows_of(operator_base),
+                [off("go", "repo_base"), off("rust", "repo_base")]
+            );
+        }
     }
 }

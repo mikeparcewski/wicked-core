@@ -1239,6 +1239,49 @@ fn a_repos_layers_turned_off_ride_its_units_governance() {
     release_all(&w);
 }
 
+/// (core#1043 part 3) A repo's own seat base image rides each of its units' governance from
+/// dispatch, read when the unit is dispatched, so a change applies from the next unit; a run of
+/// another repo, or of none, carries none.
+#[test]
+fn a_repos_own_seat_base_rides_its_units_governance() {
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+    let record = seen.clone();
+    let w = Worker::scripted(move |i, _| {
+        record.lock().unwrap().push(
+            i.governance
+                .as_ref()
+                .and_then(|g| g.seat_base_image.clone()),
+        );
+        hold()
+    });
+    let e = engine("repobase", w.clone());
+    let (repo_id, _) = repo(&e, "repo-base");
+    let entry = e
+        .core
+        .set_repo_seat_base_image(&repo_id, Some("acme/seat-base:go".into()))
+        .unwrap();
+    assert_eq!(entry.seat_base_image.as_deref(), Some("acme/seat-base:go"));
+    let err = e
+        .core
+        .set_repo_seat_base_image(&repo_id, Some("--privileged".into()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a seat base image reference"), "{err}");
+    put(&e, "rb", json!([{"catalog": "understand", "id": "answer"}]));
+    launch_preset(&e, "rb", "rb", Some(&repo_id), HumanConfirm::None);
+    wait_for("a unit dispatched", || !seen.lock().unwrap().is_empty());
+    assert_eq!(
+        seen.lock().unwrap()[0].as_deref(),
+        Some("acme/seat-base:go")
+    );
+    launch_preset(&e, "rb", "rb2", None, HumanConfirm::None);
+    wait_for("the repo-less unit dispatched", || {
+        seen.lock().unwrap().len() >= 2
+    });
+    assert_eq!(seen.lock().unwrap()[1], None);
+    release_all(&w);
+}
+
 /// (core#1933, round 1 codex P2) The repo list a person gets (`Core::list_repos`, the binding's
 /// `listRepos`) carries the seat-layer rows, with the switch applied; the engine's own reads do not.
 #[test]

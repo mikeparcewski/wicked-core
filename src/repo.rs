@@ -92,6 +92,14 @@ pub struct RepoEntry {
     /// layers out of the seat image. Kept by a re-registration. Absent on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seat_layers_off: Vec<String>,
+    /// (core#1043 part 3) This repo's own seat base image ([`set_seat_base_image`]): a local image
+    /// its seats are built on instead of the daemon's base (`WICKED_SEAT_BASE_IMAGE`, else the
+    /// default with the detected layers). An operator base: never pulled, keyed by its image id,
+    /// no layer composed on it. Set through the API only, never read from the checkout. Persisted;
+    /// dispatch hands it to each unit's governance (`GovernanceContext::seat_base_image`). Kept by
+    /// a re-registration. Absent on the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_base_image: Option<String>,
 }
 
 /// (core#1043 part 2) One toolchain layer a repo's seats get ([`RepoEntry::seat_layers`]).
@@ -102,8 +110,9 @@ pub struct RepoSeatLayer {
     /// Whether the layer is composed onto the repo's seat images.
     pub enabled: bool,
     /// What turned it off, when it is off: `repo` (this repo's switch), `daemon`
-    /// (`WICKED_SEAT_LAYERS=off`) or `operator_base` (`WICKED_SEAT_BASE_IMAGE` is set: the
-    /// operator's base image is the toolchain). `null` when it is on.
+    /// (`WICKED_SEAT_LAYERS=off`), `operator_base` (`WICKED_SEAT_BASE_IMAGE` is set: the
+    /// operator's base image is the toolchain) or `repo_base` (this repo has its own seat base
+    /// image, which is its toolchain; core#1043 part 3). `null` when it is on.
     pub off_by: Option<String>,
 }
 
@@ -181,7 +190,7 @@ impl FromNode for RepoEntry {
 
 /// (core#1043 part 2) The repo card's layer rows for the checkout at `root_path`, under this
 /// daemon's layer setting and seat base.
-fn seat_layer_rows(root_path: &str, off: &[String]) -> Vec<RepoSeatLayer> {
+fn seat_layer_rows(root_path: &str, off: &[String], repo_base: bool) -> Vec<RepoSeatLayer> {
     crate::seat_layers::rows(
         Path::new(root_path),
         off,
@@ -189,6 +198,7 @@ fn seat_layer_rows(root_path: &str, off: &[String]) -> Vec<RepoSeatLayer> {
             .ok()
             .as_deref(),
         crate::container_floor::configured_base().is_some(),
+        repo_base,
     )
 }
 
@@ -380,10 +390,19 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         .to_string_lossy()
         .into_owned();
     let id = slug(&spec.name);
-    // A re-registration keeps the repo's graph identity and the layers a person turned off.
-    let (graph_key, seat_layers_off) = match get_repo(store, &id)? {
-        Some(entry) => (entry.graph_key, entry.seat_layers_off),
-        None => (crate::code_graph::mint_repo_graph_key(&id), Vec::new()),
+    // A re-registration keeps the repo's graph identity, the layers a person turned off and its
+    // own seat base image.
+    let (graph_key, seat_layers_off, seat_base_image) = match get_repo(store, &id)? {
+        Some(entry) => (
+            entry.graph_key,
+            entry.seat_layers_off,
+            entry.seat_base_image,
+        ),
+        None => (
+            crate::code_graph::mint_repo_graph_key(&id),
+            Vec::new(),
+            None,
+        ),
     };
     let (code_graph_db, mut findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
     // (core#2001) Once, at registration: a partial clone whose recent history a seat cannot copy
@@ -403,7 +422,7 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
             path: None,
         });
     }
-    let seat_layers = seat_layer_rows(&root_path, &seat_layers_off);
+    let seat_layers = seat_layer_rows(&root_path, &seat_layers_off, seat_base_image.is_some());
     let entry = RepoEntry {
         id,
         name: spec.name,
@@ -415,6 +434,7 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         registered_at: spec.registered_at,
         seat_layers,
         seat_layers_off,
+        seat_base_image,
     };
     // Once, at registration (the record re-derives on every read; logging there would repeat the
     // same line once a step): the daemon log names what the repo card shows.
@@ -453,8 +473,47 @@ pub fn set_seat_layers_off(
     entry.seat_layers_off = ids;
     put_node(store, entry.to_node())?;
     // The caller gets the rows as the next read derives them.
-    entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
+    entry.seat_layers = seat_layer_rows(
+        &entry.root_path,
+        &entry.seat_layers_off,
+        entry.seat_base_image.is_some(),
+    );
     Ok(entry)
+}
+
+/// (core#1043 part 3) Set (`Some`) or clear (`None`, or a blank reference) the repo's own seat base
+/// image ([`RepoEntry::seat_base_image`]) and return the updated entry with its layer rows. A
+/// reference that is not a local image name ([`crate::container_floor::valid_image_ref`]) is
+/// refused and the stored one is unchanged. The image need not exist yet: a unit armed on a base
+/// the runtime lacks is refused then (`seat_base_missing`), never pulled.
+pub fn set_seat_base_image(
+    store: &mut dyn GraphStore,
+    repo_id: &str,
+    image: Option<&str>,
+) -> anyhow::Result<RepoEntry> {
+    let Some(mut entry) = get_repo(store, repo_id)? else {
+        anyhow::bail!("no registered repo `{repo_id}`");
+    };
+    let image = image.map(str::trim).filter(|i| !i.is_empty());
+    if let Some(image) = image {
+        crate::container_floor::valid_image_ref(image).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    entry.seat_base_image = image.map(str::to_string);
+    put_node(store, entry.to_node())?;
+    entry.seat_layers = seat_layer_rows(
+        &entry.root_path,
+        &entry.seat_layers_off,
+        entry.seat_base_image.is_some(),
+    );
+    Ok(entry)
+}
+
+/// (core#1043 part 3) The run's repo's own seat base image, for the unit's governance at dispatch:
+/// none for a repo-less run, a repo without one, or a repo the store no longer has.
+pub(crate) fn seat_base_image_for(store: &dyn GraphRead, repo_ref: Option<&str>) -> Option<String> {
+    repo_ref
+        .and_then(|id| get_repo(store, id).ok().flatten())
+        .and_then(|e| e.seat_base_image)
 }
 
 /// (core#1043 part 2) The layer ids the run's repo turned off, for the unit's governance at
@@ -533,7 +592,11 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
 pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
     let mut repos = list_repos(store)?;
     for entry in &mut repos {
-        entry.seat_layers = seat_layer_rows(&entry.root_path, &entry.seat_layers_off);
+        entry.seat_layers = seat_layer_rows(
+            &entry.root_path,
+            &entry.seat_layers_off,
+            entry.seat_base_image.is_some(),
+        );
     }
     Ok(repos)
 }
@@ -3384,6 +3447,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         assert_eq!(RepoEntry::from_node(&e.to_node()).unwrap(), e);
     }
@@ -3411,6 +3475,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         }
         .to_node();
         node.metadata.remove("graph_key");
@@ -3499,6 +3564,7 @@ mod tests {
             findings: findings.clone(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let notice = boot_notice(&entry).expect("in-tree graph + no live graph ⇒ a boot notice");
         assert!(
@@ -3539,6 +3605,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         }
         .to_node();
         node.metadata.remove("findings");
@@ -3573,6 +3640,7 @@ mod tests {
                 findings,
                 seat_layers: Vec::new(),
                 seat_layers_off: Vec::new(),
+                seat_base_image: None,
             }),
             None,
             "a clean checkout gets no boot notice"
@@ -5775,6 +5843,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let live: HashSet<String> = ["run-old-live".to_string(), "run-new".to_string()]
             .into_iter()
@@ -5964,6 +6033,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         reap_orphan_worktrees(&[repo], &HashSet::new(), &HashSet::new(), Some("daemon-me"));
         assert!(
@@ -6002,6 +6072,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let live: HashSet<String> = ["run-live".to_string()].into_iter().collect();
         let terminal: HashSet<String> = ["run-done".to_string(), "run-dirty".to_string()]
@@ -6749,6 +6820,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let none: HashSet<String> = HashSet::new();
         // A daemon with no id owns nothing: nothing is removed on an unknown id.
@@ -6853,6 +6925,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let none: HashSet<String> = HashSet::new();
         reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, Some("daemon-a"));
@@ -6908,6 +6981,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         let none: HashSet<String> = HashSet::new();
         let terminal: HashSet<String> = ["camp:old:a0".to_string()].into_iter().collect();
@@ -7297,6 +7371,7 @@ mod tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         // The store holds RAW ids — matching happens across spellings inside the reaper.
         let live: HashSet<String> = ["camp:live:a0".to_string()].into_iter().collect();
@@ -7730,6 +7805,102 @@ mod discard_minted_tests {
         let cleared = set_seat_layers_off(&mut store, &entry.id, &[]).unwrap();
         assert!(cleared.seat_layers_off.is_empty());
         assert!(rows(&cleared).iter().all(|(_, on, _)| *on));
+        rm_repo(&root);
+    }
+    /// (core#1043 part 3) A repo's own seat base image: validated before anything is written, kept
+    /// through a re-read and a re-registration, handed to dispatch, shown on the layer rows as what
+    /// turned every layer off, absent from the record when unset, and cleared by `None` or a blank.
+    #[test]
+    fn a_repo_keeps_its_own_seat_base_image_and_refuses_a_bad_reference() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("base1043");
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let spec = || RepoSpec {
+            name: "Base 1043".into(),
+            root_path: root.to_string_lossy().into_owned(),
+            registered_at: 0,
+        };
+        let entry = register_repo(&mut store, spec()).unwrap();
+        assert_eq!(entry.seat_base_image, None);
+        assert!(
+            !entry.to_node().metadata.contains_key("seat_base_image"),
+            "absent from the record when unset"
+        );
+        assert_eq!(seat_base_image_for(&store, Some(&entry.id)), None);
+
+        let set =
+            set_seat_base_image(&mut store, &entry.id, Some(" acme/seat-base:go1.23 ")).unwrap();
+        assert_eq!(
+            set.seat_base_image.as_deref(),
+            Some("acme/seat-base:go1.23")
+        );
+        assert_eq!(set.seat_layers.len(), 1, "{:?}", set.seat_layers);
+        assert!(!set.seat_layers[0].enabled);
+        assert_eq!(set.seat_layers[0].off_by.as_deref(), Some("repo_base"));
+        let read = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(
+            read.seat_base_image.as_deref(),
+            Some("acme/seat-base:go1.23")
+        );
+        let shown = list_repos_shown(&store).unwrap().remove(0);
+        assert_eq!(shown.seat_layers[0].off_by.as_deref(), Some("repo_base"));
+        assert_eq!(
+            seat_base_image_for(&store, Some(&entry.id)).as_deref(),
+            Some("acme/seat-base:go1.23")
+        );
+        assert_eq!(seat_base_image_for(&store, None), None);
+        assert_eq!(seat_base_image_for(&store, Some("no-such-repo")), None);
+        let again = register_repo(&mut store, spec()).unwrap();
+        assert_eq!(
+            again.seat_base_image.as_deref(),
+            Some("acme/seat-base:go1.23"),
+            "re-registering keeps the base"
+        );
+
+        // A digest is a reference too.
+        let digest = format!("seat@sha256:{}", "a".repeat(64));
+        let set = set_seat_base_image(&mut store, &entry.id, Some(&digest)).unwrap();
+        assert_eq!(set.seat_base_image.as_deref(), Some(digest.as_str()));
+        // Refused, and the stored base is unchanged: a flag, whitespace, shell text, upper case,
+        // a leading separator, an over-long name.
+        let long = "a".repeat(256);
+        for bad in [
+            "--privileged",
+            "-v/:/host",
+            "seat base",
+            "seat\tbase",
+            "seat;rm -rf /",
+            "$(id)",
+            "seat`id`",
+            "Seat:Upper",
+            "/seat",
+            ".seat",
+            "seat\nbase",
+            long.as_str(),
+        ] {
+            let err = set_seat_base_image(&mut store, &entry.id, Some(bad));
+            assert!(err.is_err(), "`{bad}` is not an image reference");
+            let kept = get_repo(&store, &entry.id).unwrap().unwrap();
+            assert_eq!(
+                kept.seat_base_image.as_deref(),
+                Some(digest.as_str()),
+                "`{bad}` left the base as it was"
+            );
+        }
+        let err = set_seat_base_image(&mut store, "no-such-repo", Some("seat:x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no-such-repo"), "{err}");
+
+        for clear in [None, Some(""), Some("  ")] {
+            set_seat_base_image(&mut store, &entry.id, Some("seat:x")).unwrap();
+            let cleared = set_seat_base_image(&mut store, &entry.id, clear).unwrap();
+            assert_eq!(cleared.seat_base_image, None, "{clear:?} clears it");
+            assert_eq!(seat_base_image_for(&store, Some(&entry.id)), None);
+        }
         rm_repo(&root);
     }
 }

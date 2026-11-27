@@ -256,6 +256,12 @@ pub struct GovernanceContext {
     /// peer's `DispatchedTask` still deserializes; absent on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seat_layers_off: Vec<String>,
+    /// (core#1043 part 3) The run's repo's own seat base image (`RepoEntry::seat_base_image`), filled
+    /// per unit at dispatch like `seat_layers_off`: the container arm builds the seat image on it
+    /// instead of the daemon's base. `#[serde(default)]` (none) so an older peer's `DispatchedTask`
+    /// still deserializes; absent on the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_base_image: Option<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

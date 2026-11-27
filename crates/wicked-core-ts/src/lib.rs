@@ -2083,6 +2083,26 @@ impl Core {
         })
     }
 
+    /// (core#1043 part 3) Set a repo's own seat base image (`null` or a blank string clears it):
+    /// its seats are built on that local image instead of the daemon's base, with no toolchain
+    /// layer on it, and a base the container runtime lacks is refused at the arm, never pulled.
+    /// Resolves to the updated `RepoEntry` JSON object (`seat_base_image`, and `seat_layers` rows
+    /// off by `repo_base`). Rejects a reference that is not a local image name, or an unknown repo.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_repo_seat_base_image(
+        &self,
+        repo_id: String,
+        image: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let entry = core
+                .set_repo_seat_base_image(&repo_id, image)
+                .map_err(err)?;
+            serde_json::to_string(&entry).map_err(err)
+        })
+    }
+
     // ── Presets (DES-TEAMING-002 §8.4, seam C2) ────────────────────────────────
     // Commands through the actor (the single writer), reads included, so a list reflects every
     // write the actor has acknowledged.

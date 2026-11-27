@@ -172,6 +172,13 @@ pub(crate) enum Command {
         off: Vec<String>,
         reply: Sender<anyhow::Result<RepoEntry>>,
     },
+    /// (core#1043 part 3) Set (`Some`) or clear (`None`) a repo's own seat base image; the single
+    /// writer validates and persists `RepoEntry::seat_base_image` and replies with the entry.
+    SetRepoSeatBaseImage {
+        repo_id: String,
+        image: Option<String>,
+        reply: Sender<anyhow::Result<RepoEntry>>,
+    },
     /// List every registered repository.
     ListRepos {
         reply: Sender<anyhow::Result<Vec<RepoEntry>>>,
