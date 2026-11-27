@@ -146,22 +146,98 @@ fn spec(session: &str) -> LaunchSpec {
     }
 }
 
-/// Block until the run reaches a terminal status, polling the store rather than the event stream —
-/// the whole point is that this test does not depend on a live subscriber.
-fn wait_terminal(core: &Core, session: &str) {
+/// The events that end a run's history: the last thing `finalize_run`, a failure or a cancel emits.
+const TERMINAL_EVENTS: [&str; 3] = ["sessionCompleted", "sessionFailed", "runCancelled"];
+
+/// Block until the run is over, polling the store and the log rather than the event stream — the
+/// whole point is that this test does not depend on a live subscriber. Returns the run's history.
+///
+/// A terminal STATUS is not enough (core#1987, core#2035): the read model answers mid-command once
+/// the actor stays busy past its quiet budget (core#1390), and `finalize_run` stores `Completed`,
+/// then runs the run's terminal cleanup, then emits `sessionCompleted`. On a slow runner a read
+/// taken as soon as the status turns is one event short. So this also waits for the terminal
+/// event itself to be in the log.
+fn wait_terminal(core: &Core, session: &str) -> Vec<serde_json::Value> {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status_terminal = false;
     while Instant::now() < deadline {
-        if let Ok(views) = core.sessions_detail() {
-            if let Some(v) = views.iter().find(|v| v.session.id == session) {
-                let s = format!("{:?}", v.session.status);
-                if s.contains("Completed") || s.contains("Failed") || s.contains("Cancelled") {
-                    return;
+        if !status_terminal {
+            if let Ok(views) = core.sessions_detail() {
+                if let Some(v) = views.iter().find(|v| v.session.id == session) {
+                    let s = format!("{:?}", v.session.status);
+                    status_terminal =
+                        s.contains("Completed") || s.contains("Failed") || s.contains("Cancelled");
                 }
+            }
+        }
+        if status_terminal {
+            let events = core.run_events(session);
+            if events
+                .iter()
+                .any(|e| TERMINAL_EVENTS.contains(&e["type"].as_str().unwrap_or("")))
+            {
+                return events;
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("run `{session}` did not reach a terminal status in 20s");
+    let types: Vec<String> = core
+        .run_events(session)
+        .iter()
+        .filter_map(|e| e["type"].as_str().map(str::to_string))
+        .collect();
+    panic!(
+        "run `{session}` did not end in 20s (status terminal: {status_terminal}; logged: {types:?})"
+    );
+}
+
+/// The `type` of each event, in order.
+fn types_of(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| e["type"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// What a live subscriber received for `session`, as JSON, in order: everything up to and including
+/// the run's terminal event, then whatever follows it within 200 ms.
+///
+/// The terminal event being in the LOG says nothing about the subscriber (core#2040 review):
+/// `EventSink::emit` hands the record to the background writer first and only then fans it out, so
+/// the actor can be descheduled in between while the writer makes the record readable. So this
+/// waits on the subscriber's own copy of the terminal event, with a 20 s bound.
+fn live_events(rx: &std::sync::mpsc::Receiver<CoreEvent>, session: &str) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    let mut ended = false;
+    loop {
+        let wait = if ended {
+            Duration::from_millis(200)
+        } else {
+            match deadline.checked_duration_since(Instant::now()) {
+                Some(left) => left,
+                None => panic!(
+                    "the subscriber never received `{session}`'s terminal event in 20s: {:?}",
+                    types_of(&seen)
+                ),
+            }
+        };
+        let ev = match rx.recv_timeout(wait) {
+            Ok(ev) => ev,
+            Err(_) if ended => return seen,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the subscriber was dropped before `{session}` ended: {:?}",
+                types_of(&seen)
+            ),
+        };
+        let json = ev.to_json();
+        if json.get("session").and_then(|v| v.as_str()) != Some(session) {
+            continue;
+        }
+        ended |= TERMINAL_EVENTS.contains(&json["type"].as_str().unwrap_or(""));
+        seen.push(json);
+    }
 }
 
 /// Poll until `session` reports `want`, naming the last-seen status on timeout so a stalled run and a
@@ -296,8 +372,7 @@ fn the_recorded_history_matches_what_the_live_stream_carried() {
 
     // Collect what the socket saw, using the same exclusions the log applies.
     let mut live: Vec<String> = Vec::new();
-    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
-        let json = ev.to_json();
+    for json in live_events(&rx, "evlog-agree") {
         let Some(ty) = json.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -307,9 +382,7 @@ fn the_recorded_history_matches_what_the_live_stream_carried() {
         ) {
             continue;
         }
-        if json.get("session").and_then(|v| v.as_str()) == Some("evlog-agree") {
-            live.push(ty.to_string());
-        }
+        live.push(ty.to_string());
     }
 
     let logged: Vec<String> = core
@@ -337,18 +410,27 @@ fn history_survives_the_core_that_wrote_it() {
     let before = {
         let core = boot(db.clone());
         core.launch_run(spec("evlog-restart")).expect("launch");
-        wait_terminal(&core, "evlog-restart");
-        core.run_events("evlog-restart")
+        // (core#2035) The history as it stands once the run's terminal event is logged, not when
+        // its status first reads terminal: that earlier read could be one event short.
+        wait_terminal(&core, "evlog-restart")
         // `core` drops here — actor thread torn down, subscribers gone.
     };
     assert!(!before.is_empty());
+    assert_eq!(
+        types_of(&before).last().map(String::as_str),
+        Some("sessionCompleted"),
+        "the run's history ends with its completion: {:?}",
+        types_of(&before)
+    );
 
     let core2 = boot(db);
     let after = core2.run_events("evlog-restart");
     assert_eq!(
         after.len(),
         before.len(),
-        "a fresh Core reads the prior Core's complete history"
+        "a fresh Core reads the prior Core's complete history (before: {:?}; after: {:?})",
+        types_of(&before),
+        types_of(&after)
     );
     assert_eq!(
         after.iter().map(|e| e["seq"].clone()).collect::<Vec<_>>(),
@@ -400,14 +482,10 @@ fn no_event_reaches_a_subscriber_without_also_reaching_the_log() {
     wait_terminal(&core, "evlog-nogap");
 
     let mut live: std::collections::BTreeSet<String> = Default::default();
-    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
-        let j: serde_json::Value = ev.to_json();
+    for j in live_events(&rx, "evlog-nogap") {
         let Some(ty) = j.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
-        if j.get("session").and_then(|v| v.as_str()) != Some("evlog-nogap") {
-            continue;
-        }
         if matches!(
             ty,
             "cliOutputDelta" | "chatDelta" | "terminalOutput" | "heartbeat"
@@ -592,25 +670,9 @@ fn seq_restart_child_approves_the_gate_in_a_fresh_process() {
         )
         .expect("approve the gate after the restart");
     assert_eq!(status, SessionStatus::Executing);
-    wait_terminal(&core, RESTART_RUN);
-    // The status can read terminal before the run's last event is in the log: the read model
-    // answers mid-command once the actor stays busy past its quiet budget (core#1390), and
-    // `finalize_run` stores `Completed`, then runs the run's terminal cleanup, then emits
-    // `sessionCompleted`. On a slow runner (Windows) this process could exit in between. So wait
-    // for the event itself before this process exits.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let terminal = ["sessionCompleted", "sessionFailed", "runCancelled"];
-    let types = loop {
-        let types: Vec<String> = core
-            .run_events(RESTART_RUN)
-            .iter()
-            .filter_map(|e| e["type"].as_str().map(str::to_string))
-            .collect();
-        if types.iter().any(|t| terminal.contains(&t.as_str())) || Instant::now() > deadline {
-            break types;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    // `wait_terminal` waits for the run's terminal event in the log, not only its status, so this
+    // process cannot exit before `sessionCompleted` is written (core#1987).
+    let types = types_of(&wait_terminal(&core, RESTART_RUN));
     assert!(
         types.iter().any(|t| t == "sessionCompleted"),
         "the run completed: {types:?}"
