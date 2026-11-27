@@ -464,7 +464,8 @@ pub(crate) fn reserve_team(
 /// (core#2009) Hand a reservation to its asker. An asker that stopped waiting has dropped its
 /// receiver, so the send fails: the bindings it would have run on never run, and each is left on
 /// the run's record as `failed`, never `seated` (its key stays taken). An asker that drops a
-/// reservation it did receive, or whose receiver outlives its wait, is core#2015.
+/// reservation it did receive, or whose receiver outlives its wait, lets it go with
+/// `Command::AbandonStandIns` (core#2015).
 pub(crate) fn reply_or_abandon(
     store: &mut dyn GraphStore,
     run_id: &str,
@@ -474,6 +475,32 @@ pub(crate) fn reply_or_abandon(
     let Err(std::sync::mpsc::SendError(abandoned)) = reply.send(seated) else {
         return Ok(());
     };
+    abandon_team(store, run_id, &abandoned)
+}
+
+/// (core#2015) `Command::AbandonStandIns`: the bindings in `seated`, and those of the reservation
+/// `pending` holds (it is the reply of an ask sent before this command, so it is there if that
+/// ask reserved any), are let go.
+pub(crate) fn abandon_reservations(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    mut seated: Vec<crate::standin::SeatedStandIn>,
+    pending: Option<std::sync::mpsc::Receiver<Vec<crate::standin::SeatedStandIn>>>,
+) -> anyhow::Result<()> {
+    if let Some(rx) = pending {
+        seated.extend(rx.try_recv().unwrap_or_default());
+    }
+    abandon_team(store, run_id, &seated)
+}
+
+/// (core#2009, core#2015) Each of these bindings still `seated` on the run's record (the same
+/// key, role, ord and attempt) is left `failed` and `abandoned`: nothing ran on it. Its key stays
+/// taken.
+fn abandon_team(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    abandoned: &[crate::standin::SeatedStandIn],
+) -> anyhow::Result<()> {
     if abandoned.is_empty() {
         return Ok(());
     }
@@ -489,6 +516,7 @@ pub(crate) fn reply_or_abandon(
         });
         if ours && b.state == crate::standin::STATE_SEATED {
             b.state = crate::standin::STATE_FAILED.to_string();
+            b.abandoned = true;
             changed = true;
         }
     }
@@ -724,6 +752,56 @@ mod reserve_team_tests {
                 ("claude~2".to_string(), si::STATE_SEATED.to_string()),
             ]
         );
+    }
+
+    /// core#2015: a reservation its asker dropped (`seated`) and one its asker stopped waiting for
+    /// (the reply `pending` holds) are both `failed` and `abandoned`, keys kept; one in use stays
+    /// `seated`. `abandoned` is absent on the wire unless set.
+    #[test]
+    fn reservations_let_go_are_failed_and_abandoned_2015() {
+        let s = run(&["claude"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let mut reserve = |store: &mut dyn GraphStore| {
+            reserve_team(
+                store,
+                &mut sink,
+                &s.id,
+                Role::Monitor,
+                1,
+                si::BindingScope::default(),
+                &[],
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            )
+            .unwrap()
+        };
+        let dropped = reserve(&mut store);
+        let late = reserve(&mut store);
+        let kept = reserve(&mut store);
+        assert_eq!((dropped.len(), late.len(), kept.len()), (1, 1, 1));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(late).unwrap();
+        abandon_reservations(&mut store, &s.id, dropped, Some(rx)).unwrap();
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        let states: Vec<(&str, &str, bool)> = after
+            .assurance
+            .stand_ins
+            .iter()
+            .map(|b| (b.key.as_str(), b.state.as_str(), b.abandoned))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("claude~1", si::STATE_FAILED, true),
+                ("claude~2", si::STATE_FAILED, true),
+                ("claude~3", si::STATE_SEATED, false),
+            ]
+        );
+        let wire = serde_json::to_value(&after.assurance.stand_ins).unwrap();
+        assert_eq!(wire[0]["abandoned"], serde_json::json!(true));
+        assert!(wire[2].get("abandoned").is_none(), "{}", wire[2]);
+        drop(kept);
     }
 
     /// A council of three on a one-CLI consented run: three fresh bindings on the one seat, each

@@ -286,6 +286,11 @@ pub struct StandInBinding {
     /// The base's display name when it was seated (`Claude Code`), for the stamp's words.
     #[serde(default)]
     pub display: Option<String>,
+    /// (core#2015) Reserved, then abandoned before anything ran on it: its asker stopped waiting
+    /// or let the reservation go. Always with `state: failed`; its key stays taken. Absent on the
+    /// wire unless set, so every other binding serializes as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub abandoned: bool,
 }
 
 impl StandInBinding {
@@ -444,6 +449,7 @@ pub(crate) fn with_judge_slots_held(
             reason: Reason::OnlyOneHelper { cli: base.clone() },
             state: STATE_SEATED.to_string(),
             display: None,
+            abandoned: false,
         });
     }
     out
@@ -505,6 +511,7 @@ pub(crate) fn fill(req: FillRequest<'_>) -> Fill {
             reason: req.reason.clone(),
             state: STATE_SEATED.to_string(),
             display: None,
+            abandoned: false,
         });
     }
     Fill::Seats {
@@ -980,6 +987,7 @@ mod tests {
             },
             state: STATE_SEATED.into(),
             display: None,
+            abandoned: false,
         });
         let offer = judge_offer(&run, &unit, 1, &[], &[], &[]).expect("consented aware run");
         assert_eq!(

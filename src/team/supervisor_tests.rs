@@ -3743,6 +3743,65 @@ fn a_team_council_carries_the_host_slot_until_the_council_drops_it() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// core#2015: an ask answered after its asker stopped waiting is let go. The asker hands the
+/// engine its receiver (`AbandonStandIns`), and since commands run in order that receiver
+/// holds the late reply, so the engine marks those bindings abandoned instead of leaving them
+/// `seated`.
+#[test]
+fn a_stand_in_ask_its_asker_stopped_waiting_for_is_let_go_2015() {
+    let (tx, rx) = channel();
+    let engine = std::thread::spawn(move || {
+        // The engine holds its reply until the asker has let the ask go (codex r1: no timing
+        // margin), then writes it: the receiver it got must still take it.
+        let (role, need, scope, reply) = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(crate::command::Command::ReserveStandIns {
+                role,
+                need,
+                scope,
+                reply,
+                ..
+            }) => (role, need, scope, reply),
+            _ => return None,
+        };
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(crate::command::Command::AbandonStandIns {
+                run_id,
+                seated,
+                pending,
+            }) => {
+                reply.send(reserved_on("claude", role, need, &scope)).ok()?;
+                let late = pending.and_then(|p| p.try_recv().ok()).unwrap_or_default();
+                Some((run_id, seated.len(), late, scope))
+            }
+            _ => None,
+        }
+    });
+    let got = reserve_stand_ins(
+        &tx,
+        "r-late",
+        crate::standin::Role::Monitor,
+        1,
+        crate::standin::BindingScope {
+            ord: Some(2),
+            attempt: Some(1),
+            ..Default::default()
+        },
+        Vec::new(),
+        Vec::new(),
+        Instant::now() + Duration::from_millis(300),
+    );
+    assert!(got.is_empty(), "the asker stopped waiting: {got:?}");
+    let (run_id, seated, late, scope) = engine.join().unwrap().expect("the asker let its ask go");
+    assert_eq!(run_id, "r-late");
+    assert_eq!(seated, 0);
+    assert_eq!(
+        late.len(),
+        1,
+        "the late reply reaches the engine to be let go"
+    );
+    assert_eq!((scope.ord, scope.attempt), (Some(2), Some(1)));
+}
+
 /// codex r2 on #1990: the council's stand-in ask can run the budget out on a slow engine. Then no
 /// council starts: the outcome is `NotConvened`, the engine is never handed a council its caller
 /// stopped waiting for, and the host slot is free at once.
@@ -3991,6 +4050,7 @@ fn reserved_on(
                 },
                 state: crate::standin::STATE_SEATED.to_string(),
                 display: Some("Claude Code".into()),
+                abandoned: false,
             };
             let mut record = builtin_seat(base);
             record.key = key;

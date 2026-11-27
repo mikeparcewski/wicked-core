@@ -3035,6 +3035,7 @@ fn one_cli_consented_review(
         },
         state: crate::standin::STATE_SEATED.into(),
         display: Some("Claude Code".into()),
+        abandoned: false,
     });
     let offer = crate::standin::judge_offer(
         &run,

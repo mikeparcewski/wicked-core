@@ -7109,6 +7109,7 @@ mod judge_bench_tests {
             reason: crate::standin::Reason::OnlyOneHelper { cli: "a".into() },
             state: crate::standin::STATE_SEATED.into(),
             display: Some("a".into()),
+            abandoned: false,
         };
         let qe_role = |u: &crate::domain::WorkUnit| {
             u.assurance
