@@ -5005,28 +5005,17 @@ mod tests {
         let started = Instant::now();
         let got = gh_token(&[("PATH", Path::new(&path))]);
         let took = started.elapsed();
-        let pid: Option<libc::pid_t> = std::fs::read_to_string(&pidfile)
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
             .ok()
-            .and_then(|p| p.trim().parse().ok());
-        // SAFETY: signal 0 only probes that the pid exists. A killed child not yet reaped (a
-        // zombie, where pid 1 does not reap) counts as gone.
-        let alive = || {
-            pid.is_some_and(|p| {
-                let exists = unsafe { libc::kill(p, 0) } == 0;
-                exists
-                    && !std::fs::read_to_string(format!("/proc/{p}/stat"))
-                        .is_ok_and(|st| st.contains(") Z "))
-            })
-        };
+            .and_then(|p| p.trim().parse().ok())
+            .expect("the fake gh wrote its sleep child's pid");
+        // (core#2030) One "gone" reading settles it: the child is never read again after that.
         let gone_by = Instant::now() + Duration::from_secs(5);
-        while alive() && Instant::now() < gone_by {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let still_alive = alive();
-        if let (true, Some(p)) = (still_alive, pid) {
+        let still_alive = outlived_2030(|| gone_now_2030(pid), gone_by);
+        if still_alive {
             // SAFETY: the test's own sleep child, read from the pidfile its fake gh wrote.
             unsafe {
-                libc::kill(p, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
             }
         }
         assert_eq!(got, Ok("fake-gh-token-1993".into()), "took {took:?}");
@@ -5034,7 +5023,188 @@ mod tests {
             took < GH_TOKEN_TIMEOUT + Duration::from_secs(3),
             "the token waited {took:?}"
         );
-        assert!(!still_alive, "the child holding stdout outlived the read");
+        assert!(
+            !still_alive,
+            "the child holding stdout outlived the read (took {took:?})"
+        );
+    }
+
+    /// (core#2030) Whether a process a test started is gone, by one reading. Only a reading that
+    /// shows it gone counts: signal 0 answering ESRCH, or the process state reading zombie or
+    /// dead. A reading that fails any other way is "not yet", and the next one decides.
+    #[cfg(unix)]
+    fn gone_now_2030(p: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only probes that the pid exists.
+        if unsafe { libc::kill(p, 0) } != 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        state_gone_2030(p)
+    }
+
+    /// (core#2030) Linux: the child's stat line. Measured under load (Debian 12, dash as `sh`, 480
+    /// kills of the #1993 test's `sleep`): a killed child read R, then Z, then X, then no pid. A
+    /// task released between the signal-0 probe and the stat read gives a read that fails (the
+    /// open ENOENT or ESRCH, or the read ESRCH). 132 runs read Z and then X or such a failed read.
+    #[cfg(target_os = "linux")]
+    fn state_gone_2030(p: libc::pid_t) -> bool {
+        stat_read_gone_2030(std::fs::read_to_string(format!("/proc/{p}/stat")))
+    }
+
+    /// (core#2030) macOS: the process's BSD info: a zombie (`SZOMB`) is gone; a failed read is "not
+    /// yet" (signal 0 decides on the next reading). The lookup must include zombies (a nonzero
+    /// `arg`, codex r2): with 0, XNU answers ESRCH for a zombie (measured on macOS: 0 bytes, errno
+    /// 3), while signal 0 still succeeds for it.
+    #[cfg(target_os = "macos")]
+    fn state_gone_2030(p: libc::pid_t) -> bool {
+        // SAFETY: a zeroed proc_bsdinfo is a valid out-parameter for this flavor.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a live proc_bsdinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                p,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        got == size && info.pbi_status == libc::SZOMB
+    }
+
+    /// (core#2030) Other unix: signal 0 alone decides, as before.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn state_gone_2030(_p: libc::pid_t) -> bool {
+        false
+    }
+
+    /// (core#2030) One read of `/proc/<pid>/stat`: gone only when it reads a zombie or dead state.
+    /// A read that fails is "not yet" (codex r1, agy r1): a live child whose stat cannot be read
+    /// (no procfs, EMFILE, EACCES) is never taken for gone, and a released one reads ESRCH on the
+    /// next signal-0 probe.
+    #[cfg(unix)]
+    fn stat_read_gone_2030(read: std::io::Result<String>) -> bool {
+        read.is_ok_and(|stat| stat_state_gone_2030(&stat))
+    }
+
+    /// (core#2030) A `/proc/<pid>/stat` line's state, read after the last `) ` (a command name may
+    /// hold one), is a zombie (`Z`) or dead (`X`, or `x` on older kernels).
+    #[cfg(unix)]
+    fn stat_state_gone_2030(stat: &str) -> bool {
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|s| matches!(s, 'Z' | 'X' | 'x'))
+    }
+
+    /// (core#2030) Read `gone` every 50 ms until it says gone (false: the child did not outlive)
+    /// or `until` passes (true). The #1993 test used to read the child once more after its loop,
+    /// so a child that read Z (gone) could then read X or a failed stat read (alive) while it was
+    /// reaped: a false "outlived the read" (core#2030, CI runs 46037193891 and 46032119267).
+    #[cfg(unix)]
+    fn outlived_2030(mut gone: impl FnMut() -> bool, until: Instant) -> bool {
+        loop {
+            if gone() {
+                return false;
+            }
+            if Instant::now() >= until {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// (core#2030) A child read gone once is not read again: the measured sequences after a kill
+    /// (alive, then gone, then a reading that looks alive while it is reaped) do not outlive, and
+    /// no reading is taken after the first "gone". One never read gone does outlive.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_read_gone_once_is_not_read_again_2030() {
+        let until = || Instant::now() + Duration::from_secs(5);
+        for seq in [
+            &[false, true, false][..],
+            &[false, false, true, false],
+            &[true, false],
+        ] {
+            let mut taken = 0;
+            let outlived = outlived_2030(
+                || {
+                    taken += 1;
+                    seq[taken - 1]
+                },
+                until(),
+            );
+            assert!(!outlived, "{seq:?}");
+            let first_gone = seq.iter().position(|g| *g).unwrap() + 1;
+            assert_eq!(taken, first_gone, "{seq:?}: read again after gone");
+        }
+        let soon = Instant::now() + Duration::from_millis(120);
+        assert!(outlived_2030(|| false, soon));
+    }
+
+    /// (core#2030) Stat lines as Linux writes them (S, R and Z captured from `/proc/<pid>/stat` in
+    /// a Debian 12 container; X and x differ from Z by the state letter): Z, X and x are gone; R, S,
+    /// an empty line and a `) Z ` inside the command name are not.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_or_dead_stat_line_reads_as_gone_2030() {
+        for state in ['Z', 'X', 'x'] {
+            assert!(
+                stat_state_gone_2030(&format!(
+                    "7 (sleep) {state} 1 1 1 0 -1 4228364 106 0 0 0 0 0 0 0 20 0 1 0 51"
+                )),
+                "{state}"
+            );
+        }
+        assert!(!stat_state_gone_2030(
+            "7 (sleep) S 1 1 1 0 -1 4194560 72 0 0 0 0 0 0 0 20 0 1 0 511"
+        ));
+        assert!(!stat_state_gone_2030(
+            "12 (sh) R 1 1 1 0 -1 4194368 27 0 0 0 29 0 0 0 20 0 1 0 5118"
+        ));
+        assert!(!stat_state_gone_2030(""));
+        assert!(!stat_state_gone_2030(
+            "9 (a) Z (b) S 1 1 1 0 -1 4194560 72 0 0 0 0 0 0 0 20 0 1 0 511"
+        ));
+    }
+
+    /// (core#2030, codex r2) A child that exited and is not reaped yet (a zombie: signal 0 still
+    /// answers for it, on Linux and macOS) reads as gone. It is reaped after the reading.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_not_yet_reaped_reads_as_gone_2030() {
+        // spawn-audit: test-only — a child that exits at once, read while it is a zombie.
+        let mut child = Command::new("true").spawn().unwrap();
+        let p = child.id() as libc::pid_t;
+        let by = Instant::now() + Duration::from_secs(5);
+        let outlived = outlived_2030(|| gone_now_2030(p), by);
+        // SAFETY: signal 0 only probes that the pid exists; the child is still unreaped here.
+        let still_listed = unsafe { libc::kill(p, 0) } == 0;
+        child.wait().unwrap();
+        assert!(still_listed, "the child was reaped before it was read");
+        assert!(!outlived, "an exited, unreaped child read as alive");
+    }
+
+    /// (core#2030, codex r1, agy r1) A stat read that fails is never "gone": a live child whose
+    /// stat cannot be read (no procfs, EMFILE, EACCES, or the released task's ESRCH and ENOENT)
+    /// waits for the next signal-0 probe, so a real survivor still fails the #1993 test.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_stat_read_is_never_gone_2030() {
+        for n in [
+            libc::ESRCH,
+            libc::ENOENT,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::EACCES,
+        ] {
+            assert!(
+                !stat_read_gone_2030(Err(std::io::Error::from_raw_os_error(n))),
+                "errno {n}"
+            );
+        }
+        assert!(stat_read_gone_2030(Ok(
+            "7 (sleep) Z 1 1 1 0 -1 4228364 106 0 0 0 0 0 0 0 20 0 1 0 51".into()
+        )));
     }
 
     /// (core#1993, codex-check on 0825145) A child that leaves gh's process group (`setsid`) and
