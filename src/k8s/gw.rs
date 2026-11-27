@@ -2070,11 +2070,25 @@ mod tests {
         }
     }
 
+    /// (core#2028) A stub this file's tests exec is installed by `install_stub`, never written and
+    /// chmod-ed in-process: a sibling test thread's fork can hold the write open into the first
+    /// exec (`ETXTBSY`), which `log_state` reads as an unknown pod (the flaky `unwrap` on None).
+    #[test]
+    fn this_files_stubs_are_installed_out_of_process_2028() {
+        let src = include_str!("gw.rs");
+        let in_process = concat!("Permissions::from_", "mode(0o7");
+        assert!(
+            !src.contains(in_process),
+            "a test stub in src/k8s/gw.rs is written in-process; use crate::test_env::install_stub"
+        );
+    }
+
     #[cfg(unix)]
     fn record_gateway(dir: &TestDir) -> Gw {
-        use std::os::unix::fs::PermissionsExt;
         let kubectl = dir.path().join("kubectl");
-        std::fs::write(
+        // (core#2028) Through `install_stub`, as core#1769: this process never holds a writable
+        // descriptor to the script it execs, so a first exec never fails with `ETXTBSY`.
+        crate::test_env::install_stub(
             &kubectl,
             r#"#!/bin/sh
 cd "$(dirname "$0")" || exit 1
@@ -2134,9 +2148,7 @@ case "$1:$2" in
         done;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let pod = serde_json::json!({
             "metadata": {"name": "pod-1", "uid": "uid-1", "resourceVersion": "1"},
             "status": {"containerStatuses": [{"name": "gateway", "restartCount": 0,
@@ -2613,10 +2625,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn lease_records_survive_a_gateway_pod_replacement() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = TestDir::new();
         let kubectl = dir.path().join("kubectl");
-        std::fs::write(
+        // (core#2028) Through `install_stub`, as core#1769: this process never holds a writable
+        // descriptor to the script it execs, so a first exec never fails with `ETXTBSY`.
+        crate::test_env::install_stub(
             &kubectl,
             r#"#!/bin/sh
 cd "$(dirname "$0")" || exit 1
@@ -2666,9 +2679,7 @@ logs)
     done;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let pod = |n: u64| {
             serde_json::json!({
                 "metadata": {
@@ -2818,10 +2829,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn timed_out_confirmation_cleans_up_the_same_remote_marker() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = TestDir::new();
         let kubectl = dir.path().join("kubectl");
-        std::fs::write(
+        // (core#2028) Through `install_stub`, as core#1769: this process never holds a writable
+        // descriptor to the script it execs, so a first exec never fails with `ETXTBSY`.
+        crate::test_env::install_stub(
             &kubectl,
             r#"#!/bin/sh
 cd "$(dirname "$0")" || exit 1
@@ -2841,9 +2853,7 @@ case "$*" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let gw = Gw {
             kube: Kube {
                 kubectl,
