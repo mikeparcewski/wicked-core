@@ -748,6 +748,9 @@ pub(crate) struct SeatBase {
     /// The operator set the base: it may exist only on this runtime.
     pub(crate) operator: bool,
     pub(crate) recipe: Option<PathBuf>,
+    /// (core#1043 part 3) The base is the run's repo's own (`RepoEntry::seat_base_image`), not
+    /// [`BASE_IMAGE_ENV`]: an operator base with no recipe, named so in its refusal.
+    pub(crate) from_repo: bool,
 }
 
 impl SeatBase {
@@ -757,13 +760,63 @@ impl SeatBase {
                 image,
                 operator: true,
                 recipe: base_recipe(),
+                from_repo: false,
             },
             None => SeatBase {
                 image: default_base(),
                 operator: false,
                 recipe: None,
+                from_repo: false,
             },
         }
+    }
+
+    /// (core#1043 part 3) The base a unit of a repo builds on: the repo's own seat base image when
+    /// it has one (it wins over [`BASE_IMAGE_ENV`]: the more specific choice), else
+    /// [`SeatBase::from_env`]. A repo base is an operator base: local to the runtime, never pulled,
+    /// keyed by its image id, with no layer composed on it. It has no recipe
+    /// ([`BASE_DOCKERFILE_ENV`] is the daemon base's).
+    pub(crate) fn for_repo(repo_base: Option<&str>) -> Self {
+        match repo_base.map(str::trim).filter(|b| !b.is_empty()) {
+            Some(image) => SeatBase {
+                image: image.to_string(),
+                operator: true,
+                recipe: None,
+                from_repo: true,
+            },
+            None => SeatBase::from_env(),
+        }
+    }
+}
+
+/// The longest seat base image reference a repo may name.
+const MAX_IMAGE_REF: usize = 255;
+
+/// (core#1043 part 3) Whether `image` may be a repo's seat base image: a local image reference of
+/// `[a-z0-9._/:@-]` (a registry host, a path, a tag or a digest), starting with a letter or digit,
+/// at most 255 characters. So it is never read as a flag (`-…`), never carries whitespace or a
+/// shell character, and is only ever one argument of a runtime command.
+pub(crate) fn valid_image_ref(image: &str) -> Result<(), String> {
+    let ok = !image.is_empty()
+        && image.len() <= MAX_IMAGE_REF
+        && image
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && image.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'.' | b'_' | b'/' | b':' | b'@' | b'-')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` is not a seat base image reference: use a local image name such as \
+             `wicked-seat-base:rust` (lowercase letters, digits and . _ / : @ -, starting with a \
+             letter or digit, at most {MAX_IMAGE_REF} characters)",
+            image.chars().take(80).collect::<String>().escape_debug()
+        ))
     }
 }
 
@@ -828,7 +881,17 @@ fn build_seat_image_on(
         if present == Some(false) {
             return Err((
                 FloorUnarmed::SeatBaseMissing,
-                missing_base_error(&base.image, rebuilt),
+                missing_base_error(base, rebuilt),
+            ));
+        }
+        // (core#1043 part 3, codex r1) A repo's own base is a person's API setting, not the
+        // operator's: it is built on only once the runtime confirms it is there. An inspection the
+        // runtime did not answer keeps the operator's build path above, but would let a build
+        // `FROM` a repo's reference pull it from a registry.
+        if base.from_repo && present != Some(true) {
+            return Err((
+                FloorUnarmed::NoSeatImage,
+                unconfirmed_repo_base(&base.image),
             ));
         }
     }
@@ -849,10 +912,23 @@ fn build_seat_image_on(
     let (tag, dockerfile) = if base.operator {
         let (tag, from) = match image_id(rt, &base.image) {
             Some(id) => {
-                let pin = pin_seat_image(rt, &base.image, &id).map_err(no_image)?;
+                // (core#1043 part 3) A repo's base is pinned where no registry answers.
+                let pin = if base.from_repo {
+                    pin_repo_base(rt, &base.image, &id)
+                } else {
+                    pin_seat_image(rt, &base.image, &id)
+                }
+                .map_err(no_image)?;
                 let from = pin.tag().to_string();
                 _base_pin = Some(pin);
                 (seat_image_tag(cli, &base.image, Some(&id), &[]), from)
+            }
+            // (core#1043 part 3, codex r1) Never by name on a repo's base: see above.
+            None if base.from_repo => {
+                return Err((
+                    FloorUnarmed::NoSeatImage,
+                    unconfirmed_repo_base(&base.image),
+                ))
             }
             None => (
                 seat_image_tag(cli, &base.image, None, &[]),
@@ -872,12 +948,23 @@ fn build_seat_image_on(
         if base.operator && image_presence(rt, &base.image) == Some(false) {
             (
                 FloorUnarmed::SeatBaseMissing,
-                format!("{}: {e}", missing_base_error(&base.image, rebuilt)),
+                format!("{}: {e}", missing_base_error(base, rebuilt)),
             )
         } else {
             no_image(e)
         }
     })
+}
+
+/// (core#1043 part 3) Why a unit on a repo's own base the runtime did not confirm gets no seat
+/// image: building on its name could pull it from a registry.
+fn unconfirmed_repo_base(image: &str) -> String {
+    format!(
+        "the container runtime did not confirm the seat base image {image} (this repo's seat base \
+         image) or its image id, and the engine builds a seat image on a repo's base only by the id \
+         it confirmed, never by name, which could pull it from a registry; retry when the runtime \
+         answers"
+    )
 }
 
 /// Whether `tag` is on the runtime: `Some(false)` only when its inspection failed AND the runtime
@@ -921,7 +1008,17 @@ pub(crate) fn rebuild_base(rt: &Runtime, base: &str, recipe: &Path) -> Result<()
 
 /// Why an operator seat base that is not on the runtime is refused ([`build_seat_image_on`]),
 /// naming the base and the fix; `rebuilt` is the Dockerfile this call built that did not produce it.
-pub(crate) fn missing_base_error(base: &str, rebuilt: Option<&Path>) -> String {
+pub(crate) fn missing_base_error(seat_base: &SeatBase, rebuilt: Option<&Path>) -> String {
+    let base = &seat_base.image;
+    if seat_base.from_repo {
+        // (core#1043 part 3) The repo's own base: no recipe, and the fix is the repo's setting.
+        return format!(
+            "the seat base image {base} (this repo's seat base image) is not on the container \
+             runtime (a runtime's image cleanup may have deleted it), and the engine does not build \
+             a seat image on a base the runtime says it lacks, which would pull it from a registry; \
+             build or load it again, or clear the repo's seat base image"
+        );
+    }
     match rebuilt {
         None => format!(
             "the seat base image {base} ({BASE_IMAGE_ENV}) is not on the container runtime (a \
@@ -1250,11 +1347,32 @@ pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<Seat
         Some(colon) if slash.is_none_or(|slash| colon > slash) => &reference[..colon],
         _ => reference,
     };
+    pin_seat_image_in(rt, repo, &id, hex)
+}
+
+/// (core#1043 part 3, codex r1 delta) The repository a repo's own seat base is pinned under: a
+/// host in `.invalid`, which is reserved never to resolve (RFC 6761), so a builder that cannot
+/// see the runtime's local images (a BuildKit OCI worker, core#1919) fails the build instead of
+/// fetching the pin's name, which an API-set reference could make a registry's, from a registry.
+/// One repository per base name, so the pin cleanup keeps each base's newest pin.
+pub(crate) const REPO_BASE_PIN_HOST: &str = "wicked-seat-pin.invalid";
+
+/// [`pin_seat_image`] for a repo's own seat base: the inspected id tagged under
+/// [`REPO_BASE_PIN_HOST`], never under the base's own name.
+fn pin_repo_base(rt: &Runtime, image: &str, id: &str) -> Result<SeatPin, String> {
+    let id = valid_image_id(id).ok_or("cannot pin seat image: invalid inspected id")?;
+    let hex = id.strip_prefix("sha256:").unwrap_or(&id);
+    let repo = format!("{REPO_BASE_PIN_HOST}/base-{}", content_tag(&[image]));
+    pin_seat_image_in(rt, &repo, &id, hex)
+}
+
+/// Tag `id` as `<repo>:id-<hex>` and hold it ([`SeatPin`]); older pins of `repo` are cleaned.
+fn pin_seat_image_in(rt: &Runtime, repo: &str, id: &str, hex: &str) -> Result<SeatPin, String> {
     let pinned = format!("{repo}:id-{hex}");
     let result = {
         let mut held = seat_pins_held();
         let mut cmd = rt.cmd();
-        cmd.args(["tag", &id, &pinned]);
+        cmd.args(["tag", id, &pinned]);
         let result = crate::k8s::run_bounded(cmd, None, rt.bound(PROBE_TIMEOUT));
         if result.ok() {
             *held.entry(pinned.clone()).or_default() += 1;
@@ -2856,13 +2974,14 @@ fn carry_prompt_scoped(
 /// (core#1043) The toolchain layers composed onto the seat image of a unit whose tree is `tree`:
 /// none on an operator base or an operator image (`WICKED_SEAT_IMAGE_<CLI>`), the operator's
 /// toolchain. (part 2) Not the layers the run's repo turned off (`layers_off`, from the unit's
-/// governance).
+/// governance). (part 3) None on the repo's own base either ([`SeatBase::for_repo`]).
 fn arm_layers(
     tree: &Path,
     cli: &str,
     layers_off: &[String],
+    base: &SeatBase,
 ) -> Vec<&'static crate::seat_layers::Layer> {
-    if configured_base().is_some() || image_override(cli).is_some() {
+    if base.operator || image_override(cli).is_some() {
         return Vec::new();
     }
     crate::seat_layers::for_tree_except(
@@ -2893,6 +3012,7 @@ pub(crate) fn arm_noting(
     warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
     timeout: Duration,
     layers_off: &[String],
+    repo_base: Option<&str>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let argv_in = argv;
     let wsl = is_wsl(
@@ -3014,8 +3134,11 @@ pub(crate) fn arm_noting(
     before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    let layers = arm_layers(&spec.tree, cli, layers_off);
-    let (image, built_in, fell_back) = ensure_seat_image_noting(&rt, cli, &layers)?;
+    // (core#1043 part 3) The run's repo's own seat base, when it has one, wins over the daemon's.
+    let base = SeatBase::for_repo(repo_base);
+    let layers = arm_layers(&spec.tree, cli, layers_off, &base);
+    let (image, built_in, fell_back) =
+        ensure_layered_seat_image(&rt, cli, image_override(cli), &base, &layers)?;
     // Egress is never widened for a layer: the unit is told which of its hosts the allowlist
     // lacks (an offline seat chose no egress at all). A unit whose layers did not build is told
     // that instead (coord R2 F1).
@@ -4773,6 +4896,7 @@ esac
                     None,
                     crate::workflow::unit_timeout_ceiling(),
                     &[],
+                    None,
                 ) else {
                     panic!("stub refuses submission");
                 };
@@ -4987,6 +5111,7 @@ esac
             None,
             crate::workflow::unit_timeout_ceiling(),
             &[],
+            None,
         );
         match out {
             Err((why, detail)) => {
@@ -5038,7 +5163,7 @@ esac
         std::fs::write(dir.0.join("go.mod"), "module x\n").unwrap();
         let ids = |off: &[&str]| -> Vec<&'static str> {
             let off: Vec<String> = off.iter().map(|s| s.to_string()).collect();
-            arm_layers(&dir.0, "claude", &off)
+            arm_layers(&dir.0, "claude", &off, &SeatBase::from_env())
                 .iter()
                 .map(|l| l.id)
                 .collect()
@@ -5048,6 +5173,198 @@ esac
         assert!(ids(&["go", "rust"]).is_empty());
         std::env::set_var("WICKED_SEAT_IMAGE_CLAUDE", "seat:operator");
         assert!(ids(&[]).is_empty(), "an operator image is the toolchain");
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// (core#1043 part 3) A repo's own seat base: it wins over the daemon's base, composes no layer,
+    /// keys its seat image by its own name and id (two repos never share one, and a repo without a
+    /// base keeps the daemon's), and one the runtime lacks is refused before any build, naming the
+    /// repo's setting rather than the daemon's, never pulled.
+    #[test]
+    fn a_repos_own_seat_base_wins_keys_its_image_and_is_never_pulled() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let keys = [
+            BASE_IMAGE_ENV,
+            BASE_DOCKERFILE_ENV,
+            "WICKED_SEAT_IMAGE_CLAUDE",
+            crate::seat_layers::LAYERS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        // References: one argument of a runtime command, never a flag.
+        for ok in [
+            "acme/seat-base:go1.23",
+            "localhost:5000/seat_base",
+            "seat@sha256:ab",
+        ] {
+            assert!(valid_image_ref(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "--privileged",
+            "a b",
+            "A",
+            "/a",
+            "a;b",
+            "a$b",
+            "a\nb",
+        ] {
+            assert!(valid_image_ref(bad).is_err(), "{bad:?}");
+        }
+        assert!(valid_image_ref(&"a".repeat(255)).is_ok());
+        assert!(valid_image_ref(&"a".repeat(256)).is_err());
+
+        // Precedence: the repo's base, then the daemon's, then the default.
+        assert_eq!(SeatBase::for_repo(None), SeatBase::from_env());
+        assert_eq!(SeatBase::for_repo(Some("  ")), SeatBase::from_env());
+        assert!(!SeatBase::for_repo(None).operator);
+        std::env::set_var(BASE_IMAGE_ENV, "seat-base:daemon");
+        std::env::set_var(BASE_DOCKERFILE_ENV, "/nonexistent/base.Dockerfile");
+        let daemon = SeatBase::for_repo(None);
+        assert_eq!(
+            (daemon.image.as_str(), daemon.from_repo),
+            ("seat-base:daemon", false)
+        );
+        let repo = SeatBase::for_repo(Some(" acme/seat-base:go "));
+        assert_eq!(
+            repo,
+            SeatBase {
+                image: "acme/seat-base:go".into(),
+                operator: true,
+                recipe: None,
+                from_repo: true,
+            },
+            "the repo's base wins, with no recipe of the daemon's"
+        );
+        std::env::remove_var(BASE_IMAGE_ENV);
+        std::env::remove_var(BASE_DOCKERFILE_ENV);
+
+        // No layer on the repo's base; the detected ones without it.
+        let dir = RemoveOnDrop(tmp(&format!("repo-base-{}", uuid::Uuid::new_v4().simple())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.0.join("go.mod"), "module x\n").unwrap();
+        let ids = |base: &SeatBase| -> Vec<&'static str> {
+            arm_layers(&dir.0, "claude", &[], base)
+                .iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        assert_eq!(ids(&SeatBase::for_repo(None)), ["go"]);
+        assert!(ids(&repo).is_empty(), "the repo's base is its toolchain");
+
+        // Identity: each repo's base keys its own seat image; no base keeps the default's.
+        let rt = Runtime::answering(image_stub(
+            &dir.0,
+            &["acme/seat-base:go", "acme/seat-base:java"],
+        ));
+        let go = seat_tag_on(&rt, "claude", &repo, &[]).unwrap();
+        let java = seat_tag_on(
+            &rt,
+            "claude",
+            &SeatBase::for_repo(Some("acme/seat-base:java")),
+            &[],
+        )
+        .unwrap();
+        let go_layer = crate::seat_layers::parse("go").unwrap();
+        let plain = seat_tag_on(&rt, "claude", &SeatBase::for_repo(None), &go_layer).unwrap();
+        assert_ne!(go, java, "two repos' bases are two seat images");
+        assert!(go != plain && java != plain, "{go} {java} {plain}");
+        let id = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(
+            go,
+            seat_image_tag("claude", "acme/seat-base:go", Some(&id), &[]).unwrap(),
+            "keyed by the base's image id: a rebuild under the name is a new seat image"
+        );
+
+        // (codex r1 delta) A present repo base is built FROM its pin under a host no registry
+        // answers, never FROM its own name.
+        let built = build_seat_image_on(&rt, "claude", seat_package("claude").unwrap(), &repo, &[])
+            .unwrap();
+        assert_eq!(built, go);
+        let calls = std::fs::read_to_string(dir.0.join("calls.log")).unwrap();
+        let from = calls
+            .lines()
+            .find_map(|l| l.split(" --build-arg BASE=").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .expect("the seat build names its base");
+        assert!(
+            from.starts_with(&format!("{REPO_BASE_PIN_HOST}/base-"))
+                && from.ends_with(&format!(":id-{}", "b".repeat(64))),
+            "{from}"
+        );
+        assert!(!calls.contains("BASE=acme/"), "{calls}");
+
+        // Missing: refused before any build, naming the repo's setting, never the daemon's.
+        let gone = c4_temp();
+        let log = gone.join("calls.log");
+        let stub = gone.join("runtime");
+        crate::test_env::install_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in image) exit 1 ;; build) cat >/dev/null; exit 0 ;; esac\nexit 0\n",
+                log.display()
+            ),
+        );
+        let rt = Runtime::answering(stub);
+        let pkg = seat_package("claude").unwrap();
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &repo, &[]).unwrap_err();
+        assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
+        assert!(
+            e.contains("acme/seat-base:go") && e.contains("this repo's seat base image"),
+            "{e}"
+        );
+        assert!(
+            !e.contains(BASE_IMAGE_ENV) && !e.contains(BASE_DOCKERFILE_ENV),
+            "{e}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!calls.contains("build"), "no build ran: {calls}");
+        let (why, _) = ensure_layered_seat_image(&rt, "claude", None, &repo, &[]).unwrap_err();
+        assert_eq!(why, FloorUnarmed::SeatBaseMissing);
+        std::fs::remove_dir_all(gone).unwrap();
+
+        // (codex r1) Unconfirmed: a runtime that answers neither the inspection nor the listing
+        // keeps the operator's build path, but a repo's base is not built on by name.
+        let mute = c4_temp();
+        let log = mute.join("calls.log");
+        let stub = mute.join("runtime");
+        crate::test_env::install_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in image|images) exit 1 ;; build) cat >/dev/null; exit 0 ;; esac\nexit 0\n",
+                log.display()
+            ),
+        );
+        let rt = Runtime::answering(stub);
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &repo, &[]).unwrap_err();
+        assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
+        assert!(
+            e.contains("did not confirm") && e.contains("acme/seat-base:go"),
+            "{e}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!calls.contains("build"), "no build ran: {calls}");
+        let operator = SeatBase {
+            from_repo: false,
+            ..repo.clone()
+        };
+        assert!(
+            build_seat_image_on(&rt, "claude", pkg, &operator, &[]).is_ok(),
+            "the operator's base keeps its build path"
+        );
+        std::fs::remove_dir_all(mute).unwrap();
         for (k, v) in saved {
             match v {
                 Some(v) => std::env::set_var(k, v),
@@ -5497,6 +5814,7 @@ esac
             image: "seat-base:rust".into(),
             operator: true,
             recipe: Some(recipe.clone()),
+            from_repo: false,
         };
         let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
@@ -5605,6 +5923,7 @@ esac
                 image: checks.clone(),
                 operator: false,
                 recipe: None,
+                from_repo: false,
             };
             let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
             let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
@@ -5682,6 +6001,7 @@ esac
             image: checks.clone(),
             operator: false,
             recipe: None,
+            from_repo: false,
         };
         let pkg = seat_package("claude").unwrap();
         let tag = build_seat_image_on(&rt, "claude", pkg, &default, &layers).unwrap();
@@ -5711,6 +6031,7 @@ esac
             image: "seat-base:rust".into(),
             operator: true,
             recipe: None,
+            from_repo: false,
         };
         let tag = build_seat_image_on(&rt, "claude", pkg, &operator, &layers).unwrap();
         let id = format!("sha256:{}", "b".repeat(64));
@@ -5784,6 +6105,7 @@ esac
             image: checks.clone(),
             operator: false,
             recipe: None,
+            from_repo: false,
         };
         // A set no other test uses (the failed-set memory is process-wide).
         let layers = crate::seat_layers::parse("go,java").unwrap();
@@ -5846,6 +6168,7 @@ esac
             image: checks.clone(),
             operator: false,
             recipe: None,
+            from_repo: false,
         };
         let (tag, _, note) = ensure_layered_seat_image(&rt, "pi", None, &default, &layers).unwrap();
         assert_eq!((tag.as_str(), note), (current.as_str(), None));
@@ -5894,6 +6217,7 @@ esac
             image: "seat-base:rust".into(),
             operator: true,
             recipe: Some(recipe.clone()),
+            from_repo: false,
         };
         build_seat_image_on(&rt, "codex", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
@@ -5928,6 +6252,7 @@ esac
             image: "seat-base:rust".into(),
             operator: true,
             recipe: None,
+            from_repo: false,
         };
         let (why, e) = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::SeatBaseMissing, "{e}");
@@ -5984,6 +6309,7 @@ esac
             image: "seat-base:rust".into(),
             operator: true,
             recipe: None,
+            from_repo: false,
         };
         let tag = build_seat_image_on(&rt, "claude", pkg, &base, &[]).unwrap();
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -6017,6 +6343,7 @@ esac
             image: default_base(),
             operator: false,
             recipe: Some(PathBuf::from("/nonexistent")),
+            from_repo: false,
         };
         let (why, e) = build_seat_image_on(&rt, "claude", pkg, &default, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
@@ -6106,6 +6433,7 @@ esac
             image: default_base(),
             operator: false,
             recipe: None,
+            from_repo: false,
         };
         let (tag, built) = ensure_seat_image_with(&rt, "pi", None, &base, &[]).unwrap();
         assert!(built.is_some(), "a missing image is built and noted");

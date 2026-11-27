@@ -618,6 +618,7 @@ fn input_for(u: &WorkUnit, db_path: &str, apps: Option<&str>) -> StepInput {
             project_id: None,
             repo_id: None,
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
             human_confirm: HumanConfirm::None,
             apps: apps.map(str::to_string),
         }),

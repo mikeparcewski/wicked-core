@@ -199,6 +199,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         project_id: None,
         repo_id: None,
         seat_layers_off: Vec::new(),
+        seat_base_image: None,
         apps: None,
     })
 }
@@ -3058,6 +3059,17 @@ pub(crate) fn run(
                 reply,
             } => {
                 let _ = reply.send(crate::repo::set_seat_layers_off(&mut store, &repo_id, &off));
+            }
+            Command::SetRepoSeatBaseImage {
+                repo_id,
+                image,
+                reply,
+            } => {
+                let _ = reply.send(crate::repo::set_seat_base_image(
+                    &mut store,
+                    &repo_id,
+                    image.as_deref(),
+                ));
             }
             Command::ListRepos { reply } => {
                 let _ = reply.send(crate::repo::list_repos_shown(&store));
@@ -14868,6 +14880,9 @@ fn dispatch_unit_with(
             // (core#1043 part 2) …and the layers that repo turned off, read at dispatch, so a
             // change applies from the next unit; the arm leaves them out of the seat image.
             seat_layers_off: crate::repo::seat_layers_off_for(&*store, session.repo_ref.as_deref()),
+            // (core#1043 part 3) …and its own seat base image, read the same way: the arm builds
+            // the unit's seat image on it instead of the daemon's base.
+            seat_base_image: crate::repo::seat_base_image_for(&*store, session.repo_ref.as_deref()),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
             // (DES-APPS-001 K0, narrowed by DES-KNOWLEDGE-DATA-001 §9.3) An Apps run's units get no
@@ -42978,6 +42993,7 @@ mod worker_code_graph_tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -43440,6 +43456,7 @@ mod project_graph_binding_tests {
             findings: Vec::new(),
             seat_layers: Vec::new(),
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));

@@ -1544,6 +1544,7 @@ mod tests {
             project_id: None,
             repo_id: None,
             seat_layers_off: Vec::new(),
+            seat_base_image: None,
             apps: None,
         });
         let out = runner.run_unit(&input);
@@ -1579,6 +1580,7 @@ mod tests {
                 project_id: None,
                 repo_id: None,
                 seat_layers_off: Vec::new(),
+                seat_base_image: None,
                 apps: None,
             })
         };
@@ -1693,6 +1695,7 @@ mod tests {
                 project_id: None,
                 repo_id: None,
                 seat_layers_off: Vec::new(),
+                seat_base_image: None,
                 apps: None,
             })
         };
