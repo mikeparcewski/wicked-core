@@ -667,6 +667,13 @@ export declare class Core {
    */
   setRepoSeatBaseImage(repoId: string, image?: string | undefined | null): Promise<string>
   /**
+   * (core#2024) Set a repo's own seat memory limit (`null` or a blank string clears it): its
+   * seats get that limit instead of the daemon's (`WICKED_SEAT_MEMORY`, else `3g`). Resolves to
+   * the updated `RepoEntry` JSON object (`seat_memory`). Rejects a size that is not a whole
+   * number with a unit (`6g`, `512m`), or an unknown repo.
+   */
+  setRepoSeatMemory(repoId: string, memory?: string | undefined | null): Promise<string>
+  /**
    * Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
    * plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's
    * scope; `createdBy` defaults to `api`. Resolves to the stored `Preset` JSON object

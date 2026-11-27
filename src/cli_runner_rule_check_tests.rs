@@ -232,6 +232,7 @@ fn review_input(repo: &std::path::Path, base: &str, db: &str) -> StepInput {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             human_confirm: crate::domain::HumanConfirm::None,
             apps: None,
         }),

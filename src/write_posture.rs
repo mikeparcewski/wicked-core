@@ -526,6 +526,7 @@ mod tests {
             repo_id: None,
             seat_layers_off: Vec::new(),
             seat_base_image: None,
+            seat_memory: None,
             apps: None,
         };
         let in_process = deliverable_roots_from(&g.extra_write_roots);

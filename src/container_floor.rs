@@ -724,6 +724,19 @@ pub(crate) fn build_seat_image(
     Ok(built)
 }
 
+/// (core#2024) Build `cli`'s seat image for the registered repo `repo`, as its unit's arm would:
+/// on the repo's own base when it has one (pinned by the id the runtime confirms, never pulled),
+/// else on the daemon's with the layers its checkout needs, less those it turned off.
+fn build_repo_seat_image(rt: &Runtime, cli: &str, repo: &SeatImageRepo) -> Result<String, String> {
+    let package =
+        seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
+    let base = SeatBase::for_repo(repo.base_image.as_deref());
+    let layers = arm_layers(&repo.root_path, cli, &repo.layers_off, &base);
+    let built = build_seat_image_on(rt, cli, package, &base, &layers).map_err(|(_, e)| e)?;
+    reclaim_after_build(rt, &base, &built, &layers);
+    Ok(built)
+}
+
 /// [`reclaim_superseded_layer_images`] after `built` was built on the default base with layers.
 fn reclaim_after_build(
     rt: &Runtime,
@@ -1861,6 +1874,40 @@ pub(crate) fn mount_plan(f: &SeatFloor) -> Result<Vec<Mount>, String> {
         put(&mut out, m)?;
     }
     Ok(out)
+}
+
+/// (core#2024) The seat memory limit for a unit of a repo: the repo's own setting
+/// (`RepoEntry::seat_memory`) when it has one, else the operator's [`MEMORY_ENV`], else `3g`. The
+/// same rule as the seat base image: the more specific choice wins, with no host ceiling (a size
+/// the host cannot honour fails at schedule).
+pub(crate) fn seat_memory<'a>(repo: Option<&'a str>, env: Option<&'a str>) -> &'a str {
+    repo.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| memory_from(env))
+}
+
+/// (core#2024) Whether `m` may be a repo's seat memory size: a whole number from 1 to 999999 with
+/// no leading zero, then `k`, `m` or `g` (or `kb`, `mb`, `gb`), any case: the forms
+/// [`k8s_memory`] turns into a Kubernetes quantity. Anything else (a fraction, a bare number, a
+/// space, a flag) is refused, so the value is only ever one well-formed size.
+pub(crate) fn valid_memory(m: &str) -> Result<(), String> {
+    let lower = m.to_ascii_lowercase();
+    let digits = lower
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(lower.len());
+    let (num, unit) = lower.split_at(digits);
+    let ok = (1..=6).contains(&num.len())
+        && !num.starts_with('0')
+        && matches!(unit, "k" | "m" | "g" | "kb" | "mb" | "gb");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` is not a seat memory size: use a whole number and k, m or g, such as `6g` or \
+             `512m`",
+            m.chars().take(40).collect::<String>().escape_debug()
+        ))
+    }
 }
 
 /// The memory limit selected by the operator, or the default when unset or blank.
@@ -3013,6 +3060,7 @@ pub(crate) fn arm_noting(
     timeout: Duration,
     layers_off: &[String],
     repo_base: Option<&str>,
+    repo_memory: Option<&str>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let argv_in = argv;
     let wsl = is_wsl(
@@ -3296,7 +3344,9 @@ pub(crate) fn arm_noting(
             None => (Vec::new(), Vec::new(), None, Vec::new(), None, None),
         };
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
-    let memory = std::env::var(MEMORY_ENV).ok();
+    // (core#2024) The run's repo's own seat memory, when it has one, wins over the daemon's.
+    let env_memory = std::env::var(MEMORY_ENV).ok();
+    let memory = seat_memory(repo_memory, env_memory.as_deref());
     let own_ports: Vec<u16> = spec
         .net
         .iter()
@@ -3365,7 +3415,7 @@ pub(crate) fn arm_noting(
         seat_dirs: &seat_dirs,
         scratch: scratch_dir.as_deref(),
         seed_base: seed_base.as_deref(),
-        memory: &k8s_memory(memory_from(memory.as_deref())),
+        memory: &k8s_memory(memory),
         gateway_ip: gateway_ip.as_deref(),
         // Warm checkout needs enough physical lifetime for this call's actual timeout;
         // cold pods retain their existing ceiling and deadline.
@@ -3965,9 +4015,95 @@ pub(crate) fn entries_around(
     Some(entries)
 }
 
+/// (core#2024) The registered repo a `seat-image --repo <id>` builds for: its checkout (where its
+/// layers are detected), its own seat base image and the layers it turned off, as the engine's
+/// store records them ([`seat_image_repo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatImageRepo {
+    pub id: String,
+    pub root_path: PathBuf,
+    pub base_image: Option<String>,
+    pub layers_off: Vec<String>,
+}
+
+/// (core#2024) The repo `id` as `seat-image --repo` builds for it, read from `store` (the engine's,
+/// opened read-only by the CLI). An unknown id is refused by name.
+pub fn seat_image_repo(
+    store: &dyn wicked_apps_core::GraphRead,
+    id: &str,
+) -> Result<SeatImageRepo, String> {
+    let entry = crate::repo::get_repo(store, id)
+        .map_err(|e| format!("could not read the repo registry: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no registered repo `{}` in this store (pass the engine's store with --db)",
+                id.escape_debug()
+            )
+        })?;
+    Ok(SeatImageRepo {
+        id: entry.id,
+        root_path: PathBuf::from(entry.root_path),
+        base_image: entry.seat_base_image,
+        layers_off: entry.seat_layers_off,
+    })
+}
+
+/// (core#2024) `seat-image`'s `--repo <id>` and `--db <path>` taken out of `args`: the repo id,
+/// the store path, then the other arguments. `--repo` with `--layers` is refused (a repo's layers
+/// are its own), as is a flag with no value.
+pub fn seat_image_repo_args(
+    args: &[String],
+) -> Result<(Option<String>, Option<String>, Vec<String>), String> {
+    let mut repo = None;
+    let mut db = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (slot, name) = if a == "--repo" || a.starts_with("--repo=") {
+            (&mut repo, "--repo")
+        } else if a == "--db" || a.starts_with("--db=") {
+            (&mut db, "--db")
+        } else {
+            rest.push(a.clone());
+            continue;
+        };
+        let value = match a.strip_prefix(&format!("{name}=")) {
+            Some(v) => v.to_string(),
+            None => it
+                .next()
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))?,
+        };
+        if value.trim().is_empty() || value.starts_with('-') {
+            return Err(format!("{name} needs a value"));
+        }
+        *slot = Some(value);
+    }
+    if repo.is_some()
+        && rest
+            .iter()
+            .any(|a| a == "--layers" || a.starts_with("--layers="))
+    {
+        return Err(
+            "--repo builds the repo's own layers (or its own base): leave out --layers".into(),
+        );
+    }
+    if repo.is_none() && db.is_some() {
+        return Err("--db is read only with --repo".into());
+    }
+    Ok((repo, db, rest))
+}
+
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images
 /// ahead of the first governed run, or report which are present. Returns the exit code.
 pub fn seat_image_main(args: &[String]) -> i32 {
+    seat_image_main_for(args, None)
+}
+
+/// [`seat_image_main`] for the registered repo `repo` (`seat-image --repo <id>`, core#2024): its
+/// images are the ones its units arm with, on its own base when it has one ([`SeatBase::for_repo`])
+/// and otherwise the daemon's with the layers its checkout needs, less those it turned off.
+pub fn seat_image_main_for(args: &[String], repo: Option<&SeatImageRepo>) -> i32 {
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(why) => {
@@ -3994,8 +4130,9 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         .map(String::as_str)
         .filter(|c| seat_package(c).is_none() && image_override(c).is_none())
         .collect();
-    let usage = "usage: wicked-core seat-image build [--layers <ids>|detect:<dir>] [<cli>…|all] | \
-                 seat-image status [--json] [--layers <ids>|detect:<dir>] [<cli>…]";
+    let usage = "usage: wicked-core seat-image build [--layers <ids>|detect:<dir>|--repo <id> \
+                 [--db <path>]] [<cli>…|all] | seat-image status [--json] [--layers \
+                 <ids>|detect:<dir>|--repo <id> [--db <path>]] [<cli>…]";
     match args.first().map(String::as_str) {
         Some("build" | "status") if !unknown.is_empty() => {
             eprintln!(
@@ -4027,7 +4164,11 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                     }
                     continue;
                 }
-                match build_seat_image(&rt, cli, &layers) {
+                let built = match repo {
+                    None => build_seat_image(&rt, cli, &layers),
+                    Some(r) => build_repo_seat_image(&rt, cli, r),
+                };
+                match built {
                     Ok(tag) => {
                         println!("{cli}: built {tag}");
                     }
@@ -4040,7 +4181,20 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             rc
         }
         Some("status") => {
-            let st = match image_status(&rt, &wanted, &layers) {
+            let st = match repo {
+                None => image_status(&rt, &wanted, &layers),
+                Some(r) => {
+                    let cfg = StatusConfig::for_repo(&wanted, r);
+                    let base = SeatBase::for_repo(r.base_image.as_deref());
+                    // The layers a unit of the repo arms with (none on an operator or repo base).
+                    let layers = wanted
+                        .first()
+                        .map(|cli| arm_layers(&r.root_path, cli, &r.layers_off, &base))
+                        .unwrap_or_default();
+                    image_status_with(&rt, &wanted, &cfg, &layers)
+                }
+            };
+            let st = match st {
                 Ok(st) => st,
                 Err(e) => {
                     eprintln!("wicked-core seat-image status: {e}");
@@ -4150,6 +4304,22 @@ pub(crate) struct StatusConfig {
 }
 
 impl StatusConfig {
+    /// (core#2024) The status of a repo's images: its own base when it has one (no recipe: a repo
+    /// base is never rebuilt), else the daemon's.
+    fn for_repo(clis: &[String], repo: &SeatImageRepo) -> Self {
+        let mut cfg = StatusConfig::from_env(clis);
+        if let Some(b) = repo
+            .base_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            cfg.base = Some(b.to_string());
+            cfg.recipe = None;
+        }
+        cfg
+    }
+
     fn from_env(clis: &[String]) -> Self {
         StatusConfig {
             base: configured_base(),
@@ -4897,6 +5067,7 @@ esac
                     crate::workflow::unit_timeout_ceiling(),
                     &[],
                     None,
+                    None,
                 ) else {
                     panic!("stub refuses submission");
                 };
@@ -5111,6 +5282,7 @@ esac
             None,
             crate::workflow::unit_timeout_ceiling(),
             &[],
+            None,
             None,
         );
         match out {
@@ -7682,6 +7854,110 @@ esac
         assert!(!land.iter().any(|a| a.starts_with("--unrestricted")));
         assert!(!landrun_prefix(&plan, &[], &[]).contains(&"--connect-tcp".to_string()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#2024) SHARED/CACHED READS: the seat's memory is the repo's own setting when it has
+    /// one, else the operator's `WICKED_SEAT_MEMORY`, else `3g` (the base image's rule), read per
+    /// arm from the values passed in, and turned into the pod's quantity.
+    #[test]
+    fn a_repos_seat_memory_wins_over_the_daemons_2024() {
+        assert_eq!(seat_memory(Some("6g"), Some("4g")), "6g");
+        assert_eq!(seat_memory(Some(" 6g "), None), "6g");
+        assert_eq!(seat_memory(Some("  "), Some("4g")), "4g");
+        assert_eq!(seat_memory(None, Some("4g")), "4g");
+        assert_eq!(seat_memory(None, Some("  ")), "3g");
+        assert_eq!(seat_memory(None, None), "3g");
+        assert_eq!(k8s_memory(seat_memory(Some("512mb"), Some("4g"))), "512Mi");
+        assert_eq!(k8s_memory(seat_memory(Some("6G"), None)), "6Gi");
+    }
+
+    /// (core#2024) UNTRUSTED TEXT OUT: a seat memory size is a whole number (1 to 999999, no
+    /// leading zero) and k, m or g (or kb, mb, gb), any case; anything else is refused, and the
+    /// refusal escapes what it quotes.
+    #[test]
+    fn a_seat_memory_size_is_strict_2024() {
+        for good in ["1k", "6g", "512m", "6G", "64KB", "999999gb", "2Mb"] {
+            assert!(valid_memory(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "6",
+            "0g",
+            "06g",
+            "6.5g",
+            "6 g",
+            " 6g",
+            "-6g",
+            "6g;rm",
+            "1234567g",
+            "6gib",
+            "6t",
+            "\u{ff16}g",
+            "6g\n",
+            "g",
+        ] {
+            assert!(valid_memory(bad).is_err(), "{bad:?}");
+        }
+        let err = valid_memory("6g\n\u{1b}[31m").unwrap_err();
+        assert!(err.contains("\\n") && !err.contains('\u{1b}'), "{err}");
+    }
+
+    /// (core#2024) `seat-image`'s `--repo` and `--db`: taken out of the arguments (both spellings),
+    /// refused with no value, with `--layers` (a repo's layers are its own), or `--db` alone.
+    #[test]
+    fn seat_image_repo_args_take_the_repo_and_the_store_2024() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (repo, db, rest) = seat_image_repo_args(&a(&[
+            "build",
+            "--repo",
+            "acme",
+            "--db",
+            "/s/core.db",
+            "codex",
+        ]))
+        .unwrap();
+        assert_eq!(repo.as_deref(), Some("acme"));
+        assert_eq!(db.as_deref(), Some("/s/core.db"));
+        assert_eq!(rest, a(&["build", "codex"]));
+        let (repo, db, rest) =
+            seat_image_repo_args(&a(&["status", "--repo=acme", "--json"])).unwrap();
+        assert_eq!(repo.as_deref(), Some("acme"));
+        assert_eq!(db, None);
+        assert_eq!(rest, a(&["status", "--json"]));
+        let (repo, _, rest) = seat_image_repo_args(&a(&["build", "--layers", "go"])).unwrap();
+        assert_eq!(repo, None);
+        assert_eq!(rest, a(&["build", "--layers", "go"]));
+        for bad in [
+            &["build", "--repo"][..],
+            &["build", "--repo", ""],
+            &["build", "--repo", "--db", "x"],
+            &["build", "--repo=", "codex"],
+            &["build", "--repo", "acme", "--layers", "go"],
+            &["build", "--repo", "acme", "--layers=go"],
+            &["build", "--db", "/s/core.db"],
+        ] {
+            assert!(seat_image_repo_args(&a(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// (core#2024) The status of a repo's images names its own base (with no recipe: a repo base
+    /// is never rebuilt); a repo without one reports the daemon's.
+    #[test]
+    fn a_repos_image_status_names_its_own_base_2024() {
+        let repo = |base: Option<&str>| SeatImageRepo {
+            id: "acme".into(),
+            root_path: PathBuf::from("/nonexistent"),
+            base_image: base.map(str::to_string),
+            layers_off: Vec::new(),
+        };
+        let clis = vec!["codex".to_string()];
+        let own = StatusConfig::for_repo(&clis, &repo(Some("acme/seat-base:go")));
+        assert_eq!(own.base.as_deref(), Some("acme/seat-base:go"));
+        assert_eq!(own.recipe, None);
+        let daemon = StatusConfig::from_env(&clis);
+        let plain = StatusConfig::for_repo(&clis, &repo(None));
+        assert_eq!(plain.base, daemon.base);
+        assert_eq!(plain.recipe, daemon.recipe);
     }
 
     #[test]

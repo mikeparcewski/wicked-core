@@ -1284,6 +1284,46 @@ fn a_repos_own_seat_base_rides_its_units_governance() {
     release_all(&w);
 }
 
+/// (core#2024) A repo's own seat memory limit rides each of its units' governance, read when the
+/// unit is dispatched (STALE READS: a change applies from the next unit); a bad size is refused
+/// through the core API and nothing is written; a repo-less run's unit carries none.
+#[test]
+fn a_repos_own_seat_memory_rides_its_units_governance_2024() {
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+    let record = seen.clone();
+    let w = Worker::scripted(move |i, _| {
+        record
+            .lock()
+            .unwrap()
+            .push(i.governance.as_ref().and_then(|g| g.seat_memory.clone()));
+        hold()
+    });
+    let e = engine("repomem", w.clone());
+    let (repo_id, _) = repo(&e, "repo-mem");
+    let entry = e
+        .core
+        .set_repo_seat_memory(&repo_id, Some("6g".into()))
+        .unwrap();
+    assert_eq!(entry.seat_memory.as_deref(), Some("6g"));
+    let err = e
+        .core
+        .set_repo_seat_memory(&repo_id, Some("6g --privileged".into()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a seat memory size"), "{err}");
+    put(&e, "rm", json!([{"catalog": "understand", "id": "answer"}]));
+    launch_preset(&e, "rm", "rm", Some(&repo_id), HumanConfirm::None);
+    wait_for("a unit dispatched", || !seen.lock().unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap()[0].as_deref(), Some("6g"));
+    release_all(&w);
+    launch_preset(&e, "rm2", "rm", None, HumanConfirm::None);
+    wait_for("the repo-less unit dispatched", || {
+        seen.lock().unwrap().len() >= 2
+    });
+    assert_eq!(seen.lock().unwrap()[1], None);
+    release_all(&w);
+}
+
 /// (core#1933, round 1 codex P2) The repo list a person gets (`Core::list_repos`, the binding's
 /// `listRepos`) carries the seat-layer rows, with the switch applied; the engine's own reads do not.
 #[test]

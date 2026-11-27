@@ -179,6 +179,13 @@ pub(crate) enum Command {
         image: Option<String>,
         reply: Sender<anyhow::Result<RepoEntry>>,
     },
+    /// (core#2024) Set (`Some`) or clear (`None`) a repo's own seat memory limit; the single writer
+    /// validates and persists `RepoEntry::seat_memory` and replies with the entry.
+    SetRepoSeatMemory {
+        repo_id: String,
+        memory: Option<String>,
+        reply: Sender<anyhow::Result<RepoEntry>>,
+    },
     /// List every registered repository.
     ListRepos {
         reply: Sender<anyhow::Result<Vec<RepoEntry>>>,
@@ -800,6 +807,7 @@ impl Command {
             Command::UnregisterRepo { .. } => "UnregisterRepo",
             Command::SetRepoSeatLayersOff { .. } => "SetRepoSeatLayersOff",
             Command::SetRepoSeatBaseImage { .. } => "SetRepoSeatBaseImage",
+            Command::SetRepoSeatMemory { .. } => "SetRepoSeatMemory",
             Command::ListRepos { .. } => "ListRepos",
             Command::ProjectCreate { .. } => "ProjectCreate",
             Command::ProjectUpdate { .. } => "ProjectUpdate",

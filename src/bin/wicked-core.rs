@@ -207,15 +207,19 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "seat-image",
-        "wicked-core seat-image build [--layers <ids>|detect:<dir>] [<cli>...|all] | \
-         seat-image status [--json] [--layers <ids>|detect:<dir>] [<cli>...]\n  \
+        "wicked-core seat-image build [--layers <ids>|detect:<dir>|--repo <id> [--db <path>]] \
+         [<cli>...|all] | seat-image status [--json] [--layers <ids>|detect:<dir>|--repo <id> \
+         [--db <path>]] [<cli>...]\n  \
          Build or report the images governed seats use in Kubernetes pods. The container CLI \
          (docker, podman, nerdctl) builds images into the store shared with the local cluster \
          (imagePullPolicy: Never). A missing WICKED_SEAT_BASE_IMAGE is rebuilt from \
          WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object. --layers \
          names toolchain layers (go, java, python; rust and node are in the base) or detects \
          them from a checkout, so an operator can pre-build a repository's seat images; a run \
-         detects its own. WICKED_SEAT_LAYERS=off turns detection off.",
+         detects its own. WICKED_SEAT_LAYERS=off turns detection off. --repo <id> builds (or \
+         reports) the images that registered repo's units arm with: on its own seat base image \
+         when it has one, else with the layers its checkout needs less those it turned off. It \
+         reads the engine's store read-only (--db, else WICKED_ESTATE_DB).",
     ),
     (
         "seat-login",
@@ -366,12 +370,40 @@ fn main() {
     // gate-hook runs as a SUBPROCESS that claude spawns per tool-call. It must NOT spawn the actor
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
-    // seat-image talks only to the container runtime: no store, no actor.
+    // seat-image talks only to the container runtime: no actor. (core#2024) `--repo <id>` reads
+    // that repo's row from the engine's store, read-only (open_store_ro), so it runs beside a live
+    // single-writer daemon.
     if args.get(1).map(String::as_str) == Some("seat-image") {
         if handled_help("seat-image", &args) {
             return;
         }
-        std::process::exit(wicked_core::seat_image_main(&args[2..]));
+        let (repo, db, rest) = match wicked_core::seat_image_repo_args(&args[2..]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("wicked-core seat-image: {e}");
+                std::process::exit(2);
+            }
+        };
+        let Some(repo) = repo else {
+            std::process::exit(wicked_core::seat_image_main(&rest));
+        };
+        let db = db.unwrap_or_else(|| store_path(&[]));
+        let store = match wicked_apps_core::open_store_ro(Some(&db)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("wicked-core seat-image: cannot open the store at {db}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let target = match wicked_core::seat_image_repo(&store, &repo) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("wicked-core seat-image: {e}");
+                std::process::exit(1);
+            }
+        };
+        drop(store);
+        std::process::exit(wicked_core::seat_image_main_for(&rest, Some(&target)));
     }
 
     // The daemon's cluster: no store, no actor.
