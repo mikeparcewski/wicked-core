@@ -22485,12 +22485,23 @@ pub(crate) fn refuse_before_resolving(
             );
         }
         crate::workflow::HumanDecision::RequestChanges { .. } => {
+            // (core#2005) The unit the send-back reviews, as the rewind reads it: at the terminal
+            // gate the cursor is past the last unit, and the work under review is that unit's.
+            let reviewed = send_back_cursor_ix(session, &units).map(|i| &units[i]);
+            let reviewed_ord = reviewed.map_or(cursor_ord, |u| u.ord);
             // (F-LEARN-2 live, run 55a1fac3) a follow-up on a conversational step is a send-back
             // too: the pre-check refused it before the rewind could route it.
-            let has_creator = cursor.is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
-                || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some()
+            let has_creator = reviewed
+                .is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
+                || crate::pipeline::most_recent_prior_creator(&units, reviewed_ord).is_some()
                 || conversation_target(&units, session.unit_ix).is_some();
             if !has_creator {
+                if cursor.is_none() && reviewed.is_some() {
+                    anyhow::bail!(
+                        "no creator phase precedes unit {reviewed_ord} to send the work back to — \
+                         approve to complete the run, or reject"
+                    );
+                }
                 anyhow::bail!(
                     "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
                 );
@@ -23652,6 +23663,27 @@ fn rewind_to_creator(
     )
 }
 
+/// (core#2005) The unit a send-back reviews: the cursor's, or at the terminal gate the run's last
+/// unit. That gate opens after the final unit's work with the cursor past it (the pause in
+/// `advance_or_pause_with` when no unit is left and the last one declares `HumanConfirm`), so the work it
+/// approves is that unit's. `None` when the cursor is past the end for any other reason. The ONE
+/// rule both the gate's pre-check ([`refuse_before_resolving`]) and the rewind read.
+pub(crate) fn send_back_cursor_ix(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+) -> Option<usize> {
+    if session.unit_ix < units.len() {
+        return Some(session.unit_ix);
+    }
+    let last = units.len().checked_sub(1)?;
+    (session.unit_ix == units.len()
+        && matches!(
+            units[last].gate,
+            crate::workflow::GateSpec::HumanConfirm { .. }
+        ))
+    .then_some(last)
+}
+
 /// (DES-learn-workflow §3.1) The conversational step a `request_changes` at a gate BETWEEN steps
 /// re-runs: the cursor has not run, and the step before it ran, is neither a Tool nor a creator, and
 /// has no creator before it (learn's walkthrough). `None` everywhere else. The ONE rule both the
@@ -23733,7 +23765,8 @@ fn rewind_to_creator_scoped(
     is_acp: bool,
 ) -> anyhow::Result<SessionStatus> {
     let mut units = crate::domain::session_units(store, run_id)?;
-    let cursor_ix = session.unit_ix;
+    // (core#2005) At the terminal gate the unit under review is the last one (the cursor is past it).
+    let cursor_ix = send_back_cursor_ix(&session, &units).unwrap_or(session.unit_ix);
     let Some(cursor) = units.get(cursor_ix) else {
         anyhow::bail!("run {run_id} has no unit at its cursor ({cursor_ix}) to send back");
     };
