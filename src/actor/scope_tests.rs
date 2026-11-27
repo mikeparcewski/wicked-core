@@ -1274,7 +1274,9 @@ fn a_repos_own_seat_base_rides_its_units_governance() {
         seen.lock().unwrap()[0].as_deref(),
         Some("acme/seat-base:go")
     );
-    launch_preset(&e, "rb", "rb2", None, HumanConfirm::None);
+    // The first run finishes; a repo-less run's unit carries no base.
+    release_all(&w);
+    launch_preset(&e, "rb2", "rb", None, HumanConfirm::None);
     wait_for("the repo-less unit dispatched", || {
         seen.lock().unwrap().len() >= 2
     });
