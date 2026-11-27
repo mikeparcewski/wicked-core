@@ -2689,37 +2689,44 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
             GH_TOKEN_TIMEOUT.as_secs()
         )
     };
+    // (core#1993) The read ends at EOF, once gh and every process holding its stdout are done.
+    // gh is not reaped before that, or before the deadline: an unreaped gh (running, or exited and
+    // not yet waited for) keeps its process group id its own, so ending the group never reaches
+    // another process. At the deadline the group is ended and the read keeps what gh printed.
+    let out = match rx.recv_timeout(GH_TOKEN_TIMEOUT) {
+        Ok(out) => Some(out),
+        Err(_) => {
+            end_group();
+            rx.recv_timeout(Duration::from_secs(1)).ok()
+        }
+    };
+    // gh has exited, or closed stdout and is about to; one still running a moment past the
+    // deadline is ended with its group (still unreaped) and did not answer.
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline + Duration::from_secs(1) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
             _ => {
                 end_group();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(late());
+                break None;
             }
         }
     };
-    // (pi r2) A gh that exited just inside the deadline still gets a moment for its last bytes.
-    // (core#1993) On unix that moment is 1 s: a read still open after it means a child gh left
-    // holds stdout, so the group is ended and the read keeps what gh printed.
-    let grace = if cfg!(unix) {
-        Duration::from_secs(1)
-    } else {
-        deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_secs(1))
+    let (Some(status), Some(out)) = (status, out) else {
+        return Err(late());
     };
-    let out = match rx.recv_timeout(grace) {
-        Ok(out) => out,
-        Err(_) if cfg!(unix) => {
-            end_group();
-            rx.recv_timeout(Duration::from_secs(1))
-                .map_err(|_| late())?
+    // A gh ended by a signal (the group's, at the deadline) did not answer in time.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return Err(late());
         }
-        Err(_) => return Err(late()),
-    };
+    }
     let token = out.trim();
     if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {
         return Err(format!(
@@ -4969,12 +4976,12 @@ mod tests {
         );
     }
 
-    /// (core#1993) A gh that leaves a child holding its stdout and exits: the token it printed is
-    /// read at once, and the child is ended with gh's process group, so no reader thread is left
-    /// blocked on the pipe.
+    /// (core#1993) A gh that leaves a child holding its stdout and exits: by the deadline the child
+    /// is ended with gh's process group and the token gh printed is read, so no reader thread is
+    /// left blocked on the pipe and the fetch gets its credential.
     #[cfg(unix)]
     #[test]
-    fn a_gh_child_holding_stdout_neither_delays_the_token_nor_outlives_the_read_1993() {
+    fn a_gh_child_holding_stdout_is_ended_and_the_token_kept_1993() {
         use std::os::unix::fs::PermissionsExt;
         let base = scratch("gh-child-1993");
         let bin = base.join("bin");
@@ -5023,7 +5030,10 @@ mod tests {
             }
         }
         assert_eq!(got, Ok("fake-gh-token-1993".into()), "took {took:?}");
-        assert!(took < Duration::from_secs(4), "the token waited {took:?}");
+        assert!(
+            took < GH_TOKEN_TIMEOUT + Duration::from_secs(3),
+            "the token waited {took:?}"
+        );
         assert!(!still_alive, "the child holding stdout outlived the read");
     }
 
