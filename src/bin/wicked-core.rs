@@ -392,7 +392,10 @@ fn main() {
         let store = match wicked_apps_core::open_store_ro(Some(&db)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("wicked-core seat-image: cannot open the store at {db}: {e}");
+                eprintln!(
+                    "wicked-core seat-image: cannot open the store at {}: {e}",
+                    db.escape_debug()
+                );
                 std::process::exit(1);
             }
         };

@@ -724,6 +724,14 @@ pub(crate) fn build_seat_image(
     Ok(built)
 }
 
+/// (core#2024, codex on #2037) The layers `seat-image status --repo` reports the repo's images
+/// with: its tree's, on its base, for every CLI alike (a CLI with the operator's own image is
+/// reported as that image by the status itself), never one CLI's choice applied to the others.
+fn repo_status_layers(repo: &SeatImageRepo) -> Vec<&'static crate::seat_layers::Layer> {
+    let base = SeatBase::for_repo(repo.base_image.as_deref());
+    tree_layers(&repo.root_path, &repo.layers_off, &base)
+}
+
 /// (core#2024) Build `cli`'s seat image for the registered repo `repo`, as its unit's arm would:
 /// on the repo's own base when it has one (pinned by the id the runtime confirms, never pulled),
 /// else on the daemon's with the layers its checkout needs, less those it turned off.
@@ -1888,27 +1896,37 @@ pub(crate) fn seat_memory<'a>(repo: Option<&'a str>, env: Option<&'a str>) -> &'
 
 /// (core#2024) Whether `m` may be a repo's seat memory size: a whole number from 1 to 999999 with
 /// no leading zero, then `k`, `m` or `g` (or `kb`, `mb`, `gb`), any case: the forms
-/// [`k8s_memory`] turns into a Kubernetes quantity. Anything else (a fraction, a bare number, a
-/// space, a flag) is refused, so the value is only ever one well-formed size.
+/// [`k8s_memory`] turns into a Kubernetes quantity. At least 1g (codex on #2037): a seat pod
+/// requests 768Mi, and a limit under its request is never scheduled (the checks floor's own
+/// minimum is 1g too). Anything else (a fraction, a bare number, a space, a flag) is refused, so
+/// the value is only ever one well-formed size.
 pub(crate) fn valid_memory(m: &str) -> Result<(), String> {
     let lower = m.to_ascii_lowercase();
     let digits = lower
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(lower.len());
     let (num, unit) = lower.split_at(digits);
-    let ok = (1..=6).contains(&num.len())
-        && !num.starts_with('0')
-        && matches!(unit, "k" | "m" | "g" | "kb" | "mb" | "gb");
-    if ok {
+    let kib_per_unit: u64 = match unit {
+        "k" | "kb" => 1,
+        "m" | "mb" => 1024,
+        "g" | "gb" => 1024 * 1024,
+        _ => 0,
+    };
+    let well_formed = (1..=6).contains(&num.len()) && !num.starts_with('0') && kib_per_unit > 0;
+    let kib = num.parse::<u64>().unwrap_or(0) * kib_per_unit;
+    if well_formed && kib >= SEAT_MEMORY_MIN_KIB {
         Ok(())
     } else {
         Err(format!(
-            "`{}` is not a seat memory size: use a whole number and k, m or g, such as `6g` or \
-             `512m`",
+            "`{}` is not a seat memory size: use a whole number and k, m or g, at least 1g, such \
+             as `6g` or `2048m`",
             m.chars().take(40).collect::<String>().escape_debug()
         ))
     }
 }
+
+/// (core#2024) The smallest seat memory a repo may set: 1g (a seat pod requests 768Mi).
+const SEAT_MEMORY_MIN_KIB: u64 = 1024 * 1024;
 
 /// The memory limit selected by the operator, or the default when unset or blank.
 fn memory_from(choice: Option<&str>) -> &str {
@@ -3028,7 +3046,21 @@ fn arm_layers(
     layers_off: &[String],
     base: &SeatBase,
 ) -> Vec<&'static crate::seat_layers::Layer> {
-    if base.operator || image_override(cli).is_some() {
+    if image_override(cli).is_some() {
+        return Vec::new();
+    }
+    tree_layers(tree, layers_off, base)
+}
+
+/// The layers a tree's seat images carry on `base`, whatever the CLI: none on an operator (or a
+/// repo's own) base, else the detected ones less those turned off. (core#2024, codex on #2037) A
+/// CLI with the operator's own image carries none, which [`arm_layers`] adds.
+fn tree_layers(
+    tree: &Path,
+    layers_off: &[String],
+    base: &SeatBase,
+) -> Vec<&'static crate::seat_layers::Layer> {
+    if base.operator {
         return Vec::new();
     }
     crate::seat_layers::for_tree_except(
@@ -4193,13 +4225,7 @@ pub fn seat_image_main_for(args: &[String], repo: Option<&SeatImageRepo>) -> i32
                 None => image_status(&rt, &wanted, &layers),
                 Some(r) => {
                     let cfg = StatusConfig::for_repo(&wanted, r);
-                    let base = SeatBase::for_repo(r.base_image.as_deref());
-                    // The layers a unit of the repo arms with (none on an operator or repo base).
-                    let layers = wanted
-                        .first()
-                        .map(|cli| arm_layers(&r.root_path, cli, &r.layers_off, &base))
-                        .unwrap_or_default();
-                    image_status_with(&rt, &wanted, &cfg, &layers)
+                    image_status_with(&rt, &wanted, &cfg, &repo_status_layers(r))
                 }
             };
             let st = match st {
@@ -7875,7 +7901,10 @@ esac
         assert_eq!(seat_memory(None, Some("4g")), "4g");
         assert_eq!(seat_memory(None, Some("  ")), "3g");
         assert_eq!(seat_memory(None, None), "3g");
-        assert_eq!(k8s_memory(seat_memory(Some("512mb"), Some("4g"))), "512Mi");
+        assert_eq!(
+            k8s_memory(seat_memory(Some("2048mb"), Some("4g"))),
+            "2048Mi"
+        );
         assert_eq!(k8s_memory(seat_memory(Some("6G"), None)), "6Gi");
     }
 
@@ -7884,8 +7913,12 @@ esac
     /// refusal escapes what it quotes.
     #[test]
     fn a_seat_memory_size_is_strict_2024() {
-        for good in ["1k", "6g", "512m", "6G", "64KB", "999999gb", "2Mb"] {
+        for good in ["1g", "6g", "1024m", "6G", "1024MB", "999999gb", "2048Mb"] {
             assert!(valid_memory(good).is_ok(), "{good}");
+        }
+        // (codex on #2037) Under 1g a seat pod's limit is below its 768Mi request.
+        for small in ["512m", "1023m", "1k", "999999k", "768mb"] {
+            assert!(valid_memory(small).is_err(), "{small} is under 1g");
         }
         for bad in [
             "",
@@ -7947,6 +7980,51 @@ esac
         ] {
             assert!(seat_image_repo_args(&a(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// (core#2024, codex on #2037: W20) `status --repo` reports every CLI's image with the repo
+    /// tree's layers, never with the first CLI's choice: a CLI with the operator's own image used to
+    /// strip the layers from the others' report. A repo base carries none; a layer the repo turned
+    /// off is left out.
+    #[test]
+    fn a_repos_status_layers_do_not_depend_on_one_cli_2024() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("status-layers-2024-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        let repo = |base: Option<&str>, off: &[&str]| SeatImageRepo {
+            id: "acme".into(),
+            root_path: dir.clone(),
+            base_image: base.map(str::to_string),
+            layers_off: off.iter().map(|s| s.to_string()).collect(),
+        };
+        let ids = |r: &SeatImageRepo| -> Vec<&str> {
+            repo_status_layers(r).iter().map(|l| l.id).collect()
+        };
+        let saved: Vec<(&str, Option<String>)> = [
+            "WICKED_SEAT_IMAGE_CLAUDE",
+            BASE_IMAGE_ENV,
+            crate::seat_layers::LAYERS_ENV,
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+        // The first CLI a person lists has the operator's own image.
+        std::env::set_var("WICKED_SEAT_IMAGE_CLAUDE", "acme/claude:mine");
+        std::env::remove_var(BASE_IMAGE_ENV);
+        std::env::remove_var(crate::seat_layers::LAYERS_ENV);
+        assert_eq!(ids(&repo(None, &[])), ["go"]);
+        assert!(ids(&repo(Some("acme/seat-base:go"), &[])).is_empty());
+        assert!(ids(&repo(None, &["go"])).is_empty());
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (core#2024) The status of a repo's images names its own base (with no recipe: a repo base

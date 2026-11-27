@@ -526,7 +526,7 @@ pub fn set_seat_memory(
     memory: Option<&str>,
 ) -> anyhow::Result<RepoEntry> {
     let Some(mut entry) = get_repo(store, repo_id)? else {
-        anyhow::bail!("no registered repo `{repo_id}`");
+        anyhow::bail!("no registered repo `{}`", repo_id.escape_debug());
     };
     let memory = memory.map(str::trim).filter(|m| !m.is_empty());
     if let Some(memory) = memory {
@@ -8012,6 +8012,7 @@ mod discard_minted_tests {
             "6gib",
             "6t",
             "6\ng",
+            "512m",
         ] {
             let err = set_seat_memory(&mut store, &entry.id, Some(bad));
             assert!(err.is_err(), "`{bad}` is not a seat memory size");
@@ -8026,9 +8027,14 @@ mod discard_minted_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no-such-repo"), "{err}");
+        // (codex on #2037) An unknown id is quoted escaped.
+        let err = set_seat_memory(&mut store, "x\u{1b}[31m", Some("6g"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
 
         for clear in [None, Some(""), Some("  ")] {
-            set_seat_memory(&mut store, &entry.id, Some("512m")).unwrap();
+            set_seat_memory(&mut store, &entry.id, Some("2048m")).unwrap();
             let cleared = set_seat_memory(&mut store, &entry.id, clear).unwrap();
             assert_eq!(cleared.seat_memory, None, "{clear:?} clears it");
             assert_eq!(seat_memory_for(&store, Some(&entry.id)), None);
