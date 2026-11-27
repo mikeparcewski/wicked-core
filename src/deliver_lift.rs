@@ -2642,6 +2642,13 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
     {
         cmd.env(k, v);
     }
+    // (core#1993) gh leads its own process group, so a child it leaves holding stdout ends with
+    // the group (as `k8s::run_capped` does).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2666,31 +2673,60 @@ fn gh_token(env: &[(&str, &Path)]) -> Result<String, String> {
         let _ = tx.send(out);
     });
     let deadline = Instant::now() + GH_TOKEN_TIMEOUT;
+    let group = child.id();
+    let end_group = || {
+        #[cfg(unix)]
+        // SAFETY: killpg on gh's own process group (pgid == its pid, set at spawn).
+        unsafe {
+            libc::killpg(group as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = group;
+    };
     let late = || {
         format!(
             "gh did not answer for its token within {}s",
             GH_TOKEN_TIMEOUT.as_secs()
         )
     };
+    // (core#1993) The read ends at EOF, once gh and every process holding its stdout are done.
+    // gh is not reaped before that, or before the deadline: an unreaped gh (running, or exited and
+    // not yet waited for) keeps its process group id its own, so ending the group never reaches
+    // another process. At the deadline the group is ended and the read keeps what gh printed.
+    let out = match rx.recv_timeout(GH_TOKEN_TIMEOUT) {
+        Ok(out) => Some(out),
+        Err(_) => {
+            end_group();
+            rx.recv_timeout(Duration::from_secs(1)).ok()
+        }
+    };
+    // gh has exited, or closed stdout and is about to; one still running a moment past the
+    // deadline is ended with its group (still unreaped) and did not answer.
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline + Duration::from_secs(1) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
             _ => {
+                end_group();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(late());
+                break None;
             }
         }
     };
-    // (pi r2) A gh that exited just inside the deadline still gets a moment for its last bytes.
-    let out = rx
-        .recv_timeout(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1)),
-        )
-        .map_err(|_| late())?;
+    let (Some(status), Some(out)) = (status, out) else {
+        return Err(late());
+    };
+    // A gh ended by a signal (the group's, at the deadline) did not answer in time.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return Err(late());
+        }
+    }
     let token = out.trim();
     if !status.success() || token.is_empty() || token.contains(char::is_whitespace) {
         return Err(format!(
@@ -4937,6 +4973,100 @@ mod tests {
         assert!(
             err.contains("gh holds no token for github.com as other"),
             "{err}"
+        );
+    }
+
+    /// (core#1993) A gh that leaves a child holding its stdout and exits: by the deadline the child
+    /// is ended with gh's process group and the token gh printed is read, so no reader thread is
+    /// left blocked on the pipe and the fetch gets its credential.
+    #[cfg(unix)]
+    #[test]
+    fn a_gh_child_holding_stdout_is_ended_and_the_token_kept_1993() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("gh-child-1993");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pidfile = base.join("child.pid");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\necho fake-gh-token-1993\nsleep 30 &\necho $! > '{}'\nexit 0\n", // ggignore: a made-up test value, not a secret
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let started = Instant::now();
+        let got = gh_token(&[("PATH", Path::new(&path))]);
+        let took = started.elapsed();
+        let pid: Option<libc::pid_t> = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.trim().parse().ok());
+        // SAFETY: signal 0 only probes that the pid exists. A killed child not yet reaped (a
+        // zombie, where pid 1 does not reap) counts as gone.
+        let alive = || {
+            pid.is_some_and(|p| {
+                let exists = unsafe { libc::kill(p, 0) } == 0;
+                exists
+                    && !std::fs::read_to_string(format!("/proc/{p}/stat"))
+                        .is_ok_and(|st| st.contains(") Z "))
+            })
+        };
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let still_alive = alive();
+        if let (true, Some(p)) = (still_alive, pid) {
+            // SAFETY: the test's own sleep child, read from the pidfile its fake gh wrote.
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
+        }
+        assert_eq!(got, Ok("fake-gh-token-1993".into()), "took {took:?}");
+        assert!(
+            took < GH_TOKEN_TIMEOUT + Duration::from_secs(3),
+            "the token waited {took:?}"
+        );
+        assert!(!still_alive, "the child holding stdout outlived the read");
+    }
+
+    /// (core#1993, codex-check on 0825145) A child that leaves gh's process group (`setsid`) and
+    /// holds stdout for a while is waited for, as on main: the token comes back once it closes
+    /// stdout, within the deadline, never a 2 s "did not answer".
+    #[cfg(unix)]
+    #[test]
+    fn a_setsid_child_holding_stdout_briefly_still_gives_the_token_1993() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("gh-setsid-1993");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\necho fake-gh-token-setsid-1993\n\
+             perl -e 'use POSIX qw(setsid); setsid(); sleep 3' &\nexit 0\n", // ggignore: a made-up test value, not a secret
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let started = Instant::now();
+        let got = gh_token(&[("PATH", Path::new(&path))]);
+        assert_eq!(
+            got,
+            Ok("fake-gh-token-setsid-1993".into()),
+            "took {:?}",
+            started.elapsed()
         );
     }
 
