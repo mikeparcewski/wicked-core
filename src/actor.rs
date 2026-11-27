@@ -22212,7 +22212,8 @@ fn worktree_holds_reviewed_tree(
         crate::worktree_guard::changed_since_readonly(worktree, &m.before).map_err(|e| {
             anyhow::anyhow!(
             "could not read the worktree to check it still holds the tree this gate reviewed, so \
-             the suggestion is not applied ({e}) — approve (retry), request changes or reject"
+             the suggestion is not applied ({}) — approve (retry), request changes or reject",
+            e.to_string().escape_debug()
         )
         })?;
     let Some(changed) = changed else {
@@ -22231,8 +22232,8 @@ fn worktree_holds_reviewed_tree(
     }
     anyhow::bail!(
         "the worktree changed since this gate was raised ({}): accepting the suggestion would \
-         overwrite those edits — commit or undo them first, or answer approve (retry), request \
-         changes or reject",
+         overwrite those edits — undo them first (committing them does not help: the content \
+         still differs), or answer approve (retry), request changes or reject",
         if named.is_empty() {
             "its tree differs".to_string()
         } else {
@@ -35653,6 +35654,7 @@ mod request_changes_tests {
         units[3].worktree_mutation = Some(m);
         put_node(&mut store, units[3].to_node()).unwrap();
 
+        let reviewed_a = std::fs::read_to_string(wt.join("src/a.ts")).unwrap();
         // Someone edits the parked worktree by hand: a tracked file, a control character in a new
         // file's name, and more new files than the refusal names.
         std::fs::write(wt.join("src/a.ts"), "export const a = 9; // by hand\n").unwrap();
@@ -35672,6 +35674,11 @@ mod request_changes_tests {
             "{err}"
         );
         assert!(err.contains("and 3 more"), "{err}");
+        // (codex on #2038: W8) The remedy is to undo them: a commit keeps the content differing.
+        assert!(
+            err.contains("undo them first") && !err.contains("commit or undo"),
+            "{err}"
+        );
         assert!(!events
             .iter()
             .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
@@ -35688,6 +35695,42 @@ mod request_changes_tests {
         )
         .unwrap();
         assert_eq!(open.len(), 1, "the gate is still open");
+
+        // (codex on #2038: W10) The edits are undone but one is in a directory git cannot open
+        // (writable and searchable, not listable): git warns and exits 0, and a plain read would
+        // call the tree unchanged. The accept is refused and the file is intact.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(wt.join("src/a.ts"), &reviewed_a).unwrap();
+        std::fs::remove_file(wt.join("src/\u{1b}[31mx.ts")).unwrap();
+        for n in 0..11 {
+            std::fs::remove_file(wt.join(format!("src/hand{n:02}.ts"))).unwrap();
+        }
+        let locked = wt.join("hand");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("notes.ts"), "by hand\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("SKIP: this user lists a mode-300 directory (root)");
+        } else {
+            let (r, events) = answer(&mut store, tag, HumanDecision::AcceptSuggestion);
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("could not read the worktree"), "{err}");
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(locked.join("notes.ts")).unwrap(),
+                "by hand\n",
+                "the hand edit in the unreadable directory is intact"
+            );
+            assert_eq!(
+                std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+                reviewed_a,
+                "the suggestion was not applied"
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// (core#1313) The first answer commit contains the row AND its redo state; nested

@@ -574,7 +574,7 @@ pub(crate) fn snapshot_through(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    snapshot_through_inner(worktree, git_dir, &[], false)
+    snapshot_through_inner(worktree, git_dir, &[], TreeRead::Plain)
 }
 
 /// (core#1314) [`snapshot_through`], STRICT, for a read that must see everything the change
@@ -591,7 +591,7 @@ pub(crate) fn snapshot_through_strict(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    snapshot_through_inner(worktree, git_dir, &[], true)
+    snapshot_through_inner(worktree, git_dir, &[], TreeRead::Strict)
 }
 
 /// Run `git <args>` in `cwd`; `Ok(stderr)` on exit 0 (in the C locale, so it can be read),
@@ -739,11 +739,24 @@ fn index_paths(cwd: &Path, env: &[(&str, &Path)]) -> anyhow::Result<Vec<Vec<u8>>
     )
 }
 
+/// How completely [`snapshot_through_inner`] reads the worktree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeRead {
+    /// `add -A` as it is: an unreadable subtree git warns about is left out (the mutation guard).
+    Plain,
+    /// (core#2036, codex on #2038) The same tree as [`TreeRead::Plain`], but an unreadable
+    /// subtree is an error: a check that compares with a plain baseline must not pass a tree it
+    /// could not read.
+    Complete,
+    /// [`snapshot_through_strict`]: [`TreeRead::Complete`] plus the force-added paths.
+    Strict,
+}
+
 fn snapshot_through_inner(
     worktree: &Path,
     git_dir: &Path,
     extra_env: &[(&str, &Path)],
-    strict: bool,
+    read: TreeRead,
 ) -> anyhow::Result<WorktreeSnapshot> {
     let mut pinned = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     pinned.extend_from_slice(extra_env);
@@ -792,10 +805,12 @@ fn snapshot_through_inner(
             "--",
             ".",
         ];
-        if !strict {
+        if read == TreeRead::Plain {
             git(worktree, &add_all, &env)?;
         } else {
             unread(&git_stderr(worktree, &add_all, &env, None)?)?;
+        }
+        if read == TreeRead::Strict {
             // Tracked in the REAL index (the pinned git dir's own) and left out by `add -A`: a
             // path force-added under an ignored directory. The engine scratch never counts.
             let scratch: std::collections::HashSet<Vec<u8>> =
@@ -884,7 +899,8 @@ pub fn snapshot(worktree: &Path, repo_root: &Path) -> anyhow::Result<WorktreeSna
 /// read through the COMMON git directory, including for a linked worktree's pinned git dir.
 pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow::Result<String> {
     with_scratch_objects(worktree, git_dir, |worktree, git_dir, objects| {
-        snapshot_through_inner(worktree, git_dir, objects, false).map(|snapshot| snapshot.tree)
+        snapshot_through_inner(worktree, git_dir, objects, TreeRead::Plain)
+            .map(|snapshot| snapshot.tree)
     })
 }
 
@@ -930,7 +946,8 @@ fn with_scratch_objects<T>(
 /// repository's object store ([`with_scratch_objects`]): a gate read may ask it. `Ok(None)` when
 /// the tree is the baseline's; `Ok(Some(paths))` otherwise (`git diff-tree --name-status`
 /// statuses; empty only if git names no path for a differing tree). `Err` when the baseline has no
-/// pinned git dir or git fails.
+/// pinned git dir, git fails, or git could not open a directory ([`TreeRead::Complete`]: a plain
+/// read leaves it out and could report an edit inside it as no change).
 pub(crate) fn changed_since_readonly(
     worktree: &Path,
     baseline: &WorktreeSnapshot,
@@ -943,7 +960,7 @@ pub(crate) fn changed_since_readonly(
         worktree,
         Path::new(git_dir),
         |worktree, git_dir, objects| {
-            let now = snapshot_through_inner(worktree, git_dir, objects, false)?;
+            let now = snapshot_through_inner(worktree, git_dir, objects, TreeRead::Complete)?;
             if now.tree == baseline.tree {
                 return Ok(None);
             }
@@ -2236,6 +2253,33 @@ pub(crate) mod tests {
             ..base.clone()
         };
         assert!(changed_since_readonly(&wt, &no_pin).is_err());
+    }
+
+    /// (core#2036, codex on #2038: W10) PARTIAL FAILURE: a directory git cannot open is an error,
+    /// never a tree without it. A plain read leaves it out, so a hand edit inside it read as no
+    /// change and the accept overwrote it.
+    #[cfg(unix)]
+    #[test]
+    fn changed_since_readonly_refuses_an_unreadable_directory_2036() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = creator_worktree("changed-ro-unread-2036");
+        let base = snapshot(&wt, &repo_of(&wt)).unwrap();
+        let locked = wt.join("hand");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("notes.ts"), "by hand\n").unwrap();
+        // Writable and searchable, not listable: git warns and exits 0.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("SKIP: this user lists a mode-300 directory (root)");
+        } else {
+            assert!(
+                snapshot_through(&wt, Path::new(base.git_dir.as_deref().unwrap())).is_ok(),
+                "the plain read leaves it out, exit 0"
+            );
+            let err = changed_since_readonly(&wt, &base).unwrap_err().to_string();
+            assert!(err.contains("could not be read completely"), "{err}");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// core#431 (F-3R2-010): the engine restores the creator's tree itself. After the F-036
