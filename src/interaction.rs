@@ -332,19 +332,39 @@ pub fn resolve_open_for_session(
     answer: Option<String>,
     now_ms: i64,
 ) -> anyhow::Result<usize> {
+    resolve_open_for_session_keeping(store, session_id, status, answer, now_ms).map(|o| o.len())
+}
+
+/// (core#2022) [`resolve_open_for_session`], returning the rows as they were open, so a caller whose
+/// answer fails before it commits can put them back ([`reopen`]).
+pub fn resolve_open_for_session_keeping(
+    store: &mut dyn GraphStore,
+    session_id: &str,
+    status: InteractionStatus,
+    answer: Option<String>,
+    now_ms: i64,
+) -> anyhow::Result<Vec<InteractionRequest>> {
     debug_assert!(
         status != InteractionStatus::Open,
         "resolving TO open is a bug"
     );
     let open = list_interactions(store, Some(session_id), Some(InteractionStatus::Open))?;
-    let n = open.len();
-    for mut req in open {
+    for req in &open {
+        let mut req = req.clone();
         req.status = status;
         req.answer = answer.clone();
         req.resolved_at = Some(now_ms);
         put_node(store, req.to_node())?;
     }
-    Ok(n)
+    Ok(open)
+}
+
+/// (core#2022) Put rows back as [`resolve_open_for_session_keeping`] found them (open, unanswered).
+pub fn reopen(store: &mut dyn GraphStore, rows: &[InteractionRequest]) -> anyhow::Result<()> {
+    for req in rows {
+        put_node(store, req.to_node())?;
+    }
+    Ok(())
 }
 
 /// (core#1319) The key an answered triage row carries for the attempt its approve re-dispatched.
