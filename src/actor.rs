@@ -35566,6 +35566,78 @@ mod request_changes_tests {
         assert_reviewed_tree(&reviewed);
     }
 
+    /// (core#2036) STALE READS / PARTIAL FAILURE: accepting the evaluator's suggestion is refused
+    /// when the parked worktree no longer holds the tree the gate reviewed (edited by hand): the
+    /// refusal names the changed paths (UNTRUSTED TEXT OUT: escaped, at most ten, the rest
+    /// counted), nothing is resolved, and the hand edits are intact.
+    #[cfg(unix)]
+    #[test]
+    fn accept_suggestion_never_overwrites_hand_edits_2036() {
+        let tag = "hand-edits-2036";
+        let wt = crate::worktree_guard::tests::creator_worktree(tag);
+        let repo = wt.parent().unwrap().join("repo");
+        let before = crate::worktree_guard::snapshot(&wt, &repo).unwrap();
+        std::fs::write(wt.join("src/a.ts"), "export const a = 3; // evaluator\n").unwrap();
+        let mut m = crate::worktree_guard::compare(&wt, &before)
+            .unwrap()
+            .expect("the evaluator changed the tree");
+        crate::worktree_guard::restore_creator_tree(
+            &wt,
+            &mut m,
+            Some(&format!("refs/wicked/suggestions/{tag}/4/0")),
+        )
+        .expect("the guard restores the creator's tree");
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        park_send_back_gate(&mut store, tag);
+        let mut session = crate::domain::get_session(&store, tag).unwrap().unwrap();
+        session.workdir = Some(wt.to_string_lossy().into_owned());
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, tag).unwrap();
+        units[3].denial = Some(crate::domain::UnitDenial::new(
+            "worktree_guard",
+            "the evaluator edited",
+        ));
+        units[3].worktree_mutation = Some(m);
+        put_node(&mut store, units[3].to_node()).unwrap();
+
+        // Someone edits the parked worktree by hand: a tracked file, a control character in a new
+        // file's name, and more new files than the refusal names.
+        std::fs::write(wt.join("src/a.ts"), "export const a = 9; // by hand\n").unwrap();
+        std::fs::write(wt.join("src/\u{1b}[31mx.ts"), "x\n").unwrap();
+        for n in 0..11 {
+            std::fs::write(wt.join(format!("src/hand{n:02}.ts")), "h\n").unwrap();
+        }
+
+        let (r, events) = answer(&mut store, tag, HumanDecision::AcceptSuggestion);
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("the worktree changed since this gate was raised"),
+            "{err}"
+        );
+        assert!(
+            err.contains("src/\\u{1b}[31mx.ts") && !err.contains('\u{1b}'),
+            "{err}"
+        );
+        assert!(err.contains("and 3 more"), "{err}");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })));
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 9; // by hand\n",
+            "the hand edit is intact"
+        );
+        assert!(wt.join("src/hand10.ts").exists());
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(tag),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate is still open");
+    }
+
     /// (core#1313) The first answer commit contains the row AND its redo state; nested
     /// domain batches must not expose an answered row before the redo is reserved.
     #[test]
