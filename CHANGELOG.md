@@ -14,6 +14,27 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.16.2** — 2026-11-27 — patch release on the train-18 cut 4d735293, carrying 6 PRs since 0.16.1: #2012, #2013, #2014, #2016, #2006, #2018.
+  The entries below were written from each PR's changelog entry (from the PR description where it had none).
+
+  - **A member-step council the final pass outlived keeps its voters** (core#2011, #2012). When the runner's final-pass
+    wait outlived a member-step council that had convened, the step review had no dispute and the delivery dropped its
+    voters (and any stand-in that sat). That step review now gets a timeout no-verdict dispute naming the seats that sat
+    and their independence.
+  - **A gh that leaves a child behind no longer loses the credential** (core#1993, #2013). On unix, when a child gh left
+    keeps stdout open, the engine's `gh auth token` read ends gh's process group at the deadline. It then keeps the
+    token gh printed instead of failing with "did not answer".
+  - **A stand-in reservation nobody received is failed, not seated** (core#2009, #2014). When the asker stopped waiting
+    before the reply arrived, its bindings stayed `seated` with nothing run on them. They are now marked `failed` on the
+    run's record; their keys stay taken, so no key is minted twice.
+  - **A review's ITEM verdicts survive the findings cap** (core#2004, #2006). Past the 4096-character findings cap, every
+    `ITEM` verdict and the verdict line stay whole in the gate's verdict summary. Steering-rule `N/A` lines are cut
+    first, and a note says how many lines were cut.
+  - **A team stand-in reservation its asker lets go is abandoned, not seated** (core#2015, #2018). A reply that landed
+    just after the wait timed out, or stand-ins a council dropped at its budget check, left bindings `seated` with
+    nothing run on them. One `AbandonStandIns` command now marks each one `failed` and `abandoned`.
+  - CI: the selftest pins wicked-ci main aea26cb9, so U04/U06 answer the stand-in choice (wicked-ci#97, #2016).
+
 - **core-ts 0.16.1** — 2026-11-27 — patch release on the train-17 cut 10788226, carrying 7 PRs since 0.16.0: #1986, #1989, #1990, #2002, #2008, #2010, #2007.
   The entries below were written from each PR's changelog entry (the PR title where it had none).
 
