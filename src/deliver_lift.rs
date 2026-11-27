@@ -4998,27 +4998,29 @@ mod tests {
         let started = Instant::now();
         let got = gh_token(&[("PATH", Path::new(&path))]);
         let took = started.elapsed();
-        let pid = std::fs::read_to_string(&pidfile)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let pid: Option<libc::pid_t> = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.trim().parse().ok());
+        // SAFETY: signal 0 only probes that the pid exists. A killed child not yet reaped (a
+        // zombie, where pid 1 does not reap) counts as gone.
         let alive = || {
-            !pid.is_empty()
-                && std::process::Command::new("kill")
-                    .args(["-0", &pid])
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success())
+            pid.is_some_and(|p| {
+                let exists = unsafe { libc::kill(p, 0) } == 0;
+                exists
+                    && !std::fs::read_to_string(format!("/proc/{p}/stat"))
+                        .is_ok_and(|st| st.contains(") Z "))
+            })
         };
         let gone_by = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < gone_by {
             std::thread::sleep(Duration::from_millis(50));
         }
         let still_alive = alive();
-        if still_alive {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid])
-                .status();
+        if let (true, Some(p)) = (still_alive, pid) {
+            // SAFETY: the test's own sleep child, read from the pidfile its fake gh wrote.
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
         }
         assert_eq!(got, Ok("fake-gh-token-1993".into()), "took {took:?}");
         assert!(took < Duration::from_secs(4), "the token waited {took:?}");
