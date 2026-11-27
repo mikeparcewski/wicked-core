@@ -3776,6 +3776,21 @@ pub(crate) fn run(
                     );
                 }
             }
+            // (core#2015) Team stand-in reservations nothing will run on.
+            Command::AbandonStandIns {
+                run_id,
+                seated,
+                pending,
+            } => {
+                if let Err(e) =
+                    stand_in_gate::abandon_reservations(&mut store, &run_id, seated, pending)
+                {
+                    eprintln!(
+                        "wicked-core: run {run_id}: abandoned stand-in reservations could not \
+                         be marked failed: {e:#}"
+                    );
+                }
+            }
             // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
             // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
             Command::ReserveRuleCouncil { run_id, ord, reply } => {
@@ -24758,6 +24773,7 @@ pub(crate) mod sessions_detail_fold_tests {
                 },
                 state: crate::standin::STATE_ANSWERED.into(),
                 display: None,
+                abandoned: false,
             };
             r.skip(a::JUDGE, a::SKIP_STAND_IN, Some("by a stand-in".into()));
             r.roles = Some(vec![a::RoleRecord::stand_in(&b, "Claude Code")]);
@@ -48199,6 +48215,7 @@ mod council_ballot_tests {
             },
             state: crate::standin::STATE_SEATED.into(),
             display: None,
+            abandoned: false,
         };
         run.assurance.stand_ins = vec![
             bound("claude~1", crate::standin::Role::Council),

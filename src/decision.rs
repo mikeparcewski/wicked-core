@@ -1848,6 +1848,7 @@ mod tests {
             },
             state: crate::standin::STATE_SEATED.into(),
             display: None,
+            abandoned: false,
         };
         let voter = |key: &str| AgenticCli {
             key: key.into(),
@@ -1908,6 +1909,7 @@ mod tests {
             },
             state: crate::standin::STATE_SEATED.into(),
             display: None,
+            abandoned: false,
         };
         let judge = crate::standin::StandInBinding {
             key: "claude~2".into(),

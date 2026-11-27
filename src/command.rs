@@ -519,6 +519,16 @@ pub(crate) enum Command {
         give_up: std::time::Instant,
         reply: std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
     },
+    /// (core#2015) Let team stand-in reservations go that nothing will run on: each binding in
+    /// `seated` (a reservation its asker received and dropped), and the reservation `pending`
+    /// holds (the reply of an ask its asker stopped waiting for), is left `failed` and
+    /// `abandoned` on the run's record. Commands run in order, so `pending` already holds the
+    /// reply of the `ReserveStandIns` sent before this, if that ask reserved any.
+    AbandonStandIns {
+        run_id: String,
+        seated: Vec<crate::standin::SeatedStandIn>,
+        pending: Option<std::sync::mpsc::Receiver<Vec<crate::standin::SeatedStandIn>>>,
+    },
     /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before
     /// it starts; replies `false` once the run has spent its budget.
     ReserveRuleCouncil {
@@ -827,6 +837,7 @@ impl Command {
             Command::CampaignTick { .. } => "CampaignTick",
             Command::ConveneDecision { .. } => "ConveneDecision",
             Command::ReserveStandIns { .. } => "ReserveStandIns",
+            Command::AbandonStandIns { .. } => "AbandonStandIns",
             Command::ReserveRuleCouncil { .. } => "ReserveRuleCouncil",
             Command::ConveneRuleCouncil { .. } => "ConveneRuleCouncil",
             Command::RegisterWorkflow { .. } => "RegisterWorkflow",

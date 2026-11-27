@@ -9116,6 +9116,7 @@ mod budget_tests {
             },
             state: crate::standin::STATE_SEATED.into(),
             display: None,
+            abandoned: false,
         };
         let (verdict, refused) = judge_on_stand_in(
             &binding,
