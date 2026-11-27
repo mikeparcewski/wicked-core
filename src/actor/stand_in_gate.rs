@@ -461,6 +461,43 @@ pub(crate) fn reserve_team(
     Ok(seated)
 }
 
+/// (core#2009) Hand a reservation to its asker. An asker that stopped waiting has dropped its
+/// receiver, so the send fails: the bindings it would have run on never run, and each is left on
+/// the run's record as `failed`, never `seated` (its key stays taken). An asker that drops a
+/// reservation it did receive, or whose receiver outlives its wait, is core#2015.
+pub(crate) fn reply_or_abandon(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    seated: Vec<crate::standin::SeatedStandIn>,
+    reply: &std::sync::mpsc::Sender<Vec<crate::standin::SeatedStandIn>>,
+) -> anyhow::Result<()> {
+    let Err(std::sync::mpsc::SendError(abandoned)) = reply.send(seated) else {
+        return Ok(());
+    };
+    if abandoned.is_empty() {
+        return Ok(());
+    }
+    let Some(mut session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for b in &mut session.assurance.stand_ins {
+        let ours = abandoned.iter().any(|s| {
+            s.binding.key == b.key
+                && s.binding.role == b.role
+                && (s.binding.ord, s.binding.attempt) == (b.ord, b.attempt)
+        });
+        if ours && b.state == crate::standin::STATE_SEATED {
+            b.state = crate::standin::STATE_FAILED.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        crate::domain::put_node(store, session.to_node())?;
+    }
+    Ok(())
+}
+
 /// (DES-STANDIN-001 §3.4, codex r1 on #1990) A council stand-in's ballot record on the HOST
 /// floor: the ballot runs in its base's home, so the template must never select a session of its
 /// own and must run on a CLI whose own switch keeps it out of the base's sessions
@@ -631,6 +668,62 @@ mod reserve_team_tests {
         )
         .unwrap();
         assert_eq!(in_time.len(), 1);
+    }
+
+    /// core#2009: a reservation whose asker dropped its receiver before the reply (it gave up
+    /// while the reservation was being written) leaves no binding `seated`: each is `failed`, and
+    /// its key stays taken. A reply the asker receives leaves them `seated`.
+    #[test]
+    fn a_reservation_nobody_received_is_failed_not_seated_2009() {
+        let s = run(&["claude"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let mut reserve = |store: &mut dyn GraphStore| {
+            reserve_team(
+                store,
+                &mut sink,
+                &s.id,
+                Role::Monitor,
+                1,
+                si::BindingScope::default(),
+                &[],
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            )
+            .unwrap()
+        };
+        let states = |store: &dyn GraphStore| -> Vec<(String, String)> {
+            crate::domain::get_session(store, &s.id)
+                .unwrap()
+                .unwrap()
+                .assurance
+                .stand_ins
+                .iter()
+                .map(|b| (b.key.clone(), b.state.clone()))
+                .collect()
+        };
+        // The asker gave up: its receiver is gone before the reply.
+        let seated = reserve(&mut store);
+        assert_eq!(seated.len(), 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        reply_or_abandon(&mut store, &s.id, seated, &tx).unwrap();
+        assert_eq!(
+            states(&store),
+            vec![("claude~1".to_string(), si::STATE_FAILED.to_string())]
+        );
+        // A reply received: seated, on a fresh key (the abandoned one stays taken).
+        let seated = reserve(&mut store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        reply_or_abandon(&mut store, &s.id, seated, &tx).unwrap();
+        assert_eq!(rx.try_recv().unwrap().len(), 1);
+        assert_eq!(
+            states(&store),
+            vec![
+                ("claude~1".to_string(), si::STATE_FAILED.to_string()),
+                ("claude~2".to_string(), si::STATE_SEATED.to_string()),
+            ]
+        );
     }
 
     /// A council of three on a one-CLI consented run: three fresh bindings on the one seat, each
