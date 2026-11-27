@@ -433,9 +433,9 @@ fn read_cache_put(host: &Path, sig: &[u8; 32], entries: &[Entry]) {
 const ENTRY_OVERHEAD: usize = 64;
 
 /// The replica's shallow history.
-const REPLICA_DEPTH: &str = "50";
+pub(crate) const REPLICA_DEPTH: &str = "50";
 /// The deadline of one engine git call on a host tree.
-const GIT_CALL: Duration = Duration::from_secs(300);
+pub(crate) const GIT_CALL: Duration = Duration::from_secs(300);
 
 /// One root of a unit's replica: where it is on the host, how it syncs, what of it the seat may
 /// never write (masks and nested roots, relative), and whether it comes back.
@@ -1936,57 +1936,12 @@ impl GitBuild<'_> {
             if !fresh {
                 return Err(detail.into());
             }
-            let promisor = bounded(tree, &["config", "--get-regexp", r"^remote\..*\.promisor$"]);
-            let remote = if promisor.ok() {
-                String::from_utf8_lossy(&promisor.stdout)
-                    .lines()
-                    .find_map(|line| {
-                        let mut fields = line.split_whitespace();
-                        let key = fields.next()?;
-                        if !fields.next()?.eq_ignore_ascii_case("true") {
-                            return None;
-                        }
-                        key.strip_prefix("remote.")?
-                            .strip_suffix(".promisor")
-                            .map(str::to_string)
-                    })
-            } else {
-                None
-            }
-            .or_else(|| {
-                let partial = bounded(tree, &["config", "--get", "extensions.partialClone"]);
-                partial
-                    .ok()
-                    .then(|| String::from_utf8_lossy(&partial.stdout).trim().to_string())
-                    .filter(|name| !name.is_empty())
-            });
-            if let Some(remote) = remote {
-                let mut c = sync::git(tree);
-                c.args([
-                    "rev-list",
-                    "--objects",
-                    "--missing=print",
-                    "-n",
-                    REPLICA_DEPTH,
-                    sha,
-                ])
-                .env("GIT_NO_LAZY_FETCH", "1");
-                let objects = super::run_capped(c, None, GIT_CALL, 64 << 20);
-                if objects.ok() {
-                    let stdout = String::from_utf8_lossy(&objects.stdout);
-                    let mut missing = stdout.lines().filter_map(|line| line.strip_prefix('?'));
-                    if let Some(first) = missing.next() {
-                        let count = 1 + missing.count();
-                        return Err(CopyInRefusal {
-                            why: FloorUnarmed::PartialClone,
-                            detail: format!(
-                            "the repository is a partial clone (promisor remote `{remote}`) and \
-                             {count} object(s) of its last {REPLICA_DEPTH} commits were never \
-                             fetched (first {first}); git fetch: {detail}"
-                        ),
-                        });
-                    }
-                }
+            // (core#2001) The same check a run start and a registration make.
+            if let Some(gap) = crate::repo::partial_clone_gap(tree, sha) {
+                return Err(CopyInRefusal {
+                    why: FloorUnarmed::PartialClone,
+                    detail: format!("{gap}; git fetch: {detail}"),
+                });
             }
             return Err(detail.into());
         }

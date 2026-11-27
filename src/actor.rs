@@ -2066,6 +2066,22 @@ pub(crate) fn run(
                                     // `None` = a live worktree was reused (a resume).
                                     let base_commit = base.as_ref().map(|b| b.commit.clone());
                                     if let Some(b) = &base {
+                                        // (core#2001) A partial clone whose recent history no
+                                        // seat can copy: refused here, before any step is spent.
+                                        if let Some(why) = crate::repo::partial_clone_start_refusal(
+                                            std::path::Path::new(&root),
+                                            &b.commit,
+                                            crate::container_floor::container_mode(),
+                                        ) {
+                                            crate::repo::discard_minted_worktree(&root, &rid);
+                                            crate::code_graph::release_graph_lease(&rid);
+                                            let _ = tx.send(Command::WorktreeFailed {
+                                                run_id: rid,
+                                                error: why,
+                                                cleaned: true,
+                                            });
+                                            return;
+                                        }
                                         let _ = tx.send(Command::EmitEvent(b.to_event(&rid)));
                                         // D8: the run is scored against the repo graph AT this
                                         // base; re-index a stale graph from the fresh worktree
