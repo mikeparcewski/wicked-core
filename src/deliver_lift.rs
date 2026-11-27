@@ -5050,8 +5050,10 @@ mod tests {
         stat_read_gone_2030(std::fs::read_to_string(format!("/proc/{p}/stat")))
     }
 
-    /// (core#2030) macOS: the process's BSD info, as `validator.rs` reads a group member: a zombie
-    /// (`SZOMB`) is gone; a failed read is "not yet" (signal 0 decides on the next reading).
+    /// (core#2030) macOS: the process's BSD info: a zombie (`SZOMB`) is gone; a failed read is "not
+    /// yet" (signal 0 decides on the next reading). The lookup must include zombies (a nonzero
+    /// `arg`, codex r2): with 0, XNU answers ESRCH for a zombie (measured on macOS: 0 bytes, errno
+    /// 3), while signal 0 still succeeds for it.
     #[cfg(target_os = "macos")]
     fn state_gone_2030(p: libc::pid_t) -> bool {
         // SAFETY: a zeroed proc_bsdinfo is a valid out-parameter for this flavor.
@@ -5062,7 +5064,7 @@ mod tests {
             libc::proc_pidinfo(
                 p,
                 libc::PROC_PIDTBSDINFO,
-                0,
+                1,
                 (&mut info as *mut libc::proc_bsdinfo).cast(),
                 size,
             )
@@ -5163,6 +5165,23 @@ mod tests {
         assert!(!stat_state_gone_2030(
             "9 (a) Z (b) S 1 1 1 0 -1 4194560 72 0 0 0 0 0 0 0 20 0 1 0 511"
         ));
+    }
+
+    /// (core#2030, codex r2) A child that exited and is not reaped yet (a zombie: signal 0 still
+    /// answers for it, on Linux and macOS) reads as gone. It is reaped after the reading.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_not_yet_reaped_reads_as_gone_2030() {
+        // spawn-audit: test-only — a child that exits at once, read while it is a zombie.
+        let mut child = Command::new("true").spawn().unwrap();
+        let p = child.id() as libc::pid_t;
+        let by = Instant::now() + Duration::from_secs(5);
+        let outlived = outlived_2030(|| gone_now_2030(p), by);
+        // SAFETY: signal 0 only probes that the pid exists; the child is still unreaped here.
+        let still_listed = unsafe { libc::kill(p, 0) } == 0;
+        child.wait().unwrap();
+        assert!(still_listed, "the child was reaped before it was read");
+        assert!(!outlived, "an exited, unreaped child read as alive");
     }
 
     /// (core#2030, codex r1, agy r1) A stat read that fails is never "gone": a live child whose
