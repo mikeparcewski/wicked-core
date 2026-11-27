@@ -801,8 +801,9 @@ pub enum CoreEvent {
         condition: String,
         verdict_summary: String,
         /// (core#549) `true` when the evaluator's findings were trimmed to fit
-        /// [`crate::validator::EVALUATOR_FINDINGS_CAP`] — the tail rides `verdict_summary`
-        /// as `"…{last N chars}"` and this flag names it on the wire.
+        /// [`crate::validator::EVALUATOR_FINDINGS_CAP`] — every ITEM verdict rides `verdict_summary`
+        /// whole, the cut lines are named in a `…` note line (core#2004), and this flag names the
+        /// trim on the wire.
         verdict_summary_trimmed: bool,
         attempt: u32,
         denial_source: String,

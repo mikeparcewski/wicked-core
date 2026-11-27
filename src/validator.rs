@@ -3942,12 +3942,16 @@ pub struct EvaluatorVerdict {
     /// `true` iff `token == Some("PASS")`. Every other token, an empty token and a missing line
     /// are NOT PASS (D-9). No alias table: a condition is a FAIL whose condition is the finding.
     pub pass: bool,
-    /// The evaluator's own words — the output's tail (≤ 4096 chars, the decisive line included;
-    /// the contract puts the findings ABOVE the verdict line) — for `gateEscalated.verdictSummary`
-    /// and the rework context a `request_changes` hands the creator (PR-1B).
+    /// The evaluator's own words (≤ 4096 chars, the decisive line included; the contract puts the
+    /// findings ABOVE the verdict line) — for `gateEscalated.verdictSummary` and the rework context
+    /// a `request_changes` hands the creator (PR-1B). Past the cap, [`cap_findings`] keeps every
+    /// ITEM line and the verdict line whole and cuts the rest, steering-rule `N/A` lines first
+    /// (core#2004); only the ITEM and verdict lines, with the one note naming a cut, can take it
+    /// past 4096.
     pub findings: String,
     /// (core#549) `true` when the evaluator's output exceeded [`EVALUATOR_FINDINGS_CAP`] chars and
-    /// `findings` is a tail-trim. Propagates to `UnitDenial.findings_trimmed` and then to
+    /// [`cap_findings`] cut a line of it (core#2004: ITEM lines alone past the cap are kept whole
+    /// and are not a trim). Propagates to `UnitDenial.findings_trimmed` and then to
     /// `gateEscalated.verdictSummaryTrimmed` so a client can detect the cap without parsing `…`.
     pub findings_trimmed: bool,
 }
@@ -4030,15 +4034,12 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     }
     let trimmed = raw.trim();
     let count = trimmed.chars().count();
-    let findings_trimmed = count > EVALUATOR_FINDINGS_CAP;
-    let findings = if !findings_trimmed {
-        trimmed.to_string()
+    // (core#2004) Trimmed means a line was cut, not that the output passed the cap: ITEM lines
+    // alone past it are kept whole and carry no elision.
+    let (findings, findings_trimmed) = if count <= EVALUATOR_FINDINGS_CAP {
+        (trimmed.to_string(), false)
     } else {
-        let tail: String = trimmed
-            .chars()
-            .skip(count - EVALUATOR_FINDINGS_CAP)
-            .collect();
-        format!("…{tail}")
+        cap_findings(trimmed)
     };
     let pass = decisive.as_deref() == Some("PASS");
     EvaluatorVerdict {
@@ -4047,6 +4048,136 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
         findings,
         findings_trimmed,
     }
+}
+
+/// Room kept under [`EVALUATOR_FINDINGS_CAP`] for the note that names what [`cap_findings`] cut.
+const FINDINGS_NOTE_RESERVE: usize = 160;
+
+/// Whether `line` is a verdict line in [`parse_evaluator_verdict`]'s grammar (its first token's head
+/// normalises to `VERDICT`).
+fn is_verdict_line(line: &str) -> bool {
+    let bare = line
+        .trim_start_matches(|c: char| c.is_whitespace() || VERDICT_LINE_DECORATION.contains(&c));
+    bare.split_whitespace().next().is_some_and(|first| {
+        first.find([':', '=']).is_some_and(|sep| {
+            first[..sep]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("VERDICT")
+        })
+    })
+}
+
+/// Whether `line` is a steering-rule line that does not apply: `RULE <id>: N/A — …` (the steering
+/// contract's least useful line for a decision).
+fn is_rule_na_line(line: &str) -> bool {
+    let bare = line
+        .trim()
+        .trim_start_matches(['#', '*', '-', '>', '`', ' ', '\t']);
+    bare.get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("rule "))
+        && bare.split_once(':').is_some_and(|(_, after)| {
+            after.split_whitespace().next().is_some_and(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric() && c != '/')
+                    .eq_ignore_ascii_case("N/A")
+            })
+        })
+}
+
+/// (core#2004) The findings for an output past [`EVALUATOR_FINDINGS_CAP`] chars. A tail-trim kept
+/// the steering-rule lines a reviewer reports after its items and cut the ITEM verdicts, so the
+/// decision card showed no reason for a FAIL. Now every ITEM line and the decisive verdict line are
+/// kept whole. The rest fills what is left of the cap: other lines from the end (one that does not
+/// fit is tail-trimmed into the room left, the old elision), then rule `N/A` lines from the end.
+/// Lines keep their order, and a note where the first cut line was names what was cut. The
+/// findings pass the cap only when the ITEM and verdict lines, with that one note line, do: no
+/// item verdict is lost. Answers whether any line was cut (none is when only ITEM and verdict lines
+/// pass the cap).
+fn cap_findings(trimmed: &str) -> (String, bool) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Class {
+        Keep,
+        Other,
+        RuleNa,
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let decisive = lines.iter().rposition(|l| is_verdict_line(l));
+    let class: Vec<Class> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if Some(i) == decisive || !crate::review_context::parse_review_items(l).is_empty() {
+                Class::Keep
+            } else if is_rule_na_line(l) {
+                Class::RuleNa
+            } else {
+                Class::Other
+            }
+        })
+        .collect();
+    let size = |l: &str| l.chars().count() + 1;
+    let mut shown: Vec<Option<String>> = vec![None; lines.len()];
+    let mut room = EVALUATOR_FINDINGS_CAP.saturating_sub(FINDINGS_NOTE_RESERVE);
+    let mut tail_cut = false;
+    for (i, l) in lines.iter().enumerate() {
+        if class[i] == Class::Keep {
+            shown[i] = Some((*l).to_string());
+            room = room.saturating_sub(size(l));
+        }
+    }
+    for i in (0..lines.len()).rev().filter(|&i| class[i] == Class::Other) {
+        let l = lines[i];
+        if size(l) <= room {
+            shown[i] = Some(l.to_string());
+            room -= size(l);
+            continue;
+        }
+        if room > 2 {
+            let n = l.chars().count();
+            let tail: String = l.chars().skip(n - (room - 2)).collect();
+            shown[i] = Some(format!("…{tail}"));
+            tail_cut = true;
+            room = 0;
+        }
+        break;
+    }
+    for i in (0..lines.len())
+        .rev()
+        .filter(|&i| class[i] == Class::RuleNa)
+    {
+        if size(lines[i]) > room {
+            break;
+        }
+        shown[i] = Some(lines[i].to_string());
+        room -= size(lines[i]);
+    }
+    let cut = |c: Class| {
+        (0..lines.len())
+            .filter(|&i| class[i] == c && shown[i].is_none() && !lines[i].trim().is_empty())
+            .count()
+    };
+    let parts: Vec<String> = [
+        (cut(Class::RuleNa), "steering-rule line"),
+        (cut(Class::Other), "other line"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}{}", if n == 1 { "" } else { "s" }))
+    .collect();
+    let note = (!parts.is_empty()).then(|| {
+        format!(
+            "… {} not shown here; see the step's output in the run's events",
+            parts.join(" and ")
+        )
+    });
+    let first_cut = (0..lines.len()).find(|&i| shown[i].is_none() && !lines[i].trim().is_empty());
+    let mut out: Vec<String> = Vec::new();
+    for (i, s) in shown.into_iter().enumerate() {
+        if Some(i) == first_cut {
+            out.extend(note.clone());
+        }
+        out.extend(s);
+    }
+    (out.join("\n"), note.is_some() || tail_cut)
 }
 
 /// Parse the reviewer's verdict FAIL-CLOSED (core#128). Keyword-FREE lines (CLI warning banners,
@@ -4827,6 +4958,117 @@ mod tests {
         );
     }
 
+    /// (core#2004) A review with 60 steering-rule lines after its ITEM verdicts (the steering
+    /// contract asks for every rule after the items) runs past the findings cap. Every ITEM verdict
+    /// survives whole, the FAIL items first among them; the rule `N/A` lines are what is cut, and
+    /// the findings say how many and where the step's output is.
+    #[test]
+    fn every_item_verdict_survives_the_findings_cap_2004() {
+        let mut raw = String::from(
+            "Reviewed the demo.\n\
+             ITEM 1: PASS — the chapters load (chapters.json:1)\n\
+             ITEM 2: FAIL — script.md:12 skips the pre-flight checklist; chapters.json:2 omits the resets\n\
+             ITEM 3: PASS — the run of show is complete\n\
+             ITEM 4: DEFERRED — CI on the opened PR\n\
+             ITEM 5: FAIL — script.md:23 calls the rules sample data without provenance\n",
+        );
+        for n in 1..=60 {
+            raw.push_str(&format!(
+                "RULE POL-{n:03}: N/A — the rule's config.json key and background timer are not \
+                 touched by this change (none introduced)\n"
+            ));
+        }
+        raw.push_str("VERDICT: FAIL");
+        assert!(
+            raw.chars().count() > EVALUATOR_FINDINGS_CAP,
+            "the fixture is past the cap"
+        );
+        let v = parse_evaluator_verdict(&raw);
+        assert!(!v.pass && v.findings_trimmed);
+        let items = crate::review_context::parse_review_items(&v.findings);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.n, i.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "PASS"),
+                (2, "FAIL"),
+                (3, "PASS"),
+                (4, "DEFERRED"),
+                (5, "FAIL")
+            ],
+            "every ITEM verdict survives: {}",
+            v.findings
+        );
+        assert!(
+            v.findings.contains(
+                "ITEM 2: FAIL — script.md:12 skips the pre-flight checklist; chapters.json:2 omits the resets"
+            ) && v.findings.contains(
+                "ITEM 5: FAIL — script.md:23 calls the rules sample data without provenance"
+            ),
+            "the FAIL items are whole: {}",
+            v.findings
+        );
+        assert!(v.findings.ends_with("VERDICT: FAIL"), "{}", v.findings);
+        assert!(
+            v.findings.chars().count() <= EVALUATOR_FINDINGS_CAP,
+            "the items fit, so the cap holds"
+        );
+        assert!(
+            v.findings.contains("steering-rule lines")
+                && v.findings
+                    .contains("see the step's output in the run's events"),
+            "the cut is named: {}",
+            v.findings
+        );
+        // (codex-check on cbebe96) A single output flush over 16 KB is elided in the middle
+        // (`output_throttle::FLUSH_MAX_BYTES`), so the note makes no completeness promise.
+        assert!(!v.findings.contains("full output"), "{}", v.findings);
+        assert!(
+            !v.findings.contains("…fig.json key"),
+            "no line starts mid-sentence: {}",
+            v.findings
+        );
+    }
+
+    /// (core#2004, codex-check on 4b42c1b) ITEM lines alone past the cap: nothing is cut, so the
+    /// findings are the output whole and are not marked trimmed (no `…` without a cut). With cut
+    /// lines beside them, every ITEM line stays and the one note names the cut, even where the
+    /// note takes the findings past 4096.
+    #[test]
+    fn item_lines_alone_past_the_cap_are_not_marked_trimmed_2004() {
+        let item = |n: u32| format!("ITEM {n}: PASS — {}", "c".repeat(85));
+        let items: Vec<String> = (1..=41).map(item).collect();
+        let only_items = format!("{}\nVERDICT: PASS", items.join("\n"));
+        assert!(only_items.chars().count() > EVALUATOR_FINDINGS_CAP);
+        let v = parse_evaluator_verdict(&only_items);
+        assert!(v.pass);
+        assert_eq!(v.findings, only_items, "nothing is cut");
+        assert!(!v.findings_trimmed, "no trim, so no trim flag");
+
+        let forty = &items[..40];
+        let mut with_rules = forty.join("\n");
+        for n in 1..=20 {
+            with_rules.push_str(&format!("\nRULE POL-{n:03}: N/A — not touched"));
+        }
+        with_rules.push_str("\nVERDICT: FAIL");
+        let v = parse_evaluator_verdict(&with_rules);
+        assert!(v.findings_trimmed, "rule lines were cut");
+        assert_eq!(
+            crate::review_context::parse_review_items(&v.findings).len(),
+            40,
+            "every ITEM line stays"
+        );
+        assert!(
+            v.findings
+                .contains("… 20 steering-rule lines not shown here"),
+            "{}",
+            v.findings
+        );
+        assert!(v.findings.ends_with("VERDICT: FAIL"));
+    }
+
     /// DES-L1 PR-1A §7 (4): the evaluator's OWN verdict grammar (des-adjudicated §4.1) — decoration
     /// tolerated, `:` or `=` head, case-insensitive, trailing punctuation trimmed, the LAST verdict
     /// line wins, `PASS` is the only pass; every other token, a bare head and no line are NOT PASS
@@ -4902,12 +5144,14 @@ mod tests {
             missing.denial_reason()
         );
         assert!(missing.denial_reason().contains("looks fine"));
-        // Findings = the output's tail, decisive line included, capped at 4096 chars from the end.
+        // Findings = the output, decisive line included, capped at 4096 chars: one long line keeps
+        // its tail (core#2004: ITEM lines are never cut; see every_item_verdict_survives_…).
         let long = format!("{}\nVERDICT: FAIL", "x".repeat(5000));
         let v = parse_evaluator_verdict(&long);
         assert!(!v.pass);
         assert!(v.findings.starts_with('…') && v.findings.ends_with("VERDICT: FAIL"));
-        assert_eq!(v.findings.chars().count(), EVALUATOR_FINDINGS_CAP + 1);
+        // (core#2004) The cap reserves room for the note naming any cut line.
+        assert!(v.findings.chars().count() <= EVALUATOR_FINDINGS_CAP);
         assert!(v.findings_trimmed, "long output sets findings_trimmed");
         let short = parse_evaluator_verdict("short\nVERDICT: FAIL");
         assert!(
