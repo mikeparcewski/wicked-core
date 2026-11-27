@@ -8011,7 +8011,7 @@ mod discard_minted_tests {
             "1234567g",
             "6gib",
             "6t",
-            "6g\n",
+            "6\ng",
         ] {
             let err = set_seat_memory(&mut store, &entry.id, Some(bad));
             assert!(err.is_err(), "`{bad}` is not a seat memory size");
