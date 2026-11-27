@@ -884,6 +884,16 @@ fn build_seat_image_on(
                 missing_base_error(base, rebuilt),
             ));
         }
+        // (core#1043 part 3, codex r1) A repo's own base is a person's API setting, not the
+        // operator's: it is built on only once the runtime confirms it is there. An inspection the
+        // runtime did not answer keeps the operator's build path above, but would let a build
+        // `FROM` a repo's reference pull it from a registry.
+        if base.from_repo && present != Some(true) {
+            return Err((
+                FloorUnarmed::NoSeatImage,
+                unconfirmed_repo_base(&base.image),
+            ));
+        }
     }
     if !base.operator && base.image == default_base() && !image_present(rt, &base.image) {
         eprintln!(
@@ -906,6 +916,13 @@ fn build_seat_image_on(
                 let from = pin.tag().to_string();
                 _base_pin = Some(pin);
                 (seat_image_tag(cli, &base.image, Some(&id), &[]), from)
+            }
+            // (core#1043 part 3, codex r1) Never by name on a repo's base: see above.
+            None if base.from_repo => {
+                return Err((
+                    FloorUnarmed::NoSeatImage,
+                    unconfirmed_repo_base(&base.image),
+                ))
             }
             None => (
                 seat_image_tag(cli, &base.image, None, &[]),
@@ -931,6 +948,17 @@ fn build_seat_image_on(
             no_image(e)
         }
     })
+}
+
+/// (core#1043 part 3) Why a unit on a repo's own base the runtime did not confirm gets no seat
+/// image: building on its name could pull it from a registry.
+fn unconfirmed_repo_base(image: &str) -> String {
+    format!(
+        "the container runtime did not confirm the seat base image {image} (this repo's seat base \
+         image) or its image id, and the engine builds a seat image on a repo's base only by the id \
+         it confirmed, never by name, which could pull it from a registry; retry when the runtime \
+         answers"
+    )
 }
 
 /// Whether `tag` is on the runtime: `Some(false)` only when its inspection failed AND the runtime
@@ -5260,6 +5288,38 @@ esac
         let (why, _) = ensure_layered_seat_image(&rt, "claude", None, &repo, &[]).unwrap_err();
         assert_eq!(why, FloorUnarmed::SeatBaseMissing);
         std::fs::remove_dir_all(gone).unwrap();
+
+        // (codex r1) Unconfirmed: a runtime that answers neither the inspection nor the listing
+        // keeps the operator's build path, but a repo's base is not built on by name.
+        let mute = c4_temp();
+        let log = mute.join("calls.log");
+        let stub = mute.join("runtime");
+        crate::test_env::install_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in image|images) exit 1 ;; build) cat >/dev/null; exit 0 ;; esac\nexit 0\n",
+                log.display()
+            ),
+        );
+        let rt = Runtime::answering(stub);
+        let (why, e) = build_seat_image_on(&rt, "claude", pkg, &repo, &[]).unwrap_err();
+        assert_eq!(why, FloorUnarmed::NoSeatImage, "{e}");
+        assert!(
+            e.contains("did not confirm") && e.contains("acme/seat-base:go"),
+            "{e}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!calls.contains("build"), "no build ran: {calls}");
+        let operator = SeatBase {
+            from_repo: false,
+            ..repo.clone()
+        };
+        assert!(
+            build_seat_image_on(&rt, "claude", pkg, &operator, &[]).is_ok(),
+            "the operator's base keeps its build path"
+        );
+        std::fs::remove_dir_all(mute).unwrap();
         for (k, v) in saved {
             match v {
                 Some(v) => std::env::set_var(k, v),
