@@ -731,7 +731,8 @@ pub const DROPPED_AT_LAUNCH: [&str; 3] = ["understand", "test_plan", "design"];
 
 /// A power launch's plan: the authored plan without its [`DROPPED_AT_LAUNCH`] steps, with every
 /// `depends_on` that named a dropped step re-pointed at what that step depended on. A plan that
-/// has no build step is returned unchanged: no orchestrator would absorb the dropped work.
+/// has no build step is returned unchanged but for its default ids (`plan_gate::with_default_ids`,
+/// which the plan gate gives it anyway): no orchestrator would absorb the dropped work.
 ///
 /// (core#2045) A step whose gate ranks `human_confirm{unconditional:true}` or higher is never
 /// dropped: power mode is a dial, and the dial never downgrades an unconditional gate
