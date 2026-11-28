@@ -1621,8 +1621,12 @@ impl Core {
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+        let mut entry = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        // (DES-2047b) What a person sees, derived on the caller's thread, never on the actor.
+        crate::repo::shown(&mut entry);
+        Ok(entry)
     }
 
     /// (core#1043 part 3) Set the repo `repo_id`'s own seat base image (`None` or a blank reference
@@ -1644,8 +1648,12 @@ impl Core {
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+        let mut entry = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        // (DES-2047b) What a person sees, derived on the caller's thread, never on the actor.
+        crate::repo::shown(&mut entry);
+        Ok(entry)
     }
 
     /// (core#2024) Set the repo `repo_id`'s own seat memory limit (`None` or a blank size clears
@@ -1665,18 +1673,30 @@ impl Core {
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+        let mut entry = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        // (DES-2047b) What a person sees, derived on the caller's thread, never on the actor.
+        crate::repo::shown(&mut entry);
+        Ok(entry)
     }
 
-    /// List every registered repository.
+    /// List every registered repository, with what each one's checkout shows a person (its layer
+    /// rows and the partial-clone warning, core#1933 and core#2047).
     pub fn list_repos(&self) -> anyhow::Result<Vec<RepoEntry>> {
         let (reply, rx) = channel();
         self.tx
             .send(Command::ListRepos { reply })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+        let mut repos = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))??;
+        // (core#1933, DES-2047b) What a person sees, derived here on the caller's thread (the
+        // binding's pool), never on the actor: it reads the disk and runs git.
+        for entry in &mut repos {
+            crate::repo::shown(entry);
+        }
+        Ok(repos)
     }
 
     // ── Projects (DES-PROJECT-001) ───────────────────────────────────────────────

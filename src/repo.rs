@@ -197,8 +197,10 @@ impl FromNode for RepoEntry {
 /// (core#1933, core#2047) What a read a person sees derives from the entry's checkout, on top of
 /// the record: its layer rows, and the partial-clone warning registration gave (a fetch that fills
 /// the objects drops it). Both reuse the checkout's last derivation for a few seconds
-/// (`seat_layers::cached_at`), so a studio poll does not rescan every checkout.
-fn shown(entry: &mut RepoEntry) {
+/// (`seat_layers::cached_at`), so a studio poll does not rescan every checkout. It reads the disk
+/// and runs git, so it runs on the caller's thread (`Core::list_repos` and the setters), never on
+/// the actor (DES-2047b).
+pub(crate) fn shown(entry: &mut RepoEntry) {
     entry.seat_layers = seat_layer_rows(
         &entry.root_path,
         &entry.seat_layers_off,
@@ -208,7 +210,7 @@ fn shown(entry: &mut RepoEntry) {
     let partial_clone = crate::seat_layers::cached_at(
         &*PARTIAL_CLONE_CHECKED,
         Path::new(&root),
-        std::time::Instant::now(),
+        &std::time::Instant::now,
         || partial_clone_finding(&root),
     );
     entry.findings.extend(partial_clone);
@@ -488,15 +490,13 @@ pub fn set_seat_layers_off(
     ids.dedup();
     entry.seat_layers_off = ids;
     put_node(store, entry.to_node())?;
-    // The caller gets the rows as the next read derives them.
-    shown(&mut entry);
     Ok(entry)
 }
 
 /// (core#1043 part 3) Set (`Some`) or clear (`None`, or a blank reference) the repo's own seat base
-/// image ([`RepoEntry::seat_base_image`]) and return the updated entry with its layer rows. A
-/// reference that is not a local image name ([`crate::container_floor::valid_image_ref`]) is
-/// refused and the stored one is unchanged. The image need not exist yet: a unit armed on a base
+/// image ([`RepoEntry::seat_base_image`]) and return the updated entry (the engine's; `Core` adds
+/// what a person sees, [`shown`]). A reference that is not a local image name
+/// ([`crate::container_floor::valid_image_ref`]) is refused and the stored one is unchanged. The image need not exist yet: a unit armed on a base
 /// the runtime lacks is refused then (`seat_base_missing`), never pulled.
 pub fn set_seat_base_image(
     store: &mut dyn GraphStore,
@@ -512,7 +512,6 @@ pub fn set_seat_base_image(
     }
     entry.seat_base_image = image.map(str::to_string);
     put_node(store, entry.to_node())?;
-    shown(&mut entry);
     Ok(entry)
 }
 
@@ -533,7 +532,6 @@ pub fn set_seat_memory(
     }
     entry.seat_memory = memory.map(str::to_string);
     put_node(store, entry.to_node())?;
-    shown(&mut entry);
     Ok(entry)
 }
 
@@ -623,10 +621,10 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
         .collect())
 }
 
-/// (core#1933, core#2047) The repo list a person sees (`Core::list_repos`): [`list_repos`] with
-/// what each repo's checkout shows ([`shown`]: its [`RepoEntry::seat_layers`] rows and its
-/// partial-clone warning).
-pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
+/// (core#1933, core#2047) The repo list a person sees, as `Core::list_repos` builds it off the
+/// actor: [`list_repos`] with what each repo's checkout shows ([`shown`]).
+#[cfg(test)]
+pub(crate) fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
     let mut repos = list_repos(store)?;
     for entry in &mut repos {
         shown(entry);
@@ -7823,7 +7821,9 @@ mod discard_minted_tests {
             },
         )
         .unwrap();
-        let set = set_seat_layers_off(&mut store, &entry.id, &["rust".into()]).unwrap();
+        // The setter's reply as `Core` hands it on (DES-2047b: derived off the actor).
+        let mut set = set_seat_layers_off(&mut store, &entry.id, &["rust".into()]).unwrap();
+        shown(&mut set);
         assert_eq!(
             set.seat_layers.len(),
             1,
@@ -7977,8 +7977,10 @@ mod discard_minted_tests {
         );
         assert_eq!(seat_base_image_for(&store, Some(&entry.id)), None);
 
-        let set =
+        // The setter's reply as `Core` hands it on (DES-2047b: derived off the actor).
+        let mut set =
             set_seat_base_image(&mut store, &entry.id, Some(" acme/seat-base:go1.23 ")).unwrap();
+        shown(&mut set);
         assert_eq!(
             set.seat_base_image.as_deref(),
             Some("acme/seat-base:go1.23")

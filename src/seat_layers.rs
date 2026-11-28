@@ -313,36 +313,46 @@ static DETECTED: std::sync::LazyLock<CheckoutCache<Vec<&'static str>>> =
 /// added or removed in the checkout shows within that time. Not for the arm, which detects on the
 /// unit's own worktree every time.
 pub(crate) fn detect_cached(tree: &Path) -> Vec<&'static Layer> {
-    detect_cached_at(tree, std::time::Instant::now())
+    detect_cached_with(tree, &std::time::Instant::now)
 }
 
-/// [`detect_cached`] at the time `now`.
-fn detect_cached_at(tree: &Path, now: std::time::Instant) -> Vec<&'static Layer> {
-    let ids = cached_at(&*DETECTED, tree, now, || {
+/// [`detect_cached`] read through `clock`.
+fn detect_cached_with(tree: &Path, clock: &dyn Fn() -> std::time::Instant) -> Vec<&'static Layer> {
+    let ids = cached_at(&*DETECTED, tree, clock, || {
         detect(tree).iter().map(|l| l.id).collect()
     });
     CATALOG.iter().filter(|l| ids.contains(&l.id)).collect()
 }
 
+/// [`detect_cached`] with the clock stopped at `now`.
+#[cfg(test)]
+fn detect_cached_at(tree: &Path, now: std::time::Instant) -> Vec<&'static Layer> {
+    detect_cached_with(tree, &|| now)
+}
+
 /// (core#1933, core#2047) `derive` for the checkout at `tree`, reused from `cache` for
-/// [`DETECT_TTL`]; at most [`DETECT_CACHE_MAX`] roots are kept (the expired go first, then the
-/// oldest). The one cache behind every checkout derivation the repo list shows.
+/// [`DETECT_TTL`] from when its derivation LANDED (`clock` read again once `derive` returns, so a
+/// slow derivation is never expired on arrival); at most [`DETECT_CACHE_MAX`] roots are kept (the
+/// expired go first, then the oldest). The one cache behind every checkout derivation the repo list
+/// shows. Call it off the actor: a derivation may read the disk and run git.
 pub(crate) fn cached_at<V: Clone>(
     cache: &CheckoutCache<V>,
     tree: &Path,
-    now: std::time::Instant,
+    clock: &dyn Fn() -> std::time::Instant,
     derive: impl FnOnce() -> V,
 ) -> V {
     let lock = || cache.lock().unwrap_or_else(|p| p.into_inner());
+    let asked = clock();
     if let Some((at, found)) = lock().get(tree) {
-        if now.saturating_duration_since(*at) < DETECT_TTL {
+        if asked.saturating_duration_since(*at) < DETECT_TTL {
             return found.clone();
         }
     }
     let found = derive();
+    let landed = clock();
     let mut map = lock();
     if map.len() >= DETECT_CACHE_MAX && !map.contains_key(tree) {
-        map.retain(|_, (at, _)| now.saturating_duration_since(*at) < DETECT_TTL);
+        map.retain(|_, (at, _)| landed.saturating_duration_since(*at) < DETECT_TTL);
         if map.len() >= DETECT_CACHE_MAX {
             let oldest = map
                 .iter()
@@ -353,21 +363,8 @@ pub(crate) fn cached_at<V: Clone>(
             }
         }
     }
-    map.insert(tree.to_path_buf(), (now, found.clone()));
+    map.insert(tree.to_path_buf(), (landed, found.clone()));
     found
-}
-
-/// (core#2047, DES-2047b) [`cached_at`] read through `clock`. Here it reads the clock once, before
-/// the derivation, so an entry is stamped with the time it was asked for (the fix stamps it when
-/// it lands).
-#[cfg(test)]
-pub(crate) fn cached_at_clocked<V: Clone>(
-    cache: &CheckoutCache<V>,
-    tree: &Path,
-    clock: &dyn Fn() -> std::time::Instant,
-    derive: impl FnOnce() -> V,
-) -> V {
-    cached_at(cache, tree, clock(), derive)
 }
 
 /// (core#1933) Forget `tree`'s detection, as [`DETECT_TTL`] passing would.
@@ -853,14 +850,20 @@ mod tests {
         };
         let a = Path::new("/checkout/a");
         let t0 = std::time::Instant::now();
-        assert_eq!(cached_at(&cache, a, t0, || derive(Some(1))), Some(1));
+        assert_eq!(cached_at(&cache, a, &|| t0, || derive(Some(1))), Some(1));
         let just_inside = t0 + DETECT_TTL - std::time::Duration::from_millis(1);
-        assert_eq!(cached_at(&cache, a, just_inside, || derive(None)), Some(1));
+        assert_eq!(
+            cached_at(&cache, a, &|| just_inside, || derive(None)),
+            Some(1)
+        );
         assert_eq!(derived.get(), 1, "reused within the TTL");
-        assert_eq!(cached_at(&cache, a, t0 + DETECT_TTL, || derive(None)), None);
+        assert_eq!(
+            cached_at(&cache, a, &|| t0 + DETECT_TTL, || derive(None)),
+            None
+        );
         assert_eq!(derived.get(), 2, "derived again once it passed");
         let b = Path::new("/checkout/b");
-        assert_eq!(cached_at(&cache, b, t0, || derive(Some(2))), Some(2));
+        assert_eq!(cached_at(&cache, b, &|| t0, || derive(Some(2))), Some(2));
         assert_eq!(derived.get(), 3, "another root has its own entry");
     }
 
@@ -874,14 +877,14 @@ mod tests {
         let now = || clock.get();
         let derived = std::cell::Cell::new(0);
         let a = Path::new("/checkout/slow");
-        let first = cached_at_clocked(&cache, a, &now, || {
+        let first = cached_at(&cache, a, &now, || {
             derived.set(derived.get() + 1);
             // The scan took longer than the TTL.
             clock.set(t0 + DETECT_TTL + std::time::Duration::from_secs(1));
             1
         });
         assert_eq!(first, 1);
-        let next = cached_at_clocked(&cache, a, &now, || {
+        let next = cached_at(&cache, a, &now, || {
             derived.set(derived.get() + 1);
             2
         });
