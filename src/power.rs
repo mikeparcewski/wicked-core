@@ -739,6 +739,9 @@ pub const DROPPED_AT_LAUNCH: [&str; 3] = ["understand", "test_plan", "design"];
 /// transitively through `depends_on`, stays too: the build that would absorb it runs after the
 /// stop. Kept steps keep their authored gates (`kept_at_launch`).
 pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
+    // Every step by the id it will have (a step with no id takes its default, as the plan gate
+    // gives it): what is kept and what a `depends_on` names are read by those ids, never by "".
+    let plan = &crate::plan_gate::with_default_ids(plan);
     let kept = kept_at_launch(plan);
     let drops = |s: &crate::plan::PlanStep| {
         DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()) && !kept.contains(&s.id)
@@ -789,8 +792,9 @@ pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
 
 /// (core#2045) The droppable steps a power launch keeps: every [`DROPPED_AT_LAUNCH`] step whose
 /// gate ranks `human_confirm{unconditional:true}` or higher (an absent gate is its catalog
-/// entry's), and every droppable step it reads, transitively through `depends_on`. A non-droppable
-/// step (the build) ends the walk: what it reads, it absorbs before the stop.
+/// entry's), and every droppable step it reads, transitively through `depends_on`. Only a `build`
+/// step ends the walk: what the orchestrator reads, it absorbs before the stop. A phased step on the
+/// way (`architecture`, say) runs before the stop, so the walk goes on through it.
 fn kept_at_launch(plan: &crate::plan::PlanSteps) -> Vec<String> {
     let droppable = |s: &crate::plan::PlanStep| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str());
     let rank = |s: &crate::plan::PlanStep| {
@@ -803,18 +807,24 @@ fn kept_at_launch(plan: &crate::plan::PlanSteps) -> Vec<String> {
         .iter()
         .filter(|&s| droppable(s) && rank(s) >= UNCONDITIONAL_RANK)
         .collect();
+    let mut seen: Vec<&str> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
     while let Some(step) = todo.pop() {
-        if kept.contains(&step.id) {
+        if seen.contains(&step.id.as_str()) {
             continue;
         }
-        kept.push(step.id.clone());
+        seen.push(step.id.as_str());
+        if droppable(step) {
+            kept.push(step.id.clone());
+        }
+        if step.catalog == "build" {
+            continue;
+        }
         todo.extend(
             step.depends_on
                 .iter()
                 .flatten()
-                .filter_map(|d| plan.steps.iter().find(|s| &s.id == d))
-                .filter(|&s| droppable(s)),
+                .filter_map(|d| plan.steps.iter().find(|s| &s.id == d)),
         );
     }
     kept
