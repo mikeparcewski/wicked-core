@@ -14,6 +14,29 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.17.0** — 2026-11-28 — minor release on the train-19 cut aa0f9746, carrying 10 PRs since 0.16.2: #2021, #2025, #2027, #2023, #2031, #2032, #2033, #2038, #2037, #2040.
+  Minor, not patch: #2023 and #2037 add per-repo seat settings to the binding. The entries below were written from each
+  PR's changelog entry (from the PR description where it had none).
+
+  - **A repo can name its own seat base image** (core#1043 part 3, #2023). `setRepoSeatBaseImage` stores a local image
+    reference on the repo, and its units' seat images are built on it instead of the daemon's base. It wins over
+    `WICKED_SEAT_BASE_IMAGE` and works like it: never pulled, keyed by its image id, no toolchain layer added, and a base
+    the runtime lacks is refused.
+  - **A repo can set its own seat memory limit** (#2024, #2037). `setRepoSeatMemory` takes a whole number with k/m/g, at
+    least `1g`, and overrides `WICKED_SEAT_MEMORY` for that repository's seats. `wicked-core seat-image build --repo <id>`
+    prebuilds the seat images a registered repository's units use.
+  - **A send-back at the terminal gate reviews the last unit** (#2005, #2021). A send-back at the gate after a run's final
+    step (the demo review's Record it again) goes back to the last creator step with the note, instead of being refused.
+  - **A crash during a send-back no longer strands a run at an answered gate** (#2022, #2027). Request changes, and
+    accepting an evaluator's suggestion, commit the answer together with the rewind of the run's steps. If a rewind
+    write fails, the rows are put back before the error commits; if putting them back also fails, the error names both
+    and the run can still be left at an answered gate (a known limit).
+  - **A failed "accept the suggestion" takes the edit back out of the worktree** (#2029, #2033); **accepting a suggestion
+    is refused over hand edits**, naming the changed paths, and the gate stays open (#2036, #2038).
+  - core-ts: the platform lockfile entries are re-stamped for the published 0.16.2 (#2025).
+  - Tests: the gateway log tests install their kubectl stubs out of process (#2028, #2031); the #1993 test reads its killed
+    child gone once (#2030, #2032); the event-log tests wait for the run's terminal event in the log (#2035, #2040).
+
 - **core-ts 0.16.2** — 2026-11-27 — patch release on the train-18 cut 4d735293, carrying 6 PRs since 0.16.1: #2012, #2013, #2014, #2016, #2006, #2018.
   The entries below were written from each PR's changelog entry (from the PR description where it had none).
 
