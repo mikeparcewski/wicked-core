@@ -2790,6 +2790,168 @@ mod tests {
         }
     }
 
+    /// The learn preset's steps, as `crate::catalog::builtin_presets()` composes them.
+    fn learn_steps() -> Vec<crate::plan::PlanStep> {
+        crate::catalog::builtin_presets()
+            .into_iter()
+            .find(|(n, _)| *n == "learn")
+            .expect("the learn preset")
+            .1
+    }
+
+    /// (core#2045) A power launch never drops a step the workflow made an unconditional human stop
+    /// (`GateSpec::HumanConfirm` doc: the dial can never downgrade it), nor the steps that stop
+    /// reads: learn keeps scope -> research -> synthesize -> walkthrough ahead of its build, as the
+    /// proposal card shows. Runs 04be8ab2 and eae863c7 planned only author and review.
+    #[test]
+    fn a_power_launch_keeps_an_unconditional_human_stop_and_the_steps_it_reads() {
+        let plan = crate::plan::PlanSteps {
+            steps: learn_steps(),
+            ..Default::default()
+        };
+        let p = launch_plan(&plan);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "scope",
+                "research",
+                "synthesize",
+                "walkthrough",
+                "author",
+                "review"
+            ]
+        );
+        let step = |id: &str| p.steps.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(
+            step("walkthrough").gate,
+            Some(crate::workflow::GateSpec::HumanConfirm {
+                unconditional: true
+            }),
+            "the stop keeps its authored gate"
+        );
+        assert_eq!(
+            step("scope").gate,
+            Some(crate::workflow::GateSpec::HumanConfirm {
+                unconditional: false
+            }),
+            "a kept input keeps its authored gate too (DES-2045 ruling)"
+        );
+        assert_eq!(
+            step("author").depends_on,
+            Some(vec!["walkthrough".to_string()]),
+            "the build still waits for the stop"
+        );
+        assert_eq!(
+            step("synthesize").depends_on,
+            Some(vec!["research".to_string()])
+        );
+        // The kept plan still composes, as every power preset must.
+        let p = crate::plan_gate::with_default_ids(&p);
+        assert!(crate::plan::compose(crate::catalog::catalog(), &p).is_ok());
+    }
+
+    /// (core#2045) The rule on a composed plan: a stop ranked `human_confirm{unconditional:true}`
+    /// or `consent_before` stays with everything it reads, transitively; every other droppable
+    /// step drops as before (a conditional confirm too), and its dependents are re-pointed.
+    #[test]
+    fn a_power_launch_keeps_each_top_ranked_stop_with_its_inputs_and_drops_the_rest() {
+        use crate::workflow::GateSpec;
+        let step = |id: &str, catalog: &str, gate: Option<GateSpec>, deps: &[&str]| {
+            crate::plan::PlanStep {
+                catalog: catalog.into(),
+                id: id.into(),
+                gate,
+                depends_on: (!deps.is_empty())
+                    .then(|| deps.iter().map(|d| d.to_string()).collect()),
+                ..Default::default()
+            }
+        };
+        for stop_gate in [
+            GateSpec::HumanConfirm {
+                unconditional: true,
+            },
+            GateSpec::ConsentBefore,
+        ] {
+            let plan = crate::plan::PlanSteps {
+                steps: vec![
+                    step("root", "understand", None, &[]),
+                    step("a", "design", None, &["root"]),
+                    step("stop", "understand", Some(stop_gate), &["a"]),
+                    step("b", "understand", None, &[]),
+                    step(
+                        "c",
+                        "test_plan",
+                        Some(GateSpec::HumanConfirm {
+                            unconditional: false,
+                        }),
+                        &["b"],
+                    ),
+                    step("build", "build", None, &["stop", "c"]),
+                    step("review", "review", None, &["build"]),
+                ],
+                ..Default::default()
+            };
+            let p = launch_plan(&plan);
+            let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                ["root", "a", "stop", "build", "review"],
+                "{stop_gate:?}: the stop and its inputs stay, b and c drop"
+            );
+            let deps = |id: &str| {
+                p.steps
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .depends_on
+                    .clone()
+            };
+            assert_eq!(deps("a"), Some(vec!["root".to_string()]), "{stop_gate:?}");
+            assert_eq!(deps("stop"), Some(vec!["a".to_string()]), "{stop_gate:?}");
+            assert_eq!(
+                deps("build"),
+                Some(vec!["stop".to_string()]),
+                "{stop_gate:?}: c resolves through b to nothing"
+            );
+            assert_eq!(p.steps[2].gate, Some(stop_gate), "{stop_gate:?}");
+        }
+    }
+
+    /// (core#2045) The intake record of a power learn launch lists its kept pre-build steps as
+    /// phased steps; run 04be8ab2's record listed none (`mandatoryPhases: []`).
+    #[test]
+    fn a_power_learn_intake_lists_its_kept_steps_as_mandatory_phases() {
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: learn_steps(),
+            ..Default::default()
+        });
+        let record = intake_plan(
+            &QePlan::default(),
+            30,
+            false,
+            "20-39",
+            false,
+            &p.steps,
+            &[],
+            &ABSORBED.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            false,
+            Vec::new(),
+            "claude",
+            9,
+        );
+        let phases: Vec<&str> = record
+            .mandatory_phases
+            .iter()
+            .map(|m| m.phase.as_str())
+            .collect();
+        assert_eq!(
+            phases,
+            ["understand", "understand", "understand", "understand"],
+            "scope, research, synthesize and walkthrough stay phased"
+        );
+    }
+
     #[test]
     fn power_absorbs_test_plan_and_design_from_the_band_floor_only() {
         let plan = crate::plan::PlanSteps {
