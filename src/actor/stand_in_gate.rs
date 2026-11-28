@@ -394,10 +394,12 @@ pub(crate) fn reserve_team(
     let reason = si::reason_from_run(&roster, &session.clis, &session.benched_seats, &first);
     // (codex r1 on #1990) A judge dispatched with a stand-in offer holds that slot unrecorded
     // until it answers (`standin::judge_offer` mints it at dispatch, `judge_answered` records it):
-    // the slot a unit in flight may hold on its base is never a team role's.
+    // the slot a unit in flight may hold on its base is never a team role's. (core#2044) The unit
+    // this reservation is for is in flight whatever its status: after a send-back it runs again
+    // `Pending` (`rewind_writes`; dispatch writes no status), and its judge's offer is still out.
     let in_flight: Vec<String> = crate::domain::session_units(store, run_id)?
         .iter()
-        .filter(|u| u.status == crate::domain::UnitStatus::Distributed)
+        .filter(|u| u.status == crate::domain::UnitStatus::Distributed || Some(u.ord) == scope.ord)
         .filter_map(|u| u.assigned_cli.as_deref())
         .map(|k| seat_id::credential(k).to_string())
         .collect();
