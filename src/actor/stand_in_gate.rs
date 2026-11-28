@@ -933,6 +933,98 @@ mod reserve_team_tests {
         );
     }
 
+    /// core#2044: a send-back leaves every unit after its target `Pending` (`rewind_writes`), and
+    /// dispatch never writes a unit's status, so the reworked review runs while `Pending`. The
+    /// monitor reserved for it still never takes its judge's offer: the slot of the unit the
+    /// reservation is for is held back, and the fold confirms the judge's key as its own.
+    #[test]
+    fn a_monitor_after_a_send_back_never_takes_the_judges_slot_2044() {
+        let mut s = run(&["claude"], true);
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut build = WorkUnit::pending(format!("{}:u1", s.id), &s.id, 1, "build it");
+        build.role = crate::workflow::PhaseRole::Creator;
+        build.assigned_cli = Some("claude".into());
+        build.status = crate::domain::UnitStatus::Done;
+        build.last_attempt = Some(0);
+        let mut review = WorkUnit::pending(format!("{}:u2", s.id), &s.id, 2, "review it");
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        review.assigned_cli = Some("claude".into());
+        review.status = crate::domain::UnitStatus::Rejected;
+        review.denial_reason = Some("range() should say why it does not use Math.min".into());
+        review.last_attempt = Some(0);
+        crate::domain::put_node(&mut store, build.to_node()).unwrap();
+        crate::domain::put_node(&mut store, review.to_node()).unwrap();
+        s.unit_ix = 1;
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        // The person sends the review back: the production rewind.
+        crate::actor::rewind_writes(
+            &mut store,
+            s.clone(),
+            &s.id,
+            Some("add a comment saying why".into()),
+            "request_changes",
+        )
+        .expect("the send-back");
+        let mut units = crate::domain::session_units(&store, &s.id).unwrap();
+        assert_eq!(units[0].status, crate::domain::UnitStatus::Distributed);
+        assert_eq!(
+            units[1].status,
+            crate::domain::UnitStatus::Pending,
+            "the send-back leaves the review Pending"
+        );
+        // The build's rework folds; the review is dispatched again, still Pending, with its
+        // judge's offer minted on the run as it is now.
+        units[0].status = crate::domain::UnitStatus::Done;
+        crate::domain::put_node(&mut store, units[0].to_node()).unwrap();
+        let review = units[1].clone();
+        let at_dispatch = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        let offer = si::judge_offer(
+            &at_dispatch.assurance,
+            &review,
+            1,
+            &[],
+            &at_dispatch.clis,
+            &[],
+        )
+        .expect("a consented aware run offers the review's judge a stand-in");
+        assert_eq!(offer.key, "claude~1");
+        // The review's monitor is reserved while it runs.
+        let mut sink = crate::event_log::EventSink::default();
+        let seated = reserve_team(
+            &mut store,
+            &mut sink,
+            &s.id,
+            Role::Monitor,
+            1,
+            si::BindingScope {
+                ord: Some(review.ord),
+                attempt: Some(1),
+                ..Default::default()
+            },
+            &["claude".to_string()],
+            None,
+        )
+        .unwrap();
+        let keys: Vec<&str> = seated.iter().map(|x| x.binding.key.as_str()).collect();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert_ne!(
+            keys[0], offer.key,
+            "the monitor never takes the review judge's slot"
+        );
+        let after = crate::domain::get_session(&store, &s.id).unwrap().unwrap();
+        let answered = si::judge_answered(
+            &after.assurance,
+            &review,
+            1,
+            &[],
+            &after.clis,
+            &[],
+            &offer.key,
+        )
+        .expect("the fold confirms the judge's key as its own");
+        assert_eq!(answered.key, offer.key);
+    }
+
     /// No consent, an unaware run, a reduced run, a benched base or no seat at all: nothing is
     /// reserved and nothing is written.
     #[test]

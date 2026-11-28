@@ -570,6 +570,145 @@ fn a_rule_check_on_the_run_judge_stand_in_is_recorded_and_its_verdicts_stand() {
     assert_eq!(receipt.rules[0].status, RuleStatus::Kept);
 }
 
+/// core#2044: after a send-back the reworked unit runs `Pending` (`rewind_writes` writes every unit
+/// after its target so, `actor.rs:24047`; dispatch writes no status). A monitor reserved for it
+/// while it runs never takes its judge's offer, so the rule check on that offer keeps its verdict
+/// through the production fold: no "not on the run's record" row.
+#[test]
+fn a_rule_check_stand_in_after_a_send_back_keeps_its_verdict_2044() {
+    use wicked_apps_core::ToNode;
+    let sid = "rc-standin-2044";
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let mut sink = |_e: CoreEvent| {};
+    let Planned {
+        mut units,
+        workflow_id,
+        cli_keys,
+        ..
+    } = plan_and_distribute(
+        &mut store,
+        &[cli("claude")],
+        "Do step one.",
+        EntityMode::Shared,
+        sid,
+        crate::domain::HumanConfirm::None,
+        false,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        &mut sink,
+        None,
+        false,
+        false,
+        Vec::new(),
+        None,
+        false,
+        &crate::assurance::QeOverride::Auto,
+    )
+    .expect("plan");
+    let mut s = crate::domain::get_session(&store, sid)
+        .unwrap()
+        .expect("session");
+    s.assurance = crate::standin::LaunchStandIn {
+        aware: true,
+        consent: Some(crate::standin::StandInConsent {
+            scope: crate::standin::SCOPE_JOB.into(),
+            by: "local (human)".into(),
+            at: 1,
+            via: "launch".into(),
+        }),
+        ..Default::default()
+    }
+    .apply(s.assurance);
+    crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    // As the send-back left it: Pending while it runs again.
+    units[0].status = crate::domain::UnitStatus::Pending;
+    crate::domain::put_node(&mut store, units[0].to_node()).unwrap();
+    let offer = crate::standin::judge_offer(
+        &s.assurance,
+        &units[0],
+        1,
+        &crate::registry_roster(),
+        &s.clis,
+        &s.benched_seats,
+    )
+    .expect("the unit's judge is offered a stand-in");
+    // The unit's team monitor, reserved while it runs.
+    let mut events = crate::event_log::EventSink::default();
+    let seated = crate::actor::stand_in_gate::reserve_team(
+        &mut store,
+        &mut events,
+        sid,
+        crate::standin::Role::Monitor,
+        1,
+        crate::standin::BindingScope {
+            ord: Some(units[0].ord),
+            attempt: Some(1),
+            ..Default::default()
+        },
+        &["claude".to_string()],
+        None,
+    )
+    .unwrap();
+    assert_eq!(seated.len(), 1, "a monitor stands in");
+    let mut kept = row("K", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:1");
+    kept.judge = Some(offer.key.clone());
+    let evidence = crate::workflow::UnitEvidence {
+        rule_check: Some(RuleCheckReport {
+            rows: vec![kept],
+            seats: vec![offer.key.clone()],
+            calls: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let output = crate::workflow::stub_output(&units[0]);
+    apply_and_finish_unit(
+        &mut store,
+        &mut units[0],
+        &output,
+        &workflow_id,
+        EntityMode::Shared,
+        sid,
+        1,
+        false,
+        false,
+        &cli_keys,
+        None,
+        &evidence,
+        &mut |_e| {},
+        None,
+    )
+    .expect("apply");
+    let unit = crate::domain::session_units(&store, sid).unwrap()[0].clone();
+    let receipt = unit.assurance.as_ref().expect("a receipt");
+    assert_eq!(
+        receipt.rules[0].status,
+        RuleStatus::Kept,
+        "{:?}",
+        receipt.rules[0].reason
+    );
+    assert!(
+        !receipt.rules[0].reason.contains("run's record"),
+        "{}",
+        receipt.rules[0].reason
+    );
+    let session = crate::domain::get_session(&store, sid).unwrap().unwrap();
+    let b = session
+        .assurance
+        .stand_ins
+        .iter()
+        .find(|b| b.key == offer.key)
+        .expect("the judge's binding is on the run's record");
+    assert_eq!(b.role, crate::standin::Role::RuleJudge);
+    assert_eq!(b.state, crate::standin::STATE_ANSWERED);
+}
+
 /// core#1985: the stand-in a rule check ran on (no semantic judge answered as it) is recorded on the
 /// run as the rule check's, never as a second judge: crew's delivery line lists the run's bindings
 /// by role ("Stood in: reviewer, judge, judge" before the fix).
