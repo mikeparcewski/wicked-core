@@ -194,6 +194,26 @@ impl FromNode for RepoEntry {
     }
 }
 
+/// (core#1933, core#2047) What a read a person sees derives from the entry's checkout, on top of
+/// the record: its layer rows, and the partial-clone warning registration gave (a fetch that fills
+/// the objects drops it). Both reuse the checkout's last derivation for a few seconds
+/// (`seat_layers::cached_at`), so a studio poll does not rescan every checkout.
+fn shown(entry: &mut RepoEntry) {
+    entry.seat_layers = seat_layer_rows(
+        &entry.root_path,
+        &entry.seat_layers_off,
+        entry.seat_base_image.is_some(),
+    );
+    let root = entry.root_path.clone();
+    let partial_clone = crate::seat_layers::cached_at(
+        &*PARTIAL_CLONE_CHECKED,
+        Path::new(&root),
+        std::time::Instant::now(),
+        || partial_clone_finding(&root),
+    );
+    entry.findings.extend(partial_clone);
+}
+
 /// (core#1043 part 2) The repo card's layer rows for the checkout at `root_path`, under this
 /// daemon's layer setting and seat base.
 fn seat_layer_rows(root_path: &str, off: &[String], repo_base: bool) -> Vec<RepoSeatLayer> {
@@ -413,23 +433,10 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         ),
     };
     let (code_graph_db, mut findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
-    // (core#2001) Once, at registration: a partial clone whose recent history a seat cannot copy
-    // is warned about here, and refused at each container-floor run start. Registration still
-    // succeeds (the floor can change, and a fetch can fill the objects).
-    if let Some(gap) = git(&root_path, &["rev-parse", "HEAD"])
-        .ok()
-        .filter(|(ok, _, _)| *ok)
-        .and_then(|(_, head, _)| partial_clone_gap(Path::new(&root_path), &head))
-    {
-        findings.push(RepoFinding {
-            code: FINDING_PARTIAL_CLONE_GAP.to_string(),
-            message: format!(
-                "{gap}; a run on the container floor is refused at its start until they are: {}",
-                crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
-            ),
-            path: None,
-        });
-    }
+    // (core#2001) A partial clone whose recent history a seat cannot copy is warned about here
+    // (checked now, not from the last read's check), and refused at each container-floor run
+    // start. Registration still succeeds (the floor can change, and a fetch can fill the objects).
+    findings.extend(partial_clone_finding(&root_path));
     let seat_layers = seat_layer_rows(&root_path, &seat_layers_off, seat_base_image.is_some());
     let entry = RepoEntry {
         id,
@@ -482,11 +489,7 @@ pub fn set_seat_layers_off(
     entry.seat_layers_off = ids;
     put_node(store, entry.to_node())?;
     // The caller gets the rows as the next read derives them.
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
+    shown(&mut entry);
     Ok(entry)
 }
 
@@ -509,11 +512,7 @@ pub fn set_seat_base_image(
     }
     entry.seat_base_image = image.map(str::to_string);
     put_node(store, entry.to_node())?;
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
+    shown(&mut entry);
     Ok(entry)
 }
 
@@ -534,11 +533,7 @@ pub fn set_seat_memory(
     }
     entry.seat_memory = memory.map(str::to_string);
     put_node(store, entry.to_node())?;
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
+    shown(&mut entry);
     Ok(entry)
 }
 
@@ -628,17 +623,13 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
         .collect())
 }
 
-/// (core#1933) The repo list a person sees (`Core::list_repos`): [`list_repos`] with each repo's
-/// [`RepoEntry::seat_layers`] rows, whose detection is reused for a few seconds
-/// (`seat_layers::detect_cached`), so a studio poll does not rescan every checkout.
+/// (core#1933, core#2047) The repo list a person sees (`Core::list_repos`): [`list_repos`] with
+/// what each repo's checkout shows ([`shown`]: its [`RepoEntry::seat_layers`] rows and its
+/// partial-clone warning).
 pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
     let mut repos = list_repos(store)?;
     for entry in &mut repos {
-        entry.seat_layers = seat_layer_rows(
-            &entry.root_path,
-            &entry.seat_layers_off,
-            entry.seat_base_image.is_some(),
-        );
+        shown(entry);
     }
     Ok(repos)
 }
@@ -1281,10 +1272,37 @@ fn git_run(
 /// whose recent history the engine cannot copy into a seat ([`partial_clone_gap`]).
 pub const FINDING_PARTIAL_CLONE_GAP: &str = "partial_clone_gap";
 
-/// (core#2047) Forget the last partial-clone check of the checkout at `root`. Nothing is kept yet:
-/// the reads a person sees do not check (the fix caches the check there and this forgets it).
+/// (core#2001) The repo-card finding for the checkout at `root_path` when it is a partial clone
+/// missing objects of its recent history ([`partial_clone_gap`] from its `HEAD`); `None` otherwise,
+/// or when git cannot answer.
+fn partial_clone_finding(root_path: &str) -> Option<RepoFinding> {
+    let (_, head, _) = git(root_path, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|(ok, _, _)| *ok)?;
+    let gap = partial_clone_gap(Path::new(root_path), &head)?;
+    Some(RepoFinding {
+        code: FINDING_PARTIAL_CLONE_GAP.to_string(),
+        message: format!(
+            "{gap}; a run on the container floor is refused at its start until they are: {}",
+            crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+        ),
+        path: None,
+    })
+}
+
+/// (core#2047) Each checkout root's last [`partial_clone_finding`], for the reads a person sees.
+static PARTIAL_CLONE_CHECKED: std::sync::LazyLock<
+    crate::seat_layers::CheckoutCache<Option<RepoFinding>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// (core#2047) Forget the last partial-clone check of the checkout at `root`, as its expiry would.
 #[cfg(test)]
-pub(crate) fn forget_partial_clone_checked(_root: &Path) {}
+pub(crate) fn forget_partial_clone_checked(root: &Path) {
+    PARTIAL_CLONE_CHECKED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(root);
+}
 
 /// (core#2001, core#1667) Whether the checkout at `tree` is a partial clone (a remote marked
 /// promisor, or `extensions.partialClone`) missing objects of the last

@@ -300,13 +300,14 @@ const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// (core#1933) The most checkout roots [`detect_cached`] remembers.
 const DETECT_CACHE_MAX: usize = 256;
 
-/// (core#1933) A checkout root's last detection: when it ran, and its layer ids.
-type Detected = (std::time::Instant, Vec<&'static str>);
+/// (core#1933, core#2047) What a read a person sees derived from one checkout root, per root:
+/// when it ran, and what it found. Each derivation keeps its own map and shares [`cached_at`].
+pub(crate) type CheckoutCache<V> =
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::Instant, V)>>;
 
-/// (core#1933) Each checkout root's last detection.
-static DETECTED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Detected>>,
-> = std::sync::LazyLock::new(Default::default);
+/// (core#1933) Each checkout root's last detection: its layer ids.
+static DETECTED: std::sync::LazyLock<CheckoutCache<Vec<&'static str>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// (core#1933) [`detect`] for the repo list a person sees, reused for [`DETECT_TTL`]: a marker
 /// added or removed in the checkout shows within that time. Not for the arm, which detects on the
@@ -317,31 +318,43 @@ pub(crate) fn detect_cached(tree: &Path) -> Vec<&'static Layer> {
 
 /// [`detect_cached`] at the time `now`.
 fn detect_cached_at(tree: &Path, now: std::time::Instant) -> Vec<&'static Layer> {
-    let cache = || DETECTED.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, ids)) = cache().get(tree) {
+    let ids = cached_at(&*DETECTED, tree, now, || {
+        detect(tree).iter().map(|l| l.id).collect()
+    });
+    CATALOG.iter().filter(|l| ids.contains(&l.id)).collect()
+}
+
+/// (core#1933, core#2047) `derive` for the checkout at `tree`, reused from `cache` for
+/// [`DETECT_TTL`]; at most [`DETECT_CACHE_MAX`] roots are kept (the expired go first, then the
+/// oldest). The one cache behind every checkout derivation the repo list shows.
+pub(crate) fn cached_at<V: Clone>(
+    cache: &CheckoutCache<V>,
+    tree: &Path,
+    now: std::time::Instant,
+    derive: impl FnOnce() -> V,
+) -> V {
+    let lock = || cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, found)) = lock().get(tree) {
         if now.saturating_duration_since(*at) < DETECT_TTL {
-            return CATALOG.iter().filter(|l| ids.contains(&l.id)).collect();
+            return found.clone();
         }
     }
-    let layers = detect(tree);
-    let mut cache = cache();
-    if cache.len() >= DETECT_CACHE_MAX && !cache.contains_key(tree) {
-        cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < DETECT_TTL);
-        if cache.len() >= DETECT_CACHE_MAX {
-            let oldest = cache
+    let found = derive();
+    let mut map = lock();
+    if map.len() >= DETECT_CACHE_MAX && !map.contains_key(tree) {
+        map.retain(|_, (at, _)| now.saturating_duration_since(*at) < DETECT_TTL);
+        if map.len() >= DETECT_CACHE_MAX {
+            let oldest = map
                 .iter()
                 .min_by_key(|(_, (at, _))| *at)
                 .map(|(k, _)| k.clone());
             if let Some(k) = oldest {
-                cache.remove(&k);
+                map.remove(&k);
             }
         }
     }
-    cache.insert(
-        tree.to_path_buf(),
-        (now, layers.iter().map(|l| l.id).collect()),
-    );
-    layers
+    map.insert(tree.to_path_buf(), (now, found.clone()));
+    found
 }
 
 /// (core#1933) Forget `tree`'s detection, as [`DETECT_TTL`] passing would.
@@ -813,6 +826,29 @@ mod tests {
             ["go"],
             "removed"
         );
+    }
+
+    /// (core#2047) Any derivation the repo list reuses goes through the one cache: derived once
+    /// within the TTL, again once it passes, and kept per checkout root.
+    #[test]
+    fn a_checkout_derivation_is_reused_until_the_ttl_passes_2047() {
+        let cache: CheckoutCache<Option<u32>> = Default::default();
+        let derived = std::cell::Cell::new(0);
+        let derive = |v: Option<u32>| {
+            derived.set(derived.get() + 1);
+            v
+        };
+        let a = Path::new("/checkout/a");
+        let t0 = std::time::Instant::now();
+        assert_eq!(cached_at(&cache, a, t0, || derive(Some(1))), Some(1));
+        let just_inside = t0 + DETECT_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(cached_at(&cache, a, just_inside, || derive(None)), Some(1));
+        assert_eq!(derived.get(), 1, "reused within the TTL");
+        assert_eq!(cached_at(&cache, a, t0 + DETECT_TTL, || derive(None)), None);
+        assert_eq!(derived.get(), 2, "derived again once it passed");
+        let b = Path::new("/checkout/b");
+        assert_eq!(cached_at(&cache, b, t0, || derive(Some(2))), Some(2));
+        assert_eq!(derived.get(), 3, "another root has its own entry");
     }
 
     /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.
