@@ -194,6 +194,28 @@ impl FromNode for RepoEntry {
     }
 }
 
+/// (core#1933, core#2047) What a read a person sees derives from the entry's checkout, on top of
+/// the record: its layer rows, and the partial-clone warning registration gave (a fetch that fills
+/// the objects drops it). Both reuse the checkout's last derivation for a few seconds
+/// (`seat_layers::cached_at`), so a studio poll does not rescan every checkout. It reads the disk
+/// and runs git, so it runs on the caller's thread (`Core::list_repos` and the setters), never on
+/// the actor (DES-2047b).
+pub(crate) fn shown(entry: &mut RepoEntry) {
+    entry.seat_layers = seat_layer_rows(
+        &entry.root_path,
+        &entry.seat_layers_off,
+        entry.seat_base_image.is_some(),
+    );
+    let root = entry.root_path.clone();
+    let partial_clone = crate::seat_layers::cached_at(
+        &*PARTIAL_CLONE_CHECKED,
+        Path::new(&root),
+        &std::time::Instant::now,
+        || partial_clone_finding(&root),
+    );
+    entry.findings.extend(partial_clone);
+}
+
 /// (core#1043 part 2) The repo card's layer rows for the checkout at `root_path`, under this
 /// daemon's layer setting and seat base.
 fn seat_layer_rows(root_path: &str, off: &[String], repo_base: bool) -> Vec<RepoSeatLayer> {
@@ -413,23 +435,10 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         ),
     };
     let (code_graph_db, mut findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
-    // (core#2001) Once, at registration: a partial clone whose recent history a seat cannot copy
-    // is warned about here, and refused at each container-floor run start. Registration still
-    // succeeds (the floor can change, and a fetch can fill the objects).
-    if let Some(gap) = git(&root_path, &["rev-parse", "HEAD"])
-        .ok()
-        .filter(|(ok, _, _)| *ok)
-        .and_then(|(_, head, _)| partial_clone_gap(Path::new(&root_path), &head))
-    {
-        findings.push(RepoFinding {
-            code: FINDING_PARTIAL_CLONE_GAP.to_string(),
-            message: format!(
-                "{gap}; a run on the container floor is refused at its start until they are: {}",
-                crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
-            ),
-            path: None,
-        });
-    }
+    // (core#2001) A partial clone whose recent history a seat cannot copy is warned about here
+    // (checked now, not from the last read's check), and refused at each container-floor run
+    // start. Registration still succeeds (the floor can change, and a fetch can fill the objects).
+    findings.extend(partial_clone_finding(&root_path));
     let seat_layers = seat_layer_rows(&root_path, &seat_layers_off, seat_base_image.is_some());
     let entry = RepoEntry {
         id,
@@ -481,19 +490,13 @@ pub fn set_seat_layers_off(
     ids.dedup();
     entry.seat_layers_off = ids;
     put_node(store, entry.to_node())?;
-    // The caller gets the rows as the next read derives them.
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
     Ok(entry)
 }
 
 /// (core#1043 part 3) Set (`Some`) or clear (`None`, or a blank reference) the repo's own seat base
-/// image ([`RepoEntry::seat_base_image`]) and return the updated entry with its layer rows. A
-/// reference that is not a local image name ([`crate::container_floor::valid_image_ref`]) is
-/// refused and the stored one is unchanged. The image need not exist yet: a unit armed on a base
+/// image ([`RepoEntry::seat_base_image`]) and return the updated entry (the engine's; `Core` adds
+/// what a person sees, [`shown`]). A reference that is not a local image name
+/// ([`crate::container_floor::valid_image_ref`]) is refused and the stored one is unchanged. The image need not exist yet: a unit armed on a base
 /// the runtime lacks is refused then (`seat_base_missing`), never pulled.
 pub fn set_seat_base_image(
     store: &mut dyn GraphStore,
@@ -509,11 +512,6 @@ pub fn set_seat_base_image(
     }
     entry.seat_base_image = image.map(str::to_string);
     put_node(store, entry.to_node())?;
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
     Ok(entry)
 }
 
@@ -534,11 +532,6 @@ pub fn set_seat_memory(
     }
     entry.seat_memory = memory.map(str::to_string);
     put_node(store, entry.to_node())?;
-    entry.seat_layers = seat_layer_rows(
-        &entry.root_path,
-        &entry.seat_layers_off,
-        entry.seat_base_image.is_some(),
-    );
     Ok(entry)
 }
 
@@ -628,17 +621,13 @@ pub fn list_repos(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
         .collect())
 }
 
-/// (core#1933) The repo list a person sees (`Core::list_repos`): [`list_repos`] with each repo's
-/// [`RepoEntry::seat_layers`] rows, whose detection is reused for a few seconds
-/// (`seat_layers::detect_cached`), so a studio poll does not rescan every checkout.
-pub fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
+/// (core#1933, core#2047) The repo list a person sees, as `Core::list_repos` builds it off the
+/// actor: [`list_repos`] with what each repo's checkout shows ([`shown`]).
+#[cfg(test)]
+pub(crate) fn list_repos_shown(store: &dyn GraphRead) -> anyhow::Result<Vec<RepoEntry>> {
     let mut repos = list_repos(store)?;
     for entry in &mut repos {
-        entry.seat_layers = seat_layer_rows(
-            &entry.root_path,
-            &entry.seat_layers_off,
-            entry.seat_base_image.is_some(),
-        );
+        shown(entry);
     }
     Ok(repos)
 }
@@ -1280,6 +1269,39 @@ fn git_run(
 /// (core#2001) The repo-card finding a registration adds when its checkout is a partial clone
 /// whose recent history the engine cannot copy into a seat ([`partial_clone_gap`]).
 pub const FINDING_PARTIAL_CLONE_GAP: &str = "partial_clone_gap";
+
+/// (core#2001) The repo-card finding for the checkout at `root_path` when it is a partial clone
+/// missing objects of its recent history ([`partial_clone_gap`] from its `HEAD`); `None` otherwise,
+/// or when git cannot answer.
+fn partial_clone_finding(root_path: &str) -> Option<RepoFinding> {
+    let (_, head, _) = git(root_path, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|(ok, _, _)| *ok)?;
+    let gap = partial_clone_gap(Path::new(root_path), &head)?;
+    Some(RepoFinding {
+        code: FINDING_PARTIAL_CLONE_GAP.to_string(),
+        message: format!(
+            "{gap}; a run on the container floor is refused at its start until they are: {}",
+            crate::worker_sandbox::FloorUnarmed::PartialClone.describe()
+        ),
+        path: None,
+    })
+}
+
+/// (core#2047) Each checkout root's last [`partial_clone_finding`], for the reads a person sees.
+static PARTIAL_CLONE_CHECKED: std::sync::LazyLock<
+    crate::seat_layers::CheckoutCache<Option<RepoFinding>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// (core#2047) Forget the last partial-clone check of the checkout at `root`, as its expiry would.
+/// Unix only, as the partial-clone tests that call it are.
+#[cfg(all(test, unix))]
+pub(crate) fn forget_partial_clone_checked(root: &Path) {
+    PARTIAL_CLONE_CHECKED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(root);
+}
 
 /// (core#2001, core#1667) Whether the checkout at `tree` is a partial clone (a remote marked
 /// promisor, or `extensions.partialClone`) missing objects of the last
@@ -4645,6 +4667,74 @@ mod tests {
         rm_repo(part.parent().unwrap());
     }
 
+    /// (core#2047) The partial-clone warning is on every read a person sees, not only on the
+    /// registration's answer: the repo list (`Core::list_repos`) carries it while the gap is there,
+    /// and drops it once the objects are fetched (and the checkout's last check has expired).
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_clone_gap_shows_on_every_read_of_the_repo_list_until_fetched_2047() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_, part, _) = partial_clone_2001("reread");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let registered = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Partial 2047".into(),
+                root_path: part.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .expect("registration succeeds");
+        let gap = |entry: &RepoEntry| {
+            entry
+                .findings
+                .iter()
+                .find(|f| f.code == FINDING_PARTIAL_CLONE_GAP)
+                .cloned()
+        };
+        assert!(gap(&registered).is_some(), "registration warns");
+        let shown = |store: &dyn GraphRead| {
+            list_repos_shown(store)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == registered.id)
+                .expect("the repo is listed")
+        };
+        let read = gap(&shown(&store)).expect("the repo list warns, as registration did");
+        assert!(read.message.contains("--refetch"), "{}", read.message);
+        assert!(
+            gap(&shown(&store)).is_some(),
+            "and on the next read as well"
+        );
+        for args in [
+            &["config", "--unset", "remote.origin.partialclonefilter"][..],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "-q",
+                "--refetch",
+                "origin",
+            ][..],
+        ] {
+            let out = crate::k8s::sync::git(&part).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        forget_partial_clone_checked(&part);
+        assert_eq!(
+            gap(&shown(&store)),
+            None,
+            "the objects are fetched: no warning"
+        );
+        rm_repo(part.parent().unwrap());
+    }
+
     /// (core#2001) A complete clone, and a partial clone whose objects were all fetched, start and
     /// register as today: no refusal, no warning.
     #[cfg(unix)]
@@ -7731,7 +7821,9 @@ mod discard_minted_tests {
             },
         )
         .unwrap();
-        let set = set_seat_layers_off(&mut store, &entry.id, &["rust".into()]).unwrap();
+        // The setter's reply as `Core` hands it on (DES-2047b: derived off the actor).
+        let mut set = set_seat_layers_off(&mut store, &entry.id, &["rust".into()]).unwrap();
+        shown(&mut set);
         assert_eq!(
             set.seat_layers.len(),
             1,
@@ -7885,8 +7977,10 @@ mod discard_minted_tests {
         );
         assert_eq!(seat_base_image_for(&store, Some(&entry.id)), None);
 
-        let set =
+        // The setter's reply as `Core` hands it on (DES-2047b: derived off the actor).
+        let mut set =
             set_seat_base_image(&mut store, &entry.id, Some(" acme/seat-base:go1.23 ")).unwrap();
+        shown(&mut set);
         assert_eq!(
             set.seat_base_image.as_deref(),
             Some("acme/seat-base:go1.23")

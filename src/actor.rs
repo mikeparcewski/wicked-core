@@ -3084,7 +3084,9 @@ pub(crate) fn run(
                 ));
             }
             Command::ListRepos { reply } => {
-                let _ = reply.send(crate::repo::list_repos_shown(&store));
+                // (DES-2047b) The engine's list: `Core::list_repos` adds what a person sees off the
+                // actor (it reads the disk and runs git).
+                let _ = reply.send(crate::repo::list_repos(&store));
             }
             Command::RejudgeReadiness { run_id, reply } => {
                 let _ = reply.send(rejudge_readiness(&store, &run_id));

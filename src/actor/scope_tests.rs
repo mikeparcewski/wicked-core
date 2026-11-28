@@ -1353,3 +1353,52 @@ fn the_repo_list_a_person_sees_shows_the_seat_layers_1933() {
     assert!(!shown[0].enabled);
     assert_eq!(shown[0].off_by.as_deref(), Some("repo"));
 }
+
+/// core#2047 (DES-2047b): what a person sees is derived from the checkout off the actor. The
+/// actor's own `ListRepos` reply is the engine's list (no layer rows, no partial-clone check: those
+/// read the disk and run git); `Core::list_repos`, which the binding runs on its pool thread, adds
+/// them.
+#[test]
+fn the_actor_replies_with_the_engine_repo_list_and_the_core_shows_it_2047() {
+    let e = engine("enginelist", Worker::scripted(|_, _| hold()));
+    let (path, _) = git_repo(&e.rig.dir);
+    std::fs::write(path.join("go.mod"), "module x\n").unwrap();
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "engine-list".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    let (reply, rx) = std::sync::mpsc::channel();
+    e.core.tx.send(Command::ListRepos { reply }).unwrap();
+    let on_actor = rx
+        .recv()
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == entry.id)
+        .expect("the actor lists the repo");
+    assert!(
+        on_actor.seat_layers.is_empty(),
+        "the actor derives nothing a person sees: {:?}",
+        on_actor.seat_layers
+    );
+    let shown = e
+        .core
+        .list_repos()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == entry.id)
+        .expect("the repo list");
+    assert_eq!(
+        shown
+            .seat_layers
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect::<Vec<_>>(),
+        ["go"],
+        "Core::list_repos shows the checkout's layers"
+    );
+}
