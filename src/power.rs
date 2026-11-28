@@ -2964,6 +2964,80 @@ mod tests {
         }
     }
 
+    /// (core#2045, R-B r1) A step with no `id` takes its default id (`plan_gate::with_default_ids`)
+    /// before power mode decides what it keeps: an unnamed stop keeps only what it reads, never an
+    /// unrelated unnamed step, and a `depends_on` that names a default id reaches its step.
+    #[test]
+    fn a_power_launch_keeps_by_default_ids_so_unnamed_steps_never_collide() {
+        use crate::workflow::GateSpec;
+        let unnamed =
+            |catalog: &str, gate: Option<GateSpec>, deps: &[&str]| crate::plan::PlanStep {
+                catalog: catalog.into(),
+                gate,
+                depends_on: (!deps.is_empty())
+                    .then(|| deps.iter().map(|d| d.to_string()).collect()),
+                ..Default::default()
+            };
+        let stop = Some(GateSpec::HumanConfirm {
+            unconditional: true,
+        });
+        // An unnamed stop next to an unrelated, unnamed conditional design step: design drops.
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                unnamed("understand", stop, &[]),
+                unnamed(
+                    "design",
+                    Some(GateSpec::HumanConfirm {
+                        unconditional: false,
+                    }),
+                    &[],
+                ),
+                unnamed("build", None, &["understand"]),
+            ],
+            ..Default::default()
+        });
+        let cats: Vec<&str> = p.steps.iter().map(|s| s.catalog.as_str()).collect();
+        assert_eq!(cats, ["understand", "build"], "{p:?}");
+        // An unnamed stop that reads `design` (the unnamed design step's default id) keeps it.
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                unnamed("design", None, &[]),
+                unnamed("understand", stop, &["design"]),
+                unnamed("build", None, &["understand"]),
+            ],
+            ..Default::default()
+        });
+        let cats: Vec<&str> = p.steps.iter().map(|s| s.catalog.as_str()).collect();
+        assert_eq!(cats, ["design", "understand", "build"], "{p:?}");
+    }
+
+    /// (core#2045, R-B r1) A phased step between a stop and its input (here `architecture`) runs
+    /// before the stop too, so it does not end the walk: only the build absorbs what it reads.
+    #[test]
+    fn a_power_launch_keeps_a_stops_inputs_through_a_phased_step_before_it() {
+        let step = |id: &str, catalog: &str, deps: &[&str]| crate::plan::PlanStep {
+            catalog: catalog.into(),
+            id: id.into(),
+            depends_on: (!deps.is_empty()).then(|| deps.iter().map(|d| d.to_string()).collect()),
+            ..Default::default()
+        };
+        let mut stop = step("stop", "understand", &["arch"]);
+        stop.gate = Some(crate::workflow::GateSpec::HumanConfirm {
+            unconditional: true,
+        });
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                step("research", "understand", &[]),
+                step("arch", "architecture", &["research"]),
+                stop,
+                step("build", "build", &["stop"]),
+            ],
+            ..Default::default()
+        });
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["research", "arch", "stop", "build"]);
+    }
+
     /// (core#2045) The intake record of a power learn launch lists its kept pre-build steps as
     /// phased steps; run 04be8ab2's record listed none (`mandatoryPhases: []`).
     #[test]
