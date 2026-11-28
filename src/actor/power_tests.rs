@@ -11,6 +11,16 @@ fn launch_power(e: &Engine, run: &str, repo_ref: &str) {
 }
 
 fn launch_power_voiced(e: &Engine, run: &str, repo_ref: &str, voice: Option<String>) {
+    launch_power_workflow(e, run, repo_ref, "bug", voice);
+}
+
+fn launch_power_workflow(
+    e: &Engine,
+    run: &str,
+    repo_ref: &str,
+    workflow: &str,
+    voice: Option<String>,
+) {
     e.core
         .launch_run(LaunchSpec {
             scope: None,
@@ -23,7 +33,7 @@ fn launch_power_voiced(e: &Engine, run: &str, repo_ref: &str, voice: Option<Stri
             human_confirm: HumanConfirm::None,
             auto_deliver: false,
             repo_ref: Some(repo_ref.to_string()),
-            workflow: Some("bug".into()),
+            workflow: Some(workflow.into()),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             optional_read_roots: Vec::new(),
@@ -217,6 +227,62 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
     );
     let v = view(&e, "ph");
     assert!(v.session.power.is_none());
+    release_all(&w);
+}
+
+/// (core#2045) The user's path: a power learn launch (studio's default) plans the workflow's
+/// unconditional walkthrough stop and the steps it reads, and runs learn's own scope step right
+/// after the PA's, before any build. Runs 04be8ab2 and eae863c7 went from pa-scope straight to
+/// author.
+#[test]
+fn a_power_learn_launch_keeps_its_walkthrough_stop_and_runs_its_scope_step_first() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":pa-scope") {
+            turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None)
+        } else {
+            hold()
+        }
+    });
+    let e = engine("pwl", w.clone());
+    let (path, _head) = git_repo(&e.rig.dir);
+    let repo = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "pwl".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    launch_power_workflow(&e, "pl", &repo.id, "learn", None);
+    wait_for("the unit after the PA scope step", || {
+        e.worker.calls().len() >= 2
+    });
+    let calls = e.worker.calls();
+    assert_eq!(
+        calls[0].2, "pl:pa-scope",
+        "the intake (scope) step runs first"
+    );
+    assert_eq!(
+        calls[1].2, "pl:scope",
+        "learn's own scope step runs before the build"
+    );
+    let v = view(&e, "pl");
+    let ids: Vec<String> = v
+        .units
+        .iter()
+        .filter_map(|u| u.id.rsplit(':').next().map(str::to_string))
+        .collect();
+    for kept in [
+        "scope",
+        "research",
+        "synthesize",
+        "walkthrough",
+        "author",
+        "review",
+    ] {
+        assert!(ids.iter().any(|i| i == kept), "{kept} is planned: {ids:?}");
+    }
+    assert!(v.session.power.is_some(), "it is still a power run");
     release_all(&w);
 }
 

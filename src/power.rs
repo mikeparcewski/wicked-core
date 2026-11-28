@@ -731,40 +731,54 @@ pub const DROPPED_AT_LAUNCH: [&str; 3] = ["understand", "test_plan", "design"];
 
 /// A power launch's plan: the authored plan without its [`DROPPED_AT_LAUNCH`] steps, with every
 /// `depends_on` that named a dropped step re-pointed at what that step depended on. A plan that
-/// has no build step is returned unchanged: no orchestrator would absorb the dropped work.
+/// has no build step is returned unchanged but for its default ids (`plan_gate::with_default_ids`,
+/// which the plan gate gives it anyway): no orchestrator would absorb the dropped work.
+///
+/// (core#2045) A step whose gate ranks `human_confirm{unconditional:true}` or higher is never
+/// dropped: power mode is a dial, and the dial never downgrades an unconditional gate
+/// ([`crate::workflow::GateSpec::HumanConfirm`]). Every droppable step that stop reads,
+/// transitively through `depends_on`, stays too: the build that would absorb it runs after the
+/// stop. Kept steps keep their authored gates (`kept_at_launch`).
 pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
-    let dropped: Vec<&crate::plan::PlanStep> = plan
-        .steps
-        .iter()
-        .filter(|s| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()))
-        .collect();
-    if !plan.steps.iter().any(|s| s.catalog == "build") || dropped.is_empty() {
+    // Every step by the id it will have (a step with no id takes its default, as the plan gate
+    // gives it): what is kept and what a `depends_on` names are read by those ids, never by "".
+    let plan = &crate::plan_gate::with_default_ids(plan);
+    let kept = kept_at_launch(plan);
+    let drops = |s: &crate::plan::PlanStep| {
+        DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()) && !kept.contains(&s.id)
+    };
+    if !plan.steps.iter().any(|s| s.catalog == "build") || !plan.steps.iter().any(drops) {
         return plan.clone();
     }
     // A dropped step's own dependencies, resolved through chains of dropped steps.
-    fn resolve(id: &str, plan: &crate::plan::PlanSteps, depth: usize) -> Vec<String> {
+    fn resolve(
+        id: &str,
+        plan: &crate::plan::PlanSteps,
+        drops: &dyn Fn(&crate::plan::PlanStep) -> bool,
+        depth: usize,
+    ) -> Vec<String> {
         let Some(step) = plan.steps.iter().find(|s| s.id == id) else {
             return vec![id.to_string()];
         };
-        if depth > 16 || !DROPPED_AT_LAUNCH.contains(&step.catalog.as_str()) {
+        if depth > 16 || !drops(step) {
             return vec![id.to_string()];
         }
         step.depends_on
             .iter()
             .flatten()
-            .flat_map(|d| resolve(d, plan, depth + 1))
+            .flat_map(|d| resolve(d, plan, drops, depth + 1))
             .collect()
     }
     let mut out = plan.clone();
     out.steps = plan
         .steps
         .iter()
-        .filter(|s| !DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()))
+        .filter(|&s| !drops(s))
         .cloned()
         .map(|mut s| {
             if let Some(deps) = s.depends_on.take() {
                 let mut next: Vec<String> = Vec::new();
-                for d in deps.iter().flat_map(|d| resolve(d, plan, 0)) {
+                for d in deps.iter().flat_map(|d| resolve(d, plan, &drops, 0)) {
                     if !next.contains(&d) {
                         next.push(d);
                     }
@@ -776,6 +790,49 @@ pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
         .collect();
     out
 }
+
+/// (core#2045) The droppable steps a power launch keeps: every [`DROPPED_AT_LAUNCH`] step whose
+/// gate ranks `human_confirm{unconditional:true}` or higher (an absent gate is its catalog
+/// entry's), and every droppable step it reads, transitively through `depends_on`. Only a `build`
+/// step ends the walk: what the orchestrator reads, it absorbs before the stop. A phased step on the
+/// way (`architecture`, say) runs before the stop, so the walk goes on through it.
+fn kept_at_launch(plan: &crate::plan::PlanSteps) -> Vec<String> {
+    let droppable = |s: &crate::plan::PlanStep| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str());
+    let rank = |s: &crate::plan::PlanStep| {
+        s.gate
+            .or_else(|| crate::catalog::catalog_entry(&s.catalog).map(|e| e.gate))
+            .map_or(0, crate::plan::gate_rank_of)
+    };
+    let mut todo: Vec<&crate::plan::PlanStep> = plan
+        .steps
+        .iter()
+        .filter(|&s| droppable(s) && rank(s) >= UNCONDITIONAL_RANK)
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    while let Some(step) = todo.pop() {
+        if seen.contains(&step.id.as_str()) {
+            continue;
+        }
+        seen.push(step.id.as_str());
+        if droppable(step) {
+            kept.push(step.id.clone());
+        }
+        if step.catalog == "build" {
+            continue;
+        }
+        todo.extend(
+            step.depends_on
+                .iter()
+                .flatten()
+                .filter_map(|d| plan.steps.iter().find(|s| &s.id == d)),
+        );
+    }
+    kept
+}
+
+/// `human_confirm{unconditional:true}` on the gate ladder ([`crate::plan::gate_rank_of`]).
+const UNCONDITIONAL_RANK: u8 = 3;
 
 /// The catalog types that are hand-off (or the build) in power mode; any other step of the
 /// composed plan stays a phased step and is listed as mandatory.
@@ -2788,6 +2845,242 @@ mod tests {
                 "preset {name} does not compose in power mode"
             );
         }
+    }
+
+    /// The learn preset's steps, as `crate::catalog::builtin_presets()` composes them.
+    fn learn_steps() -> Vec<crate::plan::PlanStep> {
+        crate::catalog::builtin_presets()
+            .into_iter()
+            .find(|(n, _)| *n == "learn")
+            .expect("the learn preset")
+            .1
+    }
+
+    /// (core#2045) A power launch never drops a step the workflow made an unconditional human stop
+    /// (`GateSpec::HumanConfirm` doc: the dial can never downgrade it), nor the steps that stop
+    /// reads: learn keeps scope -> research -> synthesize -> walkthrough ahead of its build, as the
+    /// proposal card shows. Runs 04be8ab2 and eae863c7 planned only author and review.
+    #[test]
+    fn a_power_launch_keeps_an_unconditional_human_stop_and_the_steps_it_reads() {
+        let plan = crate::plan::PlanSteps {
+            steps: learn_steps(),
+            ..Default::default()
+        };
+        let p = launch_plan(&plan);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "scope",
+                "research",
+                "synthesize",
+                "walkthrough",
+                "author",
+                "review"
+            ]
+        );
+        let step = |id: &str| p.steps.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(
+            step("walkthrough").gate,
+            Some(crate::workflow::GateSpec::HumanConfirm {
+                unconditional: true
+            }),
+            "the stop keeps its authored gate"
+        );
+        assert_eq!(
+            step("scope").gate,
+            Some(crate::workflow::GateSpec::HumanConfirm {
+                unconditional: false
+            }),
+            "a kept input keeps its authored gate too (DES-2045 ruling)"
+        );
+        assert_eq!(
+            step("author").depends_on,
+            Some(vec!["walkthrough".to_string()]),
+            "the build still waits for the stop"
+        );
+        assert_eq!(
+            step("synthesize").depends_on,
+            Some(vec!["research".to_string()])
+        );
+        // The kept plan still composes, as every power preset must.
+        let p = crate::plan_gate::with_default_ids(&p);
+        assert!(crate::plan::compose(crate::catalog::catalog(), &p).is_ok());
+    }
+
+    /// (core#2045) The rule on a composed plan: a stop ranked `human_confirm{unconditional:true}`
+    /// or `consent_before` stays with everything it reads, transitively; every other droppable
+    /// step drops as before (a conditional confirm too), and its dependents are re-pointed.
+    #[test]
+    fn a_power_launch_keeps_each_top_ranked_stop_with_its_inputs_and_drops_the_rest() {
+        use crate::workflow::GateSpec;
+        let step = |id: &str, catalog: &str, gate: Option<GateSpec>, deps: &[&str]| {
+            crate::plan::PlanStep {
+                catalog: catalog.into(),
+                id: id.into(),
+                gate,
+                depends_on: (!deps.is_empty())
+                    .then(|| deps.iter().map(|d| d.to_string()).collect()),
+                ..Default::default()
+            }
+        };
+        for stop_gate in [
+            GateSpec::HumanConfirm {
+                unconditional: true,
+            },
+            GateSpec::ConsentBefore,
+        ] {
+            let plan = crate::plan::PlanSteps {
+                steps: vec![
+                    step("root", "understand", None, &[]),
+                    step("a", "design", None, &["root"]),
+                    step("stop", "understand", Some(stop_gate), &["a"]),
+                    step("b", "understand", None, &[]),
+                    step(
+                        "c",
+                        "test_plan",
+                        Some(GateSpec::HumanConfirm {
+                            unconditional: false,
+                        }),
+                        &["b"],
+                    ),
+                    step("build", "build", None, &["stop", "c"]),
+                    step("review", "review", None, &["build"]),
+                ],
+                ..Default::default()
+            };
+            let p = launch_plan(&plan);
+            let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                ["root", "a", "stop", "build", "review"],
+                "{stop_gate:?}: the stop and its inputs stay, b and c drop"
+            );
+            let deps = |id: &str| {
+                p.steps
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .depends_on
+                    .clone()
+            };
+            assert_eq!(deps("a"), Some(vec!["root".to_string()]), "{stop_gate:?}");
+            assert_eq!(deps("stop"), Some(vec!["a".to_string()]), "{stop_gate:?}");
+            assert_eq!(
+                deps("build"),
+                Some(vec!["stop".to_string()]),
+                "{stop_gate:?}: c resolves through b to nothing"
+            );
+            assert_eq!(p.steps[2].gate, Some(stop_gate), "{stop_gate:?}");
+        }
+    }
+
+    /// (core#2045, R-B r1) A step with no `id` takes its default id (`plan_gate::with_default_ids`)
+    /// before power mode decides what it keeps: an unnamed stop keeps only what it reads, never an
+    /// unrelated unnamed step, and a `depends_on` that names a default id reaches its step.
+    #[test]
+    fn a_power_launch_keeps_by_default_ids_so_unnamed_steps_never_collide() {
+        use crate::workflow::GateSpec;
+        let unnamed =
+            |catalog: &str, gate: Option<GateSpec>, deps: &[&str]| crate::plan::PlanStep {
+                catalog: catalog.into(),
+                gate,
+                depends_on: (!deps.is_empty())
+                    .then(|| deps.iter().map(|d| d.to_string()).collect()),
+                ..Default::default()
+            };
+        let stop = Some(GateSpec::HumanConfirm {
+            unconditional: true,
+        });
+        // An unnamed stop next to an unrelated, unnamed conditional design step: design drops.
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                unnamed("understand", stop, &[]),
+                unnamed(
+                    "design",
+                    Some(GateSpec::HumanConfirm {
+                        unconditional: false,
+                    }),
+                    &[],
+                ),
+                unnamed("build", None, &["understand"]),
+            ],
+            ..Default::default()
+        });
+        let cats: Vec<&str> = p.steps.iter().map(|s| s.catalog.as_str()).collect();
+        assert_eq!(cats, ["understand", "build"], "{p:?}");
+        // An unnamed stop that reads `design` (the unnamed design step's default id) keeps it.
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                unnamed("design", None, &[]),
+                unnamed("understand", stop, &["design"]),
+                unnamed("build", None, &["understand"]),
+            ],
+            ..Default::default()
+        });
+        let cats: Vec<&str> = p.steps.iter().map(|s| s.catalog.as_str()).collect();
+        assert_eq!(cats, ["design", "understand", "build"], "{p:?}");
+    }
+
+    /// (core#2045, R-B r1) A phased step between a stop and its input (here `architecture`) runs
+    /// before the stop too, so it does not end the walk: only the build absorbs what it reads.
+    #[test]
+    fn a_power_launch_keeps_a_stops_inputs_through_a_phased_step_before_it() {
+        let step = |id: &str, catalog: &str, deps: &[&str]| crate::plan::PlanStep {
+            catalog: catalog.into(),
+            id: id.into(),
+            depends_on: (!deps.is_empty()).then(|| deps.iter().map(|d| d.to_string()).collect()),
+            ..Default::default()
+        };
+        let mut stop = step("stop", "understand", &["arch"]);
+        stop.gate = Some(crate::workflow::GateSpec::HumanConfirm {
+            unconditional: true,
+        });
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: vec![
+                step("research", "understand", &[]),
+                step("arch", "architecture", &["research"]),
+                stop,
+                step("build", "build", &["stop"]),
+            ],
+            ..Default::default()
+        });
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["research", "arch", "stop", "build"]);
+    }
+
+    /// (core#2045) The intake record of a power learn launch lists its kept pre-build steps as
+    /// phased steps; run 04be8ab2's record listed none (`mandatoryPhases: []`).
+    #[test]
+    fn a_power_learn_intake_lists_its_kept_steps_as_mandatory_phases() {
+        let p = launch_plan(&crate::plan::PlanSteps {
+            steps: learn_steps(),
+            ..Default::default()
+        });
+        let record = intake_plan(
+            &QePlan::default(),
+            30,
+            false,
+            "20-39",
+            false,
+            &p.steps,
+            &[],
+            &ABSORBED.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            false,
+            Vec::new(),
+            "claude",
+            9,
+        );
+        let phases: Vec<&str> = record
+            .mandatory_phases
+            .iter()
+            .map(|m| m.phase.as_str())
+            .collect();
+        assert_eq!(
+            phases,
+            ["understand", "understand", "understand", "understand"],
+            "scope, research, synthesize and walkthrough stay phased"
+        );
     }
 
     #[test]
