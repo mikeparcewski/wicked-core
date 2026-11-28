@@ -357,6 +357,19 @@ pub(crate) fn cached_at<V: Clone>(
     found
 }
 
+/// (core#2047, DES-2047b) [`cached_at`] read through `clock`. Here it reads the clock once, before
+/// the derivation, so an entry is stamped with the time it was asked for (the fix stamps it when
+/// it lands).
+#[cfg(test)]
+pub(crate) fn cached_at_clocked<V: Clone>(
+    cache: &CheckoutCache<V>,
+    tree: &Path,
+    clock: &dyn Fn() -> std::time::Instant,
+    derive: impl FnOnce() -> V,
+) -> V {
+    cached_at(cache, tree, clock(), derive)
+}
+
 /// (core#1933) Forget `tree`'s detection, as [`DETECT_TTL`] passing would.
 #[cfg(test)]
 pub(crate) fn forget_detected(tree: &Path) {
@@ -849,6 +862,31 @@ mod tests {
         let b = Path::new("/checkout/b");
         assert_eq!(cached_at(&cache, b, t0, || derive(Some(2))), Some(2));
         assert_eq!(derived.get(), 3, "another root has its own entry");
+    }
+
+    /// core#2047 (DES-2047b): a derivation is fresh for the TTL from when it LANDS. A scan that
+    /// took longer than the TTL is reused by the read right after it, never derived again at once.
+    #[test]
+    fn a_slow_derivation_is_fresh_for_the_ttl_after_it_lands_2047() {
+        let cache: CheckoutCache<u32> = Default::default();
+        let t0 = std::time::Instant::now();
+        let clock = std::cell::Cell::new(t0);
+        let now = || clock.get();
+        let derived = std::cell::Cell::new(0);
+        let a = Path::new("/checkout/slow");
+        let first = cached_at_clocked(&cache, a, &now, || {
+            derived.set(derived.get() + 1);
+            // The scan took longer than the TTL.
+            clock.set(t0 + DETECT_TTL + std::time::Duration::from_secs(1));
+            1
+        });
+        assert_eq!(first, 1);
+        let next = cached_at_clocked(&cache, a, &now, || {
+            derived.set(derived.get() + 1);
+            2
+        });
+        assert_eq!(next, 1, "the read right after it landed reuses it");
+        assert_eq!(derived.get(), 1, "derived once");
     }
 
     /// (core#1043 part 2) The repo card's rows: every detected layer, and what turned one off.
