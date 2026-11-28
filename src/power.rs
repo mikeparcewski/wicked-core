@@ -732,39 +732,49 @@ pub const DROPPED_AT_LAUNCH: [&str; 3] = ["understand", "test_plan", "design"];
 /// A power launch's plan: the authored plan without its [`DROPPED_AT_LAUNCH`] steps, with every
 /// `depends_on` that named a dropped step re-pointed at what that step depended on. A plan that
 /// has no build step is returned unchanged: no orchestrator would absorb the dropped work.
+///
+/// (core#2045) A step whose gate ranks `human_confirm{unconditional:true}` or higher is never
+/// dropped: power mode is a dial, and the dial never downgrades an unconditional gate
+/// ([`crate::workflow::GateSpec::HumanConfirm`]). Every droppable step that stop reads,
+/// transitively through `depends_on`, stays too: the build that would absorb it runs after the
+/// stop. Kept steps keep their authored gates (`kept_at_launch`).
 pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
-    let dropped: Vec<&crate::plan::PlanStep> = plan
-        .steps
-        .iter()
-        .filter(|s| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()))
-        .collect();
-    if !plan.steps.iter().any(|s| s.catalog == "build") || dropped.is_empty() {
+    let kept = kept_at_launch(plan);
+    let drops = |s: &crate::plan::PlanStep| {
+        DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()) && !kept.contains(&s.id)
+    };
+    if !plan.steps.iter().any(|s| s.catalog == "build") || !plan.steps.iter().any(drops) {
         return plan.clone();
     }
     // A dropped step's own dependencies, resolved through chains of dropped steps.
-    fn resolve(id: &str, plan: &crate::plan::PlanSteps, depth: usize) -> Vec<String> {
+    fn resolve(
+        id: &str,
+        plan: &crate::plan::PlanSteps,
+        drops: &dyn Fn(&crate::plan::PlanStep) -> bool,
+        depth: usize,
+    ) -> Vec<String> {
         let Some(step) = plan.steps.iter().find(|s| s.id == id) else {
             return vec![id.to_string()];
         };
-        if depth > 16 || !DROPPED_AT_LAUNCH.contains(&step.catalog.as_str()) {
+        if depth > 16 || !drops(step) {
             return vec![id.to_string()];
         }
         step.depends_on
             .iter()
             .flatten()
-            .flat_map(|d| resolve(d, plan, depth + 1))
+            .flat_map(|d| resolve(d, plan, drops, depth + 1))
             .collect()
     }
     let mut out = plan.clone();
     out.steps = plan
         .steps
         .iter()
-        .filter(|s| !DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()))
+        .filter(|&s| !drops(s))
         .cloned()
         .map(|mut s| {
             if let Some(deps) = s.depends_on.take() {
                 let mut next: Vec<String> = Vec::new();
-                for d in deps.iter().flat_map(|d| resolve(d, plan, 0)) {
+                for d in deps.iter().flat_map(|d| resolve(d, plan, &drops, 0)) {
                     if !next.contains(&d) {
                         next.push(d);
                     }
@@ -776,6 +786,42 @@ pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
         .collect();
     out
 }
+
+/// (core#2045) The droppable steps a power launch keeps: every [`DROPPED_AT_LAUNCH`] step whose
+/// gate ranks `human_confirm{unconditional:true}` or higher (an absent gate is its catalog
+/// entry's), and every droppable step it reads, transitively through `depends_on`. A non-droppable
+/// step (the build) ends the walk: what it reads, it absorbs before the stop.
+fn kept_at_launch(plan: &crate::plan::PlanSteps) -> Vec<String> {
+    let droppable = |s: &crate::plan::PlanStep| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str());
+    let rank = |s: &crate::plan::PlanStep| {
+        s.gate
+            .or_else(|| crate::catalog::catalog_entry(&s.catalog).map(|e| e.gate))
+            .map_or(0, crate::plan::gate_rank_of)
+    };
+    let mut todo: Vec<&crate::plan::PlanStep> = plan
+        .steps
+        .iter()
+        .filter(|&s| droppable(s) && rank(s) >= UNCONDITIONAL_RANK)
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
+    while let Some(step) = todo.pop() {
+        if kept.contains(&step.id) {
+            continue;
+        }
+        kept.push(step.id.clone());
+        todo.extend(
+            step.depends_on
+                .iter()
+                .flatten()
+                .filter_map(|d| plan.steps.iter().find(|s| &s.id == d))
+                .filter(|&s| droppable(s)),
+        );
+    }
+    kept
+}
+
+/// `human_confirm{unconditional:true}` on the gate ladder ([`crate::plan::gate_rank_of`]).
+const UNCONDITIONAL_RANK: u8 = 3;
 
 /// The catalog types that are hand-off (or the build) in power mode; any other step of the
 /// composed plan stays a phased step and is listed as mandatory.
