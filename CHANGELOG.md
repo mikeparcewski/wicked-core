@@ -27,8 +27,10 @@ Two release tracks share this file, newest entry first regardless of track:
     prebuilds the seat images a registered repository's units use.
   - **A send-back at the terminal gate reviews the last unit** (#2005, #2021). A send-back at the gate after a run's final
     step (the demo review's Record it again) goes back to the last creator step with the note, instead of being refused.
-  - **A send-back can no longer strand a run at an answered gate** (#2022, #2027). Request changes, and accepting an
-    evaluator's suggestion, commit the answer together with the rewind of the run's steps.
+  - **A crash during a send-back no longer strands a run at an answered gate** (#2022, #2027). Request changes, and
+    accepting an evaluator's suggestion, commit the answer together with the rewind of the run's steps. If a rewind
+    write fails, the rows are put back before the error commits; if putting them back also fails, the error names both
+    and the run can still be left at an answered gate (a known limit).
   - **A failed "accept the suggestion" takes the edit back out of the worktree** (#2029, #2033); **accepting a suggestion
     is refused over hand edits**, naming the changed paths, and the gate stays open (#2036, #2038).
   - core-ts: the platform lockfile entries are re-stamped for the published 0.16.2 (#2025).
