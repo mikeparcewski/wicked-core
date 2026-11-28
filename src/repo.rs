@@ -1296,7 +1296,8 @@ static PARTIAL_CLONE_CHECKED: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// (core#2047) Forget the last partial-clone check of the checkout at `root`, as its expiry would.
-#[cfg(test)]
+/// Unix only, as the partial-clone tests that call it are.
+#[cfg(all(test, unix))]
 pub(crate) fn forget_partial_clone_checked(root: &Path) {
     PARTIAL_CLONE_CHECKED
         .lock()
