@@ -1281,6 +1281,11 @@ fn git_run(
 /// whose recent history the engine cannot copy into a seat ([`partial_clone_gap`]).
 pub const FINDING_PARTIAL_CLONE_GAP: &str = "partial_clone_gap";
 
+/// (core#2047) Forget the last partial-clone check of the checkout at `root`. Nothing is kept yet:
+/// the reads a person sees do not check (the fix caches the check there and this forgets it).
+#[cfg(test)]
+pub(crate) fn forget_partial_clone_checked(_root: &Path) {}
+
 /// (core#2001, core#1667) Whether the checkout at `tree` is a partial clone (a remote marked
 /// promisor, or `extensions.partialClone`) missing objects of the last
 /// [`crate::k8s::seat::REPLICA_DEPTH`] commits from `sha`. The engine never fetches them lazily
@@ -4642,6 +4647,74 @@ mod tests {
             .find(|f| f.code == FINDING_PARTIAL_CLONE_GAP)
             .expect("registration warns");
         assert!(finding.message.contains("--refetch"), "{}", finding.message);
+        rm_repo(part.parent().unwrap());
+    }
+
+    /// (core#2047) The partial-clone warning is on every read a person sees, not only on the
+    /// registration's answer: the repo list (`Core::list_repos`) carries it while the gap is there,
+    /// and drops it once the objects are fetched (and the checkout's last check has expired).
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_clone_gap_shows_on_every_read_of_the_repo_list_until_fetched_2047() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_, part, _) = partial_clone_2001("reread");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let registered = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Partial 2047".into(),
+                root_path: part.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .expect("registration succeeds");
+        let gap = |entry: &RepoEntry| {
+            entry
+                .findings
+                .iter()
+                .find(|f| f.code == FINDING_PARTIAL_CLONE_GAP)
+                .cloned()
+        };
+        assert!(gap(&registered).is_some(), "registration warns");
+        let shown = |store: &dyn GraphRead| {
+            list_repos_shown(store)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == registered.id)
+                .expect("the repo is listed")
+        };
+        let read = gap(&shown(&store)).expect("the repo list warns, as registration did");
+        assert!(read.message.contains("--refetch"), "{}", read.message);
+        assert!(
+            gap(&shown(&store)).is_some(),
+            "and on the next read as well"
+        );
+        for args in [
+            &["config", "--unset", "remote.origin.partialclonefilter"][..],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "-q",
+                "--refetch",
+                "origin",
+            ][..],
+        ] {
+            let out = crate::k8s::sync::git(&part).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        forget_partial_clone_checked(&part);
+        assert_eq!(
+            gap(&shown(&store)),
+            None,
+            "the objects are fetched: no warning"
+        );
         rm_repo(part.parent().unwrap());
     }
 
